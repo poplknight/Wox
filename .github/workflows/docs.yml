@@ -1,0 +1,65 @@
+name: Docs
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "www/**"
+      - ".github/workflows/docs.yml"
+      - CHANGELOG.md
+      - CHANGELOG.zh_CN.md
+      - README.md
+      - store-plugin.json
+      - store-theme.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # Keep GitHub-owned JavaScript actions on Node 24-compatible majors; this changes the action runtime, not the docs Node version.
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # Not strictly necessary for vitepress unless using lastUpdated
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 11.9.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: cd www && pnpm install --frozen-lockfile
+
+      - name: Build docs
+        run: cd www && pnpm docs:build
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: www/docs/.vitepress/dist
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

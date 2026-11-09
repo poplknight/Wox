@@ -1,0 +1,1708 @@
+package launcher
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	"wox/common"
+	"wox/plugin"
+	"wox/ui/contract"
+	launcherview "wox/ui/launcher/view"
+	previewview "wox/ui/launcher/view/preview"
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+	"wox/util/screen"
+	utilselection "wox/util/selection"
+)
+
+type requestMRUTestServices struct {
+	contract.Services
+}
+
+func (requestMRUTestServices) QueryMRU(context.Context, string, string) ([]plugin.QueryResultUI, error) {
+	return nil, errors.New("stop after request")
+}
+
+type mruResultsTestServices struct {
+	contract.Services
+}
+
+func (mruResultsTestServices) QueryMRU(context.Context, string, string) ([]plugin.QueryResultUI, error) {
+	return []plugin.QueryResultUI{{Id: "mru"}}, nil
+}
+
+type remotePreviewTestServices struct {
+	contract.Services
+	called chan struct{}
+}
+
+func (s *remotePreviewTestServices) ResultPreview(context.Context, string, string, string, string) (plugin.WoxPreview, error) {
+	close(s.called)
+	return plugin.WoxPreview{PreviewType: plugin.WoxPreviewTypeText, PreviewData: "loaded"}, nil
+}
+
+func TestLauncherWindowOriginPreservesDraggedPosition(t *testing.T) {
+	params := showAppParams{Position: position{X: 400, Y: 300}}
+	current := woxui.Rect{X: 92, Y: 74, Width: 760, Height: 420}
+
+	x, y, anchor := launcherWindowOrigin(params, current, 620, false, 0)
+	if x != current.X || y != current.Y || anchor != 0 {
+		t.Fatalf("preserved origin = %.0f,%.0f anchor %.0f, want %.0f,%.0f anchor 0", x, y, anchor, current.X, current.Y)
+	}
+}
+
+func TestLauncherQueryWindowLeavesOverlayBandOnLinuxAndMac(t *testing.T) {
+	if !launcherQueryWindowTopmost("windows") {
+		t.Fatal("Windows query window must stay HWND_TOPMOST above other apps")
+	}
+	if launcherQueryWindowTopmost("linux") {
+		t.Fatal("Linux query window must stay on layer-shell TOP so timer overlays can cover it")
+	}
+	if launcherQueryWindowTopmost("darwin") {
+		t.Fatal("macOS query window must stay at floating level so Topmost overlays can cover it")
+	}
+}
+
+func TestLauncherPreviewRatioUsesChatLayout(t *testing.T) {
+	ratio := 0.25
+	if got := launcherPreviewRatio(queryLayout{ResultPreviewWidthRatio: &ratio}, false); got != 0.25 {
+		t.Fatalf("regular preview ratio = %v, want 0.25", got)
+	}
+	if got := launcherPreviewRatio(queryLayout{ResultPreviewWidthRatio: &ratio, ChatMode: true}, false); got != 0 {
+		t.Fatalf("chat preview ratio = %v, want 0", got)
+	}
+	if got := launcherPreviewRatio(queryLayout{ResultPreviewWidthRatio: &ratio}, true); got != 0 {
+		t.Fatalf("fullscreen preview ratio = %v, want 0", got)
+	}
+}
+
+func TestLauncherToolbarHeightIncludedInChatFullscreen(t *testing.T) {
+	if !launcherToolbarHeightIncluded(false, true, true, true) {
+		t.Fatal("chat fullscreen should retain the hidden toolbar height")
+	}
+	if launcherToolbarHeightIncluded(false, true, true, false) {
+		t.Fatal("terminal fullscreen should not retain the hidden toolbar height")
+	}
+	if launcherToolbarHeightIncluded(true, true, true, true) || launcherToolbarHeightIncluded(false, false, true, true) {
+		t.Fatal("disabled or empty toolbar should not contribute height")
+	}
+}
+
+func TestLauncherToolbarHidesAboutMenuWhenIdle(t *testing.T) {
+	if launcherToolbarHasContent(0, false, false) {
+		t.Fatal("a query with no results should hide the about-menu-only toolbar")
+	}
+	if !launcherToolbarHasContent(1, false, false) {
+		t.Fatal("results should keep the toolbar")
+	}
+	if !launcherToolbarHasContent(0, true, false) || !launcherToolbarHasContent(0, false, true) {
+		t.Fatal("a status message or open about menu should keep the toolbar")
+	}
+	if launcherToolbarHeightIncluded(false, false, false, false) {
+		t.Fatal("an idle launcher should not reserve toolbar height")
+	}
+	if !launcherToolbarHeightIncluded(false, true, false, false) {
+		t.Fatal("toolbar content should still reserve height")
+	}
+	if launcherToolbarHeightIncluded(true, true, false, false) {
+		t.Fatal("HideToolbar must still omit the toolbar")
+	}
+}
+
+func TestApplyResultsEntersChatModeFromLayout(t *testing.T) {
+	app := New(false, nil)
+	app.uiCall = nil
+	app.visible = true
+	app.querySession.query = newInputQuery("chat ")
+	defer app.cancel()
+
+	app.applyResults(app.querySession.query.QueryID, []queryResult{{
+		ID: "chat",
+		Preview: queryPreview{
+			PreviewType: "chat",
+			PreviewData: `{"ActiveChat":{"Id":"chat"}}`,
+		},
+	}}, &queryLayout{ChatMode: true}, nil, nil, 0, true)
+
+	if !app.chat.chatFullscreen || app.chat.chatPreview == nil || !app.chat.chatPreview.active {
+		t.Fatalf("chat mode state = fullscreen:%v preview:%+v", app.chat.chatFullscreen, app.chat.chatPreview)
+	}
+	preview := queryPreview{PreviewType: "chat", PreviewData: `{"ActiveChat":{"Id":"chat","IsStreaming":true}}`}
+	result := app.resultList.results[0]
+	if err := app.chat.activateChatPreview(result, preview); err != nil {
+		t.Fatal(err)
+	}
+	if !app.chat.chatPreview.chat.IsStreaming || !app.chat.chatFullscreen {
+		t.Fatal("fullscreen chat ignored its originating result's preview update")
+	}
+	preview.PreviewData = `{"ActiveChat":{"Id":"chat","IsStreaming":false}}`
+	if err := app.chat.activateChatPreview(result, preview); err != nil {
+		t.Fatal(err)
+	}
+	if app.chat.chatPreview.chat.IsStreaming || !app.chat.chatFullscreen {
+		t.Fatal("fullscreen chat did not finish the stream")
+	}
+}
+
+func TestApplyResultsKeepsChatModeWhenPreviewIsStillRemote(t *testing.T) {
+	app := New(false, nil)
+	app.uiCall = nil
+	app.visible = true
+	app.querySession.query = newInputQuery("chat ")
+	defer app.cancel()
+
+	path := "/preview?sessionId=s&queryId=q&id=chat"
+	app.remotePreview.previewRequests[path] = true
+	app.applyResults(app.querySession.query.QueryID, []queryResult{{
+		ID: "chat",
+		Preview: queryPreview{
+			PreviewType: "remote",
+			PreviewData: path,
+		},
+		Actions: []resultAction{{
+			ID:        enterChatModeActionID,
+			IsDefault: true,
+		}},
+	}}, &queryLayout{ChatMode: true}, nil, nil, 0, true)
+
+	if !app.chat.chatFullscreen {
+		t.Fatal("chat mode should stay fullscreen while the chat preview is still remote-wrapped")
+	}
+	app.previews.reconcileSelectedPreviewOnUI()
+	if !app.chat.chatFullscreen {
+		t.Fatal("unresolved remote preview should not tear down chat fullscreen")
+	}
+}
+
+func TestActivateEnterChatActionIgnoresRemotePreviewType(t *testing.T) {
+	app := New(false, nil)
+	app.uiCall = nil
+	app.visible = true
+	app.querySession.query = newInputQuery("chat ")
+	app.resultList.layout.ChatMode = true
+	defer app.cancel()
+
+	app.resultList.results = []queryResult{{
+		ID: "chat",
+		Preview: queryPreview{
+			PreviewType: "remote",
+			PreviewData: "/preview?sessionId=s&queryId=q&id=chat",
+		},
+		Actions: []resultAction{{
+			ID:        enterChatModeActionID,
+			IsDefault: true,
+		}},
+	}}
+	app.resultList.selected = 0
+	app.activateAction(0, 0)
+	if !app.chat.chatFullscreen {
+		t.Fatal("Start Chat should enter fullscreen even when the preview is still remote-wrapped")
+	}
+}
+
+// TestChatPreviewUpdatesPreserveLocalState covers embedded and fullscreen stream updates.
+func TestChatPreviewUpdatesPreserveLocalState(t *testing.T) {
+	for _, fullscreen := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fullscreen=%v", fullscreen), func(t *testing.T) {
+			app := New(false, nil)
+			defer app.cancel()
+			result := queryResult{ID: "result", QueryID: "query"}
+			preview := queryPreview{PreviewType: "chat", PreviewData: `{"ActiveChat":{"Id":"chat"}}`}
+			if err := app.chat.activateChatPreview(result, preview); err != nil {
+				t.Fatal(err)
+			}
+			app.chat.chatFullscreen = fullscreen
+			state := app.chat.chatPreview
+			state.editor = woxui.NewTextEditor("unsent draft")
+			state.scroll.Scroll(-158, 200)
+			state.expandedRounds["round"] = true
+			question := &aiQuestion{QuestionID: "pending"}
+			state.question = question
+			state.questionEditor = woxui.NewTextEditor("partial answer")
+			state.nextModel = &aiModel{Name: "next-model"}
+			state.attachments = []common.AIChatAttachment{{ID: "draft-attachment"}}
+			for _, streaming := range []bool{true, false} {
+				preview.PreviewData = fmt.Sprintf(`{"ActiveChat":{"Id":"chat","IsStreaming":%t}}`, streaming)
+				if err := app.chat.activateChatPreview(result, preview); err != nil {
+					t.Fatal(err)
+				}
+				if app.chat.chatPreview != state || state.editor.State().Text != "unsent draft" || state.scroll.Position(200) != 42 || !state.expandedRounds["round"] {
+					t.Fatal("stream update discarded local interaction state")
+				}
+				if state.question != question || state.questionEditor.State().Text != "partial answer" || len(state.attachments) != 1 || state.attachments[0].ID != "draft-attachment" {
+					t.Fatal("stream update discarded the pending question or draft attachments")
+				}
+				if state.chat.IsStreaming != streaming || state.chat.Model.Name != "next-model" || app.chat.chatFullscreen != fullscreen {
+					t.Fatal("stream update lost remote data, model selection, or fullscreen ownership")
+				}
+				if _, err := app.chat.chatPreviewSnapshotFor(result, preview); err != nil {
+					t.Fatalf("updated preview identity is not renderable: %v", err)
+				}
+			}
+			app.chat.applyChatResponse(chatData{ID: "chat", Title: "newer service snapshot"})
+			preview.PreviewData = `{"ActiveChat":{"Id":"chat","Title":"stale preview"}}`
+			if err := app.chat.activateChatPreview(result, preview); err != nil {
+				t.Fatal(err)
+			}
+			if state.chat.Title != "newer service snapshot" {
+				t.Fatal("preview overwrote the authoritative chat service snapshot")
+			}
+		})
+	}
+}
+
+func TestLauncherGridHidesRegularPreview(t *testing.T) {
+	layout := queryLayout{GridLayout: &gridLayout{Columns: 4}}
+	if launcherPreviewVisible(layout, queryPreview{PreviewType: "image", PreviewData: "wallpaper"}) {
+		t.Fatal("grid layout should hide regular result previews")
+	}
+	if !launcherPreviewVisible(layout, queryPreview{PreviewType: "query_requirement_settings", PreviewData: "settings"}) {
+		t.Fatal("grid layout should preserve Flutter's interactive settings preview exception")
+	}
+}
+
+func TestMRUResultsResetGridLayout(t *testing.T) {
+	app := New(false, mruResultsTestServices{})
+	app.uiCall = nil
+	app.resultList.layout = queryLayout{GridLayout: &gridLayout{Columns: 4}}
+	defer app.cancel()
+
+	app.loadTypedMRU(app.querySession.query.QueryID)
+
+	if app.resultList.layout.GridLayout != nil {
+		t.Fatal("MRU results retained the previous query's grid layout")
+	}
+}
+
+func TestPreviewOnlyResultExposesSubtitle(t *testing.T) {
+	snapshot := viewSnapshot{results: []queryResult{{ID: "status", Title: "File Search Status", SubTitle: "files=10000"}}, selected: 0}
+	results := wrapPreviewOnlyResults(snapshot, woxwidget.Container{}).(woxwidget.Semantics)
+	result := results.Child.(woxwidget.Semantics)
+	if result.Label != "File Search Status" || result.Description != "files=10000" {
+		t.Fatalf("preview result semantics: label=%q description=%q", result.Label, result.Description)
+	}
+}
+
+func TestLauncherChromeHiddenForPreviewOnlyModes(t *testing.T) {
+	if !launcherChromeHidden(showAppParams{HideQueryBox: true, HideToolbar: true}, false) {
+		t.Fatal("hidden query box and toolbar should expose preview close behavior")
+	}
+	if !launcherChromeHidden(showAppParams{}, true) {
+		t.Fatal("chat fullscreen should expose preview close behavior")
+	}
+	if launcherChromeHidden(showAppParams{HideQueryBox: true}, false) {
+		t.Fatal("partially hidden launcher chrome should keep normal navigation behavior")
+	}
+}
+
+func TestLauncherPreviewOnlyRequiresChromeFreeZeroRatioPreview(t *testing.T) {
+	ratio := 0.0
+	snapshot := viewSnapshot{
+		selected: 0,
+		results:  []queryResult{{Preview: queryPreview{PreviewType: "file", PreviewData: "report.xlsx"}}},
+		layout:   queryLayout{ResultPreviewWidthRatio: &ratio},
+		show:     showAppParams{HideQueryBox: true, HideToolbar: true},
+	}
+	if !launcherPreviewOnly(snapshot) {
+		t.Fatal("chrome-free zero-ratio preview should enable border dragging")
+	}
+
+	snapshot.show.HideToolbar = false
+	if launcherPreviewOnly(snapshot) {
+		t.Fatal("visible launcher chrome should not enable preview-only border dragging")
+	}
+	snapshot.show.HideToolbar = true
+	ratio = 0.4
+	if launcherPreviewOnly(snapshot) {
+		t.Fatal("split preview layout should not enable preview-only border dragging")
+	}
+}
+
+func TestLauncherPreviewTitleBarRequiresOptInFullPreview(t *testing.T) {
+	ratio := 0.0
+	snapshot := viewSnapshot{
+		selected: 0,
+		results:  []queryResult{{Title: "Document", Preview: queryPreview{PreviewType: "file", PreviewData: "report.docx"}}},
+		layout:   queryLayout{ResultPreviewWidthRatio: &ratio},
+		show:     showAppParams{HideQueryBox: true, HideToolbar: true, ShowPreviewTitleBar: true},
+	}
+	if !launcherPreviewTitleBarVisible(snapshot) {
+		t.Fatal("opt-in full preview should show the title bar")
+	}
+
+	snapshot.show.ShowPreviewTitleBar = false
+	if launcherPreviewTitleBarVisible(snapshot) {
+		t.Fatal("title bar should remain hidden by default")
+	}
+	snapshot.show.ShowPreviewTitleBar = true
+	snapshot.results[0].Preview.PreviewType = "chat"
+	if !launcherPreviewTitleBarVisible(snapshot) {
+		t.Fatal("chat preview should reuse the preview title bar")
+	}
+	snapshot.results[0].Preview.PreviewType = "file"
+	ratio = 0.4
+	if launcherPreviewTitleBarVisible(snapshot) {
+		t.Fatal("split preview should not show the full-preview title bar")
+	}
+}
+
+func TestLauncherBrowserTitleBarRequiresDirectWebViewPreview(t *testing.T) {
+	snapshot := viewSnapshot{
+		selected:            0,
+		results:             []queryResult{{Preview: queryPreview{PreviewType: "file", PreviewData: "video.mp4"}}},
+		selectedPreviewType: "file",
+	}
+	if launcherPreviewUsesWebView(snapshot) {
+		t.Fatal("file previews must not expose browser navigation chrome")
+	}
+	snapshot.selectedPreviewType = "webview"
+	if !launcherPreviewUsesWebView(snapshot) {
+		t.Fatal("direct WebView previews need browser navigation chrome")
+	}
+}
+
+func TestPreviewImageOverlayAllowedForSidebarButNotSpacePreview(t *testing.T) {
+	if !previewImageOverlayAllowed(showAppParams{}) {
+		t.Fatal("sidebar image preview should still open the overlay")
+	}
+	if previewImageOverlayAllowed(showAppParams{ShowPreviewTitleBar: true, HideQueryBox: true, HideToolbar: true}) {
+		t.Fatal("space preview should not open another image overlay")
+	}
+	if !previewImageOverlayAllowed(showAppParams{HideQueryBox: true, HideToolbar: true}) {
+		t.Fatal("chrome-free queries without a full preview window should still open the overlay")
+	}
+}
+
+func TestBuildPreviewImageOmitsOverlayTapInSpacePreview(t *testing.T) {
+	source := previewImageTestSource()
+	app := newPreviewImageTestApp(showAppParams{ShowPreviewTitleBar: true, HideQueryBox: true, HideToolbar: true}, source, 400, 300)
+	if builtPreviewImageGesture(app, source, 400, 300).OnTap != nil {
+		t.Fatal("space preview image should not open an overlay on tap")
+	}
+}
+
+func TestBuildPreviewImageKeepsOverlayTapInSidebarPreview(t *testing.T) {
+	source := previewImageTestSource()
+	app := newPreviewImageTestApp(showAppParams{}, source, 400, 300)
+	if builtPreviewImageGesture(app, source, 400, 300).OnTap == nil {
+		t.Fatal("sidebar image preview should keep the overlay tap")
+	}
+}
+
+func builtPreviewImageGesture(app *App, source woxImage, width, height float32) woxwidget.Gesture {
+	view := app.previews.buildPreviewImage(source, source, defaultPalette(), width, height).(woxwidget.Stateful)
+	return view.CreateState().Build(woxwidget.StateContext{}, view.Widget).(woxwidget.Gesture)
+}
+
+func previewImageTestSource() woxImage {
+	return woxImage{ImageType: "svg", ImageData: `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16" fill="#ffffff"/></svg>`}
+}
+
+func newPreviewImageTestApp(show showAppParams, source woxImage, width, height float32) *App {
+	size := previewImageRequestSize(width, height)
+	key := imageKey(source) + fmt.Sprintf("-svg-%d", size)
+	image := &woxui.Image{Width: 16, Height: 16}
+	return bindTestApp(&App{
+		appearance: appearanceController{palette: uiPalette{background: woxui.Color{R: 255, G: 255, B: 255, A: 255}}},
+		show:       show,
+		imageStore: imageStore{
+			images:           map[string]*woxui.Image{key: image},
+			imageRequested:   map[string]string{},
+			imageVariants:    map[string]string{imageVariantKey(source, nil): key},
+			imageVariantKeys: map[string]string{},
+			imageLastUsed:    map[string]uint64{},
+			imageErrors:      map[string]string{},
+		},
+	})
+}
+
+func TestLauncherReservesFullPreviewHeightBeforeResultsArrive(t *testing.T) {
+	previewOnly := showAppParams{HideQueryBox: true, HideToolbar: true, ShowPreviewTitleBar: true}
+	if !launcherReservesFullPreviewHeight(previewOnly, false) {
+		t.Fatal("preview-only launch should reserve full height before its result arrives")
+	}
+	if !launcherReservesFullPreviewHeight(showAppParams{}, true) {
+		t.Fatal("a visible preview should reserve full height")
+	}
+	if launcherReservesFullPreviewHeight(showAppParams{HideQueryBox: true, HideToolbar: true}, false) {
+		t.Fatal("chrome-free queries without preview-only opt-in should remain compact")
+	}
+	if launcherReservesFullPreviewHeight(showAppParams{HideQueryBox: true, ShowPreviewTitleBar: true}, false) {
+		t.Fatal("partial launcher chrome should not reserve full preview height")
+	}
+}
+
+func TestSecondaryLauncherHideClosesWithoutWebViewCache(t *testing.T) {
+	app := bindTestApp(&App{isPrimary: false})
+	app.destroyOnce.Do(func() {})
+	if err := app.hideWindow(false); err != nil {
+		t.Fatalf("non-WebView secondary hide should close the instance: %v", err)
+	}
+}
+
+func TestSecondaryLauncherHideRetainsCacheableWebView(t *testing.T) {
+	// WebView secondaries are independent named windows; only they hide-and-retain
+	// so browsing position survives reopen. Selection/explorer/tray still destroy.
+	app := bindTestApp(&App{
+		isPrimary: false,
+		visible:   false,
+		webView:   webViewPreviewController{webViewPreviewData: `{"url":"https://example.com","cacheDisabled":false}`},
+	})
+	if err := app.hideWindow(false); err != nil {
+		t.Fatalf("cacheable WebView secondary hide should preserve the instance: %v", err)
+	}
+	if app.destroyed.Load() {
+		t.Fatal("cacheable WebView secondary must stay alive so navigation can resume")
+	}
+}
+
+func TestHasCacheableWebViewPreviewIgnoresDisabledCache(t *testing.T) {
+	app := bindTestApp(&App{webView: webViewPreviewController{webViewPreviewData: `{"url":"https://example.com","cacheDisabled":true}`}})
+	if app.hasCacheableWebViewPreviewLocked() {
+		t.Fatal("cache-disabled WebView previews must not retain secondary windows")
+	}
+}
+
+func TestCloseWebViewPageKeepsOwningQueryAndLauncherVisible(t *testing.T) {
+	app := bindTestApp(&App{
+		visible: true,
+		querySession: queryController{
+			editor:       woxui.NewTextEditor("ig "),
+			query:        newInputQuery("ig "),
+			queryContext: queryContext{PluginID: common.WebSearchPluginID},
+		},
+		webView: webViewPreviewController{webViewPreviewData: `{"url":"https://www.instagram.com","cacheDisabled":false}`},
+	})
+	app.webView.closeWebViewPage()
+	if app.webView.webViewPreviewData != "" {
+		t.Fatal("close must drop the cached preview session")
+	}
+	if app.hasCacheableWebViewPreviewLocked() {
+		t.Fatal("closed WebView must not stay retained in the background")
+	}
+	if app.querySession.query.QueryText != "ig " || app.querySession.editor.State().Text != "ig " {
+		t.Fatalf("query = %q editor = %q, want %q to preserve the owning search", app.querySession.query.QueryText, app.querySession.editor.State().Text, "ig ")
+	}
+	if !app.visible {
+		t.Fatal("close must keep Wox visible after destroying the page")
+	}
+}
+
+func TestCloseWebViewPageDestroysFullPreviewWithoutRewritingQuery(t *testing.T) {
+	app := bindTestApp(&App{
+		isPrimary: false,
+		visible:   true,
+		querySession: queryController{
+			editor: woxui.NewTextEditor("x "),
+			query:  newInputQuery("x "),
+		},
+		webView: webViewPreviewController{webViewPreviewData: `{"url":"https://x.com","cacheDisabled":false}`},
+		show:    showAppParams{HideQueryBox: true, HideToolbar: true, ShowPreviewTitleBar: true},
+	})
+	app.destroyOnce.Do(func() {})
+	app.webView.closeWebViewPage()
+	if app.webView.webViewPreviewData != "" {
+		t.Fatal("full-preview close must destroy the page")
+	}
+	if app.querySession.query.QueryText != "x " || app.querySession.editor.State().Text != "x " {
+		t.Fatalf("full-preview query = %q editor = %q, want the original hotkey query", app.querySession.query.QueryText, app.querySession.editor.State().Text)
+	}
+}
+
+func TestHideWebViewPageKeepsCacheableFullPreview(t *testing.T) {
+	app := bindTestApp(&App{
+		isPrimary: false,
+		visible:   false,
+		webView:   webViewPreviewController{webViewPreviewData: `{"url":"https://x.com","cacheDisabled":false}`},
+		show:      showAppParams{HideQueryBox: true, HideToolbar: true, ShowPreviewTitleBar: true},
+	})
+	if !app.webView.canHideWebViewPage() {
+		t.Fatal("Run in background full-preview windows must offer Hide Webpage")
+	}
+	app.webView.hideWebViewPage()
+	if app.webView.webViewPreviewData == "" || app.destroyed.Load() {
+		t.Fatal("hide must keep the page and the secondary window")
+	}
+}
+
+func TestCanHideWebViewPageRequiresBackgroundFullPreview(t *testing.T) {
+	inline := bindTestApp(&App{webView: webViewPreviewController{webViewPreviewData: `{"url":"https://x.com","cacheDisabled":false}`}})
+	if inline.webView.canHideWebViewPage() {
+		t.Fatal("typed WebView queries should not offer Hide Webpage")
+	}
+	disabled := bindTestApp(&App{
+		webView: webViewPreviewController{webViewPreviewData: `{"url":"https://x.com","cacheDisabled":true}`},
+		show:    showAppParams{HideQueryBox: true, HideToolbar: true, ShowPreviewTitleBar: true},
+	})
+	if disabled.webView.canHideWebViewPage() {
+		t.Fatal("Hide Webpage requires Run in background")
+	}
+}
+
+func TestSecondaryLauncherIgnoresGlobalFocusLoss(t *testing.T) {
+	if err := (bindTestApp(&App{})).notifyFocusLost(); err != nil {
+		t.Fatalf("secondary launcher should ignore global focus loss: %v", err)
+	}
+}
+
+type queryFocusLifecycleTestServices struct {
+	contract.Services
+	calls chan struct{}
+}
+
+func (s *queryFocusLifecycleTestServices) QueryBoxFocused(context.Context, string) error {
+	s.calls <- struct{}{}
+	return nil
+}
+
+func TestLauncherReactivationNotifiesRetainedQueryFocus(t *testing.T) {
+	host := woxwidget.NewHost(func(woxui.FrameInfo) woxwidget.Widget {
+		return woxwidget.EditableText{
+			Key:       launcherview.LauncherQueryInputKey,
+			Autofocus: true,
+			Child:     woxwidget.Container{Width: 100, Height: 30},
+		}
+	})
+	host.AttachServices(formTableHostServices{})
+	defer host.Dispose()
+	var displayList woxui.DisplayList
+	host.Frame(&displayList, woxui.FrameInfo{Size: woxui.Size{Width: 100, Height: 30}, PixelSize: woxui.PixelSize{Width: 100, Height: 30}, Scale: 1})
+	if !host.HasFocus(launcherview.LauncherQueryInputKey) {
+		t.Fatal("query input should retain logical focus")
+	}
+
+	services := &queryFocusLifecycleTestServices{calls: make(chan struct{}, 2)}
+	app := bindTestApp(&App{
+		visible:  true,
+		host:     host,
+		services: services,
+	})
+	app.onFocus(woxui.FocusEvent{Active: true})
+	select {
+	case <-services.calls:
+	case <-time.After(time.Second):
+		t.Fatal("window activation did not notify retained query focus")
+	}
+
+	app.onFocus(woxui.FocusEvent{Active: true})
+	select {
+	case <-services.calls:
+		t.Fatal("repeated active event duplicated query focus notification")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	app.onFocus(woxui.FocusEvent{Active: false})
+	app.onFocus(woxui.FocusEvent{Active: true})
+	select {
+	case <-services.calls:
+	case <-time.After(time.Second):
+		t.Fatal("reactivation after blur did not notify retained query focus")
+	}
+}
+
+func TestLauncherShowRestoresQueryFocusFromWebView(t *testing.T) {
+	host := woxwidget.NewHost(func(woxui.FrameInfo) woxwidget.Widget {
+		return woxwidget.Flex{Axis: woxwidget.Horizontal, Children: []woxwidget.Widget{
+			woxwidget.EditableText{
+				Key:       launcherview.LauncherQueryInputKey,
+				Autofocus: true,
+				Child:     woxwidget.Container{Width: 100, Height: 30},
+			},
+			woxwidget.Focusable{
+				Key:   previewview.WebViewPreviewFocusKey,
+				Child: woxwidget.Container{Width: 100, Height: 30},
+			},
+		}}
+	})
+	host.AttachServices(formTableHostServices{})
+	defer host.Dispose()
+	var displayList woxui.DisplayList
+	host.Frame(&displayList, woxui.FrameInfo{Size: woxui.Size{Width: 200, Height: 30}, PixelSize: woxui.PixelSize{Width: 200, Height: 30}, Scale: 1})
+	if !host.RequestFocus(previewview.WebViewPreviewFocusKey) {
+		t.Fatal("failed to focus WebView before launcher show")
+	}
+
+	app := bindTestApp(&App{host: host})
+	if !app.restoreQueryFocusAfterShow() {
+		t.Fatal("launcher show did not restore query focus")
+	}
+	if !host.HasFocus(launcherview.LauncherQueryInputKey) {
+		t.Fatalf("focused key = %q, want query input", host.FocusedKey())
+	}
+}
+
+func TestLauncherShowPreservesPreviewFocusWithoutQueryBox(t *testing.T) {
+	host := woxwidget.NewHost(func(woxui.FrameInfo) woxwidget.Widget {
+		return woxwidget.Focusable{
+			Key:       previewview.WebViewPreviewFocusKey,
+			Autofocus: true,
+			Child:     woxwidget.Container{Width: 100, Height: 30},
+		}
+	})
+	host.AttachServices(formTableHostServices{})
+	defer host.Dispose()
+	var displayList woxui.DisplayList
+	host.Frame(&displayList, woxui.FrameInfo{Size: woxui.Size{Width: 100, Height: 30}, PixelSize: woxui.PixelSize{Width: 100, Height: 30}, Scale: 1})
+
+	app := bindTestApp(&App{
+		host: host,
+		show: showAppParams{HideQueryBox: true},
+	})
+	if app.restoreQueryFocusAfterShow() {
+		t.Fatal("launcher show restored a query focus target while the query box was hidden")
+	}
+	if !host.HasFocus(previewview.WebViewPreviewFocusKey) {
+		t.Fatalf("focused key = %q, want WebView preview", host.FocusedKey())
+	}
+}
+
+func TestQueryCanFocusWhileChatPreviewIsActive(t *testing.T) {
+	app := bindTestApp(&App{})
+	if !app.queryCanFocus() {
+		t.Fatal("query input should own focus without an active overlay")
+	}
+	app.chat.chatPreview = &chatPreviewState{active: true}
+	if !app.queryCanFocus() {
+		t.Fatal("active chat input prevented the query from accepting pointer focus")
+	}
+}
+
+func TestQueryCanFocusWhileTerminalSearchIsOpen(t *testing.T) {
+	app := bindTestApp(&App{terminal: terminalController{terminalPreview: &terminalPreviewState{SearchOpen: true}}})
+	if !app.queryCanFocus() {
+		t.Fatal("terminal search prevented pointer focus from returning to the query input")
+	}
+}
+
+func TestTerminalSearchIgnoresKeyUp(t *testing.T) {
+	app := bindTestApp(&App{terminal: terminalController{terminalPreview: &terminalPreviewState{SearchOpen: true, Matches: []terminalMatch{{start: 0, end: 2}, {start: 3, end: 5}}, MatchIndex: 0}}})
+	if app.terminal.onTerminalPreviewKey(woxui.KeyEvent{Key: woxui.KeyEnter}) || app.terminal.terminalPreview.MatchIndex != 0 {
+		t.Fatal("terminal search advanced on Enter key-up")
+	}
+}
+
+func TestLauncherWindowOriginKeepsBottomQueryBoxAnchored(t *testing.T) {
+	params := showAppParams{QueryBoxAtBottom: true}
+	current := woxui.Rect{X: 92, Y: 200, Width: 760, Height: 420}
+
+	x, y, anchor := launcherWindowOrigin(params, current, 620, false, 0)
+	if x != current.X || y != 0 || anchor != 620 {
+		t.Fatalf("bottom-anchored origin = %.0f,%.0f anchor %.0f, want %.0f,0 anchor 620", x, y, anchor, current.X)
+	}
+}
+
+func TestLauncherWindowOriginUsesShowPositionWhenRequested(t *testing.T) {
+	params := showAppParams{Position: position{X: 400, Y: 300}}
+	current := woxui.Rect{X: 92, Y: 74, Width: 760, Height: 420}
+
+	x, y, anchor := launcherWindowOrigin(params, current, 620, true, 0)
+	if x != 400 || y != 300 || anchor != 0 {
+		t.Fatalf("show origin = %.0f,%.0f anchor %.0f, want 400,300 anchor 0", x, y, anchor)
+	}
+}
+
+func TestLauncherWindowOriginBottomQueryKeepsShowBottomFixed(t *testing.T) {
+	params := showAppParams{
+		QueryBoxAtBottom: true,
+		Position:         position{X: 100, Y: 500},
+		PositionHeight:   80,
+	}
+
+	x, y, anchor := launcherWindowOrigin(params, woxui.Rect{}, 200, true, 0)
+	if x != 100 || y != 380 || anchor != 580 {
+		t.Fatalf("bottom-anchored show origin = %.0f,%.0f anchor %.0f, want 100,380 anchor 580", x, y, anchor)
+	}
+
+	x, y, anchor = launcherWindowOrigin(params, woxui.Rect{Y: 381, Height: 200.4}, 200, false, anchor)
+	if x != 0 || y != 380 || anchor != 580 {
+		t.Fatalf("stable bottom-anchored resize = %.0f,%.0f anchor %.0f, want 0,380 anchor 580", x, y, anchor)
+	}
+
+	x, y, anchor = launcherWindowOrigin(params, woxui.Rect{}, 80, true, anchor)
+	if x != 100 || y != 500 || anchor != 580 {
+		t.Fatalf("initial-height show origin = %.0f,%.0f anchor %.0f, want 100,500 anchor 580", x, y, anchor)
+	}
+}
+
+func TestConstrainLauncherHeightToWorkArea(t *testing.T) {
+	displays := []screen.Display{
+		{ID: "left", Bounds: screen.Rect{X: -1280, Y: -720, Width: 1280, Height: 720}, WorkArea: screen.Rect{X: -1280, Y: -680, Width: 1280, Height: 680}, Scale: 1.25},
+		{ID: "main", Bounds: screen.Rect{X: 0, Y: 0, Width: 1920, Height: 1080}, WorkArea: screen.Rect{X: 0, Y: 0, Width: 1920, Height: 1040}, Scale: 2, Primary: true},
+	}
+
+	y, height, anchor := constrainLauncherHeightToWorkArea(false, false, 400, 850, 760, 500, 75, 0, displays)
+	if y != 850 || height != 190 || anchor != 0 {
+		t.Fatalf("downward launcher = y %.0f height %.0f anchor %.0f, want 850/190/0", y, height, anchor)
+	}
+
+	y, height, anchor = constrainLauncherHeightToWorkArea(true, false, -1100, -600, 500, 500, 75, -480, displays)
+	if y != -680 || height != 200 || anchor != -480 {
+		t.Fatalf("upward launcher = y %.0f height %.0f anchor %.0f, want -680/200/-480", y, height, anchor)
+	}
+}
+
+func TestConstrainLauncherHeightKeepsQueryChromeInWorkArea(t *testing.T) {
+	displays := []screen.Display{{Bounds: screen.Rect{Width: 1920, Height: 1080}, WorkArea: screen.Rect{Width: 1920, Height: 1040}, Primary: true}}
+
+	y, height, _ := constrainLauncherHeightToWorkArea(false, false, 400, 1020, 760, 500, 75, 0, displays)
+	if y != 965 || height != 75 {
+		t.Fatalf("low launcher = y %.0f height %.0f, want 965/75", y, height)
+	}
+}
+
+// TestConstrainLauncherHeightPreservesPartlyVisibleSavedPosition covers both query directions.
+func TestConstrainLauncherHeightPreservesPartlyVisibleSavedPosition(t *testing.T) {
+	displays := []screen.Display{{Bounds: screen.Rect{Width: 1920, Height: 1080}, WorkArea: screen.Rect{Width: 1920, Height: 1040}}}
+	for _, tc := range []struct {
+		name          string
+		queryAtBottom bool
+		y, anchor     float32
+	}{
+		{"top outside", false, -30, 0},
+		{"bottom outside", false, 1020, 0},
+		{"taskbar area", false, 1070, 0},
+		{"bottom query below", true, 990, 1090},
+		{"bottom query above", true, -80, 20},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			y, height, anchor := constrainLauncherHeightToWorkArea(tc.queryAtBottom, true, 200, tc.y, 800, 100, 75, tc.anchor, displays)
+			if y != tc.y || height != 100 || anchor != tc.anchor {
+				t.Fatalf("got y=%v height=%v anchor=%v, want %v/100/%v", y, height, anchor, tc.y, tc.anchor)
+			}
+		})
+	}
+}
+
+// TestLauncherHeightOnResolvedDisplay reproduces #4572's primary work-area clipping at mixed DPI.
+func TestLauncherHeightOnResolvedDisplay(t *testing.T) {
+	primary := screen.Display{ID: "main", Bounds: screen.Rect{Width: 2560, Height: 1440}, WorkArea: screen.Rect{Width: 2560, Height: 1392}, Scale: 1, Primary: true}
+	lower := screen.Display{ID: "lower", Bounds: screen.Rect{Y: 1152, Width: 2048, Height: 960}, WorkArea: screen.Rect{Y: 1152, Width: 2048, Height: 922}, Scale: 1.25}
+	// Both displays contain the logical anchor. The native display must remain authoritative.
+	if area, _ := launcherWorkAreaAt(1038, 1379.5, []screen.Display{primary, lower}); area != primary.WorkArea {
+		t.Fatal("fixture must reproduce ambiguous logical display selection")
+	}
+	for _, height := range []float32{75, 179, 571} {
+		y, gotHeight, _ := constrainLauncherHeightToWorkArea(false, false, 663, 1322, 750, height, min(height, 115), 0, []screen.Display{lower})
+		if y != 1322 || gotHeight != height {
+			t.Fatalf("lower display: y=%v height=%v, want 1322/%v", y, gotHeight, height)
+		}
+	}
+	y, height, anchor := constrainLauncherHeightToWorkArea(true, false, 663, 1322, 750, 571, 115, 1893, []screen.Display{lower})
+	if y != 1322 || height != 571 || anchor != 1893 {
+		t.Fatalf("bottom query: y=%v height=%v anchor=%v", y, height, anchor)
+	}
+}
+
+func TestLauncherBoundsEffectivelyEqualToleratesDPIRoundTrip(t *testing.T) {
+	current := woxui.Rect{X: 10, Y: 20.2, Width: 400.2, Height: 75.2}
+	target := woxui.Rect{X: 10, Y: 20, Width: 400, Height: 75}
+	if !launcherBoundsEffectivelyEqual(current, target) {
+		t.Fatal("expected DPI round-trip bounds to compare equal")
+	}
+}
+
+func TestRestoreRefreshSelectionFollowsResultID(t *testing.T) {
+	queryID := "q"
+	pending := &pendingResultSelection{queryID: queryID, index: 3, resultID: "b"}
+	partial := []queryResult{{ID: "group", IsGroup: true}, {ID: "top"}, {ID: "a"}, {ID: "b"}}
+	selected, preserved, keep := restoreRefreshSelection(partial, pending, queryID, false)
+	if selected != 3 || !preserved || !keep {
+		t.Fatalf("partial selection = %d preserved=%v keep=%v", selected, preserved, keep)
+	}
+
+	reordered := []queryResult{{ID: "group", IsGroup: true}, {ID: "top"}, {ID: "b"}, {ID: "a"}}
+	selected, preserved, keep = restoreRefreshSelection(reordered, pending, queryID, true)
+	if selected != 2 || !preserved || keep {
+		t.Fatalf("moved selection = %d preserved=%v keep=%v", selected, preserved, keep)
+	}
+
+	indexPending := &pendingResultSelection{queryID: queryID, index: 3, preserveIndex: true}
+	selected, preserved, keep = restoreRefreshSelection(reordered, indexPending, queryID, false)
+	if selected != 3 || !preserved || keep {
+		t.Fatalf("index selection = %d preserved=%v keep=%v", selected, preserved, keep)
+	}
+
+	missing := &pendingResultSelection{queryID: queryID, index: 3, resultID: "gone"}
+	selected, preserved, keep = restoreRefreshSelection(reordered, missing, queryID, true)
+	if selected != 1 || preserved || keep {
+		t.Fatalf("missing id selection = %d preserved=%v keep=%v", selected, preserved, keep)
+	}
+	missing.preserveIndex = true
+	selected, preserved, keep = restoreRefreshSelection(reordered, missing, queryID, true)
+	if selected != 3 || !preserved || keep {
+		t.Fatalf("missing id index fallback = %d preserved=%v keep=%v", selected, preserved, keep)
+	}
+
+	selected, preserved, keep = restoreRefreshSelection(reordered, pending, "other", true)
+	if selected != 1 || preserved || keep {
+		t.Fatalf("stale query selection = %d preserved=%v keep=%v", selected, preserved, keep)
+	}
+}
+
+func TestSelectableIndexFromPreservesExplicitRefreshIndex(t *testing.T) {
+	results := []queryResult{{ID: "first"}, {ID: "group", IsGroup: true}, {ID: "third"}}
+
+	if index := selectableIndex(results); index != 0 {
+		t.Fatalf("default selected index = %d, want 0", index)
+	}
+	if index := selectableIndexFrom(results, 1); index != 2 {
+		t.Fatalf("preserved selected index = %d, want 2", index)
+	}
+	if index := selectableIndexFrom(results, 3); index != 2 {
+		t.Fatalf("removed final row selection = %d, want 2", index)
+	}
+}
+
+// TestRefreshMRUPreservesSelection covers the extra query generation used by the homepage.
+func TestRefreshMRUPreservesSelection(t *testing.T) {
+	services := &sendQueryRecorderServices{}
+	app := newSendQueryTestApp(services, newInputQuery(""), showAppParams{StartPage: "mru"})
+	app.resultList.selected = 2
+	if err := app.RefreshQuery(context.Background(), common.RefreshQueryOptions{PreserveSelectedIndex: true}); err != nil {
+		t.Fatalf("refresh homepage: %v", err)
+	}
+	if services.startedQuery.QueryId != "" {
+		t.Fatal("homepage refresh started an unnecessary empty query")
+	}
+	results := []queryResult{{ID: "first"}, {ID: "second"}, {ID: "third"}}
+	selected, preserved, _ := restoreRefreshSelection(results, app.resultList.pendingSelection, app.querySession.query.QueryID, true)
+	if selected != 2 || !preserved {
+		t.Fatalf("homepage selection = %d preserved=%v, want 2/true", selected, preserved)
+	}
+}
+
+// TestRefreshQueryKeepsListUntilSnapshotStopsShrinking covers pin/refresh.
+// The first snapshot is often only the fastest plugins, and painting it collapses
+// the window until the rest of the results arrive.
+func TestRefreshQueryKeepsListUntilSnapshotStopsShrinking(t *testing.T) {
+	services := &sendQueryRecorderServices{}
+	query := newInputQuery("setting")
+	app := newSendQueryTestApp(services, query, showAppParams{MaxResultCount: 8})
+	app.visible = true
+	app.resultList.results = make([]queryResult, 8)
+	for index := range app.resultList.results {
+		app.resultList.results[index] = queryResult{ID: fmt.Sprintf("old-%d", index), QueryID: query.QueryID}
+	}
+	app.resultList.resultsQueryID = query.QueryID
+	app.resultList.selected = 1
+
+	if err := app.RefreshQuery(context.Background(), common.RefreshQueryOptions{SelectedResultId: "old-1"}); err != nil {
+		t.Fatalf("refresh query: %v", err)
+	}
+	t.Cleanup(func() {
+		app.querySession.resetQueryTransitionLocked()
+		app.querySession.releaseRefreshResultHoldLocked()
+		app.querySession.resetQueryLoadingLocked()
+	})
+	refreshedQueryID := app.querySession.query.QueryID
+	if app.querySession.queryRefreshHoldQueryID != refreshedQueryID || app.querySession.queryRefreshHoldTimer == nil {
+		t.Fatal("refresh did not hold the previous results")
+	}
+
+	app.applyResults(refreshedQueryID, []queryResult{{ID: "fast-1"}, {ID: "fast-2"}, {ID: "fast-3"}}, &queryLayout{}, nil, nil, 0, false)
+	if len(app.resultList.results) != 8 || app.resultList.results[0].ID != "old-0" || app.resultList.resultsQueryID != query.QueryID {
+		t.Fatalf("early snapshot replaced retained results: %#v query %q", app.resultList.results, app.resultList.resultsQueryID)
+	}
+	if app.querySession.queryRefreshHoldQueryID != refreshedQueryID {
+		t.Fatal("early snapshot cancelled the refresh hold")
+	}
+
+	final := make([]queryResult, 8)
+	for index := range final {
+		final[index] = queryResult{ID: fmt.Sprintf("new-%d", index)}
+	}
+	app.applyResults(refreshedQueryID, final, &queryLayout{}, nil, nil, 0, true)
+	if len(app.resultList.results) != 8 || app.resultList.results[0].ID != "new-0" || app.resultList.resultsQueryID != refreshedQueryID {
+		t.Fatalf("final snapshot = %#v query %q", app.resultList.results, app.resultList.resultsQueryID)
+	}
+	if app.querySession.queryRefreshHoldQueryID != "" || app.querySession.queryRefreshHoldTimer != nil {
+		t.Fatal("final snapshot left the refresh hold active")
+	}
+}
+
+func TestRefreshQueryKeepsVisibleGlance(t *testing.T) {
+	services := &sendQueryRecorderServices{}
+	app := newSendQueryTestApp(services, newInputQuery("setting"), showAppParams{})
+	app.visible = true
+	app.resultList.results = []queryResult{{ID: "old", QueryID: app.querySession.query.QueryID}}
+	app.resultList.resultsQueryID = app.querySession.query.QueryID
+	app.glance.glanceItem = &glanceItem{Text: "638.3 MB"}
+
+	if err := app.RefreshQuery(context.Background(), common.RefreshQueryOptions{SelectedResultId: "old"}); err != nil {
+		t.Fatalf("refresh query: %v", err)
+	}
+	t.Cleanup(func() {
+		app.querySession.resetQueryTransitionLocked()
+		app.querySession.releaseRefreshResultHoldLocked()
+		app.querySession.resetQueryLoadingLocked()
+	})
+	if app.glance.glanceItem == nil || app.glance.glanceItem.Text != "638.3 MB" {
+		t.Fatalf("refresh glance = %#v, want the previous accessory kept", app.glance.glanceItem)
+	}
+}
+
+func TestRefreshResultHoldClearsWhenResultsStayLate(t *testing.T) {
+	app := bindTestApp(&App{
+		visible:      true,
+		querySession: queryController{query: newInputQuery("setting")},
+		show:         showAppParams{MaxResultCount: 8},
+		resultList: resultController{
+			results:        []queryResult{{ID: "old", QueryID: "old-query"}},
+			resultsQueryID: "old-query",
+			selected:       0,
+		},
+	})
+	app.querySession.query.QueryID = "refresh"
+	app.querySession.beginRefreshResultHoldLocked()
+	if app.querySession.queryRefreshHoldTimer == nil {
+		t.Fatal("refresh hold timer is nil")
+	}
+	app.querySession.queryRefreshHoldTimer.Stop()
+	app.querySession.queryRefreshHoldTimer = nil
+
+	app.querySession.expireRefreshResultHold("refresh")
+	if len(app.resultList.results) != 0 || app.resultList.resultsQueryID != "" || app.resultList.selected != -1 || app.querySession.queryRefreshHoldQueryID != "" {
+		t.Fatalf("expired hold = results %#v query %q selected %d hold %q", app.resultList.results, app.resultList.resultsQueryID, app.resultList.selected, app.querySession.queryRefreshHoldQueryID)
+	}
+}
+
+func TestMoveSelectionWrapsPastLeadingGroup(t *testing.T) {
+	app := bindTestApp(&App{
+		resultList: resultController{
+			selected: 2,
+			results:  []queryResult{{ID: "group", IsGroup: true}, {ID: "first"}, {ID: "last"}},
+		},
+		uiCall: func(func()) error { return nil },
+	})
+
+	app.moveSelection(1)
+
+	if app.resultList.selected != 1 {
+		t.Fatalf("wrapped selected index = %d, want 1", app.resultList.selected)
+	}
+}
+
+func TestGroupSelectionIndexJumpsByGroup(t *testing.T) {
+	grouped := []queryResult{
+		{ID: "group-a", IsGroup: true},
+		{ID: "a1"},
+		{ID: "a2"},
+		{ID: "group-b", IsGroup: true},
+		{ID: "b1"},
+		{ID: "b2"},
+		{ID: "group-c", IsGroup: true},
+		{ID: "c1"},
+	}
+	leadingUngrouped := []queryResult{
+		{ID: "x1"},
+		{ID: "x2"},
+		{ID: "group-a", IsGroup: true},
+		{ID: "a1"},
+		{ID: "a2"},
+	}
+	plain := []queryResult{{ID: "r1"}, {ID: "r2"}, {ID: "r3"}}
+
+	tests := []struct {
+		name      string
+		results   []queryResult
+		current   int
+		direction int
+		want      int
+	}{
+		{name: "down from first group to next first", results: grouped, current: 1, direction: 1, want: 4},
+		{name: "down from middle of first group to next first", results: grouped, current: 2, direction: 1, want: 4},
+		{name: "down from middle group to next first", results: grouped, current: 5, direction: 1, want: 7},
+		{name: "down from last group to last item", results: grouped, current: 7, direction: 1, want: 7},
+		{name: "up from only item of last group to previous first", results: grouped, current: 7, direction: -1, want: 4},
+		{name: "up from last of middle group to that group first", results: grouped, current: 5, direction: -1, want: 4},
+		{name: "up from first of middle group to previous first", results: grouped, current: 4, direction: -1, want: 1},
+		{name: "up from first group last to first item", results: grouped, current: 2, direction: -1, want: 1},
+		{name: "up from first item stays", results: grouped, current: 1, direction: -1, want: 1},
+		{name: "down from leading items to first named group", results: leadingUngrouped, current: 0, direction: 1, want: 3},
+		{name: "up from last of named group to that group first", results: leadingUngrouped, current: 4, direction: -1, want: 3},
+		{name: "up from first of named group to leading first", results: leadingUngrouped, current: 3, direction: -1, want: 0},
+		{name: "down without groups goes to last", results: plain, current: 0, direction: 1, want: 2},
+		{name: "up without groups goes to first", results: plain, current: 2, direction: -1, want: 0},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := groupSelectionIndex(test.results, test.current, test.direction); got != test.want {
+				t.Fatalf("groupSelectionIndex() = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+func TestQueryGroupJumpModifierAvoidsMacOSCommandArrows(t *testing.T) {
+	got := queryGroupJumpModifier()
+	if runtime.GOOS == "darwin" {
+		if got != woxui.KeyModifierAlt {
+			t.Fatalf("macOS group jump modifier = %v, want Option", got)
+		}
+		return
+	}
+	if got != woxui.KeyModifierControl {
+		t.Fatalf("group jump modifier = %v, want Control", got)
+	}
+}
+
+func TestMoveSelectionByGroupJumpsAdjacentGroups(t *testing.T) {
+	app := bindTestApp(&App{
+		resultList: resultController{
+			selected: 1,
+			results: []queryResult{
+				{ID: "group-a", IsGroup: true},
+				{ID: "a1"},
+				{ID: "a2"},
+				{ID: "group-b", IsGroup: true},
+				{ID: "b1"},
+				{ID: "b2"},
+			},
+		},
+		uiCall: func(fn func()) error {
+			fn()
+			return nil
+		},
+	})
+
+	app.moveSelectionByGroup(1)
+	if app.resultList.selected != 4 {
+		t.Fatalf("down to next group selected = %d, want 4", app.resultList.selected)
+	}
+
+	app.moveSelectionByGroup(1)
+	if app.resultList.selected != 5 {
+		t.Fatalf("down without next group selected = %d, want 5", app.resultList.selected)
+	}
+
+	app.moveSelectionByGroup(-1)
+	if app.resultList.selected != 4 {
+		t.Fatalf("up from last of current group selected = %d, want 4", app.resultList.selected)
+	}
+
+	app.moveSelectionByGroup(-1)
+	if app.resultList.selected != 1 {
+		t.Fatalf("up from first of current group selected = %d, want 1", app.resultList.selected)
+	}
+}
+
+func TestHotkeyMatchesOnlyKeyDown(t *testing.T) {
+	if hotkeyMatches("", woxui.KeyEvent{Key: woxui.KeyUnknown, Down: true}) {
+		t.Fatal("unknown key unexpectedly matched an empty hotkey")
+	}
+	event := woxui.KeyEvent{Key: "j", Modifiers: woxui.KeyModifierControl}
+	if hotkeyMatches("ctrl+j", event) {
+		t.Fatal("key-up unexpectedly matched Ctrl+J")
+	}
+	event.Down = true
+	if !hotkeyMatches("ctrl+j", event) {
+		t.Fatal("key-down did not match Ctrl+J")
+	}
+	if !hotkeyMatches("cmd+t", woxui.KeyEvent{Key: "t", Modifiers: woxui.KeyModifierMeta, Down: true}) {
+		t.Fatal("key-down did not match Cmd+T")
+	}
+	if hotkeyMatches("cmd+t", woxui.KeyEvent{Key: "t", Modifiers: woxui.KeyModifierMeta, Down: true, Composing: true}) {
+		t.Fatal("composing key unexpectedly matched Cmd+T")
+	}
+	searchHotkey := primaryHotkey("shift+f")
+	primaryModifier := woxui.KeyModifierControl
+	if strings.HasPrefix(searchHotkey, "command+") {
+		primaryModifier = woxui.KeyModifierMeta
+	}
+	if !hotkeyMatches(searchHotkey, woxui.KeyEvent{Key: "f", Modifiers: woxui.KeyModifierShift | primaryModifier, Down: true}) {
+		t.Fatalf("%s did not match terminal search shortcut", searchHotkey)
+	}
+	if hotkeyMatches(searchHotkey, woxui.KeyEvent{Key: "f", Modifiers: primaryModifier, Down: true}) {
+		t.Fatalf("%s unexpectedly accepted the shortcut without Shift", searchHotkey)
+	}
+}
+
+func TestPreviousQueryHistoryStartsAtLatestInFreshMode(t *testing.T) {
+	app := bindTestApp(&App{
+		querySession: queryController{
+			queryHistories:    []plainQuery{newInputQuery("latest"), newInputQuery("older")},
+			queryHistoryIndex: -1,
+			canRecallHistory:  true,
+		},
+	})
+
+	query, handled := app.querySession.previousQueryHistory()
+	if !handled || query == nil || query.QueryText != "latest" {
+		t.Fatalf("first recalled query = %#v, handled = %v, want latest", query, handled)
+	}
+	query, handled = app.querySession.previousQueryHistory()
+	if !handled || query == nil || query.QueryText != "older" {
+		t.Fatalf("second recalled query = %#v, handled = %v, want older", query, handled)
+	}
+	query, handled = app.querySession.previousQueryHistory()
+	if !handled || query != nil {
+		t.Fatalf("exhausted history query = %#v, handled = %v, want nil and handled", query, handled)
+	}
+}
+
+func TestPreviousQueryHistorySkipsCurrentQueryInContinueMode(t *testing.T) {
+	app := bindTestApp(&App{
+		querySession: queryController{
+			queryHistories:    []plainQuery{newInputQuery("current"), newInputQuery("previous")},
+			queryHistoryIndex: 0,
+			canRecallHistory:  true,
+		},
+	})
+
+	query, handled := app.querySession.previousQueryHistory()
+	if !handled || query == nil || query.QueryText != "previous" {
+		t.Fatalf("recalled query = %#v, handled = %v, want previous", query, handled)
+	}
+	app.querySession.canRecallHistory = false
+	query, handled = app.querySession.previousQueryHistory()
+	if handled || query != nil {
+		t.Fatalf("disabled history query = %#v, handled = %v, want nil and unhandled", query, handled)
+	}
+}
+
+func TestQueryTextChangeDisablesHistoryRecall(t *testing.T) {
+	app := bindTestApp(&App{
+		querySession: queryController{
+			query:            newInputQuery(""),
+			canRecallHistory: true,
+		},
+		resultList: resultController{selected: -1},
+	})
+
+	app.applyQueryTextChangeLocked("typed")
+
+	if app.querySession.canRecallHistory {
+		t.Fatal("history recall remained enabled after query text changed")
+	}
+}
+
+func TestRequestMRUPreservesGlance(t *testing.T) {
+	item := &glanceItem{Text: "100 MB"}
+	uiDepth := 0
+	app := bindTestApp(&App{
+		services:      requestMRUTestServices{},
+		lifecycleCtx:  context.Background(),
+		querySession:  queryController{editor: woxui.NewTextEditor("query")},
+		glance:        glanceController{glanceItem: item},
+		resultList:    resultController{selected: -1},
+		themeSettings: newThemeSettingsController(CommonDeps{}),
+		uiCall: func(fn func()) error {
+			uiDepth++
+			defer func() { uiDepth-- }()
+			if uiDepth == 1 {
+				fn()
+			}
+			return nil
+		},
+	})
+
+	if err := app.requestMRU(); err != nil {
+		t.Fatalf("request MRU: %v", err)
+	}
+	if app.glance.glanceItem != item {
+		t.Fatal("MRU request cleared the visible Glance item")
+	}
+}
+
+func TestRequestMRUPreservesVisibleResultsDuringTransition(t *testing.T) {
+	app := bindTestApp(&App{
+		services:     requestMRUTestServices{},
+		lifecycleCtx: context.Background(),
+		querySession: queryController{
+			editor: woxui.NewTextEditor("query"),
+			query:  newInputQuery("old"),
+		},
+		show:    showAppParams{StartPage: "mru"},
+		visible: true,
+		resultList: resultController{
+			results:        []queryResult{{ID: "old-result", QueryID: "old-query"}},
+			resultsQueryID: "old-query",
+			selected:       0,
+		},
+		themeSettings: newThemeSettingsController(CommonDeps{}),
+	})
+
+	oldQueryID := app.querySession.query.QueryID
+	if err := app.requestMRU(); err != nil {
+		t.Fatalf("request MRU: %v", err)
+	}
+	if app.querySession.queryTransitionTimer == nil {
+		t.Fatal("MRU request did not start result transition timer")
+	}
+	app.querySession.queryTransitionTimer.Stop()
+	app.querySession.queryTransitionTimer = nil
+
+	if app.querySession.query.QueryID == oldQueryID {
+		t.Fatal("MRU request reused the previous query ID")
+	}
+	if len(app.resultList.results) != 1 || app.resultList.results[0].ID != "old-result" || app.resultList.selected != 0 {
+		t.Fatalf("MRU transition state = results %#v selected %d, want previous result selected", app.resultList.results, app.resultList.selected)
+	}
+}
+
+// newRetainedMRUTestApp reproduces the launcher state the smoke suite hits when it
+// clears a query that produced results: the default StartPage is "mru", so the
+// transition keeps the previous results visible instead of blanking the list.
+func newRetainedMRUTestApp(t *testing.T) *App {
+	t.Helper()
+	app := New(false, requestMRUTestServices{})
+	app.uiCall = nil
+	t.Cleanup(app.cancel)
+	app.show = showAppParams{StartPage: "mru"}
+	app.visible = true
+	app.querySession.query = newInputQuery("1+1")
+	app.querySession.editor = woxui.NewTextEditor("1+1")
+	app.resultList.results = []queryResult{{ID: "calculator", QueryID: app.querySession.query.QueryID}}
+	app.resultList.resultsQueryID = app.querySession.query.QueryID
+	app.resultList.selected = 0
+	return app
+}
+
+// TestInPlaceQueryGenerationsClearPreviousCompletion covers the invariant that query
+// completion describes one generation. These paths start a generation in place while the
+// transition deliberately keeps the previous results on screen, so a completion carried
+// over from them reported the new query as finished before it had requested anything.
+func TestInPlaceQueryGenerationsClearPreviousCompletion(t *testing.T) {
+	starts := map[string]func(*App){
+		"query text change":   func(app *App) { app.applyQueryTextChangeLocked("> echo") },
+		"query scope cleared": func(app *App) { app.clearQueryScopeLocked() },
+	}
+	for name, start := range starts {
+		t.Run(name, func(t *testing.T) {
+			app := newRetainedMRUTestApp(t)
+			app.querySession.queryComplete = true
+			previousQueryID := app.querySession.query.QueryID
+
+			start(app)
+			if app.querySession.queryTransitionTimer != nil {
+				defer app.querySession.queryTransitionTimer.Stop()
+			}
+
+			if app.querySession.query.QueryID == previousQueryID {
+				t.Fatal("reused the previous query generation")
+			}
+			if app.querySession.queryComplete {
+				t.Fatal("kept the previous generation's completion")
+			}
+			if len(app.resultList.results) == 0 {
+				t.Fatal("dropped the retained results this invariant depends on")
+			}
+		})
+	}
+}
+
+func TestEmptyMRUResponseDropsRetainedResults(t *testing.T) {
+	app := newRetainedMRUTestApp(t)
+
+	if err := app.requestMRU(); err != nil {
+		t.Fatalf("request MRU: %v", err)
+	}
+	mruQueryID := app.querySession.query.QueryID
+	if app.querySession.queryTransitionTimer == nil {
+		t.Fatal("MRU request did not retain the previous results behind a transition timer")
+	}
+	app.querySession.queryTransitionTimer.Stop()
+	app.querySession.queryTransitionTimer = nil
+
+	app.applyResults(mruQueryID, nil, &queryLayout{}, nil, nil, 0, true)
+
+	if len(app.resultList.results) != 0 || app.resultList.resultsQueryID != mruQueryID || app.resultList.selected != -1 {
+		t.Fatalf("state after an empty MRU response = results %#v query %q selected %d, want cleared", app.resultList.results, app.resultList.resultsQueryID, app.resultList.selected)
+	}
+}
+
+func TestQueryTransitionTimerDropsRetainedResultsWhenMRUNeverApplies(t *testing.T) {
+	app := newRetainedMRUTestApp(t)
+
+	if err := app.requestMRU(); err != nil {
+		t.Fatalf("request MRU: %v", err)
+	}
+	mruQueryID := app.querySession.query.QueryID
+
+	app.querySession.showPendingQueryResults(mruQueryID, false)
+
+	if len(app.resultList.results) != 0 || app.resultList.resultsQueryID != "" || app.resultList.selected != -1 {
+		t.Fatalf("state after the transition timer = results %#v query %q selected %d, want cleared", app.resultList.results, app.resultList.resultsQueryID, app.resultList.selected)
+	}
+}
+
+// TestStaleMRUResponseStillDropsRetainedResults covers the interleaving the smoke
+// suite produces by clearing and retyping a query faster than the transition
+// window: a newer query replaces the MRU generation before its empty response
+// arrives, so the stale response is discarded and only the newer transition can
+// still drop the retained results.
+func TestStaleMRUResponseStillDropsRetainedResults(t *testing.T) {
+	app := newRetainedMRUTestApp(t)
+
+	if err := app.requestMRU(); err != nil {
+		t.Fatalf("request MRU: %v", err)
+	}
+	staleQueryID := app.querySession.query.QueryID
+
+	app.applyQueryTextChangeLocked("h 1+1")
+	if app.querySession.query.QueryID == staleQueryID {
+		t.Fatal("query text change reused the MRU generation")
+	}
+	app.applyResults(staleQueryID, nil, &queryLayout{}, nil, nil, 0, true)
+	if len(app.resultList.results) == 0 {
+		t.Fatal("stale MRU response cleared results for a newer query generation")
+	}
+
+	if app.querySession.queryTransitionTimer == nil {
+		t.Fatal("newer query did not retain the previous results behind a transition timer")
+	}
+	app.querySession.queryTransitionTimer.Stop()
+	app.querySession.queryTransitionTimer = nil
+	app.querySession.showPendingQueryResults(app.querySession.query.QueryID, false)
+
+	if len(app.resultList.results) != 0 {
+		t.Fatalf("retained results after the newer transition = %#v, want cleared", app.resultList.results)
+	}
+}
+
+type sendQueryRecorderServices struct {
+	contract.Services
+	startedQuery common.PlainQuery
+	mruCalled    bool
+}
+
+func (s *sendQueryRecorderServices) StartQuery(_ context.Context, request contract.QueryRequest, _ contract.QueryView) error {
+	s.startedQuery = request.Query
+	return nil
+}
+
+func (s *sendQueryRecorderServices) QueryMRU(context.Context, string, string) ([]plugin.QueryResultUI, error) {
+	s.mruCalled = true
+	return nil, errors.New("stop after request")
+}
+
+func newSendQueryTestApp(services *sendQueryRecorderServices, query plainQuery, show showAppParams) *App {
+	return bindTestApp(&App{
+		services:     services,
+		lifecycleCtx: context.Background(),
+		querySession: queryController{
+			editor: woxui.NewTextEditor(query.QueryText),
+			query:  query,
+		},
+		generalSettings: newGeneralSettingsController(CommonDeps{}, newSharedEditState()),
+		themeSettings:   newThemeSettingsController(CommonDeps{}),
+		show:            show,
+	})
+}
+
+func waitForMRUCalled(t *testing.T, services *sendQueryRecorderServices) bool {
+	t.Helper()
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for !services.mruCalled && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	return services.mruCalled
+}
+
+func TestSendCurrentQueryPreservesSelectionQuery(t *testing.T) {
+	services := &sendQueryRecorderServices{}
+	app := newSendQueryTestApp(services, plainQuery{
+		QueryID:        "sel",
+		QueryType:      "selection",
+		QuerySelection: selection{Type: "text", Text: "selected text"},
+	}, showAppParams{StartPage: "mru", ShowSource: "selection", LaunchMode: "continue"})
+
+	if err := app.sendCurrentQuery(); err != nil {
+		t.Fatalf("send current query: %v", err)
+	}
+	if services.startedQuery.QueryType != "selection" {
+		t.Fatalf("started query type = %q, want selection", services.startedQuery.QueryType)
+	}
+	if app.querySession.query.QueryType != "selection" || app.querySession.query.QuerySelection.Text != "selected text" {
+		t.Fatalf("selection query was not preserved: %+v", app.querySession.query)
+	}
+	if waitForMRUCalled(t, services) {
+		t.Fatal("selection query was replaced by MRU results")
+	}
+}
+
+func TestSendCurrentQueryLoadsMRUForEmptyInput(t *testing.T) {
+	for _, source := range []string{"default", "query_hotkey", "selection", "tray_query", "quickjump", "deeplink"} {
+		t.Run(source, func(t *testing.T) {
+			services := &sendQueryRecorderServices{}
+			app := newSendQueryTestApp(services, newInputQuery(""), showAppParams{StartPage: "mru", ShowSource: source, LaunchMode: "continue"})
+
+			if err := app.sendCurrentQuery(); err != nil {
+				t.Fatalf("send current query: %v", err)
+			}
+			if !waitForMRUCalled(t, services) {
+				t.Fatal("empty input with mru start page should request MRU")
+			}
+		})
+	}
+}
+
+func TestShouldPreserveQueryOnShowLocked(t *testing.T) {
+	selectionQuery := plainQuery{QueryType: "selection", QuerySelection: selection{Type: "text", Text: "selected"}}
+	tests := []struct {
+		name  string
+		query plainQuery
+		show  showAppParams
+		want  bool
+	}{
+		{name: "selection show source", query: selectionQuery, show: showAppParams{ShowSource: "selection"}, want: true},
+		{name: "query hotkey show source", query: selectionQuery, show: showAppParams{ShowSource: "query_hotkey"}, want: true},
+		{name: "tray query show source", query: selectionQuery, show: showAppParams{ShowSource: "tray_query"}, want: true},
+		{name: "quick jump show source", query: selectionQuery, show: showAppParams{ShowSource: "quickjump"}, want: true},
+		{name: "deeplink show source", query: newInputQuery("theme Saffron"), show: showAppParams{ShowSource: "deeplink"}, want: true},
+		{name: "continue selection query", query: selectionQuery, show: showAppParams{LaunchMode: "continue"}, want: true},
+		{name: "continue input query with text", query: newInputQuery("abc"), show: showAppParams{LaunchMode: "continue"}, want: true},
+		{name: "continue empty input query", query: newInputQuery(""), show: showAppParams{LaunchMode: "continue"}, want: false},
+		{name: "default empty input query", query: newInputQuery(""), show: showAppParams{}, want: false},
+	}
+	for _, test := range tests {
+		app := newSendQueryTestApp(&sendQueryRecorderServices{}, test.query, test.show)
+		if got := app.shouldPreserveQueryOnShowLocked(); got != test.want {
+			t.Fatalf("%s: shouldPreserveQueryOnShowLocked() = %v, want %v", test.name, got, test.want)
+		}
+	}
+}
+
+// TestApplyLaunchModeOnShowLocked covers fresh reset and explicit incoming-query preservation.
+func TestApplyLaunchModeOnShowLocked(t *testing.T) {
+	tests := []struct {
+		name            string
+		show            showAppParams
+		wantPreserved   bool
+		wantQueryText   string
+		wantResultCount int
+	}{
+		{name: "fresh clears stale default query", show: showAppParams{LaunchMode: "fresh", ShowSource: "default"}, wantQueryText: "", wantResultCount: 0},
+		{name: "fresh preserves injected query", show: showAppParams{LaunchMode: "fresh", ShowSource: "query_hotkey"}, wantPreserved: true, wantQueryText: "stale", wantResultCount: 1},
+		{name: "fresh preserves deeplink query", show: showAppParams{LaunchMode: "fresh", ShowSource: "deeplink"}, wantPreserved: true, wantQueryText: "stale", wantResultCount: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			app := newSendQueryTestApp(&sendQueryRecorderServices{}, newInputQuery("stale"), test.show)
+			app.resultList.results = []queryResult{{ID: "stale-result"}}
+
+			if got := app.applyLaunchModeOnShowLocked(); got != test.wantPreserved {
+				t.Fatalf("applyLaunchModeOnShowLocked() = %v, want %v", got, test.wantPreserved)
+			}
+			if app.querySession.query.QueryText != test.wantQueryText || app.querySession.editor.State().Text != test.wantQueryText {
+				t.Fatalf("query text = %q editor text = %q, want %q", app.querySession.query.QueryText, app.querySession.editor.State().Text, test.wantQueryText)
+			}
+			if len(app.resultList.results) != test.wantResultCount {
+				t.Fatalf("result count = %d, want %d", len(app.resultList.results), test.wantResultCount)
+			}
+		})
+	}
+}
+
+// TestApplyLaunchModeOnShowLockedContinuesPreviousQuery verifies continue mode retains the complete visible query state.
+func TestApplyLaunchModeOnShowLockedContinuesPreviousQuery(t *testing.T) {
+	query := newInputQuery("continued query")
+	query.QueryID = "continued-query-id"
+	app := newSendQueryTestApp(&sendQueryRecorderServices{}, query, showAppParams{LaunchMode: "continue", ShowSource: "default"})
+	app.resultList.results = []queryResult{{ID: "continued-result", QueryID: query.QueryID}}
+	app.resultList.resultsQueryID = query.QueryID
+	app.resultList.selected = 0
+
+	if !app.applyLaunchModeOnShowLocked() {
+		t.Fatal("continue mode should preserve the previous query")
+	}
+	if app.querySession.query.QueryID != query.QueryID || app.querySession.query.QueryText != query.QueryText || app.querySession.editor.State().Text != query.QueryText {
+		t.Fatalf("continued query state = id %q query %q editor %q, want id %q text %q", app.querySession.query.QueryID, app.querySession.query.QueryText, app.querySession.editor.State().Text, query.QueryID, query.QueryText)
+	}
+	if len(app.resultList.results) != 1 || app.resultList.results[0].ID != "continued-result" || app.resultList.resultsQueryID != query.QueryID || app.resultList.selected != 0 {
+		t.Fatalf("continued result state = results %#v query id %q selected %d", app.resultList.results, app.resultList.resultsQueryID, app.resultList.selected)
+	}
+}
+
+func TestInformationalGlanceCanBeTapped(t *testing.T) {
+	app := bindTestApp(&App{})
+	widget := app.buildGlance(glanceItem{Text: "100 MB"}, true, defaultPalette(), 100, 1, launcherDensityMetricsFor(""))
+	boundary, ok := widget.(woxwidget.Boundary[launcherview.GlanceProps])
+	if !ok {
+		t.Fatalf("Glance widget = %T, want boundary", widget)
+	}
+	if boundary.Props.OnTap == nil {
+		t.Fatal("informational Glance should expose a refresh tap handler")
+	}
+}
+
+func TestUpdatedResultBoundaryKeysFollowFieldUpdates(t *testing.T) {
+	title := "Title"
+	subtitle := "Subtitle"
+	icon := common.WoxImage{}
+	tails := []plugin.QueryResultTail{}
+	update := plugin.UpdatableResult{Id: "live", Icon: &icon, Title: &title, SubTitle: &subtitle, Tails: &tails}
+	got := updatedResultBoundaryKeys(update, false)
+	want := []woxwidget.Key{
+		launcherview.LauncherResultIconBoundaryKey("live"),
+		launcherview.LauncherResultTitleBoundaryKey("live"),
+		launcherview.LauncherResultSubtitleBoundaryKey("live"),
+		launcherview.LauncherResultTailsBoundaryKey("live"),
+	}
+	if len(got) != len(want) {
+		t.Fatalf("updated result boundary keys = %v, want %v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("updated result boundary keys = %v, want %v", got, want)
+		}
+	}
+	grid := updatedResultBoundaryKeys(update, true)
+	if len(grid) != 2 || grid[0] != want[0] || grid[1] != want[1] {
+		t.Fatalf("grid updated result boundary keys = %v, want icon and title only", grid)
+	}
+}
+
+func TestResultPreviewBecameVisible(t *testing.T) {
+	preview := &plugin.WoxPreview{PreviewType: "markdown", PreviewData: "translated text"}
+	if !resultPreviewBecameVisible(queryPreview{}, preview) {
+		t.Fatal("empty preview should require bounds refresh when content first arrives")
+	}
+	if resultPreviewBecameVisible(queryPreview{PreviewData: "first chunk"}, preview) {
+		t.Fatal("subsequent streaming preview updates should not recalculate window bounds")
+	}
+	if resultPreviewBecameVisible(queryPreview{}, nil) {
+		t.Fatal("missing preview update should not recalculate window bounds")
+	}
+}
+
+func TestLivePreviewBypassesPreparedSectionBoundary(t *testing.T) {
+	for _, kind := range []string{"media", "chat"} {
+		app := bindTestApp(&App{})
+		result := queryResult{Preview: queryPreview{PreviewType: kind, PreviewData: `{"title":"Track"}`}}
+		widget := app.buildPreviewSection(result, viewSnapshot{palette: defaultPalette()}, 700, 400, 1)
+		if _, wrapped := widget.(woxwidget.Boundary[launcherPreparedSectionProps]); wrapped {
+			t.Fatalf("%s preview retained the full-section boundary", kind)
+		}
+	}
+}
+
+func TestUnresolvedRemotePreviewRendersBlank(t *testing.T) {
+	app := bindTestApp(&App{remotePreview: remotePreviewController{remotePreviews: map[string]queryPreview{}}})
+	widget := app.buildPreview(queryResult{Preview: queryPreview{PreviewType: "remote", PreviewData: "/preview?id=result"}}, defaultPalette(), 700, 400, 1)
+	blank, ok := widget.(woxwidget.Container)
+	if !ok || blank.Child != nil || blank.Width != 700 || blank.Height != 400 {
+		t.Fatalf("unresolved remote preview = %#v, want blank 700x400 container", widget)
+	}
+}
+
+func TestPrepareRemotePreviewStartsDeferredRequest(t *testing.T) {
+	path := "/preview?sessionId=session&queryId=query&id=result"
+	services := &remotePreviewTestServices{called: make(chan struct{})}
+	app := bindTestApp(&App{
+		services:     services,
+		lifecycleCtx: context.Background(),
+		remotePreview: remotePreviewController{
+			remotePreviews:  map[string]queryPreview{},
+			previewRequests: map[string]bool{},
+		},
+	})
+
+	app.remotePreview.prepareRemotePreview(queryPreview{PreviewType: "remote", PreviewData: path})
+	select {
+	case <-services.called:
+	case <-time.After(time.Second):
+		t.Fatal("deferred remote preview request did not start")
+	}
+	if !app.remotePreview.previewRequests[path] {
+		t.Fatal("remote preview request was not marked as pending")
+	}
+}
+
+func TestQueryEditorShiftEnterInsertsNewline(t *testing.T) {
+	editor := woxui.NewTextEditor("firstsecond")
+	editor.SetCaret(5)
+	handled, changed := handleQueryEditorKey(editor, woxui.KeyEvent{Key: woxui.KeyEnter, Modifiers: woxui.KeyModifierShift, Down: true})
+	if !handled || !changed || editor.State().Text != "first\nsecond" {
+		t.Fatalf("Shift+Enter = handled %v, changed %v, text %q", handled, changed, editor.State().Text)
+	}
+	if handled, changed = handleQueryEditorKey(editor, woxui.KeyEvent{Key: woxui.KeyEnter, Down: true}); handled || changed {
+		t.Fatalf("plain Enter = handled %v, changed %v, want launcher activation", handled, changed)
+	}
+}
+
+func TestNormalizeQueryNewlinesPreservesPastedLines(t *testing.T) {
+	if got := normalizeQueryNewlines("one\r\ntwo\rthree"); got != "one\ntwo\nthree" {
+		t.Fatalf("normalized pasted text = %q", got)
+	}
+}
+
+func TestNormalizeQueryPaste(t *testing.T) {
+	for _, tt := range []struct {
+		input string
+		want  string
+	}{
+		{"500 Mbps in MBps\n", "500 Mbps in MBps"},
+		{"\r\n500 Mbps in MBps\r\n\r\n", "500 Mbps in MBps"},
+		{"\rone\r\ntwo\rthree\r", "one\ntwo\nthree"},
+		{"\none\n\ntwo\n", "one\n\ntwo"},
+		{"\n one \n two \n", " one \n two "},
+		{" \t ", " \t "},
+		{"\r\n\n\r", ""},
+		{"", ""},
+	} {
+		if got := normalizeQueryPaste(tt.input); got != tt.want {
+			t.Errorf("normalizeQueryPaste(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestQueryPasteReplacesSelectionWithMultilineText(t *testing.T) {
+	editor := woxui.NewTextEditor("replace me")
+	editor.SelectAll()
+	if !editor.InsertTextSeparate(normalizeQueryPaste("\r\none\r\ntwo\rthree\r\n")) {
+		t.Fatal("multiline paste did not change query text")
+	}
+	state := editor.State()
+	if state.Text != "one\ntwo\nthree" || state.Selection.Focus != len([]rune(state.Text)) || !state.Selection.Collapsed() {
+		t.Fatalf("pasted query state = text %q selection %#v", state.Text, state.Selection)
+	}
+}
+
+func TestQueryDisplayProvidesAllLinesToSharedViewport(t *testing.T) {
+	runes := []rune("one\ntwo\nthree\nfour\nfive")
+	lines, caretLine, _, _, _, _, _ := queryDisplayLines(runes, len(runes), len(runes), len(runes), -1, 0, func(value string) float32 {
+		return float32(len([]rune(value)))
+	})
+	if len(lines) != 5 || caretLine != 4 || lines[4].Text != "five" {
+		t.Fatalf("query lines = count %d, caret %d, last %q", len(lines), caretLine, lines[4].Text)
+	}
+}
+
+func TestFromCoreShowOptionsPreservesQueryHistoryOrderAndPayload(t *testing.T) {
+	options := contract.ShowOptions{ShowPreviewTitleBar: true, HideResults: true, QueryHistories: []common.PlainQuery{
+		{QueryId: "latest-id", QueryType: "input", QueryText: "latest", QueryRefinements: map[string]string{"scope": "recent"}, ContextData: common.ContextData{"token": "latest"}},
+		{QueryId: "older-id", QueryType: "selection", QueryText: "older", QuerySelection: utilselection.Selection{Text: "selected"}},
+	}}
+
+	params := fromCoreShowOptions(options)
+	if !params.ShowPreviewTitleBar || !params.HideResults {
+		t.Fatal("preview title-bar and result visibility controls were not preserved")
+	}
+	if len(params.QueryHistories) != 2 {
+		t.Fatalf("query history count = %d, want 2", len(params.QueryHistories))
+	}
+	if got := params.QueryHistories[0]; got.QueryID != "latest-id" || got.QueryText != "latest" || got.QueryRefinements["scope"] != "recent" || got.ContextData["token"] != "latest" {
+		t.Fatalf("latest query history = %#v, want complete latest payload", got)
+	}
+	if got := params.QueryHistories[1]; got.QueryID != "older-id" || got.QueryType != "selection" || got.QuerySelection.Text != "selected" {
+		t.Fatalf("older query history = %#v, want complete older payload", got)
+	}
+}
+
+func TestFromCoreShowOptionsPreservesRestoreWindow(t *testing.T) {
+	source := &common.ActiveWindowSnapshot{Pid: 42, WindowId: "99", Name: "Open Folder", IsOpenSaveDialog: true}
+	params := fromCoreShowOptions(contract.ShowOptions{RestoreWindow: source})
+	if params.RestoreWindow == nil {
+		t.Fatal("restore window was dropped while adapting show options")
+	}
+	if params.RestoreWindow.Pid != source.Pid || params.RestoreWindow.WindowId != source.WindowId || params.RestoreWindow.Name != source.Name || !params.RestoreWindow.IsOpenSaveDialog {
+		t.Fatalf("restore window = %#v, want %#v", params.RestoreWindow, source)
+	}
+}

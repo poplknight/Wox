@@ -1,0 +1,696 @@
+package ui
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"image"
+	"strings"
+	"sync"
+	"wox/cloudsync"
+	"wox/common"
+	"wox/plugin"
+	"wox/setting"
+	"wox/ui/contract"
+	"wox/util"
+	"wox/util/notifier"
+	"wox/util/timetracking"
+)
+
+type uiImpl struct {
+	isVisible          bool // cached visibility state, updated by PostOnShow/PostOnHide
+	isInSettingView    bool // cached setting-view state, updated by PostOnSetting
+	isInOnboardingView bool // cached onboarding state, updated by PostOnOnboarding
+	isRecordingHotkey  bool // cached hotkey-recorder focus state, updated by PostOnHotkeyRecording
+	sessionMu          sync.RWMutex
+	primarySessionID   string
+	sessionVisible     map[string]bool
+}
+
+func (u *uiImpl) ChangeQuery(ctx context.Context, query common.PlainQuery) {
+	u.applyView(ctx, "change query", func(view contract.View) error { return view.ChangeQuery(ctx, query) })
+}
+
+func (u *uiImpl) RefreshQuery(ctx context.Context, options common.RefreshQueryOptions) {
+	u.applyView(ctx, "refresh query", func(view contract.View) error { return view.RefreshQuery(ctx, options) })
+}
+
+func (u *uiImpl) RefreshGlance(ctx context.Context, pluginId string, ids []string) {
+	u.applyView(ctx, "refresh glance", func(view contract.View) error { return view.RefreshGlance(ctx, pluginId, ids) })
+}
+
+func (u *uiImpl) HideApp(ctx context.Context) {
+	u.applyView(ctx, "hide app", func(view contract.View) error { return view.Hide(ctx) })
+}
+
+func (u *uiImpl) ShowApp(ctx context.Context, showContext common.ShowContext) {
+	GetUIManager().RefreshActiveWindowSnapshot(ctx)
+	options := getShowOptions(ctx, showContext)
+	u.applyView(ctx, "show app", func(view contract.View) error { return view.Show(ctx, options) })
+}
+
+func (u *uiImpl) ToggleApp(ctx context.Context, showContext common.ShowContext) {
+	GetUIManager().RefreshActiveWindowSnapshot(ctx)
+	options := getShowOptions(ctx, showContext)
+	u.applyView(ctx, "toggle app", func(view contract.View) error { return view.Toggle(ctx, options) })
+}
+
+// OpenWoxInstance delegates named launcher reuse to the embedded UI runtime.
+func (u *uiImpl) OpenWoxInstance(ctx context.Context, request common.OpenWoxInstanceRequest) {
+	u.applyView(ctx, "open Wox instance", func(view contract.View) error {
+		return view.OpenInstance(ctx, contract.OpenInstanceOptions{
+			Role: string(request.Role), InstanceName: request.InstanceName, Query: request.Query,
+			Show: getShowOptions(ctx, request.ShowApp),
+		})
+	})
+}
+
+func (u *uiImpl) RecordHotkey(ctx context.Context, hotkey string, kind string) {
+	logger.Info(ctx, fmt.Sprintf("send RecordHotkey to UI: hotkey=%s kind=%s", hotkey, kind))
+	u.applyView(ctx, "record hotkey", func(view contract.View) error { return view.RecordHotkey(ctx, hotkey, kind) })
+}
+
+func (u *uiImpl) GetServerPort(ctx context.Context) int {
+	return GetUIManager().serverPort
+}
+
+func (u *uiImpl) ChangeTheme(ctx context.Context, theme common.Theme) {
+	logger.Info(ctx, fmt.Sprintf("change theme: %s", theme.ThemeName))
+
+	// If it's an auto appearance theme, delegate to manager for proper handling
+	if theme.IsAutoAppearance {
+		GetUIManager().ChangeTheme(ctx, theme)
+		return
+	}
+
+	// For normal themes, save and apply directly
+	// New feature: direct common.UI callers may bypass Manager.ChangeTheme, so
+	// resolve platform overrides here as well before sending the flat payload to
+	// UI.
+	effectiveTheme := GetUIManager().resolvePlatformTheme(ctx, theme)
+	woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+	woxSetting.ThemeId.Set(effectiveTheme.ThemeId)
+	u.applyView(ctx, "change theme", func(view contract.View) error { return view.ChangeTheme(ctx, effectiveTheme) })
+}
+
+// ChangeThemeWithoutSave applies the theme without saving to settings
+// This is used for auto appearance theme switching
+func (u *uiImpl) ChangeThemeWithoutSave(ctx context.Context, theme common.Theme) {
+	logger.Info(ctx, fmt.Sprintf("change theme (without save): %s", theme.ThemeName))
+	effectiveTheme := GetUIManager().resolvePlatformTheme(ctx, theme)
+	u.applyView(ctx, "change theme without save", func(view contract.View) error { return view.ChangeTheme(ctx, effectiveTheme) })
+}
+
+func (u *uiImpl) InstallTheme(ctx context.Context, theme common.Theme) {
+	logger.Info(ctx, fmt.Sprintf("install theme: %s", theme.ThemeName))
+	GetStoreManager().Install(ctx, theme)
+}
+
+func (u *uiImpl) UninstallTheme(ctx context.Context, theme common.Theme) {
+	logger.Info(ctx, fmt.Sprintf("uninstall theme: %s", theme.ThemeName))
+	GetStoreManager().Uninstall(ctx, theme)
+	GetUIManager().ChangeToDefaultTheme(ctx)
+}
+
+func (u *uiImpl) OpenSettingWindow(ctx context.Context, windowContext common.SettingWindowContext) {
+	u.applyView(ctx, "open setting", func(view contract.View) error { return view.OpenSetting(ctx, windowContext) })
+}
+
+func (u *uiImpl) FocusSettingWindow(ctx context.Context) {
+	u.applyView(ctx, "focus setting", func(view contract.View) error { return view.FocusSetting(ctx) })
+}
+
+func (u *uiImpl) OpenOnboardingWindow(ctx context.Context) {
+	// Onboarding reuses the same UI process and command path as the
+	// settings window. Keeping it here avoids a second desktop window lifecycle
+	// while still letting UI choose the dedicated onboarding view.
+	u.applyView(ctx, "open onboarding", func(view contract.View) error { return view.OpenOnboarding(ctx) })
+}
+
+func (u *uiImpl) OpenNotesWindow(ctx context.Context, request common.NotesWindowRequest) {
+	u.applyView(ctx, "open Notes", func(view contract.View) error { return view.OpenNotes(ctx, request) })
+}
+
+func (u *uiImpl) RefreshNotesWindow(ctx context.Context, noteID string) {
+	u.applyView(ctx, "refresh Notes", func(view contract.View) error { return view.RefreshNotes(ctx, noteID) })
+}
+
+// OpenMacOSPermissionFlow asks the UI host to present the native permission guide for one permission.
+func (u *uiImpl) OpenMacOSPermissionFlow(ctx context.Context, permissionType string) {
+	u.applyView(ctx, "open macOS permission flow", func(view contract.View) error { return view.OpenMacOSPermissionFlow(ctx, permissionType) })
+}
+
+func (u *uiImpl) GetAllThemes(ctx context.Context) []common.Theme {
+	return GetUIManager().GetAllThemes(ctx)
+}
+
+func (u *uiImpl) GetCurrentTheme(ctx context.Context) common.Theme {
+	return GetUIManager().GetCurrentTheme(ctx)
+}
+
+func (u *uiImpl) RestoreTheme(ctx context.Context) {
+	GetUIManager().RestoreTheme(ctx)
+}
+
+func (u *uiImpl) Notify(ctx context.Context, msg common.NotifyMsg) {
+	// In-app notifications only when the primary launcher is showing; secondary
+	// panels should not swallow system notifications.
+	primaryVisible := u.IsVisible(context.Background())
+	inManagement := u.IsInManagementView()
+	toolbarOwners := plugin.GetPluginManager().VisibleToolbarMsgOwners()
+	hasToolbarMsg := len(toolbarOwners) > 0
+	hotkeyWarning := GetUIManager().mainHotkeyToolbarWarning()
+	useToolbar := primaryVisible && !inManagement && !hasToolbarMsg && hotkeyWarning == ""
+
+	notifySession := util.GetContextSessionId(ctx)
+	u.sessionMu.RLock()
+	primarySession := u.primarySessionID
+	notifySessionVisible := "n/a"
+	if notifySession != "" {
+		if visible, ok := u.sessionVisible[notifySession]; ok {
+			notifySessionVisible = fmt.Sprintf("%t", visible)
+		} else {
+			notifySessionVisible = "unknown"
+		}
+	}
+	u.sessionMu.RUnlock()
+
+	failed := "none"
+	route := "toolbar"
+	if !useToolbar {
+		route = "overlay"
+		reasons := make([]string, 0, 4)
+		if !primaryVisible {
+			reasons = append(reasons, "primaryVisible")
+		}
+		if inManagement {
+			reasons = append(reasons, "inManagement")
+		}
+		if hasToolbarMsg {
+			reasons = append(reasons, "toolbarMsg")
+		}
+		if hotkeyWarning != "" {
+			reasons = append(reasons, "hotkeyWarning")
+		}
+		failed = strings.Join(reasons, ",")
+	}
+	logger.Debug(ctx, fmt.Sprintf(
+		"notify route=%s failed=%s text=%q plugin=%s primaryVisible=%t inManagement=%t toolbarMsg=%t toolbarOwners=%s hotkeyWarning=%q notifySession=%s notifySessionVisible=%s primarySession=%s",
+		route, failed, msg.Text, msg.PluginId,
+		primaryVisible, inManagement, hasToolbarMsg, strings.Join(toolbarOwners, ","),
+		hotkeyWarning, notifySession, notifySessionVisible, primarySession,
+	))
+
+	if useToolbar {
+		u.applyView(ctx, "show notification message", func(view contract.View) error { return view.ShowNotificationMessage(ctx, msg) })
+	} else {
+		var icon image.Image
+		if msg.Icon != "" {
+			wimg, parseErr := common.ParseWoxImage(msg.Icon)
+			if parseErr == nil {
+				// System notifications should appear as soon as the action succeeds. The previous path used
+				// ToImage(), which could synchronously download Twemoji assets for emoji icons and delay the
+				// success notification by seconds on a cold cache. Keep the notify path local-only and let the
+				// notifier fall back to the default Wox icon when the plugin icon is not already cached.
+				img, imgErr := wimg.ToImageWithoutRemoteFetch()
+				if imgErr == nil {
+					icon = img
+				}
+			}
+		}
+		notifier.Notify(icon, msg.Text)
+	}
+}
+
+func (u *uiImpl) UpdateAttentionUnreadCount(ctx context.Context, unreadCount int) {
+	u.applyView(ctx, "update attention unread count", func(view contract.View) error { return view.UpdateAttentionUnreadCount(ctx, unreadCount) })
+}
+
+func (u *uiImpl) ShowToolbarMsg(ctx context.Context, msg interface{}) {
+	message, ok := msg.(plugin.ToolbarMsgUI)
+	if !ok {
+		logger.Error(ctx, fmt.Sprintf("invalid toolbar message type: %T", msg))
+		return
+	}
+	u.applyView(ctx, "show toolbar message", func(view contract.View) error { return view.ShowToolbarMessage(ctx, message) })
+}
+
+func (u *uiImpl) ClearToolbarMsg(ctx context.Context, toolbarMsgId string) {
+	u.applyView(ctx, "clear toolbar message", func(view contract.View) error { return view.ClearToolbarMessage(ctx, toolbarMsgId) })
+}
+
+func (u *uiImpl) IsInSettingView() bool {
+	return u.isInSettingView
+}
+
+func (u *uiImpl) IsInManagementView() bool {
+	return u.isInSettingView
+}
+
+func (u *uiImpl) GetActiveWindowSnapshot(ctx context.Context) common.ActiveWindowSnapshot {
+	return GetUIManager().GetActiveWindowSnapshot(ctx)
+}
+
+func (u *uiImpl) SendChatResponse(ctx context.Context, aiChatData common.AIChatData) {
+	u.applyView(ctx, "send chat response", func(view contract.View) error { return view.SendChatResponse(ctx, aiChatData) })
+}
+
+func (u *uiImpl) RemoveChat(ctx context.Context, chatID string) {
+	u.applyView(ctx, "remove chat", func(view contract.View) error { return view.RemoveChat(ctx, chatID) })
+}
+
+func (u *uiImpl) ReloadChatResources(ctx context.Context, resouceName string) {
+	u.applyView(ctx, "reload chat resources", func(view contract.View) error { return view.ReloadChatResources(ctx, resouceName) })
+}
+
+// SendAIQuestion pushes a question to the UI. The answer comes back via the
+// /ai/question/answer HTTP route, which resolves the pending ask_user channel.
+func (u *uiImpl) SendAIQuestion(ctx context.Context, questionId string, question string, options []common.AIQuestionOption) {
+	u.applyView(ctx, "send AI question", func(view contract.View) error { return view.SendAIQuestion(ctx, questionId, question, options) })
+}
+
+func (u *uiImpl) ReloadSettingPlugins(ctx context.Context) {
+	u.applyView(ctx, "reload setting plugins", func(view contract.View) error { return view.ReloadSettingPlugins(ctx) })
+}
+
+func (u *uiImpl) ReloadSetting(ctx context.Context) {
+	u.applyView(ctx, "reload setting", func(view contract.View) error { return view.ReloadSetting(ctx) })
+}
+
+func (u *uiImpl) ReloadSettingThemes(ctx context.Context) {
+	u.applyView(ctx, "reload setting themes", func(view contract.View) error { return view.ReloadSettingThemes(ctx) })
+}
+
+func (u *uiImpl) CloudSyncProgressChanged(ctx context.Context, progress any) {
+	typedProgress, ok := progress.(cloudsync.CloudSyncProgress)
+	if !ok {
+		logger.Error(ctx, fmt.Sprintf("invalid cloud sync progress type: %T", progress))
+		return
+	}
+	u.applyView(ctx, "cloud sync progress changed", func(view contract.View) error { return view.CloudSyncProgressChanged(ctx, typedProgress) })
+}
+
+func (u *uiImpl) RefreshAccountStatus(ctx context.Context) {
+	u.applyView(ctx, "refresh account status", func(view contract.View) error { return view.RefreshAccountStatus(ctx) })
+}
+
+func (u *uiImpl) UpdateResult(ctx context.Context, result interface{}) bool {
+	// Type assert to plugin.UpdatableResult
+	// We use interface{} in the signature to avoid circular dependency between common and plugin packages
+	typedResult, ok := result.(plugin.UpdatableResult)
+	if !ok {
+		logger.Error(ctx, fmt.Sprintf("invalid update result type: %T", result))
+		return false
+	}
+	view, err := u.getView(ctx)
+	if err != nil {
+		logger.Error(ctx, fmt.Sprintf("UpdateResult error: %s", err.Error()))
+		return false
+	}
+	success, err := view.UpdateResult(ctx, typedResult)
+	if err != nil {
+		logger.Error(ctx, fmt.Sprintf("UpdateResult error: %s", err.Error()))
+		return false
+	}
+	return success
+}
+
+func (u *uiImpl) PushResults(ctx context.Context, payload interface{}) bool {
+	typedPayload, ok := payload.(plugin.PushResultsPayload)
+	if !ok {
+		logger.Error(ctx, fmt.Sprintf("invalid push results type: %T", payload))
+		return false
+	}
+	view, err := u.getView(ctx)
+	if err != nil {
+		logger.Error(ctx, fmt.Sprintf("PushResults error: %s", err.Error()))
+		return false
+	}
+	success, err := view.PushResults(ctx, typedPayload)
+	if err != nil {
+		logger.Error(ctx, fmt.Sprintf("PushResults error: %s", err.Error()))
+		return false
+	}
+	return success
+}
+
+func (u *uiImpl) IsVisible(ctx context.Context) bool {
+	// Return cached visibility state instead of querying the UI.
+	// The state is updated by PostOnShow/PostOnHide callbacks.
+	// With a session id, report that session. Without one, report the primary
+	// launcher only — secondary panels (WebView preview, Space Quick Look, etc.)
+	// must not make plugins believe the main window is open.
+	sessionID := util.GetContextSessionId(ctx)
+	u.sessionMu.RLock()
+	defer u.sessionMu.RUnlock()
+	if sessionID != "" {
+		if visible, ok := u.sessionVisible[sessionID]; ok {
+			return visible
+		}
+	}
+	return u.isVisible
+}
+
+// hasAnyVisibleSession reports whether any primary or secondary UI session is
+// currently marked visible. Used for process-wide cleanup that must wait until
+// every window is gone, not just the primary launcher.
+func (u *uiImpl) hasAnyVisibleSession() bool {
+	u.sessionMu.RLock()
+	defer u.sessionMu.RUnlock()
+	if u.isVisible {
+		return true
+	}
+	for _, visible := range u.sessionVisible {
+		if visible {
+			return true
+		}
+	}
+	return false
+}
+
+// ToggleRecordingMode asks the macOS UI to switch between launcher and capture-friendly window levels.
+func (u *uiImpl) ToggleRecordingMode(ctx context.Context) (bool, error) {
+	view, err := u.getView(ctx)
+	if err != nil {
+		return false, err
+	}
+	return view.ToggleRecordingMode(ctx)
+}
+
+// ToggleRepaintDebugMode cycles partial-refresh visualization on the active launcher surface.
+func (u *uiImpl) ToggleRepaintDebugMode(ctx context.Context) (string, error) {
+	view, err := u.getView(ctx)
+	if err != nil {
+		return "", err
+	}
+	return view.ToggleRepaintDebugMode(ctx)
+}
+
+func (u *uiImpl) PickFiles(ctx context.Context, params common.PickFilesParams) []string {
+	view, err := u.getView(ctx)
+	if err != nil {
+		return nil
+	}
+	result, err := view.PickFiles(ctx, params)
+	if err != nil {
+		logger.Error(ctx, fmt.Sprintf("pick files failed: %v", err))
+		return nil
+	}
+	return result
+}
+
+func (u *uiImpl) CaptureScreenshot(ctx context.Context, request common.CaptureScreenshotRequest) (common.CaptureScreenshotResult, error) {
+	if request.SessionId == "" {
+		// The UI request itself needs a stable session identifier so UI can correlate this long-lived
+		// screenshot session with the same window instance that owns the current query/action context.
+		request.SessionId = util.GetContextSessionId(ctx)
+	}
+	view, err := u.getView(ctx)
+	if err != nil {
+		return common.CaptureScreenshotResult{}, err
+	}
+	return view.CaptureScreenshot(ctx, request)
+}
+
+// WriteClipboardImageFile delegates image clipboard ownership to the UI process.
+func (u *uiImpl) WriteClipboardImageFile(ctx context.Context, filePath string) error {
+	if strings.TrimSpace(filePath) == "" {
+		return errors.New("clipboard image file path is empty")
+	}
+
+	view, err := u.getView(ctx)
+	if err != nil {
+		return err
+	}
+	return view.WriteClipboardImageFile(ctx, filePath)
+}
+
+func (u *uiImpl) getView(ctx context.Context) (contract.View, error) {
+	view := GetUIManager().getViewForSession(util.GetContextSessionId(ctx))
+	if view == nil {
+		return nil, errors.New("embedded UI view is not attached")
+	}
+	return view, nil
+}
+
+func (u *uiImpl) applyView(ctx context.Context, operation string, apply func(view contract.View) error) {
+	view, err := u.getView(ctx)
+	if err == nil {
+		err = apply(view)
+	}
+	if err != nil {
+		logger.Error(ctx, fmt.Sprintf("%s failed: %v", operation, err))
+	}
+}
+
+func getShowOptions(ctx context.Context, showContext common.ShowContext) contract.ShowOptions {
+	woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+	var position Position
+	rememberPosition := false
+	showQueryBox := !showContext.HideQueryBox
+	hideToolbar := showContext.HideToolbar
+	showSource := showContext.ShowSource
+	windowWidth := showContext.WindowWidth
+	maxResultCount := showContext.MaxResultCount
+
+	if showSource == "" {
+		showSource = common.ShowSourceDefault
+	}
+	if windowWidth <= 0 {
+		windowWidth = woxSetting.AppWidth.Get()
+	}
+	// A zero show-context value means there is no per-session override, so the
+	// launcher must use the global setting just like the Flutter controller did.
+	if maxResultCount <= 0 {
+		maxResultCount = woxSetting.MaxResultCount.Get()
+	}
+
+	// if specific position provided, use it
+	if showContext.WindowPosition != nil {
+		position = explicitWindowPosition(*showContext.WindowPosition)
+	} else {
+		switch woxSetting.ShowPosition.Get() {
+		case setting.PositionTypeActiveScreen:
+			position = NewActiveScreenPositionWithOptions(ctx, windowWidth, maxResultCount, showQueryBox, !hideToolbar)
+		case setting.PositionTypeLastLocation:
+			// An explicit WindowPosition above does not set this, so it cannot replace the saved origin.
+			last := woxSetting.LastWindowPosition.Get()
+			rememberPosition = true
+			if restored, ok := resolveLastLocation(last, windowWidth, CalculateMaxWindowHeight(ctx, maxResultCount, showQueryBox, !hideToolbar)); ok {
+				logger.Info(ctx, fmt.Sprintf("Using saved window position: x=%d, y=%d, display=%s", restored.X, restored.Y, restored.DisplayID))
+				position = restored
+			} else if last.Valid {
+				logger.Info(ctx, fmt.Sprintf("Saved window position is off-screen: x=%d, y=%d", last.X, last.Y))
+				position = NewMouseScreenPositionWithOptions(ctx, windowWidth, maxResultCount, showQueryBox, !hideToolbar)
+			} else {
+				logger.Info(ctx, "No saved window position, using mouse screen position as fallback")
+				position = NewMouseScreenPositionWithOptions(ctx, windowWidth, maxResultCount, showQueryBox, !hideToolbar)
+			}
+		case setting.PositionTypeSpecificScreen:
+			position = NewSpecificScreenPositionWithOptions(ctx, windowWidth, maxResultCount, showQueryBox, !hideToolbar, woxSetting.ShowDisplay.Get(), !util.IsLinux())
+		default: // Default to mouse screen
+			position = NewMouseScreenPositionWithOptions(ctx, windowWidth, maxResultCount, showQueryBox, !hideToolbar)
+		}
+	}
+
+	latestHistories := setting.GetSettingManager().GetLatestQueryHistory(ctx, 10)
+	queryHistories := make([]common.PlainQuery, 0, len(latestHistories))
+	for _, history := range latestHistories {
+		queryHistories = append(queryHistories, history.Query)
+	}
+
+	return contract.ShowOptions{
+		SelectAll: showContext.SelectAll, HideQueryBox: showContext.HideQueryBox, HideToolbar: hideToolbar, HideResults: showContext.HideResults, ShowPreviewTitleBar: showContext.ShowPreviewTitleBar,
+		QueryBoxAtBottom: showContext.QueryBoxAtBottom, HideOnBlur: showContext.HideOnBlur,
+		RestoreWindow:    showContext.RestoreWindow,
+		Position:         contract.Position{Type: string(position.Type), X: position.X, Y: position.Y, DisplayID: position.DisplayID},
+		RememberPosition: rememberPosition,
+		PositionHeight:   showContext.WindowPositionHeight,
+		WindowWidth:      windowWidth, MaxResultCount: maxResultCount, QueryHistories: queryHistories, LaunchMode: woxSetting.LaunchMode.Get(),
+		StartPage: woxSetting.StartPage.Get(), ShowSource: string(showSource),
+	}
+}
+
+// runUIQuery executes one decoded query and reports snapshots through a typed view.
+func runUIQuery(ctx context.Context, request contract.QueryRequest, view contract.QueryView) {
+	handlerStart := util.GetSystemTimestamp()
+	changedQuery := request.Query
+	queryId := changedQuery.QueryId
+	sessionId := request.SessionID
+	ctx = util.WithQueryIdContext(util.WithSessionContext(ctx, sessionId), queryId)
+
+	logger.Info(ctx, fmt.Sprintf("start to handle query changed: %s, queryId: %s", changedQuery.String(), queryId))
+
+	if changedQuery.QueryType == plugin.QueryTypeInput && changedQuery.QueryText == "" && changedQuery.QueryScope.IsEmpty() {
+		emptyInputQuery := plugin.Query{
+			Id:        queryId,
+			SessionId: sessionId,
+			Type:      plugin.QueryTypeInput,
+		}
+		plugin.GetPluginManager().HandleQueryLifecycle(ctx, emptyInputQuery, nil)
+		// Bug fix: blank-page empty input still occupies the global query box.
+		// The previous zero-value QueryContext serialized as IsGlobalQuery=false,
+		// so the UI treated a cleared search as plugin/selection context and hid
+		// Glance. Return the same backend-owned classification used by normal
+		// queries so clearing search keeps the global accessory visible.
+		view.ApplyQueryResponse(ctx, contract.QueryResponse{QueryID: queryId, Response: plugin.QueryResponseUI{
+			Results: []plugin.QueryResultUI{},
+			Context: plugin.BuildQueryContext(emptyInputQuery, nil),
+		}, IsFinal: true})
+		return
+	}
+	if changedQuery.QueryType == plugin.QueryTypeSelection && changedQuery.QuerySelection.String() == "" && changedQuery.QueryScope.IsEmpty() {
+		plugin.GetPluginManager().HandleQueryLifecycle(ctx, plugin.Query{
+			Id:        queryId,
+			SessionId: sessionId,
+			Type:      plugin.QueryTypeSelection,
+		}, nil)
+		view.ApplyQueryResponse(ctx, contract.QueryResponse{QueryID: queryId, Response: plugin.QueryResponseUI{Results: []plugin.QueryResultUI{}}, IsFinal: true})
+		return
+	}
+
+	newQueryStart := util.GetSystemTimestamp()
+	query, ownerPlugin, queryErr := plugin.GetPluginManager().NewQuery(ctx, changedQuery)
+	if queryErr != nil {
+		if conflictErr, ok := plugin.AsTriggerKeywordConflictError(queryErr); ok {
+			plugin.GetPluginManager().HandleQueryLifecycle(ctx, query, nil)
+			view.ApplyQueryResponse(ctx, contract.QueryResponse{QueryID: queryId, Response: plugin.GetPluginManager().BuildTriggerKeywordConflictResponse(ctx, query, conflictErr.Conflict), IsFinal: true})
+			return
+		}
+		logger.Error(ctx, queryErr.Error())
+		view.ApplyQueryError(ctx, queryId, queryErr)
+		return
+	}
+	if tracker := timetracking.New("handle_query_new_query"); tracker.Enabled() {
+		tracker.SetRawString("queryId", queryId)
+		tracker.SetRawString("query", query.String())
+		tracker.SetRawString("ownerPlugin", queryPipelinePluginLabel(ctx, ownerPlugin))
+		tracker.SetInt64("costMs", util.GetSystemTimestamp()-newQueryStart)
+		tracker.SetInt64("elapsedMs", util.GetSystemTimestamp()-handlerStart)
+		tracker.Log(ctx)
+	}
+
+	completionHintScheduleStart := util.GetSystemTimestamp()
+	woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+	if !request.SkipCompletionHint && woxSetting.EnableQueryCompletionHint.Get() && changedQuery.QueryScope.IsEmpty() {
+		util.Go(ctx, "query completion hint", func() {
+			view.ApplyQueryCompletionHint(
+				ctx,
+				queryId,
+				plugin.BuildQueryCompletionHintForInputPrefixWithFeedback(
+					query,
+					ownerPlugin,
+					setting.GetSettingManager().GetLatestQueryHistory(ctx, plugin.QueryCompletionHistoryLimit),
+					setting.GetSettingManager().GetQueryCompletionFeedbacks(ctx),
+					changedQuery.QueryText,
+				),
+			)
+		})
+	}
+	if tracker := timetracking.New("handle_query_completion_hint_schedule"); tracker.Enabled() {
+		tracker.SetRawString("queryId", queryId)
+		tracker.SetBool("enabled", woxSetting.EnableQueryCompletionHint.Get())
+		tracker.SetBool("skipped", request.SkipCompletionHint)
+		tracker.SetInt64("costMs", util.GetSystemTimestamp()-completionHintScheduleStart)
+		tracker.Log(ctx)
+	}
+
+	lifecycleStart := util.GetSystemTimestamp()
+	plugin.GetPluginManager().HandleQueryLifecycle(ctx, query, ownerPlugin)
+	if tracker := timetracking.New("handle_query_lifecycle"); tracker.Enabled() {
+		tracker.SetRawString("queryId", queryId)
+		tracker.SetInt64("costMs", util.GetSystemTimestamp()-lifecycleStart)
+		tracker.SetInt64("elapsedMs", util.GetSystemTimestamp()-handlerStart)
+		tracker.Log(ctx)
+	}
+
+	if tracker := timetracking.New("handle_query_run_starting"); tracker.Enabled() {
+		tracker.SetRawString("queryId", queryId)
+		tracker.SetInt64("elapsedMs", util.GetSystemTimestamp()-handlerStart)
+		tracker.Log(ctx)
+	}
+	newQueryRun(ctx, request, view, query, ownerPlugin).start()
+}
+
+func queryPipelinePluginLabel(ctx context.Context, pluginInstance *plugin.Instance) string {
+	if pluginInstance == nil {
+		return "<global>"
+	}
+	name := pluginInstance.GetName(ctx)
+	if name == "" {
+		name = pluginInstance.Metadata.Id
+	}
+	return fmt.Sprintf("%s(%s)", name, pluginInstance.Metadata.Id)
+}
+
+func appendQueryDebugTails(ctx context.Context, sessionId string, queryId string, snapshot []plugin.QueryResultUI, firstVisibleFlushElapsedMs float64, backendPreparedElapsedMs int64) []plugin.QueryResultUI {
+	if len(snapshot) == 0 {
+		return snapshot
+	}
+	woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+	if !woxSetting.ShowPerformanceTail.Get() {
+		return snapshot
+	}
+	showBatchTail := woxSetting.ShowPerformanceTailBatch.Get()
+	showPluginQueryTail := woxSetting.ShowPerformanceTailPluginQuery.Get()
+	showBackendPreparedTail := woxSetting.ShowPerformanceTailBackendPrepared.Get()
+	if !showBatchTail && !showPluginQueryTail && !showBackendPreparedTail {
+		return snapshot
+	}
+
+	annotated := make([]plugin.QueryResultUI, len(snapshot))
+	for i, result := range snapshot {
+		if result.IsGroup {
+			annotated[i] = result
+			continue
+		}
+
+		resultCopy := result
+		resultCopy.Tails = append([]plugin.QueryResultTail{}, result.Tails...)
+		if batch, _, batchQueueElapsed, batchQueueElapsedSet, pluginQueryElapsed, pluginQueryElapsedSet, ok := plugin.GetPluginManager().GetQueryResultDebugInfo(sessionId, queryId, result.Id); ok {
+			if showBatchTail {
+				batchTail := plugin.NewQueryResultTailTextWithCategory(fmt.Sprintf("B%d", batch), queryDebugBatchTailTextCategory(batch))
+				batchTail.Tooltip = fmt.Sprintf("First batch flush tick: %.1fms", firstVisibleFlushElapsedMs)
+				if batchQueueElapsedSet {
+					batchTail.Tooltip = fmt.Sprintf("First batch flush tick: %.1fms\nReady for batch: %.1fms", firstVisibleFlushElapsedMs, batchQueueElapsed)
+				}
+				resultCopy.Tails = append(resultCopy.Tails, batchTail)
+			}
+
+			if showPluginQueryTail && pluginQueryElapsedSet {
+				pluginQueryTail := plugin.NewQueryResultTailTextWithCategory(fmt.Sprintf("%dms", pluginQueryElapsed), queryDebugPluginQueryTailTextCategory(pluginQueryElapsed))
+				pluginQueryTail.Tooltip = "Raw Plugin.Query duration"
+				resultCopy.Tails = append(resultCopy.Tails, pluginQueryTail)
+			}
+
+			if showBackendPreparedTail {
+				backendPreparedCategory := plugin.QueryResultTailTextCategoryDefault
+				elapsedTail := plugin.NewQueryResultTailTextWithCategory(fmt.Sprintf("%dms", backendPreparedElapsedMs), backendPreparedCategory)
+				elapsedTail.Tooltip = "Backend ready to send elapsed since UI query request"
+				resultCopy.Tails = append(resultCopy.Tails, elapsedTail)
+			}
+		}
+		annotated[i] = resultCopy
+	}
+
+	return annotated
+}
+
+// queryDebugBatchTailTextCategory highlights results that missed the first response batch.
+func queryDebugBatchTailTextCategory(batch int) plugin.QueryResultTailTextCategory {
+	if batch > 1 {
+		return plugin.QueryResultTailTextCategoryWarning
+	}
+	return plugin.QueryResultTailTextCategoryDefault
+}
+
+// queryDebugPluginQueryTailTextCategory highlights raw plugin execution cost before backend/UI overhead.
+func queryDebugPluginQueryTailTextCategory(elapsedMs int64) plugin.QueryResultTailTextCategory {
+	if elapsedMs > 10 {
+		return plugin.QueryResultTailTextCategoryDanger
+	}
+	if elapsedMs > 5 {
+		return plugin.QueryResultTailTextCategoryWarning
+	}
+	return plugin.QueryResultTailTextCategoryDefault
+}

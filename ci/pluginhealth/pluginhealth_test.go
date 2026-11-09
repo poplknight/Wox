@@ -1,0 +1,294 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"wox/plugin"
+	"wox/util"
+)
+
+type fakeProbePlugin struct {
+	queryErr error
+}
+
+func (f *fakeProbePlugin) Init(context.Context, plugin.InitParams) {}
+
+func (f *fakeProbePlugin) Query(context.Context, plugin.Query) plugin.QueryResponse {
+	return plugin.QueryResponse{}
+}
+
+func (f *fakeProbePlugin) QueryWithError(context.Context, plugin.Query) (plugin.QueryResponse, error) {
+	return plugin.QueryResponse{}, f.queryErr
+}
+
+func TestLoadStoreManifestsNormalizesRuntime(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store-plugin.json")
+	require.NoError(t, os.WriteFile(path, []byte(`[
+		{"Id":"a","Name":"Alpha","Runtime":"nodejs","SupportedOS":["Windows"]},
+		{"Id":"b","Name":"Beta","Runtime":"script","SupportedOS":["Linux"]}
+	]`), 0644))
+
+	manifests, err := loadStoreManifests(path)
+	require.NoError(t, err)
+	require.Len(t, manifests, 2)
+	assert.Equal(t, plugin.PLUGIN_RUNTIME_NODEJS, manifests[0].Runtime)
+	assert.Equal(t, plugin.PLUGIN_RUNTIME_SCRIPT, manifests[1].Runtime)
+}
+
+func TestPluginDisplayNameUsesStoreEnglishI18n(t *testing.T) {
+	manifest := plugin.StorePluginManifest{
+		Id:   "9014abc5-7a57-46c4-8961-abf3d8f1b008",
+		Name: "i18n:plugin_name",
+		I18n: map[string]map[string]string{
+			"en_US": {"plugin_name": "Color Picker"},
+			"zh_CN": {"plugin_name": "取色器"},
+		},
+	}
+
+	assert.Equal(t, "Color Picker", pluginDisplayName(manifest, nil))
+}
+
+func TestPluginDisplayNamePrefersInstalledPluginJSON(t *testing.T) {
+	manifest := plugin.StorePluginManifest{
+		Id:   "id",
+		Name: "i18n:plugin_name",
+		I18n: map[string]map[string]string{
+			"en_US": {"plugin_name": "Store Name"},
+		},
+	}
+	instance := &plugin.Instance{
+		Metadata: plugin.Metadata{
+			Name: "i18n:plugin_name",
+			I18n: map[string]map[string]string{
+				"en_US": {"plugin_name": "Unsplash"},
+			},
+		},
+	}
+
+	assert.Equal(t, "Unsplash", pluginDisplayName(manifest, instance))
+}
+
+func TestSelectManifestsMatchesEnglishName(t *testing.T) {
+	manifests := []plugin.StorePluginManifest{
+		{Id: "aaa", Name: "Alpha"},
+		{
+			Id:   "bbb",
+			Name: "i18n:plugin_name",
+			I18n: map[string]map[string]string{
+				"en_US": {"plugin_name": "Kill Process"},
+			},
+		},
+	}
+
+	selected, missing := selectManifests(manifests, []string{"Kill Process", "missing"})
+
+	require.Len(t, selected, 1)
+	assert.Equal(t, "bbb", selected[0].Id)
+	require.Len(t, missing, 1)
+	assert.Equal(t, healthStatusFailed, missing[0].Status)
+	assert.Equal(t, healthStageCatalog, missing[0].Stage)
+}
+
+func TestSkipUnreliableHealthQuery(t *testing.T) {
+	manifest := plugin.StorePluginManifest{
+		Id:      "8b8a1b35-3d9e-4d7d-9f2e-3b1d0b7f9e10",
+		Name:    "IP Geolocation",
+		Version: "1.0.1",
+		Runtime: plugin.PLUGIN_RUNTIME_SCRIPT,
+	}
+
+	skipped, ok := skipUnreliableHealthQuery(manifest, nil, "darwin", true)
+	assert.True(t, ok)
+	assert.Equal(t, healthStatusSkipped, skipped.Status)
+	assert.Equal(t, healthStageCI, skipped.Stage)
+	assert.Contains(t, skipped.Error, "CI runners")
+
+	skipped, ok = skipUnreliableHealthQuery(manifest, nil, "windows", true)
+	assert.True(t, ok)
+	assert.Equal(t, healthStatusSkipped, skipped.Status)
+
+	skipped, ok = skipUnreliableHealthQuery(manifest, nil, "linux", true)
+	assert.True(t, ok)
+	assert.Equal(t, healthStatusSkipped, skipped.Status)
+
+	_, ok = skipUnreliableHealthQuery(manifest, nil, "darwin", false)
+	assert.False(t, ok)
+
+	_, ok = skipUnreliableHealthQuery(plugin.StorePluginManifest{Id: "other"}, nil, "darwin", true)
+	assert.False(t, ok)
+}
+
+func TestSkipUnsupportedOS(t *testing.T) {
+	current := util.GetCurrentPlatform()
+	other := "linux"
+	if current == "linux" {
+		other = "windows"
+	}
+
+	_, skipped := skipUnsupportedOS(plugin.StorePluginManifest{
+		Id:          "x",
+		Name:        "X",
+		SupportedOS: []string{other},
+	})
+	assert.True(t, skipped)
+
+	_, skipped = skipUnsupportedOS(plugin.StorePluginManifest{
+		Id:          "y",
+		Name:        "Y",
+		SupportedOS: []string{current, other},
+	})
+	assert.False(t, skipped)
+
+	_, skipped = skipUnsupportedOS(plugin.StorePluginManifest{Id: "z", Name: "Z"})
+	assert.False(t, skipped)
+}
+
+func TestFormatHealthResultLineIncludesInitAndQueryDuration(t *testing.T) {
+	line := formatHealthResultLine(healthResult{
+		Name:       "Unsplash",
+		Version:    "0.0.1",
+		Runtime:    "PYTHON",
+		Status:     healthStatusPassed,
+		InitMs:     10,
+		QueryMs:    8,
+		hasInitMs:  true,
+		hasQueryMs: true,
+	})
+	assert.Equal(t, "[PASS] Unsplash 0.0.1 (PYTHON) 10ms@init 8ms@query", line)
+}
+
+func TestWriteHealthReportRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "report.json")
+	report := healthReport{Platform: "windows", Passed: 1, Results: []healthResult{{Id: "a", Status: healthStatusPassed}}}
+	require.NoError(t, writeHealthReport(path, report))
+
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	var decoded healthReport
+	require.NoError(t, json.Unmarshal(raw, &decoded))
+	assert.Equal(t, 1, decoded.Passed)
+	assert.Equal(t, "a", decoded.Results[0].Id)
+}
+
+func TestBuildHealthProbeQueriesAddsFirstCommand(t *testing.T) {
+	instance := &plugin.Instance{
+		Metadata: plugin.Metadata{
+			TriggerKeywords: []string{"*", "demo"},
+			Commands:        []plugin.MetadataCommand{{Command: "list"}, {Command: "add"}},
+		},
+	}
+
+	queries := buildHealthProbeQueries(instance)
+
+	require.Len(t, queries, 2)
+	assert.Equal(t, "demo", queries[0].TriggerKeyword)
+	assert.Equal(t, "", queries[0].Command)
+	assert.Equal(t, "demo", queries[0].RawQuery)
+	assert.Equal(t, "list", queries[1].Command)
+	assert.Equal(t, "demo list", queries[1].RawQuery)
+}
+
+func TestProbePluginQueryFailsOnHostQueryError(t *testing.T) {
+	instance := &plugin.Instance{Plugin: &fakeProbePlugin{queryErr: errors.New("rpc timeout")}}
+
+	err := probePluginQuery(context.Background(), instance, plugin.Query{Type: plugin.QueryTypeInput})
+
+	require.EqualError(t, err, "rpc timeout")
+}
+
+func TestCheckStorePluginRejectsInvalidArtifactBeforeInstall(t *testing.T) {
+	result := checkStorePlugin(context.Background(), time.Second, plugin.StorePluginManifest{
+		Id:          "bad",
+		Name:        "Bad",
+		Runtime:     plugin.PLUGIN_RUNTIME_PYTHON,
+		DownloadUrl: "https://example.com/plugin",
+		Version:     "1.0.0",
+	})
+	assert.Equal(t, healthStatusFailed, result.Status)
+	assert.Equal(t, healthStageManifest, result.Stage)
+	assert.Contains(t, result.Error, "extension")
+}
+
+func TestCheckStorePluginRejectsSingleFileWithoutMinWoxVersion(t *testing.T) {
+	result := checkStorePlugin(context.Background(), time.Second, plugin.StorePluginManifest{
+		Id:          "sf",
+		Name:        "Single",
+		Runtime:     plugin.PLUGIN_RUNTIME_PYTHON,
+		DownloadUrl: "https://example.com/plugin.py",
+		Version:     "1.0.0",
+	})
+	assert.Equal(t, healthStatusFailed, result.Status)
+	assert.Equal(t, healthStageManifest, result.Stage)
+	assert.Contains(t, result.Error, "MinWoxVersion")
+}
+
+func TestCheckStorePluginRejectsSingleFileMinWoxVersionBelowFloor(t *testing.T) {
+	result := checkStorePlugin(context.Background(), time.Second, plugin.StorePluginManifest{
+		Id:            "sf",
+		Name:          "Single",
+		Runtime:       plugin.PLUGIN_RUNTIME_NODEJS,
+		DownloadUrl:   "https://example.com/plugin.js",
+		Version:       "1.0.0",
+		MinWoxVersion: "2.0.0",
+	})
+	assert.Equal(t, healthStatusFailed, result.Status)
+	assert.Equal(t, healthStageManifest, result.Stage)
+	assert.Contains(t, result.Error, "below")
+}
+
+func TestIsTransientHealthQueryError(t *testing.T) {
+	assert.True(t, isTransientHealthQueryError(errors.New("ip: script execution failed: signal: killed, stderr: ")))
+	assert.True(t, isTransientHealthQueryError(context.DeadlineExceeded))
+	assert.False(t, isTransientHealthQueryError(errors.New("plugin returned error: invalid setting")))
+	assert.False(t, isTransientHealthQueryError(nil))
+}
+
+type flakyProbePlugin struct {
+	failsLeft int
+	err       error
+	calls     int
+}
+
+func (f *flakyProbePlugin) Init(context.Context, plugin.InitParams) {}
+
+func (f *flakyProbePlugin) Query(context.Context, plugin.Query) plugin.QueryResponse {
+	return plugin.QueryResponse{}
+}
+
+func (f *flakyProbePlugin) QueryWithError(context.Context, plugin.Query) (plugin.QueryResponse, error) {
+	f.calls++
+	if f.failsLeft > 0 {
+		f.failsLeft--
+		return plugin.QueryResponse{}, f.err
+	}
+	return plugin.QueryResponse{}, nil
+}
+
+func TestProbePluginQueryWithRetryRecoversFromTransientError(t *testing.T) {
+	flaky := &flakyProbePlugin{failsLeft: 1, err: errors.New("script execution failed: signal: killed, stderr: ")}
+	instance := &plugin.Instance{Plugin: flaky}
+
+	err := probePluginQueryWithRetry(context.Background(), instance, plugin.Query{RawQuery: "ip"})
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, flaky.calls)
+}
+
+func TestProbePluginQueryWithRetryDoesNotRetryPermanentError(t *testing.T) {
+	flaky := &flakyProbePlugin{failsLeft: 2, err: errors.New("invalid plugin response")}
+	instance := &plugin.Instance{Plugin: flaky}
+
+	err := probePluginQueryWithRetry(context.Background(), instance, plugin.Query{RawQuery: "ip"})
+
+	require.EqualError(t, err, "invalid plugin response")
+	assert.Equal(t, 1, flaky.calls)
+}

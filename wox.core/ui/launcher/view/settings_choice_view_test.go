@@ -1,0 +1,484 @@
+package view
+
+import (
+	"testing"
+
+	woxcomponent "wox/ui/launcher/component"
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+)
+
+// TestSettingsChoiceInputKeys checks IME and key releases through the focused search field.
+func TestSettingsChoiceInputKeys(t *testing.T) {
+	chosen, cancelled := -1, false
+	host := woxwidget.NewHost(func(woxui.FrameInfo) woxwidget.Widget {
+		return SettingsChoiceView(SettingsChoiceProps{
+			ID: "currency", Width: 640, Height: 480, Filterable: true, CurrentValue: "USD",
+			Choices:  []SettingsChoice{{Value: "USD", Label: "USD"}, {Value: "CNY", Label: "CNY"}},
+			OnChoose: func(index int) { chosen = index }, OnCancel: func() { cancelled = true },
+		})
+	})
+	defer host.Dispose()
+	host.AttachServices(actionSearchHostServices{})
+	frame := woxui.FrameInfo{Size: woxui.Size{Width: 640, Height: 480}, PixelSize: woxui.PixelSize{Width: 640, Height: 480}, Scale: 1}
+	host.Frame(&woxui.DisplayList{}, frame)
+	for _, event := range []woxui.KeyEvent{{Down: true, Composing: true}, {Down: false}} {
+		for _, key := range []woxui.Key{woxui.KeyEnter, woxui.KeyEscape, woxui.KeyArrowUp, woxui.KeyArrowDown} {
+			event.Key = key
+			if host.Key(event) || chosen != -1 || cancelled {
+				t.Fatalf("key %s (down=%t, composing=%t) changed the dropdown", key, event.Down, event.Composing)
+			}
+		}
+	}
+	if !host.Key(woxui.KeyEvent{Key: woxui.KeyEnter, Down: true}) || chosen != 0 {
+		t.Fatal("ignored keys changed the selection")
+	}
+	if !host.Key(woxui.KeyEvent{Key: woxui.KeyArrowDown, Down: true}) || !host.Key(woxui.KeyEvent{Key: woxui.KeyEnter, Down: true}) || chosen != 1 {
+		t.Fatal("Down and Enter did not select CNY")
+	}
+	if !host.Key(woxui.KeyEvent{Key: woxui.KeyArrowUp, Down: true}) || !host.Key(woxui.KeyEvent{Key: woxui.KeyEnter, Down: true}) || chosen != 0 {
+		t.Fatal("Up and Enter did not select USD")
+	}
+	if !host.Key(woxui.KeyEvent{Key: woxui.KeyEscape, Down: true}) || !cancelled {
+		t.Fatal("Escape did not close the dropdown")
+	}
+}
+
+// TestSettingsChoiceCurrencySearch checks code matching and clearing the search.
+func TestSettingsChoiceCurrencySearch(t *testing.T) {
+	choices := []SettingsChoice{
+		{Value: "auto", Label: "Auto"}, {Value: "BRL", Label: "BRL"},
+		{Value: "EUR", Label: "EUR"}, {Value: "USD", Label: "USD"},
+	}
+	for query, want := range map[string]string{"brl": "BRL", " UsD ": "USD", "ur": "EUR", "auto": "auto", "xyz": ""} {
+		visible := filteredSettingsChoices(choices, query)
+		if want == "" {
+			if len(visible) != 0 {
+				t.Fatalf("%q: expected no matches", query)
+			}
+		} else if len(visible) != 1 || visible[0].choice.Value != want {
+			t.Fatalf("%q: expected %s", query, want)
+		}
+	}
+	if len(filteredSettingsChoices(choices, "")) != len(choices) {
+		t.Fatal("clearing search did not restore the list")
+	}
+}
+
+func TestFilteredSettingsChoicesInsertsGroupHeaders(t *testing.T) {
+	choices := []SettingsChoice{
+		{Value: "groq", Label: "groq", Group: "API"},
+		{Value: "openai", Label: "openai", Group: "API"},
+		{Value: "codex-cli", Label: "codex-cli", Group: "Installed CLI"},
+	}
+
+	visible := filteredSettingsChoices(choices, "")
+	if len(visible) != 5 || !visible[0].header || visible[0].choice.Label != "API" {
+		t.Fatalf("unfiltered list = %#v, want API header first", visible)
+	}
+	if visible[1].choice.Value != "groq" || visible[2].choice.Value != "openai" || visible[3].choice.Label != "Installed CLI" || !visible[3].header || visible[4].originalIndex != 2 {
+		t.Fatalf("grouped list = %#v", visible)
+	}
+
+	visible = filteredSettingsChoices(choices, "codex")
+	if len(visible) != 2 || !visible[0].header || visible[0].choice.Label != "Installed CLI" || visible[1].originalIndex != 2 {
+		t.Fatalf("codex filter = %#v, want Installed CLI header and original index 2", visible)
+	}
+
+	visible = filteredSettingsChoices(choices, "api")
+	if len(visible) != 3 || visible[1].choice.Value != "groq" || visible[2].choice.Value != "openai" {
+		t.Fatalf("group-name filter = %#v, want both API providers", visible)
+	}
+}
+
+func TestSettingsChoiceKeyboardSkipsGroupHeaders(t *testing.T) {
+	choices := []SettingsChoice{
+		{Value: "openai", Label: "openai", Group: "API"},
+		{Value: "codex-cli", Label: "codex-cli", Group: "Installed CLI"},
+	}
+	visible := filteredSettingsChoices(choices, "")
+	if got := settingsChoiceVisibleIndex(visible, "codex-cli"); got != 3 {
+		t.Fatalf("visible index for codex-cli = %d, want 3", got)
+	}
+	if got := settingsChoiceNearestSelectable(visible, 0, 1); got != 1 {
+		t.Fatalf("down from API header = %d, want first API option", got)
+	}
+	if got := settingsChoiceNearestSelectable(visible, 1, 1); got != 3 {
+		t.Fatalf("down from openai = %d, want first CLI option", got)
+	}
+	single := filteredSettingsChoices([]SettingsChoice{{Value: "openai", Label: "openai", Group: "API"}}, "")
+	if got := settingsChoiceNearestSelectable(single, 1, 1); got != 1 {
+		t.Fatalf("wrap from the only option = %d, want the same option", got)
+	}
+	if settingsChoiceContentHeight(visible) != 2*settingsChoiceGroupHeight+2*settingsChoiceRowHeight {
+		t.Fatalf("grouped content height = %.0f", settingsChoiceContentHeight(visible))
+	}
+}
+
+func TestGroupedSettingsChoiceRendersSectionLabel(t *testing.T) {
+	props := SettingsChoiceProps{
+		ID: "providers", Width: 640, Height: 480, Anchor: woxui.Rect{X: 100, Y: 80, Width: 320, Height: 34}, Filterable: true,
+		CurrentValue: "openai", Theme: woxcomponent.ControlTheme{TextSecondary: woxui.Color{R: 160, A: 255}},
+		Choices: []SettingsChoice{
+			{Value: "openai", Label: "openai", Group: "API"},
+			{Value: "codex-cli", Label: "codex-cli", Group: "Installed CLI"},
+		},
+	}
+	state := &settingsChoiceState{}
+	state.InitState(woxwidget.StateContext{}, props)
+	if state.selected != 1 {
+		t.Fatalf("initial selected = %d, want first option after the API header", state.selected)
+	}
+
+	stack := state.Build(woxwidget.StateContext{}, props).(woxwidget.Stack)
+	menuScope := stack.Children[1].Child.(woxwidget.FocusScope)
+	menuContent := menuScope.Child.(woxwidget.Semantics).Child.(woxwidget.Stack).Children[0].Child.(woxwidget.Container)
+	scroll := menuContent.Child.(woxwidget.Flex).Children[1].(woxwidget.Stateful).Widget.(woxcomponent.ScrollViewProps)
+	rows := scroll.Content.(woxwidget.Flex).Children
+	if len(rows) != 4 {
+		t.Fatalf("row count = %d, want two headers and two options", len(rows))
+	}
+	header := rows[0].(woxwidget.Semantics)
+	if header.Role != woxui.AccessibilityRoleGroup || header.Label != "API" {
+		t.Fatalf("first row = %#v, want a group header", header)
+	}
+	title := header.Child.(woxwidget.Container).Child.(woxwidget.Align).Child.(woxwidget.Flex).Children[0].(woxwidget.Text)
+	if title.Value != "API" || title.Style.Size != woxcomponent.SettingsSectionTitleFontSize || title.Style.Weight != woxui.FontWeightSemibold {
+		t.Fatalf("group label = %#v", title)
+	}
+}
+
+func TestFilteredSettingsChoicesDoesNotSearchInternalJSONValue(t *testing.T) {
+	choices := []SettingsChoice{
+		{Value: `{"Name":"deepseek-v4-flash","Provider":"deepseek"}`, Label: "deepseek-v4-flash"},
+		{Value: `{"Name":"deepseek-v4-pro","Provider":"deepseek"}`, Label: "deepseek-v4-pro"},
+	}
+
+	visible := filteredSettingsChoices(choices, "pro")
+	if len(visible) != 1 || visible[0].choice.Label != "deepseek-v4-pro" {
+		t.Fatalf("filtered choices = %#v, want only deepseek-v4-pro", visible)
+	}
+}
+
+func TestFilterableSettingsChoiceCollapsesWhenNothingMatches(t *testing.T) {
+	props := SettingsChoiceProps{
+		ID: "models", Width: 640, Height: 480, Anchor: woxui.Rect{X: 100, Y: 80, Width: 320, Height: 34}, Filterable: true,
+		Theme: woxcomponent.ControlTheme{}, Choices: []SettingsChoice{{Value: "flash", Label: "deepseek-v4-flash"}},
+	}
+	state := &settingsChoiceState{}
+	state.InitState(woxwidget.StateContext{}, props)
+	state.queryController.SetText("missing", false)
+
+	stack := state.Build(woxwidget.StateContext{}, props).(woxwidget.Stack)
+	menuScope := stack.Children[1].Child.(woxwidget.FocusScope)
+	menuStack := menuScope.Child.(woxwidget.Semantics).Child.(woxwidget.Stack)
+	if menuStack.Height != settingsChoiceSearchHeight {
+		t.Fatalf("empty filtered menu height = %.0f, want search-only height %.0f", menuStack.Height, settingsChoiceSearchHeight)
+	}
+	menuContent := menuStack.Children[0].Child.(woxwidget.Container)
+	children := menuContent.Child.(woxwidget.Flex).Children
+	if len(children) != 1 {
+		t.Fatalf("empty filtered menu child count = %d, want only the search field", len(children))
+	}
+}
+
+func TestFilterableSettingsChoiceShowsSearchIcon(t *testing.T) {
+	icon := &woxui.Image{}
+	props := SettingsChoiceProps{
+		ID: "models", Width: 640, Height: 480, Anchor: woxui.Rect{X: 100, Y: 80, Width: 320, Height: 34}, Filterable: true,
+		SearchIcon: icon, Theme: woxcomponent.ControlTheme{}, Choices: []SettingsChoice{{Value: "flash", Label: "deepseek-v4-flash"}},
+	}
+	state := &settingsChoiceState{}
+	state.InitState(woxwidget.StateContext{}, props)
+
+	stack := state.Build(woxwidget.StateContext{}, props).(woxwidget.Stack)
+	menuScope := stack.Children[1].Child.(woxwidget.FocusScope)
+	menuStack := menuScope.Child.(woxwidget.Semantics).Child.(woxwidget.Stack)
+	menuContent := menuStack.Children[0].Child.(woxwidget.Container)
+	searchLayer := menuContent.Child.(woxwidget.Flex).Children[0].(woxwidget.Stack)
+	searchRow := searchLayer.Children[1].Child.(woxwidget.Container)
+	searchFlex := searchRow.Child.(woxwidget.Flex)
+	if searchFlex.CrossAxisAlignment != woxwidget.CrossAxisCenter {
+		t.Fatalf("search row cross-axis alignment = %v, want center", searchFlex.CrossAxisAlignment)
+	}
+	searchChildren := searchFlex.Children
+	if len(searchChildren) != 2 {
+		t.Fatalf("search row child count = %d, want icon and text field", len(searchChildren))
+	}
+	searchField := searchChildren[1].(woxwidget.Stateful)
+	searchFieldProps := searchField.Widget.(woxcomponent.TextFieldProps)
+	if searchFieldProps.TextAlignmentY != 0.5 {
+		t.Fatalf("search text vertical alignment = %.1f, want 0.5", searchFieldProps.TextAlignmentY)
+	}
+}
+
+func TestSettingsChoiceTrailingUsesRowTextColor(t *testing.T) {
+	title := woxui.Color{R: 240, G: 244, B: 248, A: 255}
+	props := SettingsChoiceProps{
+		ID: "glance", Width: 640, Height: 480, Anchor: woxui.Rect{X: 100, Y: 80, Width: 320, Height: 34}, Filterable: true,
+		CurrentValue: "time", Theme: woxcomponent.ControlTheme{Text: title, TextSecondary: woxui.Color{R: 255, A: 255}},
+		Choices: []SettingsChoice{
+			{Value: "battery", Label: "Battery", Trailing: "AC"},
+			{Value: "time", Label: "Time", Trailing: "14:35"},
+		},
+	}
+	state := &settingsChoiceState{}
+	state.InitState(woxwidget.StateContext{}, props)
+	stack := state.Build(woxwidget.StateContext{}, props).(woxwidget.Stack)
+	menuScope := stack.Children[1].Child.(woxwidget.FocusScope)
+	menuContent := menuScope.Child.(woxwidget.Semantics).Child.(woxwidget.Stack).Children[0].Child.(woxwidget.Container)
+	scroll := menuContent.Child.(woxwidget.Flex).Children[1].(woxwidget.Stateful).Widget.(woxcomponent.ScrollViewProps)
+	semantics := scroll.Content.(woxwidget.Flex).Children[0].(woxwidget.Semantics)
+	if semantics.Description != "AC" {
+		t.Fatalf("choice description = %q, want trailing text for accessibility", semantics.Description)
+	}
+	row := semantics.Child.(woxwidget.Gesture).Child.(woxwidget.Stack)
+	trailing := settingsChoiceRowTrailing(row)
+	if trailing.Value != "AC" || trailing.Color != title {
+		t.Fatalf("choice trailing = %q %#v, want row Text so TextSecondary cannot restyle Glance values", trailing.Value, trailing.Color)
+	}
+}
+
+func TestSettingsChoiceSelectedItemUsesThemeHighlight(t *testing.T) {
+	highlight := woxui.Color{R: 54, G: 123, B: 220, A: 255}
+	props := SettingsChoiceProps{
+		ID: "start-page", Width: 640, Height: 480, Anchor: woxui.Rect{X: 100, Y: 80, Width: 320, Height: 34}, Filterable: true,
+		CurrentValue: "recent", Theme: woxcomponent.ControlTheme{SelectionBackground: highlight},
+		Choices: []SettingsChoice{{Value: "recent", Label: "Recent"}, {Value: "blank", Label: "Blank"}},
+	}
+	state := &settingsChoiceState{}
+	state.InitState(woxwidget.StateContext{}, props)
+
+	stack := state.Build(woxwidget.StateContext{}, props).(woxwidget.Stack)
+	menuScope := stack.Children[1].Child.(woxwidget.FocusScope)
+	menuStack := menuScope.Child.(woxwidget.Semantics).Child.(woxwidget.Stack)
+	menuContent := menuStack.Children[0].Child.(woxwidget.Container)
+	scrollProps := menuContent.Child.(woxwidget.Flex).Children[1].(woxwidget.Stateful).Widget.(woxcomponent.ScrollViewProps)
+	rowStack := scrollProps.Content.(woxwidget.Flex).Children[0].(woxwidget.Semantics).Child.(woxwidget.Gesture).Child.(woxwidget.Stack)
+	row := rowStack.Children[0].Child.(woxwidget.Container)
+
+	if row.Color != highlight {
+		t.Fatalf("selected choice fill = %#v, want theme highlight %#v", row.Color, highlight)
+	}
+}
+
+func TestSettingsChoiceHighlightsHoveredItemLikeLauncherResult(t *testing.T) {
+	highlight := woxui.Color{R: 54, G: 123, B: 220, A: 200}
+	props := SettingsChoiceProps{
+		ID: "start-page", Width: 640, Height: 480, Anchor: woxui.Rect{X: 100, Y: 80, Width: 320, Height: 34}, Filterable: true,
+		CurrentValue: "recent", Theme: woxcomponent.ControlTheme{SelectionBackground: highlight},
+		Choices: []SettingsChoice{{Value: "recent", Label: "Recent"}, {Value: "blank", Label: "Blank"}, {Value: "query", Label: "Query"}},
+	}
+	state := &settingsChoiceState{}
+	state.InitState(woxwidget.StateContext{}, props)
+	state.selected = 1
+	state.hovered = 1
+
+	stack := state.Build(woxwidget.StateContext{}, props).(woxwidget.Stack)
+	menuScope := stack.Children[1].Child.(woxwidget.FocusScope)
+	menuStack := menuScope.Child.(woxwidget.Semantics).Child.(woxwidget.Stack)
+	menuContent := menuStack.Children[0].Child.(woxwidget.Container)
+	scrollProps := menuContent.Child.(woxwidget.Flex).Children[1].(woxwidget.Stateful).Widget.(woxcomponent.ScrollViewProps)
+	rowStack := scrollProps.Content.(woxwidget.Flex).Children[1].(woxwidget.Semantics).Child.(woxwidget.Gesture).Child.(woxwidget.Stack)
+	row := rowStack.Children[0].Child.(woxwidget.Container)
+
+	if row.Color.A != 50 || row.Color.R != highlight.R || row.Color.G != highlight.G || row.Color.B != highlight.B {
+		t.Fatalf("highlighted choice fill = %#v, want launcher-style 25%% alpha of %#v", row.Color, highlight)
+	}
+}
+
+func TestFilterableSettingsChoiceUsesSharedScrollbarAndRoundedEnds(t *testing.T) {
+	choices := make([]SettingsChoice, 10)
+	for index := range choices {
+		choices[index] = SettingsChoice{Value: string(rune('a' + index)), Label: "Choice"}
+	}
+	props := SettingsChoiceProps{
+		ID: "fonts", Width: 640, Height: 480, Anchor: woxui.Rect{X: 100, Y: 80, Width: 320, Height: 34}, Filterable: true,
+		CurrentValue: choices[0].Value, Theme: woxcomponent.ControlTheme{}, Choices: choices,
+	}
+	state := &settingsChoiceState{}
+	state.InitState(woxwidget.StateContext{}, props)
+
+	stack := state.Build(woxwidget.StateContext{}, props).(woxwidget.Stack)
+	menuScope := stack.Children[1].Child.(woxwidget.FocusScope)
+	menuStack := menuScope.Child.(woxwidget.Semantics).Child.(woxwidget.Stack)
+	menuContent := menuStack.Children[0].Child.(woxwidget.Container)
+	children := menuContent.Child.(woxwidget.Flex).Children
+	searchLayer := children[0].(woxwidget.Stack)
+	if _, ok := searchLayer.Children[0].Child.(woxwidget.Painter); !ok {
+		t.Fatalf("search background type = %T, want rounded-end painter", searchLayer.Children[0].Child)
+	}
+	scrollbar := children[1].(woxwidget.Stateful)
+	scrollProps := scrollbar.Widget.(woxcomponent.ScrollViewProps)
+	if scrollProps.Controller != state.scrollController || scrollProps.ContentHeight != 0 {
+		t.Fatalf("choice scrollbar = controller %p content hint %.0f, want measured shared controller", scrollProps.Controller, scrollProps.ContentHeight)
+	}
+	lastRow := scrollProps.Content.(woxwidget.Flex).Children[len(choices)-1].(woxwidget.Semantics).Child.(woxwidget.Gesture).Child.(woxwidget.Stack)
+	if _, ok := lastRow.Children[0].Child.(woxwidget.Painter); !ok {
+		t.Fatalf("last row background type = %T, want rounded-end painter", lastRow.Children[0].Child)
+	}
+}
+
+// TestSettingsChoiceGroupTooltip survives filtering and uses the icon bounds as its anchor.
+func TestSettingsChoiceGroupTooltip(t *testing.T) {
+	const explanation = "Use installed CLIs with their account quota."
+	choices := []SettingsChoice{{Value: "codex-cli", Label: "Codex", Group: "Installed CLI", GroupTooltip: explanation}}
+	visible := filteredSettingsChoices(choices, "codex")
+	if len(visible) != 2 || visible[0].choice.GroupTooltip != explanation {
+		t.Fatalf("filtered group lost tooltip: %+v", visible)
+	}
+	var gotInside bool
+	var gotText string
+	var gotAnchor woxui.Rect
+	props := SettingsChoiceProps{InfoIcon: &woxui.Image{}, OnTooltip: func(inside bool, text string, anchor woxui.Rect) {
+		gotInside, gotText, gotAnchor = inside, text, anchor
+	}}
+	header := settingsChoiceGroupHeader(320, visible[0].choice, 0, props).(woxwidget.Semantics)
+	if header.Description != explanation {
+		t.Fatal("group explanation is missing from accessibility semantics")
+	}
+	children := header.Child.(woxwidget.Container).Child.(woxwidget.Align).Child.(woxwidget.Flex).Children
+	if len(children) != 2 {
+		t.Fatalf("group children = %d, want label and info icon", len(children))
+	}
+	hover := children[1].(woxwidget.Semantics).Child.(woxwidget.Gesture)
+	anchor := woxui.Rect{X: 150, Y: 80, Width: 28, Height: 28}
+	hover.OnHoverAt(true, anchor)
+	if !gotInside || gotText != explanation || gotAnchor != anchor {
+		t.Fatal("hover did not forward the group tooltip and icon bounds")
+	}
+	hover.OnHoverAt(false, anchor)
+	if gotInside {
+		t.Fatal("hover exit did not dismiss the tooltip")
+	}
+	visible[0].choice.GroupTooltip = ""
+	header = settingsChoiceGroupHeader(320, visible[0].choice, 0, props).(woxwidget.Semantics)
+	if len(header.Child.(woxwidget.Container).Child.(woxwidget.Align).Child.(woxwidget.Flex).Children) != 1 {
+		t.Fatal("group without explanation should not show an icon")
+	}
+}
+
+func TestSettingsChoiceIdleRowsShareMenuBackground(t *testing.T) {
+	surface := woxui.Color{R: 22, G: 22, B: 26, A: 88}
+	props := SettingsChoiceProps{
+		ID: "width", Theme: woxcomponent.ControlTheme{Surface: surface},
+		Choices: []SettingsChoice{{Value: "600", Label: "600"}},
+	}
+	state := &settingsChoiceState{}
+	state.InitState(woxwidget.StateContext{}, props)
+	menu := settingsChoiceMenu(woxwidget.StateContext{}, props, state, []visibleSettingsChoice{{choice: props.Choices[0]}}, 200, 64, 48, 8)
+	scope := menu.(woxwidget.FocusScope).Child.(woxwidget.Focusable).Child.(woxwidget.Semantics)
+	background := scope.Child.(woxwidget.Stack).Children[0].Child.(woxwidget.Container)
+	scroll := background.Child.(woxwidget.Flex).Children[0].(woxwidget.Stateful).Widget.(woxcomponent.ScrollViewProps)
+	row := scroll.Content.(woxwidget.Flex).Children[0].(woxwidget.Semantics).Child.(woxwidget.Gesture).Child.(woxwidget.Stack)
+	if background.Color != surface || row.Children[0].Child.(woxwidget.Container).Color.A != 0 {
+		t.Fatal("idle rows must inherit the menu fill without a second translucent layer")
+	}
+}
+
+func TestSettingsChoiceMenuGrowsBeyondAnchorForTrailersAndTooltips(t *testing.T) {
+	props := SettingsChoiceProps{
+		ID: "channel", Width: 800, Height: 600, Anchor: woxui.Rect{X: 500, Y: 80, Width: woxcomponent.SettingsChoiceControlWidth, Height: 32},
+		Choices: []SettingsChoice{
+			{Value: "stable", Label: "Stable channel", Trailing: "v2.4.4", Tooltip: "More stable releases, but updates may arrive later"},
+			{Value: "beta", Label: "Beta channel", Trailing: "v2.4.4", Tooltip: "Try the newest Wox features early"},
+		},
+	}
+	menu := settingsChoiceBuiltMenu(t, props)
+	if menu.Width <= woxcomponent.SettingsChoiceControlWidth {
+		t.Fatalf("menu width = %.0f, want wider than the %.0f trigger so channel labels are not clipped", menu.Width, woxcomponent.SettingsChoiceControlWidth)
+	}
+	if menu.Width > settingsChoiceMenuMaxWidth {
+		t.Fatalf("menu width = %.0f, want at most %.0f", menu.Width, settingsChoiceMenuMaxWidth)
+	}
+}
+
+func TestSettingsChoiceMenuKeepsAnchorWidthWhenContentFits(t *testing.T) {
+	props := SettingsChoiceProps{
+		ID: "mode", Width: 800, Height: 600, Anchor: woxui.Rect{X: 500, Y: 80, Width: woxcomponent.SettingsChoiceControlWidth, Height: 32},
+		Choices: []SettingsChoice{{Value: "fresh", Label: "Fresh"}, {Value: "continue", Label: "Continue"}},
+	}
+	menu := settingsChoiceBuiltMenu(t, props)
+	if menu.Width != woxcomponent.SettingsChoiceControlWidth {
+		t.Fatalf("menu width = %.0f, want the trigger width %.0f when labels fit", menu.Width, woxcomponent.SettingsChoiceControlWidth)
+	}
+}
+
+func settingsChoiceBuiltMenu(t *testing.T, props SettingsChoiceProps) woxwidget.Stack {
+	t.Helper()
+	state := &settingsChoiceState{}
+	state.InitState(woxwidget.StateContext{}, props)
+	stack := state.Build(woxwidget.StateContext{}, props).(woxwidget.Stack)
+	scope := stack.Children[1].Child.(woxwidget.FocusScope)
+	surface := scope.Child
+	if focusable, ok := surface.(woxwidget.Focusable); ok {
+		surface = focusable.Child
+	}
+	return surface.(woxwidget.Semantics).Child.(woxwidget.Stack)
+}
+
+func settingsChoiceRowTrailing(row woxwidget.Stack) woxwidget.Text {
+	flex := row.Children[1].Child.(woxwidget.Container).Child.(woxwidget.Flex)
+	for _, child := range flex.Children {
+		if text, ok := child.(woxwidget.Text); ok {
+			return text
+		}
+	}
+	return woxwidget.Text{}
+}
+
+func TestMultiSettingsChoiceKeepsHighlight(t *testing.T) {
+	choices := []SettingsChoice{{Value: "a", Label: "A"}, {Value: "b", Label: "B"}, {Value: "c", Label: "C"}}
+	visible := filteredSettingsChoices(choices, "")
+	props := SettingsChoiceProps{CurrentValue: "b", SelectedValues: []string{"b"}, Choices: choices}
+	state := &settingsChoiceState{}
+	state.InitState(woxwidget.StateContext{}, props)
+	if state.selected != settingsChoiceExactIndex(visible, "b") {
+		t.Fatalf("initial highlight = %d", state.selected)
+	}
+	next := props
+	next.CurrentValue = "b,c"
+	next.SelectedValues = []string{"b", "c"}
+	state.DidUpdateWidget(woxwidget.StateContext{}, props, next)
+	if state.selected != settingsChoiceExactIndex(visible, "b") {
+		t.Fatalf("multi highlight moved to %d", state.selected)
+	}
+
+	joined := SettingsChoiceProps{CurrentValue: "b,c", SelectedValues: []string{"b", "c"}, Choices: choices}
+	opened := &settingsChoiceState{}
+	opened.InitState(woxwidget.StateContext{}, joined)
+	if opened.selected != settingsChoiceExactIndex(visible, "b") {
+		t.Fatalf("joined value highlighted %d, want b", opened.selected)
+	}
+
+	single := SettingsChoiceProps{CurrentValue: "b", Choices: choices}
+	singleState := &settingsChoiceState{}
+	singleState.InitState(woxwidget.StateContext{}, single)
+	updated := single
+	updated.CurrentValue = "c"
+	singleState.DidUpdateWidget(woxwidget.StateContext{}, single, updated)
+	if singleState.selected != settingsChoiceExactIndex(visible, "c") {
+		t.Fatalf("single highlight = %d, want c", singleState.selected)
+	}
+}
+
+func TestMultiSettingsChoiceMenuStaysAnchored(t *testing.T) {
+	choices := []SettingsChoice{{Value: "a", Label: "A"}, {Value: "b", Label: "B"}}
+	anchor := woxui.Rect{X: 40, Y: 300, Width: 220, Height: 36}
+	visible := filteredSettingsChoices(choices, "")
+	listHeight := settingsChoiceContentHeight(visible)
+	menuHeight := settingsChoiceMenuPadding*2 + listHeight
+	props := SettingsChoiceProps{Width: 800, Height: 800, Anchor: anchor, Choices: choices, CurrentValue: "a", SelectedValues: []string{"a"}}
+	top := settingsChoiceMenuTop(props, anchor, menuHeight, listHeight)
+	props.CurrentValue = "a,b"
+	props.SelectedValues = []string{"a", "b"}
+	if got := settingsChoiceMenuTop(props, anchor, menuHeight, listHeight); got != top {
+		t.Fatalf("multi menu moved from %.0f to %.0f", top, got)
+	}
+	single := SettingsChoiceProps{Width: 800, Height: 800, Anchor: anchor, Choices: choices, CurrentValue: "a"}
+	first := settingsChoiceMenuTop(single, anchor, menuHeight, listHeight)
+	single.CurrentValue = "b"
+	if settingsChoiceMenuTop(single, anchor, menuHeight, listHeight) == first {
+		t.Fatal("single-select menu should follow the selected row")
+	}
+}

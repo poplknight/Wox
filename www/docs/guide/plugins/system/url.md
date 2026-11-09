@@ -1,0 +1,14 @@
+# URL Plugin
+
+URL opens web addresses from the launcher. Paste or type a URL; Wox can open it in the browser and remember recent addresses.
+
+![The URL plugin](/images/guide/plugin_url.png)
+
+## Quick Start
+
+```text
+https://www.woxlauncher.com
+github.com/Wox-launcher/Wox
+```
+
+Recent URLs can reappear as you type. URLs open in the default browser. Use the Action Panel on a recent URL to remove it from history.

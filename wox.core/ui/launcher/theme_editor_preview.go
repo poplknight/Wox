@@ -1,0 +1,599 @@
+package launcher
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"log"
+	"strings"
+	"time"
+
+	"wox/common"
+	woxcomponent "wox/ui/launcher/component"
+	woxui "wox/ui/runtime"
+	"wox/util"
+	"wox/util/osvariant"
+)
+
+type themeColorToken struct {
+	key   string
+	label string
+}
+
+type themeColorGroup struct {
+	label  string
+	tokens []themeColorToken
+}
+
+var themeEditorColorGroups = []themeColorGroup{
+	{label: "i18n:ui_theme_editor_group_window", tokens: []themeColorToken{{key: "AppBackgroundColor", label: "i18n:ui_theme_editor_token_app_background"}}},
+	{label: "i18n:ui_theme_editor_group_query_box", tokens: []themeColorToken{
+		{key: "QueryBoxBackgroundColor", label: "i18n:ui_theme_editor_token_query_background"},
+		{key: "QueryBoxFontColor", label: "i18n:ui_theme_editor_token_query_text"},
+		{key: "QueryBoxCursorColor", label: "i18n:ui_theme_editor_token_query_cursor"},
+		{key: "QueryBoxTextSelectionBackgroundColor", label: "i18n:ui_theme_editor_token_query_selection"},
+	}},
+	{label: "i18n:ui_theme_editor_group_results", tokens: []themeColorToken{
+		{key: "ResultItemTitleColor", label: "i18n:ui_theme_editor_token_result_title"},
+		{key: "ResultItemSubTitleColor", label: "i18n:ui_theme_editor_token_result_subtitle"},
+		{key: "ResultItemTailTextColor", label: "i18n:ui_theme_editor_token_result_tail"},
+		{key: "ResultItemActiveBackgroundColor", label: "i18n:ui_theme_editor_token_result_active_background"},
+		{key: "ResultItemActiveTitleColor", label: "i18n:ui_theme_editor_token_result_active_title"},
+		{key: "ResultItemActiveTailTextColor", label: "i18n:ui_theme_editor_token_result_active_tail"},
+	}},
+	{label: "i18n:ui_theme_editor_group_preview", tokens: []themeColorToken{
+		{key: "PreviewFontColor", label: "i18n:ui_theme_editor_token_preview_text"},
+		{key: "PreviewPropertyTitleColor", label: "i18n:ui_theme_editor_token_preview_tag_border"},
+		{key: "PreviewPropertyContentColor", label: "i18n:ui_theme_editor_token_preview_tag_text"},
+		{key: "PreviewSplitLineColor", label: "i18n:ui_theme_editor_token_preview_split"},
+		{key: "PreviewTextSelectionColor", label: "i18n:ui_theme_editor_token_preview_selection"},
+	}},
+	{label: "i18n:ui_theme_editor_group_action_panel", tokens: []themeColorToken{
+		{key: "ActionContainerBackgroundColor", label: "i18n:ui_theme_editor_token_action_background"},
+		{key: "ActionContainerHeaderFontColor", label: "i18n:ui_theme_editor_token_action_header"},
+		{key: "ActionItemFontColor", label: "i18n:ui_theme_editor_token_action_text"},
+		{key: "ActionItemActiveBackgroundColor", label: "i18n:ui_theme_editor_token_action_active_background"},
+		{key: "ActionItemActiveFontColor", label: "i18n:ui_theme_editor_token_action_active_text"},
+		{key: "ActionQueryBoxBackgroundColor", label: "i18n:ui_theme_editor_token_action_query_background"},
+	}},
+	{label: "i18n:ui_theme_editor_group_toolbar", tokens: []themeColorToken{
+		{key: "ToolbarBackgroundColor", label: "i18n:ui_theme_editor_token_toolbar_background"},
+		{key: "ToolbarFontColor", label: "i18n:ui_theme_editor_token_toolbar_text"},
+	}},
+}
+
+type themeEditorPreviewState struct {
+	surfaces *woxcomponent.ThemeSurfaceSet
+	ai       themeEditorAIState
+	formFieldsState
+	key            string
+	raw            map[string]any
+	initial        map[string]string
+	sourceID       string
+	sourceName     string
+	isSystem       bool
+	isAuto         bool
+	activeGroup    int
+	dialogMode     string
+	dialogToken    string
+	dialogOriginal string
+	flashToken     string
+	flashRevision  uint64
+	saving         bool
+	error          string
+	revision       uint64
+}
+
+type themeEditorPreviewSnapshot struct {
+	surfaces *woxcomponent.ThemeSurfaceSet
+	ai       themeEditorAIState
+	formFieldsSnapshot
+	raw         map[string]any
+	key         string
+	initial     map[string]string
+	sourceID    string
+	sourceName  string
+	isSystem    bool
+	isAuto      bool
+	activeGroup int
+	dialogMode  string
+	dialogToken string
+	flashToken  string
+	saving      bool
+	error       string
+}
+
+// themeEditorSurfaceOpacity is the background whose alpha is edited in the inspector.
+// Text and border colors stay opaque; other fills keep the color dialog's opacity slider.
+func themeEditorSurfaceOpacity(key string) bool {
+	switch key {
+	case "AppBackgroundColor", "AppContentBackgroundColor", "ToolbarBackgroundColor", "ActionContainerBackgroundColor":
+		return true
+	default:
+		return false
+	}
+}
+
+// themeEditorColorAllowsOpacity reports colors that may store an alpha below 1.
+func themeEditorColorAllowsOpacity(key string) bool {
+	if strings.Contains(key, "Background") || key == "BaseBackgroundColor" {
+		return true
+	}
+	switch {
+	case strings.Contains(key, "Font"),
+		strings.Contains(key, "Border"),
+		strings.Contains(key, "Divider"),
+		strings.Contains(key, "Separator"),
+		strings.Contains(key, "Split"),
+		strings.Contains(key, "Icon"),
+		strings.Contains(key, "Cursor"),
+		strings.Contains(key, "Title"),
+		strings.Contains(key, "Tail"),
+		strings.Contains(key, "Text"),
+		key == "BaseTextColor",
+		key == "BaseAccentColor":
+		return false
+	default:
+		return true
+	}
+}
+
+// themeEditorNormalizeOpaqueColor drops alpha from text and border colors once the value is a complete color.
+func themeEditorNormalizeOpaqueColor(key, value string) string {
+	if themeEditorColorAllowsOpacity(key) {
+		return value
+	}
+	color, ok := decodeThemeColor(strings.TrimSpace(value))
+	if !ok || color.A == 255 {
+		return value
+	}
+	color.A = 255
+	return encodeThemeColor(color)
+}
+
+// themeEditorColorWithOpacity writes one background alpha without changing the authored RGB.
+func themeEditorColorWithOpacity(value, effective string, opacity float64) (string, bool) {
+	source := strings.TrimSpace(value)
+	if source == "" {
+		source = strings.TrimSpace(effective)
+	}
+	color, ok := decodeThemeColor(source)
+	if !ok {
+		return "", false
+	}
+	color.A = colorByte(min(float64(1), max(float64(0), opacity)) * 255)
+	return encodeThemeColor(color), true
+}
+
+func themeEditorTokens() []themeColorToken {
+	count := 0
+	for _, group := range themeEditorColorGroups {
+		count += len(group.tokens)
+	}
+	tokens := make([]themeColorToken, 0, count)
+	for _, group := range themeEditorColorGroups {
+		tokens = append(tokens, group.tokens...)
+	}
+	return tokens
+}
+
+func themeMapString(raw map[string]any, key string) string {
+	value, ok := raw[key]
+	if !ok || value == nil {
+		return ""
+	}
+	return fmt.Sprint(value)
+}
+
+func themeEditorForm(raw map[string]any) ([]formDefinition, map[string]string) {
+	definitions := []formDefinition{{Type: "textbox", Value: formDefinitionValue{Key: "ThemeName", Label: "Theme name", Tooltip: "Change the name to save a new copy"}}, {Type: "newline"}}
+	values := map[string]string{"ThemeName": themeMapString(raw, "ThemeName")}
+	for _, group := range themeEditorGroups(raw) {
+		definitions = append(definitions, formDefinition{Type: "head", Value: formDefinitionValue{Content: group.label}})
+		for _, token := range group.tokens {
+			tooltip := "CSS color: #RRGGBB, #RRGGBBAA, rgb(), or rgba()"
+			if themeEditorNumericToken(token.key) {
+				tooltip = ""
+			}
+			definitions = append(definitions, formDefinition{Type: "textbox", Value: formDefinitionValue{Key: token.key, Label: token.label, Tooltip: tooltip}})
+			source := themeEditorTokenSource(raw, token.key, util.GetCurrentPlatform(), osvariant.GetCurrentPlatformVariant(), woxui.ThemeCapabilities()...)
+			values[token.key] = themeMapString(source, token.key)
+		}
+	}
+	return definitions, values
+}
+
+func copyStringMap(source map[string]string) map[string]string {
+	copy := make(map[string]string, len(source))
+	for key, value := range source {
+		copy[key] = value
+	}
+	return copy
+}
+
+// copyThemeMap isolates nested platform/variant maps before a draft or snapshot can edit them.
+func copyThemeMap(source map[string]any) map[string]any {
+	copy := make(map[string]any, len(source))
+	for key, value := range source {
+		if nested, ok := value.(map[string]any); ok {
+			value = copyThemeMap(nested)
+		}
+		copy[key] = value
+	}
+	return copy
+}
+
+// newThemeEditorState builds one portable draft from the current Settings theme.
+func newThemeEditorState(key string, raw map[string]any) *themeEditorPreviewState {
+	definitions, values := themeEditorForm(raw)
+	fields := newFormFieldsState(definitions, values, false)
+	isSystem, _ := raw["IsSystem"].(bool)
+	isAuto, _ := raw["IsAutoAppearance"].(bool)
+	return &themeEditorPreviewState{
+		formFieldsState: fields,
+		key:             key,
+		raw:             copyThemeMap(raw),
+		initial:         copyStringMap(values),
+		sourceID:        themeMapString(raw, "ThemeId"),
+		sourceName:      themeMapString(raw, "ThemeName"),
+		isSystem:        isSystem,
+		isAuto:          isAuto,
+	}
+}
+
+// loadSettingsThemeEditor opens the applied theme as the Settings theme editor draft.
+func (c *themeSettingsController) loadSettingsThemeEditor() error {
+	retained := false
+	if err := c.runOnUI("resume settings theme editor", func() {
+		state := c.ThemeEditor()
+		retained = state != nil && (state.saving || themeEditorDirtyLocked(state))
+		if retained {
+			c.preloadThemeEditorModels()
+		}
+	}); err != nil {
+		return err
+	}
+	// CurrentTheme contains the saved source, not the unsaved palette already being previewed.
+	if retained {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	theme, err := c.services.CurrentTheme(ctx, c.sessionID)
+	if err != nil {
+		return fmt.Errorf("load active theme: %w", err)
+	}
+	encoded, err := json.Marshal(theme)
+	if err != nil {
+		return fmt.Errorf("encode active theme: %w", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(encoded, &raw); err != nil {
+		return fmt.Errorf("decode active theme: %w", err)
+	}
+	if strings.TrimSpace(themeMapString(raw, "AppBackgroundColor")) == "" {
+		return fmt.Errorf("active theme has no color data")
+	}
+	encoded, _ = json.Marshal(raw)
+	hash := sha256.Sum256(encoded)
+	return c.runOnUI("apply settings theme editor", func() {
+		c.SetThemeEditor(newThemeEditorState(fmt.Sprintf("settings-theme|%x", hash[:8]), raw))
+		c.ThemeEditor().surfaces = fromCoreTheme(theme).Surfaces
+		c.preloadThemeEditorModels()
+		c.preloadDemoWallpaper(true)
+		c.invalidateThemeEditorWindow()
+	})
+}
+
+// snapshotThemeEditorPreviewLocked copies the Settings draft for a render pass.
+func snapshotThemeEditorPreviewLocked(state *themeEditorPreviewState) *themeEditorPreviewSnapshot {
+	if state == nil {
+		return nil
+	}
+	return &themeEditorPreviewSnapshot{
+		surfaces:           state.surfaces,
+		formFieldsSnapshot: snapshotFormFieldsLocked(&state.formFieldsState),
+		ai:                 state.ai,
+		raw:                copyThemeMap(state.raw),
+		key:                state.key,
+		initial:            copyStringMap(state.initial),
+		sourceID:           state.sourceID,
+		sourceName:         state.sourceName,
+		isSystem:           state.isSystem,
+		isAuto:             state.isAuto,
+		activeGroup:        state.activeGroup,
+		dialogMode:         state.dialogMode,
+		dialogToken:        state.dialogToken,
+		flashToken:         state.flashToken,
+		saving:             state.saving,
+		error:              state.error,
+	}
+}
+
+func themeEditorPalette(values map[string]string) uiPalette {
+	theme := themeData{}
+	raw, _ := json.Marshal(values)
+	_ = json.Unmarshal(raw, &theme)
+	return paletteForTheme(theme)
+}
+
+// themeEditorDraftPalette preserves non-editable theme geometry while applying the live color draft.
+func themeEditorDraftPalette(raw map[string]any, values map[string]string, surfaces ...*woxcomponent.ThemeSurfaceSet) uiPalette {
+	theme, err := themeEditorDraftTheme(raw, values, surfaces...)
+	if err != nil {
+		return themeEditorPalette(values)
+	}
+	return paletteForTheme(theme)
+}
+
+// themeEditorDraftTheme merges editable values into the complete source theme.
+func themeEditorDraftTheme(raw map[string]any, values map[string]string, surfaces ...*woxcomponent.ThemeSurfaceSet) (themeData, error) {
+	for _, token := range themeEditorTokens() {
+		if isV2Theme(raw) {
+			break
+		}
+		if _, ok := decodeThemeColor(values[token.key]); !ok {
+			return themeData{}, fmt.Errorf("%s is not a valid CSS color", token.key)
+		}
+	}
+	draft := mergeThemeEditorDraft(raw, values)
+	var theme themeData
+	encoded, err := json.Marshal(draft)
+	if err == nil {
+		err = json.Unmarshal(encoded, &theme)
+	}
+	if err != nil {
+		return themeData{}, err
+	}
+	if len(surfaces) > 0 {
+		theme.Surfaces = surfaces[0]
+	}
+	return theme, nil
+}
+
+// applySettingsThemeEditorDraft previews a valid draft on theme-aware windows; Settings chrome stays fixed.
+func (c *themeSettingsController) applySettingsThemeEditorDraft() {
+	state := c.ThemeEditor()
+	if state == nil || !strings.HasPrefix(state.key, "settings-theme|") {
+		return
+	}
+	theme, err := themeEditorDraftTheme(state.raw, state.values, state.surfaces)
+	if err == nil {
+		c.applyTheme(theme)
+	}
+}
+
+// onThemeEditorPreviewKey gives the draft form keyboard ownership only after a field is focused.
+func (c *themeSettingsController) onThemeEditorPreviewKey(event woxui.KeyEvent) bool {
+	state := c.ThemeEditor()
+	active := state != nil && state.active
+	dialogOpen := state != nil && state.dialogMode != ""
+	if !active {
+		return false
+	}
+	if dialogOpen && event.Key == woxui.KeyEscape {
+		c.cancelThemeEditorDialog()
+		return true
+	}
+	if dialogOpen && event.Key == woxui.KeyEnter && !event.Modifiers.HasPrimary() {
+		c.confirmThemeEditorDialog()
+		return true
+	}
+	if event.Key == woxui.KeyEscape {
+		c.deactivateThemeEditorPreview()
+		return true
+	}
+	switch event.Key {
+	case woxui.KeyTab, woxui.KeyArrowDown:
+		delta := 1
+		if event.Key == woxui.KeyTab && event.Modifiers&woxui.KeyModifierShift != 0 {
+			delta = -1
+		}
+		c.moveThemeEditorFocus(delta)
+	case woxui.KeyArrowUp:
+		c.moveThemeEditorFocus(-1)
+	case woxui.KeyEnter:
+		return true
+	default:
+		return false
+	}
+	return true
+}
+
+func (c *themeSettingsController) onThemeEditorPreviewTextInput(_ woxui.TextInputEvent) bool {
+	state := c.ThemeEditor()
+	active := state != nil && state.active
+	return active
+}
+
+func (c *themeSettingsController) editThemeEditorKey(event woxui.KeyEvent) {
+	state := c.ThemeEditor()
+	if state != nil && state.active && state.editor != nil && state.focused >= 0 && state.focused < len(state.definitions) {
+		_, changed := handleFormEditorKey(state.editor, state.definitions[state.focused], event)
+		if changed {
+			syncFormFieldsEditorLocked(&state.formFieldsState)
+			state.error = ""
+			c.applySettingsThemeEditorDraft()
+		}
+	}
+	c.invalidateThemeEditorWindow()
+}
+
+func (c *themeSettingsController) moveThemeEditorFocus(delta int) {
+	state := c.ThemeEditor()
+	if state == nil || len(state.definitions) == 0 {
+		return
+	}
+	syncFormFieldsEditorLocked(&state.formFieldsState)
+	index := state.focused
+	for step := 0; step < len(state.definitions); step++ {
+		index = (index + delta + len(state.definitions)) % len(state.definitions)
+		if formDefinitionFocusable(state.definitions[index]) {
+			setFormFieldsFocusLocked(&state.formFieldsState, index)
+			break
+		}
+	}
+	textInput := state.editor != nil
+	c.updateThemeEditorTextInput(textInput)
+	c.invalidateThemeEditorWindow()
+}
+
+func (c *themeSettingsController) focusThemeEditorField(index int) {
+	state := c.ThemeEditor()
+	if state == nil || state.saving || index < 0 || index >= len(state.definitions) || !formDefinitionFocusable(state.definitions[index]) {
+		return
+	}
+	syncFormFieldsEditorLocked(&state.formFieldsState)
+	setFormFieldsFocusLocked(&state.formFieldsState, index)
+	state.error = ""
+	textInput := state.editor != nil
+	c.updateThemeEditorTextInput(textInput)
+	c.invalidateThemeEditorWindow()
+}
+
+func (c *themeSettingsController) setThemeEditorText(index int, value string) {
+	state := c.ThemeEditor()
+	if state != nil && index >= 0 && index < len(state.definitions) {
+		value = themeEditorNormalizeOpaqueColor(state.definitions[index].Value.Key, value)
+	}
+	changed := state != nil && !state.saving && setFormFieldsTextLocked(&state.formFieldsState, index, value)
+	if changed {
+		state.error = ""
+		c.applySettingsThemeEditorDraft()
+		c.invalidateThemeEditorWindow()
+	}
+}
+
+func (c *themeSettingsController) deactivateThemeEditorPreview() {
+	state := c.ThemeEditor()
+	wasActive := state != nil && state.active
+	if wasActive {
+		syncFormFieldsEditorLocked(&state.formFieldsState)
+		state.active = false
+	}
+	if !wasActive {
+		return
+	}
+	c.restoreThemeEditorTextInput()
+	c.invalidateThemeEditorWindow()
+}
+
+func validateThemeEditorValues(values map[string]string) string {
+	if strings.TrimSpace(values["ThemeName"]) == "" {
+		return "Theme name cannot be empty."
+	}
+	for _, token := range themeEditorTokens() {
+		if _, ok := decodeThemeColor(values[token.key]); !ok {
+			return fmt.Sprintf("%s is not a valid CSS color.", token.key)
+		}
+	}
+	return ""
+}
+
+// saveThemeEditorDraft preserves non-color theme fields while saving through the shared theme service.
+func (c *themeSettingsController) saveThemeEditorDraft(name string, overwrite bool) {
+	state := c.ThemeEditor()
+	if state == nil || state.saving {
+		return
+	}
+	syncFormFieldsEditorLocked(&state.formFieldsState)
+	validationError := validateThemeEditorValues(state.values)
+	if isV2Theme(state.raw) {
+		validationError = ""
+		if _, err := themeEditorDraftTheme(state.raw, state.values, state.surfaces); err != nil {
+			validationError = err.Error()
+		}
+	}
+	if validationError != "" {
+		state.error = validationError
+		c.invalidateThemeEditorWindow()
+		return
+	}
+	values := copyStringMap(state.values)
+	draft := mergeThemeEditorDraft(state.raw, values)
+	name = strings.TrimSpace(name)
+	values["ThemeName"] = name
+	draft["ThemeName"] = name
+	if !isV2Theme(state.raw) {
+		for _, token := range themeEditorTokens() {
+			draft[token.key] = strings.TrimSpace(values[token.key])
+		}
+	}
+	if overwrite && (state.isSystem || state.isAuto || state.sourceID == "") {
+		state.error = "This theme cannot be overwritten."
+		c.invalidateThemeEditorWindow()
+		return
+	}
+	state.saving = true
+	state.active = false
+	state.dialogMode = ""
+	state.dialogToken = ""
+	state.dialogOriginal = ""
+	state.error = ""
+	state.revision++
+	revision := state.revision
+	key := state.key
+	c.restoreThemeEditorTextInput()
+	c.invalidateThemeEditorWindow()
+
+	util.Go(c.lifecycleCtx, "save theme editor draft", func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		encodedDraft, err := json.Marshal(draft)
+		var theme common.Theme
+		if err == nil {
+			err = json.Unmarshal(encodedDraft, &theme)
+		}
+		var saved map[string]any
+		var applied themeData
+		if err == nil {
+			var savedTheme common.Theme
+			savedTheme, err = c.services.SaveTheme(ctx, c.sessionID, name, theme, overwrite)
+			if err == nil {
+				resolved, resolveErr := savedTheme.ResolveForTarget(util.GetCurrentPlatform(), osvariant.GetCurrentPlatformVariant(), woxui.ThemeCapabilities()...)
+				if resolveErr != nil {
+					err = resolveErr
+				} else {
+					applied = fromCoreTheme(resolved)
+				}
+				if err == nil {
+					var encodedSaved []byte
+					encodedSaved, err = json.Marshal(savedTheme)
+					if err == nil {
+						err = json.Unmarshal(encodedSaved, &saved)
+					}
+				}
+			}
+		}
+
+		_ = c.runOnUI("apply saved theme editor draft", func() {
+			if err == nil {
+				c.applyTheme(applied)
+				c.generalSettings().Update(func(d *settingsData) { d.ThemeID = themeMapString(saved, "ThemeId") })
+			}
+			current := c.ThemeEditor()
+			if current != nil && current.key == key && current.revision == revision {
+				current.saving = false
+				if err != nil {
+					current.error = err.Error()
+				} else {
+					definitions, savedValues := themeEditorForm(saved)
+					current.formFieldsState = newFormFieldsState(definitions, savedValues, false)
+					current.raw = saved
+					current.surfaces = applied.Surfaces
+					current.initial = copyStringMap(savedValues)
+					current.sourceID = themeMapString(saved, "ThemeId")
+					current.sourceName = themeMapString(saved, "ThemeName")
+					current.isSystem = false
+					current.isAuto = false
+					current.error = ""
+				}
+			}
+			c.invalidateThemeEditorWindow()
+		})
+		if err != nil {
+			log.Printf("save theme editor draft: %v", err)
+		}
+	})
+}

@@ -1,0 +1,874 @@
+package view
+
+import (
+	"testing"
+
+	woxcomponent "wox/ui/launcher/component"
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+)
+
+func TestFormTableSideTitleMatchesFormLabel(t *testing.T) {
+	field := FormTableField(FormTableFieldProps{
+		ID: "actions", Title: "Actions", Width: 720, LabelWidth: 80,
+		AddLabel: "Add", Theme: woxcomponent.ControlTheme{Text: woxui.Color{R: 240, G: 240, B: 240, A: 255}},
+	})
+	title := field.(woxwidget.Container).Child.(woxwidget.Flex).Children[0].(woxwidget.Container).Child.(woxwidget.Text)
+	if title.Value != "Actions" || title.Style.Size != 13 || title.Style.Weight != woxui.FontWeightRegular || title.Color.R != 240 {
+		t.Fatalf("table title = %+v, want the shared 13 regular form label", title)
+	}
+}
+
+func TestFormTableSideTitleUsesHeaderWeight(t *testing.T) {
+	field := FormTableField(FormTableFieldProps{
+		ID: "hotkeys", Title: "Query Hotkeys", Width: 720, LabelWidth: 80,
+		HeaderWeight: woxui.FontWeightSemibold, AddLabel: "Add", Theme: woxcomponent.ControlTheme{},
+	})
+	title := field.(woxwidget.Container).Child.(woxwidget.Flex).Children[0].(woxwidget.Container).Child.(woxwidget.Text)
+	if title.Style.Size != 13 || title.Style.Weight != woxui.FontWeightSemibold {
+		t.Fatalf("settings side title = %+v, want 13 semibold", title.Style)
+	}
+}
+
+// translatedLabelHostServices measures CJK runes at full width like a real font,
+// which the halved-width stub understates. The Linux language smoke failure came
+// from a Chinese label, so a Latin-only approximation hides the regression.
+type translatedLabelHostServices struct {
+	actionSearchHostServices
+}
+
+func (translatedLabelHostServices) MeasureText(text string, style woxui.TextStyle) (woxui.TextMetrics, error) {
+	width := float32(0)
+	for _, glyph := range text {
+		advance := max(style.Size/2, 1)
+		if glyph > 0x2E80 {
+			advance = max(style.Size, 1)
+		}
+		width += advance
+	}
+	return woxui.TextMetrics{Size: woxui.Size{Width: width, Height: max(style.Size, 1)}}, nil
+}
+
+// TestFormTableInlineHeaderKeepsTranslatedActionLabelsVisible guards the header
+// against a fixed action reserve. A hardcoded width tuned for the English labels
+// clipped the leading icon and gap of every longer translation, which only the
+// language smoke case caught because English never overflows.
+func TestFormTableInlineHeaderKeepsTranslatedActionLabelsVisible(t *testing.T) {
+	icon := &woxui.Image{}
+	for _, label := range []struct {
+		language string
+		add      string
+		template string
+	}{
+		{language: "en_US", add: "Add", template: "From Templates"},
+		{language: "zh_CN", add: "添加", template: "从模板添加"},
+		{language: "ru_RU", add: "Добавить", template: "Из шаблонов"},
+		{language: "pt_BR", add: "Adicionar", template: "A partir de modelos"},
+		{language: "ko_KR", add: "추가", template: "템플릿에서"},
+		{language: "ja_JP", add: "追加", template: "テンプレートから"},
+	} {
+		t.Run(label.language, func(t *testing.T) {
+			host := woxwidget.NewHost(func(woxui.FrameInfo) woxwidget.Widget {
+				return FormTableField(FormTableFieldProps{
+					ID: "query-hotkeys", Title: "Query Hotkeys", Description: "Open a configured query from a hotkey.",
+					Width: 720, InlineTitle: true, MaxHeight: 300,
+					Columns:  []FormTableColumn{{Label: "Name", Width: 120}, {Label: "Hotkey"}},
+					AddLabel: label.add, SecondaryLabel: label.template, AddIcon: icon, SecondaryIcon: icon,
+					OperationLabel: "Operation", EmptyLabel: "No data", Theme: woxcomponent.ControlTheme{},
+				})
+			})
+			host.AttachServices(translatedLabelHostServices{})
+			if err := host.SetRepaintDebugMode(woxwidget.RepaintDebugVerify); err != nil {
+				t.Fatal(err)
+			}
+			frame := woxui.FrameInfo{Size: woxui.Size{Width: 720, Height: 400}, PixelSize: woxui.PixelSize{Width: 720, Height: 400}, Scale: 1}
+			host.Frame(&woxui.DisplayList{}, frame)
+			if diagnostics := host.Snapshot().Diagnostics; len(diagnostics) != 0 {
+				t.Fatalf("%s table header diagnostics = %v, want translated action labels to fit", label.language, diagnostics)
+			}
+		})
+	}
+}
+
+func formTableOperationIconButton(action woxwidget.Widget) woxcomponent.IconButtonProps {
+	stateful := action.(woxwidget.Stateful)
+	if props, ok := stateful.Widget.(woxcomponent.IconButtonProps); ok {
+		return props
+	}
+	return stateful.CreateState().Build(woxwidget.StateContext{}, stateful.Widget).(woxwidget.Stateful).Widget.(woxcomponent.IconButtonProps)
+}
+
+func TestFormTableDisabledBlocksMutatingActions(t *testing.T) {
+	props := FormTableFieldProps{ID: "commands", AddLabel: "Add", Disabled: true, Theme: woxcomponent.ControlTheme{}}
+	add := formTableAddButton(props).(woxwidget.Semantics)
+	edit := formTableIconButton(props, "commands-row-0-edit", "Edit", nil, nil, props.Disabled, func() {}).(woxwidget.Semantics)
+	if !add.Disabled || len(add.Actions) != 0 || !edit.Disabled || len(edit.Actions) != 0 {
+		t.Fatal("disabled table must not expose mutating actions")
+	}
+}
+
+func TestFormTableRowNonTextControlsExposeControlledFocus(t *testing.T) {
+	focused := 0
+	props := FormTableRowFieldProps{
+		ID: "field", Label: "Field", Focused: true, Theme: woxcomponent.ControlTheme{},
+		OnFocus: func() { focused++ }, OnKey: func(woxui.KeyEvent) bool { return true }, OnTap: func() {},
+	}
+
+	checkboxSemantics := formTableRowCheckboxControl(props).(woxwidget.Semantics)
+	if checkboxSemantics.AutomationID != "field" || checkboxSemantics.Role != woxui.AccessibilityRoleCheckBox || len(checkboxSemantics.Actions) != 1 || checkboxSemantics.Actions[0] != woxui.AccessibilityActionToggle {
+		t.Fatal("checkbox should expose its controlled value to accessibility and automation")
+	}
+	checkbox := checkboxSemantics.Child.(woxwidget.Focusable)
+	if !checkbox.Autofocus || checkbox.OnKey == nil || checkbox.OnFocusChange == nil {
+		t.Fatal("checkbox should expose the controlled table-row focus contract")
+	}
+	if _, ok := checkbox.Child.(woxwidget.Stateful); !ok {
+		t.Fatalf("checkbox control = %T, want shared hoverable checkbox state", checkbox.Child)
+	}
+	checkbox.OnFocusChange(true)
+
+	props.OnChoiceTap = func(woxui.Rect) {}
+	selectControl := formTableRowSelectControl(props, 200, woxcomponent.SettingsControlHeight).(woxwidget.Semantics).Child.(woxwidget.Focusable)
+	if !selectControl.Autofocus || selectControl.OnKey == nil || selectControl.OnFocusChange == nil {
+		t.Fatal("select should expose the controlled table-row focus contract")
+	}
+	selectControl.OnFocusChange(true)
+
+	if focused != 2 {
+		t.Fatalf("focus callbacks = %d, want both controls to synchronize logical focus", focused)
+	}
+}
+
+func TestFormTableRowTextControlLeavesCaretFocusToHost(t *testing.T) {
+	changes := []bool{}
+	control := formTableRowTextControl(FormTableRowFieldProps{
+		ID: "field", Focused: true, State: woxui.TextEditingState{}, Theme: woxcomponent.ControlTheme{},
+		OnFocusChange: func(focused bool) { changes = append(changes, focused) },
+	}, 240, woxcomponent.SettingsControlHeight)
+	field := control.(woxwidget.Stateful).Widget.(woxcomponent.TextFieldProps)
+	if field.Focused {
+		t.Fatal("table row state must not control the retained text field caret")
+	}
+	field.OnFocusChange(true)
+	field.OnFocusChange(false)
+	if len(changes) != 2 || !changes[0] || changes[1] {
+		t.Fatalf("focus changes = %v, want Host transitions forwarded unchanged", changes)
+	}
+}
+
+func TestFormTableRowTextControlPlacesVariableTriggerInsideInput(t *testing.T) {
+	tapped := false
+	theme := woxcomponent.ControlTheme{Text: woxui.Color{R: 200, G: 210, B: 220, A: 255}, Focus: woxui.Color{R: 1, G: 2, B: 3, A: 255}}
+	control := formTableRowTextControl(FormTableRowFieldProps{
+		ID: "prompt", State: woxui.TextEditingState{Text: "Summarize {wox:input_text}"}, Theme: theme,
+		TrailingLabel: "{}", TrailingActionLabel: "Insert dynamic placeholder", OnTrailingTap: func(woxui.Rect) { tapped = true },
+	}, 420, woxcomponent.SettingsControlHeight)
+	stack, ok := control.(woxwidget.Stack)
+	if !ok || len(stack.Children) != 2 {
+		t.Fatalf("variable trigger layout = %T children, want input plus inside {} icon", control)
+	}
+	trailingAlign, ok := stack.Children[1].Child.(woxwidget.Align)
+	if !ok {
+		t.Fatalf("trailing slot = %T, want centered compact icon button", stack.Children[1].Child)
+	}
+	trailing := formTableOperationIconButton(trailingAlign.Child)
+	if trailing.ID != "prompt-trailing" || trailing.Label != "Insert dynamic placeholder" {
+		t.Fatalf("trailing button = id %q label %q", trailing.ID, trailing.Label)
+	}
+	if trailing.Width != woxcomponent.SettingsCompactControlHeight || trailing.Height != woxcomponent.SettingsCompactControlHeight || trailing.HoverBackground != formTableRowIconHoverBackground(theme) {
+		t.Fatalf("trailing geometry/hover = %.0fx%.0f %#v, want compact icon-button hover", trailing.Width, trailing.Height, trailing.HoverBackground)
+	}
+	if trailing.OnTap == nil {
+		t.Fatal("trailing {} icon should open the variable picker")
+	}
+	trailing.OnTap()
+	if !tapped {
+		t.Fatal("trailing {} icon should open the variable picker")
+	}
+	input := stack.Children[0].Child.(woxwidget.Stateful).Widget.(woxcomponent.TextFieldProps)
+	if len(input.RichRuns) != 0 || len(input.AtomicTokens) != 0 {
+		t.Fatalf("text control without decorations should not invent chips, got %#v %#v", input.RichRuns, input.AtomicTokens)
+	}
+	if input.Padding.Right != 38 {
+		t.Fatalf("input trailing padding = %.0f, want room for the {} icon", input.Padding.Right)
+	}
+}
+
+func TestFormTableRowTextControlForwardsQueryVariableChips(t *testing.T) {
+	run := woxcomponent.NewTokenChipRun(10, 35, "query", nil, woxcomponent.ControlTheme{}).WithDismissible().WithChipEdit()
+	dismissed := false
+	edited := false
+	control := formTableRowTextControl(FormTableRowFieldProps{
+		ID: "urls", State: woxui.TextEditingState{Text: "q={wox:parameter?name=query}"},
+		RichRuns: []woxcomponent.TextFieldRichRun{run}, AtomicTokens: []woxcomponent.TextFieldTokenRange{{Start: 10, End: 35}},
+		OnDismissRun: func(start, end int) bool {
+			dismissed = start == 10 && end == 35
+			return true
+		},
+		OnEditRun: func(start, end int) bool {
+			edited = start == 10 && end == 35
+			return true
+		},
+	}, 420, 80)
+	input := control.(woxwidget.Stateful).Widget.(woxcomponent.TextFieldProps)
+	if len(input.RichRuns) != 1 || !input.RichRuns[0].HideText || !input.RichRuns[0].Dismissible || !input.RichRuns[0].ChipEditable || len(input.AtomicTokens) != 1 {
+		t.Fatalf("query variable decorations = runs %#v tokens %#v", input.RichRuns, input.AtomicTokens)
+	}
+	if input.OnDismissRun == nil || !input.OnDismissRun(10, 35) || !dismissed {
+		t.Fatal("query variable close should reach the table editor")
+	}
+	if input.OnEditRun == nil || !input.OnEditRun(10, 35) || !edited {
+		t.Fatal("query variable edit should reach the table editor")
+	}
+}
+
+func TestFormTableRowTextControlPlacesActionBesideInput(t *testing.T) {
+	tapped := false
+	theme := woxcomponent.ControlTheme{Text: woxui.Color{R: 200, G: 210, B: 220, A: 255}, Focus: woxui.Color{R: 1, G: 2, B: 3, A: 255}}
+	control := formTableRowTextControl(FormTableRowFieldProps{
+		ID: "query", State: woxui.TextEditingState{Text: "ai translate {wox:selected_text}"}, Theme: theme,
+		ActionIcon: &woxui.Image{}, ActionLabel: "Test this query", OnActionTap: func() { tapped = true },
+	}, 420, woxcomponent.SettingsControlHeight).(woxwidget.Flex)
+	if control.Gap != 8 || len(control.Children) != 2 {
+		t.Fatalf("query action layout = children %d gap %.0f, want input plus outside action icon", len(control.Children), control.Gap)
+	}
+	input := control.Children[0].(woxwidget.Stateful).Widget.(woxcomponent.TextFieldProps)
+	if input.Width != 380 {
+		t.Fatalf("input width = %.0f, want room reserved for the outside action icon", input.Width)
+	}
+	action := formTableOperationIconButton(control.Children[1])
+	if action.ID != "query-action" || action.Label != "Test this query" {
+		t.Fatalf("action button = id %q label %q", action.ID, action.Label)
+	}
+	if action.Width != woxcomponent.SettingsControlHeight || action.Height != woxcomponent.SettingsControlHeight || action.HoverBackground != formTableRowIconHoverBackground(theme) {
+		t.Fatalf("action geometry/hover = %.0fx%.0f %#v, want standard icon-button hover", action.Width, action.Height, action.HoverBackground)
+	}
+	if action.OnTap == nil {
+		t.Fatal("action icon should keep the query test tap")
+	}
+	action.OnTap()
+	if !tapped {
+		t.Fatal("action icon should keep the query test tap")
+	}
+}
+
+func TestFormTableRowAppControlMatchesFlutterSelectorLayout(t *testing.T) {
+	theme := woxcomponent.ControlTheme{
+		Accent:        woxui.Color{R: 20, G: 80, B: 140, A: 255},
+		TextSecondary: woxui.Color{R: 100, G: 110, B: 120, A: 255},
+	}
+	control := formTableRowAppControl(FormTableRowFieldProps{
+		ID: "app", Value: "No app selected", SelectLabel: "Select Apps", SelectWidth: 104, Theme: theme, OnTap: func() {},
+	}, 420, 42).(woxwidget.Flex)
+	if control.Gap != 10 || control.CrossAxisAlignment != woxwidget.CrossAxisCenter || len(control.Children) != 2 {
+		t.Fatal("app selector should keep Flutter's preview and primary button split layout")
+	}
+	preview := control.Children[0].(woxwidget.Container)
+	if preview.Width != 306 || preview.Radius != 4 || preview.BorderColor.A != 115 {
+		t.Fatalf("preview geometry = width %.0f radius %.0f alpha %d", preview.Width, preview.Radius, preview.BorderColor.A)
+	}
+	emptyText := preview.Child.(woxwidget.Flex).Children[0].(woxwidget.Align)
+	if emptyText.Height != 42 || emptyText.Vertical != 0.5 {
+		t.Fatalf("empty app alignment = height %.0f vertical %.1f, want full-height center", emptyText.Height, emptyText.Vertical)
+	}
+	buttonFocus := control.Children[1].(woxwidget.Semantics).Child.(woxwidget.Focusable)
+	if buttonFocus.OnFocusChange == nil {
+		t.Fatal("app selector button should keep table-row focus synchronized")
+	}
+	button := focusedControlGesture(control.Children[1]).Child.(woxwidget.Container)
+	if button.Width != 0 || button.Height != 32 || button.Color != theme.Accent {
+		t.Fatal("app selector action should use a content-sized Flutter-style primary button")
+	}
+	selected := formTableRowAppControl(FormTableRowFieldProps{
+		ID: "selected-app", Value: "Lightroom Classic", Detail: "/Applications/Lightroom Classic.app", Image: &woxui.Image{},
+		SelectLabel: "Select Apps", SelectWidth: 104, Theme: theme, OnTap: func() {},
+	}, 420, 42).(woxwidget.Flex)
+	selectedPreview := selected.Children[0].(woxwidget.Container).Child.(woxwidget.Flex)
+	if len(selectedPreview.Children) != 2 {
+		t.Fatalf("selected app preview children = %d, want icon and name only", len(selectedPreview.Children))
+	}
+	selectedText := selectedPreview.Children[1].(woxwidget.Align)
+	name := selectedText.Child.(woxwidget.TextBlock)
+	if selectedText.Height != 42 || selectedText.Vertical != 0.5 || name.Value != "Lightroom Classic" || name.Height < name.LineHeight {
+		t.Fatal("selected app should render only its vertically centered name")
+	}
+}
+
+func TestFormTableRowEditorActionsSizeToTranslatedLabels(t *testing.T) {
+	editor := FormTableRowEditor(FormTableRowEditorProps{
+		Width: 700, Height: 400, CancelLabel: "Cancel", SaveLabel: "Save", Theme: woxcomponent.ControlTheme{},
+	}).(woxwidget.Flex)
+	footer := editor.Children[len(editor.Children)-1].(woxwidget.Container)
+	if footer.Height != FormTableRowEditorFooterHeight || footer.Padding.Top != SettingsDialogActionsHeight-settingsDialogActionHeight {
+		t.Fatalf("row editor footer = height %v padding %+v, want shared action height plus top spacing", footer.Height, footer.Padding)
+	}
+	actions := footer.Child.(woxwidget.Align)
+	if actions.Horizontal != 1 || actions.Width != 700 {
+		t.Fatalf("row editor actions alignment = horizontal %v width %v", actions.Horizontal, actions.Width)
+	}
+	buttons := actions.Child.(woxwidget.Flex)
+	if len(buttons.Children) != 2 || buttons.Gap != 12 {
+		t.Fatalf("row editor actions = %d gap %.0f", len(buttons.Children), buttons.Gap)
+	}
+	for _, child := range buttons.Children {
+		container := focusedControlGesture(child).Child.(woxwidget.Container)
+		if container.Width != 0 {
+			t.Fatalf("action button width = %v, want content-sized Cancel/Save like Flutter", container.Width)
+		}
+	}
+}
+
+func TestQueryHotkeyEditorHeaderUsesFourEqualPresets(t *testing.T) {
+	selected := ""
+	demoKind := ""
+	openedLink := ""
+	header := QueryHotkeyEditorHeader(QueryHotkeyEditorHeaderProps{
+		Width: 700, Title: "Add Query Hotkey", Selected: "web-panel", Description: "Open the launcher. [Learn more](https://example.com)",
+		NormalLabel: "Normal", WebPanelLabel: "Preview", SilentLabel: "Silent", CustomLabel: "Custom",
+		DemoIcon: &woxui.Image{}, Theme: woxcomponent.ControlTheme{}, OnSelect: func(value string) { selected = value },
+		OnOpenLink: func(target string) { openedLink = target },
+		OnDemoHover: func(value string, inside bool, _ woxui.Rect) {
+			if inside {
+				demoKind = value
+			}
+		},
+	}).(woxwidget.Container)
+	content := header.Child.(woxwidget.Flex)
+	buttons := content.Children[1].(woxwidget.Flex)
+	if len(buttons.Children) != 4 || buttons.Gap != 8 {
+		t.Fatalf("preset buttons = %d gap %.0f", len(buttons.Children), buttons.Gap)
+	}
+	for index, button := range buttons.Children {
+		semantics := button.(woxwidget.Semantics)
+		if semantics.Selected != (index == 1) || semantics.Role != woxui.AccessibilityRoleButton || semantics.AutomationID == "" {
+			t.Fatalf("preset %d semantics = id %q selected %v", index, semantics.AutomationID, semantics.Selected)
+		}
+	}
+	preview := focusedControlGesture(buttons.Children[1])
+	preview.OnTap()
+	if selected != "web-panel" {
+		t.Fatalf("selected preset = %q", selected)
+	}
+	for _, button := range buttons.Children {
+		content := focusedControlGesture(button).Child.(woxwidget.Container).Child.(woxwidget.Align).Child
+		if _, hasTrailing := content.(woxwidget.Flex); hasTrailing {
+			t.Fatal("preset button should not contain a demo trigger")
+		}
+	}
+	description := content.Children[2].(woxwidget.Container).Child.(woxwidget.Flex)
+	paragraph := description.Children[0].(woxwidget.Wrap)
+	link := paragraph.Children[len(paragraph.Children)-2].(woxwidget.Semantics).Child.(woxwidget.Gesture)
+	link.OnTap()
+	if openedLink != "https://example.com" {
+		t.Fatalf("opened link = %q", openedLink)
+	}
+	previewDemo := paragraph.Children[len(paragraph.Children)-1].(woxwidget.Semantics).Child.(woxwidget.Gesture)
+	demoContainer := previewDemo.Child.(woxwidget.Container)
+	if demoContainer.Padding.Left != 6 {
+		t.Fatalf("demo leading gap = %.0f, want 6", demoContainer.Padding.Left)
+	}
+	previewDemo.OnHoverAt(true, woxui.Rect{})
+	if demoKind != "web-panel" {
+		t.Fatalf("demo preset = %q", demoKind)
+	}
+}
+
+func TestQueryHotkeyEditorHeaderHidesDemoForCustomPreset(t *testing.T) {
+	header := QueryHotkeyEditorHeader(QueryHotkeyEditorHeaderProps{
+		Width: 700, Selected: "custom", Description: "Tune all options.", DemoIcon: &woxui.Image{}, Theme: woxcomponent.ControlTheme{},
+	}).(woxwidget.Container)
+	content := header.Child.(woxwidget.Flex)
+	description := content.Children[2].(woxwidget.Container).Child.(woxwidget.Flex)
+	paragraph := description.Children[0].(woxwidget.Wrap)
+	if _, hasDemo := paragraph.Children[len(paragraph.Children)-1].(woxwidget.Semantics); hasDemo {
+		t.Fatal("custom preset should not append a demo trigger")
+	}
+}
+
+func TestFormTableRowDescriptionWrapsLongPlainText(t *testing.T) {
+	description := "填写名称、通配规则或绝对路径。不含路径分隔符的规则匹配任意路径片段；相对路径匹配搜索目录内的路径；绝对路径（如 D:\\Games\\Cache 或 /Users/me/Downloads）会排除该文件夹及其内容。"
+	width := float32(500)
+	labelWidth := float32(80)
+	controlWidth := width - labelWidth - 10
+	height := FormTableRowFieldHeightFor("textbox", description, "", 1, false, controlWidth)
+	singleLine := FormTableRowFieldHeightFor("textbox", "短说明", "", 1, false, controlWidth)
+	if height <= singleLine {
+		t.Fatalf("wrapped height = %.0f, want more than single-line height %.0f", height, singleLine)
+	}
+
+	row := FormTableRowField(FormTableRowFieldProps{
+		Kind: "textbox", Description: description, Width: width, Height: height, LabelWidth: labelWidth, MaxLines: 1, Theme: woxcomponent.ControlTheme{},
+	}).(woxwidget.Container)
+	right := row.Child.(woxwidget.Flex).Children[1].(woxwidget.Flex)
+	help := right.Children[1].(woxwidget.TextBlock)
+	if help.MaxLines < 2 {
+		t.Fatalf("description max lines = %d, want wrapping so the full tip stays visible", help.MaxLines)
+	}
+	if help.Height < float32(help.MaxLines)*18 {
+		t.Fatalf("description height = %.0f, want room for %d wrapped lines", help.Height, help.MaxLines)
+	}
+}
+
+func TestFormTableRowDescriptionPreservesFlutterParagraphs(t *testing.T) {
+	description := "Type { to insert variables.\n\nInstall the browser extension."
+	height := FormTableRowFieldHeight("textbox", description, 1)
+	row := FormTableRowField(FormTableRowFieldProps{Kind: "textbox", Description: description, Width: 500, Height: height, LabelWidth: 80, MaxLines: 1, Theme: woxcomponent.ControlTheme{}}).(woxwidget.Container)
+	right := row.Child.(woxwidget.Flex).Children[1].(woxwidget.Flex)
+	help := right.Children[1].(woxwidget.TextBlock)
+	if help.MaxLines != 3 || help.Height != 54 {
+		t.Fatalf("description lines = %d height %.0f", help.MaxLines, help.Height)
+	}
+}
+
+// TestFormTableHotkeySemantics verifies assistive activation uses the real recorder callback.
+func TestFormTableHotkeySemantics(t *testing.T) {
+	activated := false
+	control := formTableRowControl(FormTableRowFieldProps{
+		ID: "hotkey", Kind: "hotkey", Label: "Shortcut", Value: "ctrl+f12", RecordingStatus: "Press a key",
+		OnTap: func() { activated = true },
+	}, 400, 40).(woxwidget.Semantics)
+	if control.AutomationID != "hotkey" || control.Role != woxui.AccessibilityRoleButton || control.Label != "Shortcut" || control.Value != "ctrl+f12" || control.Description != "Press a key" {
+		t.Fatalf("recorder semantics = %+v", control)
+	}
+	if len(control.Actions) != 1 || control.Actions[0] != woxui.AccessibilityActionActivate {
+		t.Fatalf("recorder actions = %v", control.Actions)
+	}
+	if err := control.OnAction(woxui.AccessibilityActionActivate, ""); err != nil || !activated {
+		t.Fatalf("activate recorder: called=%v error=%v", activated, err)
+	}
+}
+
+func TestFormTableHotkeyStatusUsesRemainingControlWidth(t *testing.T) {
+	control := formTableRowControl(FormTableRowFieldProps{
+		ID: "hotkey", Kind: "hotkey", Recording: true, RecordingStatus: "Press a key", Theme: woxcomponent.ControlTheme{},
+	}, 400, 40).(woxwidget.Flex)
+	if _, ok := control.Children[1].(woxwidget.Expanded); !ok {
+		t.Fatalf("hotkey recording status slot = %T, want Expanded", control.Children[1])
+	}
+}
+
+func TestFormTableRowMarkdownDescriptionReservesWrappedHeight(t *testing.T) {
+	description := "The query when the hotkey is triggered. Type { to insert dynamic variables.\n\nUsing the active browser URL variable requires the Wox browser extension: [Install for Chrome](https://chromewebstore.google.com/detail/wox/bjbkdpjdnagiongdfemjhepkkglnailh) or [Install for Firefox](https://addons.mozilla.org/en-US/firefox/addon/wox/)."
+	plainHeight := FormTableRowFieldHeight("textbox", description, 1)
+	markdownHeight := FormTableRowFieldHeightFor("textbox", description, "", 1, true, 500)
+	if markdownHeight <= plainHeight {
+		t.Fatalf("markdown height = %.0f, want more than newline-only height %.0f so the tip cannot overlap the next field", markdownHeight, plainHeight)
+	}
+	row := FormTableRowField(FormTableRowFieldProps{
+		Kind: "textbox", Description: description, DescriptionMarkdown: true, Width: 580, Height: markdownHeight, LabelWidth: 80, MaxLines: 1, Theme: woxcomponent.ControlTheme{},
+	}).(woxwidget.Container)
+	right := row.Child.(woxwidget.Flex).Children[1].(woxwidget.Flex)
+	help := right.Children[1].(woxwidget.Container)
+	if help.Height < 54 {
+		t.Fatalf("markdown help height = %.0f, want room for wrapped chrome-extension tip", help.Height)
+	}
+	markdown := help.Child.(woxwidget.Flex)
+	if markdown.Gap != formTableMarkdownDescriptionGap {
+		t.Fatalf("markdown block gap = %.0f, want compact form gap %.0f", markdown.Gap, formTableMarkdownDescriptionGap)
+	}
+}
+
+func TestFormTableRowGroupHeaderUsesDisclosureChevron(t *testing.T) {
+	collapsed := FormTableRowGroupHeader(FormTableRowGroupHeaderProps{
+		Width: 500, Title: "WebView", Collapsed: true, Theme: woxcomponent.ControlTheme{Text: woxui.Color{A: 255}},
+	})
+	expanded := FormTableRowGroupHeader(FormTableRowGroupHeaderProps{
+		Width: 500, Title: "WebView", Theme: woxcomponent.ControlTheme{Text: woxui.Color{A: 255}},
+	})
+	if FormTableRowGroupHeaderHeight != woxcomponent.SettingsControlHeight {
+		t.Fatalf("group header height = %.0f, want ordinary settings control %.0f", FormTableRowGroupHeaderHeight, woxcomponent.SettingsControlHeight)
+	}
+	collapsedSemantics := collapsed.(woxwidget.Semantics)
+	if collapsedSemantics.Role != woxui.AccessibilityRoleButton || collapsedSemantics.Label != "WebView" {
+		t.Fatalf("header semantics = %#v", collapsedSemantics)
+	}
+	if collapsed.(woxwidget.Semantics).Child.(woxwidget.Focusable).Child.(woxwidget.Gesture).Child.(woxwidget.Container).Height != FormTableRowGroupHeaderHeight {
+		t.Fatal("collapsed header should keep the ordinary control height")
+	}
+	if expanded.(woxwidget.Semantics).Child.(woxwidget.Focusable).Child.(woxwidget.Gesture).Child.(woxwidget.Container).Height != FormTableRowGroupHeaderHeight {
+		t.Fatal("expanded header should keep the ordinary control height")
+	}
+}
+
+// TestFormTableRowGroupKeyboardActivation exercises the same focus and semantic dispatch as the dialog.
+func TestFormTableRowGroupKeyboardActivation(t *testing.T) {
+	collapsed := true
+	host := woxwidget.NewHost(func(woxui.FrameInfo) woxwidget.Widget {
+		return woxwidget.Flex{Axis: woxwidget.Vertical, Children: []woxwidget.Widget{
+			woxwidget.Focusable{Key: "before", Child: woxwidget.Container{Width: 100, Height: 30}},
+			FormTableRowGroupHeader(FormTableRowGroupHeaderProps{
+				ID: "group", Width: 200, Title: "Advanced", Collapsed: collapsed,
+				OnTap: func() { collapsed = !collapsed },
+			}),
+			woxwidget.Focusable{Key: "after", Child: woxwidget.Container{Width: 100, Height: 30}},
+		}}
+	})
+	host.AttachServices(actionSearchHostServices{})
+	frame := woxui.FrameInfo{Size: woxui.Size{Width: 200, Height: 120}, PixelSize: woxui.PixelSize{Width: 200, Height: 120}, Scale: 1}
+	displayList := woxui.DisplayList{}
+	host.Frame(&displayList, frame)
+	host.RequestFocus("before")
+	if !host.Key(woxui.KeyEvent{Key: woxui.KeyTab, Down: true}) || !host.HasFocus("group") {
+		t.Fatal("Tab must reach the collapsed group header")
+	}
+	if !host.Key(woxui.KeyEvent{Key: woxui.KeyEnter, Down: true}) || collapsed {
+		t.Fatal("Enter must expand the group")
+	}
+	host.Frame(&displayList, frame)
+	if !host.HasFocus("group") || !host.Key(woxui.KeyEvent{Key: woxui.KeySpace, Down: true}) || !collapsed {
+		t.Fatal("the header must retain focus and collapse on Space")
+	}
+	if !host.Key(woxui.KeyEvent{Key: woxui.KeyTab, Down: true}) || !host.HasFocus("after") {
+		t.Fatal("Tab must leave the group header")
+	}
+}
+
+func TestFormTableRowEditorUsesFlutterFieldGap(t *testing.T) {
+	editor := FormTableRowEditor(FormTableRowEditorProps{
+		Width: 500, Height: 320, Title: "Add",
+		Rows:          []woxwidget.Widget{woxwidget.Container{Height: 40}, woxwidget.Container{Height: 40}},
+		ContentHeight: 400, CancelLabel: "Cancel", SaveLabel: "Save", Theme: woxcomponent.ControlTheme{},
+	}).(woxwidget.Flex)
+	body := editor.Children[1].(woxwidget.Stateful).Widget.(woxcomponent.ScrollViewProps)
+	content := body.Content.(woxwidget.Flex)
+	if content.Gap != formTableRowFieldGap {
+		t.Fatalf("row gap = %.0f, want Flutter bottom padding %.0f", content.Gap, formTableRowFieldGap)
+	}
+}
+
+func TestFormTableRowFieldRendersInlineValidationError(t *testing.T) {
+	errorMessage := "Value cannot be empty"
+	height := FormTableRowFieldHeightWithError("textbox", "Website keyword.", errorMessage, 1)
+	withoutError := FormTableRowFieldHeight("textbox", "Website keyword.", 1)
+	if height <= withoutError {
+		t.Fatalf("error height = %.0f, want more than %.0f without error", height, withoutError)
+	}
+	row := FormTableRowField(FormTableRowFieldProps{
+		ID: "form-table-row-field-0", Kind: "textbox", Label: "Keyword", Description: "Website keyword.", Error: errorMessage,
+		Width: 500, Height: height, LabelWidth: 80, MaxLines: 1, Theme: woxcomponent.ControlTheme{Error: woxui.Color{R: 255, A: 255}},
+	}).(woxwidget.Container)
+	right := row.Child.(woxwidget.Flex).Children[1].(woxwidget.Flex)
+	if len(right.Children) != 3 {
+		t.Fatalf("right children = %d, want control, description, and error", len(right.Children))
+	}
+	errorNode, ok := right.Children[2].(woxwidget.Semantics)
+	if !ok || errorNode.AutomationID != "form-table-row-field-0-error" || errorNode.Value != errorMessage {
+		t.Fatalf("inline error = %#v", right.Children[2])
+	}
+	errorText := errorNode.Child.(woxwidget.TextBlock)
+	if errorText.Value != errorMessage || errorText.Color.R != 255 {
+		t.Fatalf("inline error text = %#v", errorText)
+	}
+}
+
+func formTableEmptyLabel(t *testing.T, empty woxwidget.Widget) woxwidget.TextBlock {
+	t.Helper()
+	align, ok := empty.(woxwidget.Align)
+	if !ok {
+		t.Fatalf("empty state = %T, want a compact aligned line", empty)
+	}
+	label, ok := align.Child.(woxwidget.TextBlock)
+	if !ok {
+		t.Fatalf("empty label = %T, want a single TextBlock", align.Child)
+	}
+	return label
+}
+
+func TestFormTableEmptyStateOmitsGridChrome(t *testing.T) {
+	field := FormTableField(FormTableFieldProps{
+		ID: "ignored-apps", Title: "Ignore Hotkey Apps",
+		Description: "When one of these apps is active, Wox global hotkeys on this platform will be ignored",
+		Width:       720, InlineTitle: true, AddLabel: "Add",
+		Columns: []FormTableColumn{{Label: "App", Width: 420}},
+		Theme:   woxcomponent.ControlTheme{TextSecondary: woxui.Color{R: 150, G: 152, B: 156, A: 255}},
+	})
+	children := field.(woxwidget.Container).Child.(woxwidget.Flex).Children
+	if len(children) != 1 {
+		t.Fatalf("empty field children = %d, want only the header", len(children))
+	}
+	if _, grid := children[0].(woxwidget.Stateful); grid {
+		t.Fatal("empty table must not mount spreadsheet chrome")
+	}
+	if formTableEmptyState(FormTableFieldProps{}, 240, woxcomponent.SettingsControlHeight) != nil {
+		t.Fatal("unused empty lists must not paint a placeholder sentence")
+	}
+	noMatches := formTableEmptyLabel(t, formTableEmptyState(FormTableFieldProps{
+		EmptyLabel: "No matches", Theme: woxcomponent.ControlTheme{TextSecondary: woxui.Color{R: 150, A: 255}},
+	}, 240, woxcomponent.SettingsControlHeight))
+	if noMatches.Value != "No matches" {
+		t.Fatalf("search empty copy = %q, want the no-matches sentence", noMatches.Value)
+	}
+	invalid := formTableEmptyLabel(t, formTableEmptyState(FormTableFieldProps{
+		EmptyLabel: "None", Invalid: true, Theme: woxcomponent.ControlTheme{Error: woxui.Color{R: 210, A: 255}},
+	}, 240, woxcomponent.SettingsControlHeight))
+	if invalid.Value != "Invalid table data" || invalid.Color.R != 210 {
+		t.Fatalf("invalid empty copy = %#v, want error text", invalid)
+	}
+}
+
+func TestFormTableRowStatusUsesQuietLabel(t *testing.T) {
+	subtitle := woxui.Color{R: 150, G: 152, B: 156, A: 255}
+	title := woxui.Color{R: 240, G: 240, B: 240, A: 255}
+	row := FormTableRow{
+		Index:  0,
+		Status: "Disabled",
+		Cells:  []FormTableCell{{Text: "Clipboard"}, {Text: "capslock+v"}},
+	}
+	cell := formTableDataCellAt(FormTableFieldProps{Theme: woxcomponent.ControlTheme{Text: title, TextSecondary: subtitle}}, row, 0, 0, row.Cells[0], 180, false)
+	content := formTableDataCellContent(t, cell).(woxwidget.Flex)
+	if content.Gap != 6 || len(content.Children) != 2 {
+		t.Fatalf("status cell = gap %v children %d, want a 6px tag beside the name", content.Gap, len(content.Children))
+	}
+	name := content.Children[0].(woxwidget.Flexible).Child.(woxwidget.TextBlock)
+	if name.Value != "Clipboard" || !name.ShrinkWrap || name.Color.A != woxcomponent.DisabledContentAlpha {
+		t.Fatalf("disabled name = %#v, want shrink-wrapped reduced emphasis", name)
+	}
+	tag := content.Children[1].(woxwidget.Container)
+	label := tag.Child.(woxwidget.TextBlock)
+	if tag.Radius != 4 || tag.BorderWidth != 0 || tag.Color.A != 13 || label.Color != subtitle || label.Value != "Disabled" || label.Style.Size != woxcomponent.CompactTagFontSize {
+		t.Fatalf("status tag = %#v / %#v, want the compact WoxTag beside the name", tag, label)
+	}
+	hotkey := formTableDataCellAt(FormTableFieldProps{Theme: woxcomponent.ControlTheme{Text: title}}, row, 0, 1, row.Cells[1], 120, false)
+	hotkeyContent := formTableDataCellContent(t, hotkey)
+	hotkeyText, ok := hotkeyContent.(woxwidget.TextBlock)
+	if !ok {
+		t.Fatalf("hotkey cell = %T, want plain text", hotkeyContent)
+	}
+	if hotkeyText.Value != "capslock+v" {
+		t.Fatalf("hotkey cell = %q", hotkeyText.Value)
+	}
+}
+
+func formTableDataCellSlot(t *testing.T, cell woxwidget.Widget) (woxwidget.Clip, woxwidget.Align, woxwidget.Widget) {
+	t.Helper()
+	container, ok := cell.(woxwidget.Container)
+	if !ok {
+		t.Fatalf("data cell = %T, want a table grid cell", cell)
+	}
+	clip, ok := container.Child.(woxwidget.Clip)
+	if !ok {
+		t.Fatalf("data cell child = %T, want Clip around a centered slot", container.Child)
+	}
+	align, ok := clip.Child.(woxwidget.Align)
+	if !ok || align.Height != tableSurfaceRowHeight || align.Vertical != 0.5 {
+		t.Fatalf("data cell slot = %#v, want a full-height vertically centered Align inside Clip", clip.Child)
+	}
+	return clip, align, align.Child
+}
+
+func formTableDataCellContent(t *testing.T, cell woxwidget.Widget) woxwidget.Widget {
+	t.Helper()
+	_, _, content := formTableDataCellSlot(t, cell)
+	return formTableDataCellInner(content)
+}
+
+func formTableDataCellInner(content woxwidget.Widget) woxwidget.Widget {
+	if semantics, ok := content.(woxwidget.Semantics); ok {
+		return semantics.Child
+	}
+	return content
+}
+
+func TestFormTableDataCellExposesPathText(t *testing.T) {
+	full := `D:\dev\wox-plugin-demo`
+	visible := `D:\dev\wox-plugin-d…`
+	cell := formTableDataCellAt(FormTableFieldProps{
+		ID: "plugin-settings-field-1", Theme: woxcomponent.ControlTheme{},
+	}, FormTableRow{Index: 0}, 0, 0, FormTableCell{Text: visible, SearchText: full}, 220, false)
+	_, _, raw := formTableDataCellSlot(t, cell)
+	semantics, ok := raw.(woxwidget.Semantics)
+	if !ok {
+		t.Fatalf("path cell = %T, want Semantics exposing the stored path", raw)
+	}
+	if semantics.AutomationID != "plugin-settings-field-1-row-0-cell-0" || semantics.Role != woxui.AccessibilityRoleText || semantics.Label != visible || semantics.Value != full {
+		t.Fatalf("path cell semantics = %+v, want the compacted label and full path value", semantics)
+	}
+}
+
+func formTableGridFlex(t *testing.T, grid woxwidget.Widget) woxwidget.Flex {
+	t.Helper()
+	frame, ok := grid.(woxwidget.Stack)
+	if !ok || len(frame.Children) < 2 {
+		t.Fatalf("table grid = %T, want a stacked outer frame", grid)
+	}
+	body, ok := frame.Children[1].Child.(woxwidget.Flex)
+	if !ok {
+		t.Fatalf("table grid body = %T, want header/body flex", frame.Children[1].Child)
+	}
+	return body
+}
+
+func formTableHeaderLabel(props FormTableFieldProps) woxwidget.TextBlock {
+	cell := formTableHeaderCell(props, FormTableColumn{Label: "Name"}, 120, 0).(woxwidget.Container)
+	return cell.Child.(woxwidget.Align).Child.(woxwidget.Flex).Children[0].(woxwidget.TextBlock)
+}
+
+func TestFormTableColumnTitleStaysRegular(t *testing.T) {
+	regular := formTableHeaderLabel(FormTableFieldProps{ID: "plugin-commands", Theme: woxcomponent.ControlTheme{}})
+	if regular.Style.Weight != woxui.FontWeightRegular {
+		t.Fatalf("plugin table column title weight = %v, want regular", regular.Style.Weight)
+	}
+
+	settings := formTableHeaderLabel(FormTableFieldProps{
+		ID: "query-hotkeys", HeaderWeight: woxui.FontWeightSemibold, Theme: woxcomponent.ControlTheme{},
+	})
+	if settings.Style.Weight != woxui.FontWeightRegular {
+		t.Fatalf("settings table column title weight = %v, want regular", settings.Style.Weight)
+	}
+}
+
+func TestFormTableUsesQuietHorizontalSeparators(t *testing.T) {
+	theme := woxcomponent.ControlTheme{
+		Border:        woxui.Color{R: 80, G: 90, B: 100, A: 200},
+		Text:          woxui.Color{R: 240, G: 240, B: 240, A: 255},
+		TextSecondary: woxui.Color{R: 160, G: 160, B: 160, A: 255},
+	}
+	props := FormTableFieldProps{
+		ID: "hotkeys", Width: 400, Height: tableSurfaceHeaderHeight + tableSurfaceRowHeight*2,
+		Columns: []FormTableColumn{{Label: "Name", Width: 120}, {Label: "Hotkey", Width: 120}},
+		Rows: []FormTableRow{
+			{Index: 0, Cells: []FormTableCell{{Text: "one"}, {Text: "ctrl"}}},
+			{Index: 1, Cells: []FormTableCell{{Text: "two"}, {Text: "alt"}}},
+		},
+		Theme: theme,
+	}
+
+	frame := buildFormTableGrid(props, props.Width, props.Height, newFormTableGridState()).(woxwidget.Stack)
+	if len(frame.Children) != 3 {
+		t.Fatalf("table frame children = %d, want background, content, and outer stroke", len(frame.Children))
+	}
+	outline := frame.Children[2].Child.(woxwidget.Container)
+	if outline.BorderWidth != tableSurfaceBorderWidth || outline.BorderColor != newTableSurfaceStyle(theme).border || outline.Radius != 8 || outline.Color.A != 0 {
+		t.Fatalf("outer table stroke = %#v, want a quiet rounded frame", outline)
+	}
+
+	headerCell := formTableHeaderCell(props, props.Columns[0], 130, 0).(woxwidget.Container)
+	if headerCell.BorderWidth != 0 || headerCell.RightBorderWidth != 0 || headerCell.BottomBorderWidth != tableSurfaceBorderWidth {
+		t.Fatalf("header separator = full %.0f right %.0f bottom %.0f, want bottom only", headerCell.BorderWidth, headerCell.RightBorderWidth, headerCell.BottomBorderWidth)
+	}
+	operationHeader := formTableHeaderCell(props, FormTableColumn{Label: "Operation"}, 130, len(props.Columns)).(woxwidget.Container)
+	if operationHeader.RightBorderWidth != 0 || operationHeader.BottomBorderWidth != tableSurfaceBorderWidth {
+		t.Fatalf("last header separator = right %.0f bottom %.0f, want bottom only", operationHeader.RightBorderWidth, operationHeader.BottomBorderWidth)
+	}
+
+	firstBody := formTableDataCellAt(props, props.Rows[0], 0, 0, props.Rows[0].Cells[0], 130, false).(woxwidget.Container)
+	if firstBody.BottomBorderColor.A >= headerCell.BottomBorderColor.A || firstBody.BorderWidth != 0 || firstBody.RightBorderWidth != 0 || firstBody.BottomBorderWidth != tableSurfaceBorderWidth {
+		t.Fatalf("body separator = full %.0f right %.0f bottom %.0f, want bottom only", firstBody.BorderWidth, firstBody.RightBorderWidth, firstBody.BottomBorderWidth)
+	}
+	lastBody := formTableDataCellAt(props, props.Rows[1], 1, 1, props.Rows[1].Cells[1], 130, true).(woxwidget.Container)
+	if lastBody.RightBorderWidth != 0 || lastBody.BottomBorderWidth != 0 {
+		t.Fatalf("last data separator = right %.0f bottom %.0f, want no separators on the last row", lastBody.RightBorderWidth, lastBody.BottomBorderWidth)
+	}
+	lastOperation := formTableOperationCell(props, props.Rows[1], 130, true).(woxwidget.Container)
+	if lastOperation.BorderWidth != 0 || lastOperation.RightBorderWidth != 0 || lastOperation.BottomBorderWidth != 0 {
+		t.Fatalf("last operation separator = %#v, want the outer frame to own that corner", lastOperation)
+	}
+
+	empty := formTableEmptyState(FormTableFieldProps{EmptyLabel: "None", Theme: theme}, 240, woxcomponent.SettingsControlHeight)
+	if _, framed := empty.(woxwidget.Stack); framed {
+		t.Fatal("empty state must not use table frame chrome")
+	}
+	emptyLabel := formTableEmptyLabel(t, empty)
+	if emptyLabel.Value != "None" || emptyLabel.Color != theme.TextSecondary {
+		t.Fatalf("empty label = %#v, want secondary text without grid chrome", emptyLabel)
+	}
+}
+
+func TestFormTableScrollbarUsesValueText(t *testing.T) {
+	title := woxui.Color{R: 240, G: 244, B: 248, A: 255}
+	props := FormTableFieldProps{
+		ID: "hotkeys", Width: 400, Height: tableSurfaceHeaderHeight + tableSurfaceRowHeight,
+		Columns: []FormTableColumn{{Label: "Name", Width: 120}, {Label: "Hotkey", Width: 120}},
+		Rows: []FormTableRow{
+			{Index: 0, Cells: []FormTableCell{{Text: "one"}, {Text: "ctrl"}}},
+			{Index: 1, Cells: []FormTableCell{{Text: "two"}, {Text: "alt"}}},
+		},
+		Theme: woxcomponent.ControlTheme{Text: title, TextSecondary: woxui.Color{R: 255, A: 255}},
+	}
+	body := formTableGridFlex(t, buildFormTableGrid(props, props.Width, props.Height, newFormTableGridState())).Children[1]
+	scroll := body.(woxwidget.Stateful).Widget.(woxcomponent.ScrollViewProps)
+	if scroll.ThumbColor != title {
+		t.Fatalf("table scrollbar = %#v, want Text so TextSecondary cannot restyle it", scroll.ThumbColor)
+	}
+}
+
+func TestQueryVariablePickerWrapsLongDescription(t *testing.T) {
+	description := "A long picker description that should wrap onto more than one line when the menu is not wide enough for the full sentence."
+	picker := QueryVariablePicker(QueryVariablePickerProps{
+		Width: 400, Height: 600, Anchor: woxui.Rect{X: 20, Y: 40, Width: 180, Height: 32},
+		Choices: []QueryVariableChoice{{Label: "Input Parameter", Description: description}},
+		Theme:   woxcomponent.ControlTheme{},
+	})
+	desc := queryVariablePickerDescription(t, picker)
+	if desc.Value != description || desc.MaxLines < 2 || desc.Width < 200 {
+		t.Fatalf("description = %q lines %d width %.0f, want a wrapped TextBlock", desc.Value, desc.MaxLines, desc.Width)
+	}
+	if desc.Height < float32(desc.MaxLines)*queryVariablePickerDescriptionLine {
+		t.Fatalf("description height = %.0f, want room for %d wrapped lines", desc.Height, desc.MaxLines)
+	}
+}
+
+func queryVariablePickerDescription(t *testing.T, picker woxwidget.Widget) woxwidget.TextBlock {
+	t.Helper()
+	menu := picker.(woxwidget.Stack).Children[1].Child.(woxwidget.Semantics).Child.(woxwidget.Container)
+	row := menu.Child.(woxwidget.Flex).Children[0].(woxwidget.Semantics).Child.(woxwidget.Gesture).Child.(woxwidget.Container)
+	column := row.Child.(woxwidget.Flex).Children[1].(woxwidget.Flex)
+	desc, ok := column.Children[1].(woxwidget.TextBlock)
+	if !ok {
+		t.Fatalf("picker description = %T, want wrapping TextBlock", column.Children[1])
+	}
+	return desc
+}
+
+// TestFormTableHeightShowsWholeRows covers empty, short, and scrolling tables
+// without changing the logical row size for display scaling.
+func TestFormTableHeightShowsWholeRows(t *testing.T) {
+	for _, tc := range []struct {
+		rows, maximum int
+		want          float32
+	}{
+		{0, 300, 0}, {1, 300, 76}, {6, 300, 276}, {7, 300, 276}, {20, 0, 276}, {20, 120, 116}, {20, 316, 316},
+	} {
+		if got := formTableGridHeight(tc.rows, tc.maximum); got != tc.want {
+			t.Fatalf("height(%d,%d) = %v, want %v", tc.rows, tc.maximum, got, tc.want)
+		}
+	}
+}
+
+func TestFormTableImagePreviewDoesNotOpenEmojiPicker(t *testing.T) {
+	opened := false
+	control := formTableRowImageControl(FormTableRowFieldProps{
+		ID: "icon", ImageEmoji: "🤖", EmojiLabel: "Emoji", OnEmoji: func() { opened = true },
+	}, 600, 88)
+	flex, ok := control.(woxwidget.Flex)
+	if !ok || len(flex.Children) == 0 {
+		t.Fatalf("image control = %#v, want a preview beside actions", control)
+	}
+	if gesture, isGesture := flex.Children[0].(woxwidget.Gesture); isGesture && gesture.OnTap != nil {
+		t.Fatal("icon preview must not open the emoji picker")
+	}
+	if opened {
+		t.Fatal("emoji picker opened without tapping the Emoji button")
+	}
+}
+
+// TestFormTableImageActionsFitTranslatedLabels checks wrapping at narrow logical widths and scaled displays.
+func TestFormTableImageActionsFitTranslatedLabels(t *testing.T) {
+	for _, width := range []float32{360, 600} {
+		for _, scale := range []float32{1, 1.5, 2} {
+			host := woxwidget.NewHost(func(woxui.FrameInfo) woxwidget.Widget {
+				return formTableRowImageControl(FormTableRowFieldProps{
+					ID: "icon", EmojiLabel: "Emoji", UploadLabel: "Загрузить изображение", URLLabel: "从 URL 获取", OnURL: func() {},
+				}, width, 88)
+			})
+			host.AttachServices(translatedLabelHostServices{})
+			if err := host.SetRepaintDebugMode(woxwidget.RepaintDebugVerify); err != nil {
+				t.Fatal(err)
+			}
+			host.Frame(&woxui.DisplayList{}, woxui.FrameInfo{Size: woxui.Size{Width: width, Height: 88}, PixelSize: woxui.PixelSize{Width: int(width * scale), Height: int(88 * scale)}, Scale: scale})
+			if diagnostics := host.Snapshot().Diagnostics; len(diagnostics) != 0 {
+				t.Fatalf("width %v scale %v: %v", width, scale, diagnostics)
+			}
+		}
+	}
+}

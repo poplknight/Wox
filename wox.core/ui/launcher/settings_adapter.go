@@ -1,0 +1,606 @@
+package launcher
+
+import (
+	"log"
+	"runtime"
+	"strings"
+
+	"wox/common/icons"
+	"wox/network"
+	"wox/setting"
+	woxcomponent "wox/ui/launcher/component"
+	launcherview "wox/ui/launcher/view"
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+	"wox/util"
+)
+
+const settingsTitleBarHeight = launcherview.SettingsTitleBarHeight
+
+func (a *App) buildSettings(frame woxui.FrameInfo) woxwidget.Widget {
+	snapshot := a.settingsSnapshot()
+	snapshot.general.Data.EnableOfflineMode = network.IsOffline()
+	snapshot.palette.DensityScale = a.appearance.densityMetrics.normalized().scale
+	items := settingItemsForSnapshot(snapshot)
+	if snapshot.row >= len(items) && len(items) > 0 {
+		snapshot.row = len(items) - 1
+	}
+	width := frame.Size.Width
+	height := frame.Size.Height
+	contentHeight := max(float32(0), height-settingsTitleBarHeight)
+	pageHeight := max(float32(0), height-launcherview.SettingsPageTop(runtime.GOOS))
+	railWidth := woxcomponent.SettingsRailWidth(width)
+	var page woxwidget.Widget
+	if network.IsOffline() && (snapshot.tab == "cloud" || (snapshot.tab == "plugins" && snapshot.plugins.PluginsStore) || (snapshot.tab == "theme" && snapshot.theme.ThemesMode == "store")) {
+		page = launcherview.OfflineSettingsView(launcherview.OfflineSettingsProps{Width: width - railWidth, Height: pageHeight, Theme: snapshot.palette, Icon: a.imageForTint(fromCoreImage(icons.Get(icons.StatusOffline)), &snapshot.palette.TextSecondary, physicalImageSize(48, frame.Scale*snapshot.palette.Scaled(1))), Window: a.settingsWindow.settingsNativeWindow(), Title: a.language.translate("i18n:ui_offline_title"), Description: a.language.translate("i18n:ui_offline_unavailable"), SettingsLabel: a.language.translate("i18n:ui_offline_open_settings"), OnSettings: func() { a.selectSettingTab("privacy") }})
+	} else if snapshot.tab == "plugins" {
+		page = a.pluginSettings.buildPluginSettingsPage(snapshot, width-railWidth, pageHeight, frame.Scale)
+	} else if snapshot.tab == "theme" {
+		page = a.buildSettingsThemePage(snapshot, width-railWidth, pageHeight, frame.Scale)
+	} else if snapshot.tab == "ai" {
+		page = a.aiSettings.buildAISettingsPage(snapshot, width-railWidth, pageHeight, frame.Scale)
+	} else if snapshot.tab == "data" {
+		page = a.dataSettings.buildDataSettingsPage(snapshot, width-railWidth, pageHeight)
+		// } else if snapshot.tab == "cloud" {
+		// 	page = a.cloudSettings.buildCloudSettingsPage(snapshot, width-railWidth, pageHeight, frame.Scale)
+	} else if snapshot.tab == "runtime" {
+		page = a.runtimeSettings.buildRuntimeSettingsPage(snapshot, items, width-railWidth, pageHeight, frame.Scale)
+	} else if snapshot.tab == "usage" {
+		page = a.buildUsageSettingsPage(snapshot, width-railWidth, pageHeight, frame.Scale)
+	} else if snapshot.tab == "about" {
+		page = a.buildAboutSettingsPage(snapshot, width-railWidth, pageHeight, frame.Scale)
+	} else if snapshot.tab == "privacy" {
+		page = a.buildPrivacySettingsPage(snapshot, width-railWidth, pageHeight)
+	} else {
+		page = a.buildSettingsPage(snapshot, items, width-railWidth, pageHeight, frame.Scale)
+	}
+	var overlay woxwidget.Widget
+	var overlayLeft float32
+	var overlayTop float32
+	if snapshot.tableEditor != nil {
+		overlay = a.formTables.buildFormTableOverlay(snapshot.tableEditor, snapshot.palette, width, height, frame.Scale)
+	} else if snapshot.plugins.ModelManager != nil {
+		overlay = a.pluginSettings.buildModelManagerOverlay(snapshot.plugins.ModelManager, snapshot.palette, width, height, frame.Scale)
+	} else if snapshot.general.ShowDisplayPicker != nil {
+		overlay = a.buildShowDisplayPickerOverlay(snapshot, width, height)
+	} else if snapshot.general.ChoicePicker != nil {
+		overlay = a.generalSettings.buildSettingChoicePickerOverlay(snapshot.general.ChoicePicker, snapshot.palette, width, height, frame.Scale)
+	} else if snapshot.cloud.PluginDialog != nil {
+		overlay = a.cloudSettings.buildCloudPluginExclusionOverlay(snapshot.cloud.PluginDialog, snapshot.palette, width, height, frame.Scale)
+	} else if snapshot.cloud.Form != nil {
+		overlay = a.cloudSettings.buildCloudFormOverlay(snapshot.cloud.Form, snapshot.palette, width, height)
+	} else if snapshot.privacy.Sample != "" {
+		overlay = a.buildPrivacySampleOverlay(snapshot, width, height)
+	} else if snapshot.tab == "theme" && snapshot.theme.AutoEditor != nil {
+		overlay = a.themeSettings.buildAutoThemeEditorOverlay(snapshot, width, height, frame.Scale)
+	} else if a.settingsWindow.demo != nil {
+		overlay, overlayLeft, overlayTop = a.buildSettingsDemoOverlay(snapshot, width, height)
+	} else if snapshot.tab == "cloud" && a.settingsWindow.cloudPlanTooltip != nil {
+		overlay, overlayLeft, overlayTop = launcherview.CloudPlanTooltipOverlay(a.cloudSettings.cloudIntroViewProps(snapshot, frame.Scale), a.settingsWindow.cloudPlanTooltip.anchor, width, height, snapshot.palette)
+	}
+	if snapshot.tableEditor != nil && a.settingsWindow.demo != nil {
+		demo, left, top := a.buildSettingsDemoOverlay(snapshot, width, height)
+		overlay = woxwidget.Stack{Width: width, Height: height, Children: []woxwidget.StackChild{
+			{Child: overlay},
+			{Left: left, Top: top, Child: demo},
+		}}
+		overlayLeft, overlayTop = 0, 0
+	}
+	if snapshot.tooltip != nil {
+		tooltip, left, top := launcherview.SettingsInlineTooltipOverlay(launcherview.SettingsInlineTooltipProps{
+			Width: width, Height: height, Anchor: snapshot.tooltip.Anchor, Message: snapshot.tooltip.Text, Side: snapshot.tooltip.Side, Theme: snapshot.palette,
+			Window: a.settingsWindow.settingsNativeWindow(),
+		})
+		if tooltip != nil {
+			if overlay == nil {
+				overlay = tooltip
+				overlayLeft = left
+				overlayTop = top
+			} else {
+				overlay = woxwidget.Stack{Width: width, Height: height, Children: []woxwidget.StackChild{
+					{Left: overlayLeft, Top: overlayTop, Child: overlay},
+					{Left: left, Top: top, Child: tooltip},
+				}}
+				overlayLeft = 0
+				overlayTop = 0
+			}
+		}
+	}
+	return launcherview.SettingsWindow(launcherview.SettingsWindowProps{
+		Width: width, Height: height, PageID: snapshot.tab, Platform: runtime.GOOS, RailWidth: railWidth, Theme: snapshot.palette,
+		TitleBar: a.buildSettingsTitleBar(snapshot, width, railWidth, frame.WindowFocused, frame.Scale), Rail: a.buildSettingsRail(snapshot, railWidth, contentHeight, frame.Scale), Page: page,
+		Overlay: overlay, OverlayLeft: overlayLeft, OverlayTop: overlayTop,
+	})
+}
+
+func (a *App) settingsWindowTitle() string {
+	title := a.language.translate("i18n:ui_settings_window_title")
+	if title == "" {
+		return "Wox Settings"
+	}
+	return title
+}
+
+func (a *App) buildSettingsTitleBar(snapshot settingsSnapshot, width, railWidth float32, windowFocused bool, imageScale float32) woxwidget.Widget {
+	title := a.settingsWindowTitle()
+	titleStyle := woxui.TextStyle{Size: snapshot.palette.Scaled(13), Weight: woxui.FontWeightSemibold}
+	titleWidth := float32(160)
+	if window := a.settingsWindow.settingsNativeWindow(); window != nil {
+		if metrics, err := window.MeasureText(title, titleStyle); err == nil {
+			titleWidth = metrics.Size.Width + 24
+		}
+	}
+	// The caption draws this at 20 logical px. A 256 px raster filtered down in GL softens the mark.
+	return launcherview.SettingsTitleBar(launcherview.SettingsTitleBarProps{
+		Width: width, RailWidth: railWidth, Title: title, TitleWidth: titleWidth, Platform: runtime.GOOS, AppIcon: a.imageForSurface(appIconImageSource, physicalImageSize(20, imageScale), settingsPalette().Background),
+		Theme: snapshot.palette, Active: windowFocused,
+		OnDrag: func() {
+			if window := a.settingsWindow.settingsNativeWindow(); window != nil {
+				_ = window.StartDragging()
+			}
+		},
+		OnMinimize: func() {
+			if window := a.settingsWindow.settingsNativeWindow(); window != nil {
+				_ = window.Minimize()
+			}
+		},
+		OnClose: func() {
+			util.Go(a.lifecycleCtx, "close settings window", func() {
+				if err := a.closeSettings(); err != nil {
+					log.Printf("close settings window: %v", err)
+				}
+			})
+		},
+	})
+}
+
+// buildSettingsThemePage mounts theme catalogs and the shared live editor under one portable route.
+func (a *App) buildSettingsThemePage(snapshot settingsSnapshot, width, height, imageScale float32) woxwidget.Widget {
+	innerWidth := max(float32(0), width-40)
+	bodyHeight := max(float32(0), height-40)
+	var body woxwidget.Widget
+	if snapshot.theme.ThemesMode != "editor" {
+		body = a.themeSettings.buildThemeCatalog(snapshot, innerWidth, bodyHeight, imageScale)
+	} else {
+		theme := snapshot.theme.ThemeEditor
+		if theme == nil {
+			body = woxwidget.Container{Width: innerWidth, Height: bodyHeight}
+			if snapshot.theme.ThemesError != "" {
+				body = launcherview.SettingsMessage(snapshot.theme.ThemesError, innerWidth, bodyHeight, snapshot.palette)
+			}
+		} else {
+			body = a.themeSettings.buildThemeEditorSettingsSurface(theme, snapshot.palette, innerWidth, bodyHeight, imageScale)
+		}
+	}
+	return launcherview.SettingsThemePage(launcherview.SettingsThemePageProps{
+		Width: width, Height: height, Body: body,
+	})
+}
+
+func (a *App) buildSettingsRail(snapshot settingsSnapshot, width, height, imageScale float32) woxwidget.Widget {
+	specs := settingNavSpecs(snapshot.isDev)
+	activeID := activeSettingNavID(snapshot.tab, snapshot.plugins.PluginsStore, snapshot.theme.ThemesMode)
+	items := make([]launcherview.SettingsNavItem, 0, len(specs))
+	for _, spec := range specs {
+		selected := spec.id == activeID
+		foreground := snapshot.palette.TextSecondary
+		if selected {
+			foreground = snapshot.palette.SelectionText
+		}
+		var icon *woxui.Image
+		if source := settingNavIconSource(spec.id); source.ImageData != "" {
+			icon = a.imageForTint(source, &snapshot.palette.TextSecondary, physicalImageSize(18, imageScale))
+			if selected {
+				// Keep the cached SVG shape while its selected tint is rasterized asynchronously.
+				if selectedIcon := a.imageForTint(source, &foreground, physicalImageSize(18, imageScale)); selectedIcon != nil {
+					icon = selectedIcon
+				}
+			}
+		}
+		items = append(items, launcherview.SettingsNavItem{
+			ID: spec.id, Label: a.settingNavLabel(spec), FallbackIcon: spec.icon, Icon: icon, Depth: spec.depth, Parent: spec.parent, Selected: selected,
+			OnTap: func() { a.selectSettingsNavItem(spec) },
+		})
+	}
+	innerWidth := width - 28
+	searchAreaHeight := float32(58)
+	viewportHeight := max(float32(1), height-searchAreaHeight-28)
+	return launcherview.SettingsRail(launcherview.SettingsRailProps{
+		Width: width, Height: height, Items: items,
+		SearchBox: a.buildSettingsSearchBox(snapshot, innerWidth, imageScale), SearchPanel: a.buildSettingsSearchResultPanel(snapshot, innerWidth, viewportHeight, imageScale),
+		ShowSearch: snapshot.search.Panel && strings.TrimSpace(snapshot.search.Query.Text) != "", Theme: snapshot.palette,
+	})
+}
+
+func (a *App) settingNavLabel(spec settingNavSpec) string {
+	translated := a.language.translate("i18n:" + spec.labelKey)
+	if translated == "" || translated == strings.ReplaceAll(spec.labelKey, "_", " ") {
+		return spec.fallback
+	}
+	return translated
+}
+
+func (a *App) activeSettingsNavLabel(snapshot settingsSnapshot) string {
+	activeID := activeSettingNavID(snapshot.tab, snapshot.plugins.PluginsStore, snapshot.theme.ThemesMode)
+	for _, spec := range settingNavSpecs(snapshot.isDev) {
+		if spec.id == activeID {
+			return a.settingNavLabel(spec)
+		}
+	}
+	return a.language.translate("i18n:ui_tray_open_setting_window")
+}
+
+// buildSettingsSearchBox owns the settings window's default text-input focus and native IME cursor.
+func (a *App) buildSettingsSearchBox(snapshot settingsSnapshot, width, imageScale float32) woxwidget.Widget {
+	placeholder := a.language.translate("i18n:ui_setting_search_placeholder")
+	iconTint := snapshot.palette.TextSecondary
+	return launcherview.SettingsSearchBox(launcherview.SettingsSearchBoxProps{
+		Width: width, Placeholder: placeholder, State: snapshot.search.Query, Focused: snapshot.search.Focused, Controller: a.settingsSearch.Editor(),
+		SearchIcon: a.imageForTint(settingControlIconSource("search"), &iconTint, physicalImageSize(18, imageScale)), Window: a.settingsWindow.settingsNativeWindow(), Theme: snapshot.palette,
+		OnFocus: func() { a.settingsSearch.focusSettingsSearch(false) }, OnClear: a.settingsSearch.clearSettingsSearch,
+		OnKey: a.settingsSearch.onSettingsSearchKey, OnFocusChange: a.settingsSearch.setSettingsSearchFocused, OnChanged: func(value string) { _ = a.settingsSearch.setSettingsSearchValue(value) }, OnSetValue: a.settingsSearch.setSettingsSearchValue,
+	})
+}
+
+// buildSettingsSearchResultPanel overlays navigation without shifting the rail while the query changes.
+func (a *App) buildSettingsSearchResultPanel(snapshot settingsSnapshot, width, availableHeight, imageScale float32) woxwidget.Widget {
+	results := a.settingsSearch.settingsSearchResults(snapshot)
+	items := make([]launcherview.SettingsSearchResult, 0, len(results))
+	for index, result := range results {
+		iconTint := snapshot.palette.TextSecondary
+		if index == snapshot.search.Selected {
+			iconTint = snapshot.palette.SelectionText
+		}
+		icon := a.imageForTint(settingsSearchResultIconSource(result.kind), &iconTint, physicalImageSize(24, imageScale))
+		if (result.kind == settingsSearchPlugin || result.kind == settingsSearchPluginSetting) && result.icon.ImageData != "" {
+			if pluginIcon := a.imageForSurface(result.icon, physicalImageSize(24, imageScale), settingsPalette().Background); pluginIcon != nil {
+				icon = pluginIcon
+			}
+		}
+		items = append(items, launcherview.SettingsSearchResult{
+			Title: result.title, Subtitle: a.settingsSearchResultTypeLabel(result.kind) + " · " + result.subtitle, Icon: icon,
+			OnHover: func() { a.settingsSearch.selectSettingsSearchResult(index) }, OnTap: func() { a.settingsSearch.activateSettingsSearchResult(result) },
+		})
+	}
+	emptyMessage := a.language.translate("i18n:ui_setting_search_empty")
+	if len(results) == 0 {
+		if snapshot.search.Loading {
+			emptyMessage = a.language.translate("i18n:ui_cloud_sync_plugin_exclusions_loading")
+		} else if snapshot.search.Error != "" {
+			emptyMessage = snapshot.search.Error
+		}
+	}
+	return launcherview.SettingsSearchResults(launcherview.SettingsSearchResultsProps{
+		Width: width, AvailableHeight: availableHeight, Results: items, Selected: snapshot.search.Selected,
+		EmptyMessage: emptyMessage, Theme: snapshot.palette,
+	})
+}
+
+func settingsSearchResultIconSource(kind settingsSearchResultKind) woxImage {
+	switch kind {
+	case settingsSearchPlugin:
+		return settingNavIconSource("plugins")
+	case settingsSearchPluginSetting:
+		return settingControlIconSource("settings-suggest")
+	default:
+		return settingControlIconSource("tune")
+	}
+}
+
+func (a *App) settingsSearchResultTypeLabel(kind settingsSearchResultKind) string {
+	switch kind {
+	case settingsSearchPlugin:
+		return a.language.translate("i18n:ui_setting_search_type_plugin")
+	case settingsSearchPluginSetting:
+		return a.language.translate("i18n:ui_setting_search_type_plugin_setting")
+	case settingsSearchSection:
+		return a.language.translate("i18n:ui_setting_search_type_setting")
+	default:
+		return a.language.translate("i18n:ui_setting_search_type_setting")
+	}
+}
+
+func (a *App) buildSettingsPage(snapshot settingsSnapshot, items []settingItem, width, height, imageScale float32) woxwidget.Widget {
+	contentWidth := launcherview.SettingsPageContentWidth(width)
+	children := make([]woxwidget.Widget, 0, len(items)+9)
+	children = append(children, a.buildSettingsPageHeader(
+		a.activeSettingsNavLabel(snapshot),
+		a.settingsPageDescription(snapshot.tab),
+		contentWidth,
+		snapshot.palette,
+	))
+	var keepVisibleKey woxwidget.Key
+	var navigationHotkeyRow woxwidget.Widget
+	var fullscreenHotkeyRow woxwidget.Widget
+	var networkRows []woxwidget.Widget
+	currentSection := ""
+	for index, item := range items {
+		item = a.generalSettings.localizedSettingItem(item)
+		if index == snapshot.row {
+			keepVisibleKey = woxwidget.Key("setting-row-" + item.key)
+		}
+		row := a.generalSettings.buildSettingRow(snapshot, item, index, contentWidth, woxui.Color{}, imageScale)
+		target := woxwidget.Keyed{Key: woxwidget.Key("setting-row-" + item.key), Child: woxcomponent.WoxSettingTarget(woxcomponent.SettingTargetProps{
+			Width: contentWidth, Highlighted: snapshot.highlight == "built-in:"+item.key, Child: row, Theme: snapshot.palette,
+		})}
+		// Keep the built-in rows' save/search callbacks inside the hotkey group.
+		if snapshot.tab == "hotkey" && snapshot.hotkey.Form != nil {
+			switch item.key {
+			case "NavigationBindings":
+				navigationHotkeyRow = target
+				continue
+			case "IgnoreHotkeysOnFullscreen":
+				fullscreenHotkeyRow = target
+				continue
+			}
+		}
+		// Query Aliases and Tray Queries sit above Network, so proxy rows wait
+		// until those tables have been appended.
+		if snapshot.tab == "general" && (item.key == "HttpProxyEnabled" || item.key == "HttpProxyUrl") {
+			networkRows = append(networkRows, target)
+			continue
+		}
+		section := a.settingsSectionLabel(snapshot.tab, item.key)
+		if section != currentSection {
+			currentSection = section
+			children = append(children, a.buildSettingsSectionHeader(section, contentWidth, snapshot.palette))
+		}
+		children = append(children, target)
+		if snapshot.tab == "appearance" && item.key == "ShowPosition" && item.value == string(setting.PositionTypeSpecificScreen) {
+			a.ensureShowDisplays()
+			children = append(children, a.buildShowDisplayRow(snapshot, contentWidth))
+		}
+	}
+	if snapshot.tab == "hotkey" && snapshot.hotkey.Form != nil {
+		children = append(children, a.buildSettingsSectionHeader(a.language.translate("i18n:ui_global_hotkeys"), contentWidth, snapshot.palette))
+		hotkeyForm := *snapshot.hotkey.Form
+		hotkeyForm.active = snapshot.hotkey.Focused
+		callbacks := formFieldCallbacks{
+			idPrefix: "hotkey-settings", labelWidth: 550, settingsLayout: true, imageScale: imageScale,
+			focus: a.hotkeySettings.focusHotkeySettingsField, openTable: a.hotkeySettings.openHotkeySettingsTable, recordKey: a.hotkeySettings.recordHotkeySettingsField,
+		}
+		for index, definition := range hotkeyForm.definitions {
+			if definition.Value.Key == "ActionPanelHotkey" {
+				children = append(children, a.buildSettingsSectionHeader(a.language.translate("i18n:ui_in_app_hotkeys"), contentWidth, snapshot.palette))
+			}
+			// On Wayland the app-exclusion table is absent; keep the switch before
+			// query hotkeys, immediately after the available hotkey recorders.
+			if definition.Type == "table" && fullscreenHotkeyRow != nil {
+				children = append(children, fullscreenHotkeyRow)
+				fullscreenHotkeyRow = nil
+			}
+			if hotkeyForm.active && index == hotkeyForm.focused {
+				keepVisibleKey = formFieldRowKey("settings-hotkey", index)
+			}
+			field := a.buildFormField(hotkeyForm, callbacks, snapshot.palette, index, definition, contentWidth, 0)
+			if definition.Type == "table" {
+				// Flutter wraps built-in setting tables in a 24px outer bottom gap so
+				// adjacent tables keep the same breathing room as the settings form.
+				field = woxwidget.Container{Width: contentWidth, Padding: woxwidget.Insets{Bottom: 24}, Child: field}
+			}
+			target := woxcomponent.WoxSettingTarget(woxcomponent.SettingTargetProps{
+				Width: contentWidth, Highlighted: snapshot.highlight == "built-in:"+definition.Value.Key, Child: field, Theme: snapshot.palette,
+			})
+			children = append(children, woxwidget.Keyed{Key: formFieldRowKey("settings-hotkey", index), Child: target})
+			if definition.Value.Key == "ActionPanelHotkey" && navigationHotkeyRow != nil {
+				children = append(children, navigationHotkeyRow)
+			}
+		}
+	}
+	if snapshot.tab == "general" && snapshot.general.Form != nil {
+		generalForm := *snapshot.general.Form
+		generalForm.active = snapshot.general.FormFocused
+		callbacks := formFieldCallbacks{
+			idPrefix: "general-settings", labelWidth: 550, settingsLayout: true, imageScale: imageScale,
+			focus: a.hotkeySettings.focusGeneralQuerySettingsField, openTable: a.hotkeySettings.openGeneralQuerySettingsTable,
+		}
+		for index, definition := range generalForm.definitions {
+			if generalForm.active && index == generalForm.focused {
+				keepVisibleKey = formFieldRowKey("settings-general", index)
+			}
+			field := a.buildFormField(generalForm, callbacks, snapshot.palette, index, definition, contentWidth, 0)
+			if definition.Type == "table" {
+				// Flutter wraps built-in setting tables in a 24px outer bottom gap so
+				// adjacent tables keep the same breathing room as the settings form.
+				field = woxwidget.Container{Width: contentWidth, Padding: woxwidget.Insets{Bottom: 24}, Child: field}
+			}
+			target := woxcomponent.WoxSettingTarget(woxcomponent.SettingTargetProps{
+				Width: contentWidth, Highlighted: snapshot.highlight == "built-in:"+definition.Value.Key, Child: field, Theme: snapshot.palette,
+			})
+			children = append(children, woxwidget.Keyed{Key: formFieldRowKey("settings-general", index), Child: target})
+		}
+	}
+	if len(networkRows) > 0 {
+		children = append(children, a.buildSettingsSectionHeader(a.language.translate("i18n:ui_network"), contentWidth, snapshot.palette))
+		children = append(children, networkRows...)
+	}
+	return launcherview.SettingsPage(launcherview.SettingsPageProps{Theme: snapshot.palette,
+		ID: "settings-page-" + snapshot.tab, Width: width, Height: height, Children: children, KeepVisibleKey: keepVisibleKey,
+	})
+}
+
+// buildSettingsPageHeader keeps built-in pages aligned with Flutter's wide settings form.
+func (a *App) buildSettingsPageHeader(title, description string, width float32, palette woxcomponent.ControlTheme) woxwidget.Widget {
+	return woxcomponent.WoxPageHeader(woxcomponent.PageHeaderProps{
+		Title: title, Description: description, Width: width, Theme: palette,
+	})
+}
+
+func (a *App) settingsPageDescription(tab string) string {
+	switch tab {
+	case "general":
+		return a.language.translate("i18n:ui_general_description")
+	case "appearance":
+		return a.language.translate("i18n:ui_ui_description")
+	case "hotkey":
+		return a.language.translate("i18n:ui_hotkeys_description")
+	case "debug":
+		return a.language.translate("i18n:ui_debug_description")
+	case "updates":
+		return a.language.translate("i18n:ui_update_description")
+	default:
+		return ""
+	}
+}
+
+func (a *App) buildSettingsSectionHeader(label string, width float32, palette woxcomponent.ControlTheme) woxwidget.Widget {
+	return woxcomponent.WoxSectionHeader(woxcomponent.SectionHeaderProps{Label: label, Width: width, Theme: palette})
+}
+
+func (a *App) settingsSectionLabel(tab, key string) string {
+	if tab == "general" {
+		switch key {
+		case "EnableAutostart", "HideOnStart":
+			return a.language.translate("i18n:ui_general_section_startup")
+		case "UsePinYin", "SwitchInputMethodABC":
+			return a.language.translate("i18n:ui_general_section_input_search")
+		case "HttpProxyEnabled", "HttpProxyUrl":
+			return a.language.translate("i18n:ui_network")
+		default:
+			return a.language.translate("i18n:ui_general_section_launch")
+		}
+	}
+	if tab == "appearance" {
+		switch key {
+		case "UseSoftwareRendering":
+			return a.language.translate("i18n:ui_rendering")
+		case "LangCode":
+			return a.language.translate("i18n:ui_general_section_language")
+		case "MaxResultCount":
+			return a.language.translate("i18n:ui_ui_section_results")
+		case "EnableGlance", "HideGlanceIcon", "PrimaryGlance":
+			return a.language.translate("i18n:ui_ui_section_glance")
+		default:
+			return a.language.translate("i18n:ui_ui_section_launcher")
+		}
+	}
+	if tab == "updates" {
+		return a.language.translate("i18n:ui_update_section_updates")
+	}
+	return ""
+}
+
+func (c *generalSettingsController) localizedSettingItem(item settingItem) settingItem {
+	keys := map[string][2]string{
+		"UseSoftwareRendering": {"ui_software_rendering", "ui_software_rendering_tips"},
+		"EnableAutostart":      {"ui_autostart", "ui_autostart_tips"}, "HideOnStart": {"ui_hide_on_start", "ui_hide_on_start_tips"},
+		"LaunchMode": {"ui_launch_mode", "ui_launch_mode_tips"}, "StartPage": {"ui_start_page", "ui_start_page_tips"},
+		"IgnoreHotkeysOnFullscreen": {"ui_hotkey_ignore_fullscreen", "ui_hotkey_ignore_fullscreen_tips"},
+		"NavigationBindings":        {"ui_navigation_bindings", "ui_navigation_bindings_tips"},
+		"HideOnLostFocus":           {"ui_hide_on_lost_focus", "ui_hide_on_lost_focus_tips"}, "UsePinYin": {"ui_use_pinyin", "ui_use_pinyin_tips"},
+		"SwitchInputMethodABC": {"ui_switch_input_method_abc", "ui_switch_input_method_abc_tips"}, "LangCode": {"ui_lang", "ui_lang_tips"},
+		"ShowPosition": {"ui_show_position", "ui_show_position_tips"}, "ShowTray": {"ui_show_tray", "ui_show_tray_tips"},
+		"AppWidth": {"ui_app_width", "ui_app_width_tips"}, "UiDensity": {"ui_interface_size", "ui_interface_size_tips"},
+		"AppFontFamily": {"ui_app_font_family", "ui_app_font_family_tips"}, "EnableQueryCompletionHint": {"ui_query_completion_hint", "ui_query_completion_hint_tips"},
+		"MaxResultCount": {"ui_max_result_count", "ui_max_result_count_tips"}, "EnableGlance": {"ui_glance_enable", "ui_glance_enable_tips"},
+		"HideGlanceIcon": {"ui_glance_hide_icon", "ui_glance_hide_icon_tips"}, "PrimaryGlance": {"ui_glance_primary", "ui_glance_primary_tips"},
+		"HttpProxyEnabled": {"ui_proxy_enabled", ""}, "HttpProxyUrl": {"ui_proxy_url", "ui_proxy_url_tips"},
+		"CustomPythonPath": {"ui_runtime_python_path", "ui_runtime_python_path_tips"}, "CustomNodejsPath": {"ui_runtime_nodejs_path", "ui_runtime_nodejs_path_tips"},
+		"CloudSyncServerUrl": {"ui_cloud_sync_server_url", "ui_cloud_sync_server_url_tips"},
+		"ShowScoreTail":      {"ui_debug_show_score_tail", "ui_debug_show_score_tail_tips"}, "ShowPerformanceTail": {"ui_debug_show_performance_tail", "ui_debug_show_performance_tail_tips"},
+		"ShowPerformanceTailBatch": {"ui_debug_show_performance_tail_batch", "ui_debug_show_performance_tail_batch_tips"}, "ShowPerformanceTailPluginQuery": {"ui_debug_show_performance_tail_plugin_query", "ui_debug_show_performance_tail_plugin_query_tips"},
+		"ShowPerformanceTailBackendPrepared": {"ui_debug_show_performance_tail_backend_prepared", "ui_debug_show_performance_tail_backend_prepared_tips"}, "ShowPerformanceTailUiReceived": {"ui_debug_show_performance_tail_ui_received", "ui_debug_show_performance_tail_ui_received_tips"},
+		"EnableOfflineMode": {"ui_offline_title", "ui_offline_description"},
+		"EnableAutoUpdate":  {"ui_enable_auto_update", "ui_enable_auto_update_tips"}, "ReleaseChannel": {"ui_release_channel", "ui_release_channel_tips"},
+	}
+	if pair, ok := keys[item.key]; ok {
+		item.title = c.language.translate("i18n:" + pair[0])
+		if pair[1] != "" {
+			item.description = c.language.translate("i18n:" + pair[1])
+		}
+	}
+	if item.key == "IgnoreHotkeysOnFullscreen" && item.disabled {
+		item.description = c.language.translate("i18n:ui_hotkey_ignore_fullscreen_unavailable")
+	}
+	for index := range item.choices {
+		item.choices[index].label = c.localizedSettingChoiceLabel(item.key, item.choices[index])
+	}
+	return item
+}
+
+func (c *generalSettingsController) localizedSettingChoiceLabel(key string, choice settingChoice) string {
+	choiceKeys := map[string]map[string]string{
+		"LaunchMode":         {"fresh": "ui_launch_mode_fresh", "continue": "ui_launch_mode_continue"},
+		"StartPage":          {"blank": "ui_start_page_blank", "mru": "ui_start_page_mru"},
+		"ShowPosition":       {"mouse_screen": "ui_show_position_mouse_screen", "active_screen": "ui_show_position_active_screen", "last_location": "ui_show_position_last_location", "specific_screen": "ui_show_position_specific_screen"},
+		"UiDensity":          {"compact": "ui_interface_size_compact", "normal": "ui_interface_size_normal", "comfortable": "ui_interface_size_comfortable"},
+		"AppFontFamily":      {"": "ui_app_font_family_system_default"},
+		"NavigationBindings": {string(setting.NavigationBindingModeOff): "ui_disabled"},
+		"CloudSyncServerUrl": {"https://sync.woxlauncher.com": "ui_cloud_sync_server_url_production", "http://127.0.0.1:8787": "ui_cloud_sync_server_url_local"},
+		"ReleaseChannel":     {"stable": "ui_release_channel_stable", "beta": "ui_release_channel_beta"},
+	}
+	if valueKeys := choiceKeys[key]; valueKeys != nil {
+		if labelKey := valueKeys[choice.value]; labelKey != "" {
+			return c.language.translate("i18n:" + labelKey)
+		}
+	}
+	return choice.label
+}
+
+func (c *generalSettingsController) localizedSettingChoiceTooltip(key string, choice settingChoice) string {
+	tooltipKeys := map[string]map[string]string{
+		"LaunchMode":     {"fresh": "ui_launch_mode_fresh_tips", "continue": "ui_launch_mode_continue_tips"},
+		"StartPage":      {"blank": "ui_start_page_blank_tips", "mru": "ui_start_page_mru_tips"},
+		"ReleaseChannel": {"stable": "ui_release_channel_stable_tips", "beta": "ui_release_channel_beta_tips"},
+	}
+	if valueKeys := tooltipKeys[key]; valueKeys != nil {
+		if tooltipKey := valueKeys[choice.value]; tooltipKey != "" {
+			return c.language.translate("i18n:" + tooltipKey)
+		}
+	}
+	return ""
+}
+
+func (c *generalSettingsController) buildSettingRow(snapshot settingsSnapshot, item settingItem, index int, width float32, background woxui.Color, imageScale float32) woxwidget.Widget {
+	offlinePaused := snapshot.general.Data.EnableOfflineMode && item.key == "EnableAutoUpdate"
+	if offlinePaused {
+		item.disabled = true
+		item.value = "false"
+		item.description = c.language.translate("i18n:ui_offline_paused")
+	}
+	kind := "choice"
+	value := settingValueLabel(item)
+	state := woxui.TextEditingState{Text: item.value}
+	focused := snapshot.general.EditKey == item.key
+	if item.text {
+		kind = "text"
+		if focused {
+			state = snapshot.general.Editing
+		}
+		value = item.value
+	} else if isBooleanSettingItem(item) {
+		kind = "bool"
+		value = item.value
+	}
+	var valueLeading *woxui.Image
+	if source := item.icons[item.value]; source.ImageData != "" {
+		if item.preserveIconColor {
+			valueLeading = c.imageForSurface(source, physicalImageSize(18, imageScale), settingsPalette().Background)
+		} else {
+			valueLeading = c.imageForTint(source, &snapshot.palette.Text, physicalImageSize(18, imageScale))
+		}
+	}
+	var controlAction woxwidget.Widget
+	if item.key == "UseSoftwareRendering" && snapshot.general.Data.SoftwareRenderingRestartRequired {
+		controlAction = woxcomponent.WoxButton(woxcomponent.ButtonProps{
+			ID: "settings-restart-wox", Label: c.language.translate("i18n:ui_restart_wox"),
+			Variant: woxcomponent.ButtonSecondary, Disabled: snapshot.saving || snapshot.restarting,
+			OnTap: c.restartFromSettings, Theme: snapshot.palette,
+		})
+		if snapshot.restartError != "" {
+			item.description += "\n" + snapshot.restartError
+		}
+		item.disabled = item.disabled || snapshot.saving || snapshot.restarting
+	}
+	return launcherview.SettingRow(launcherview.SettingRowProps{
+		ID: item.key, Title: item.title, Description: item.description, Value: value, ControlAction: controlAction, ValueTrailing: item.trailers[item.value], ValueLeading: valueLeading,
+		Width: width, Background: background, Disabled: item.disabled, PreserveLabelColor: offlinePaused,
+		Kind: kind, ControlWidth: item.controlWidth, BrowseFile: item.browseFile, Editing: state, Focused: focused, Window: c.settings.settingsNativeWindow(), Theme: snapshot.palette,
+		OnTap:       func() { c.selectSettingRow(index); c.openOrActivateSetting() },
+		OnChoiceTap: func(anchor woxui.Rect) { c.selectSettingRow(index); c.openSettingChoicePickerAt(item, anchor) },
+		OnFocus:     func() { c.selectSettingRow(index); c.startBuiltInSettingEdit(item, -1) },
+		OnBlur:      func() { c.blurBuiltInSettingEdit(item) },
+		OnChanged:   func(value string) { c.setBuiltInSettingEditValue(item, value) }, OnKey: c.onBuiltInSettingsEditorKey,
+		OnBrowse: func() { c.selectSettingRow(index); c.browseBuiltInSettingFile(item) },
+	})
+}

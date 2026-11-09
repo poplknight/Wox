@@ -1,0 +1,133 @@
+package definition
+
+import (
+	"context"
+	"wox/setting/validator"
+)
+
+type PluginSettingValueTableColumnType = string
+
+const (
+	PluginSettingValueTableColumnTypeText                   PluginSettingValueTableColumnType = "text"
+	PluginSettingValueTableColumnTypeTextList               PluginSettingValueTableColumnType = "textList"
+	PluginSettingValueTableColumnTypeCheckbox               PluginSettingValueTableColumnType = "checkbox"
+	PluginSettingValueTableColumnTypeDirPath                PluginSettingValueTableColumnType = "dirPath"
+	PluginSettingValueTableColumnTypeHotkey                 PluginSettingValueTableColumnType = "hotkey"
+	PluginSettingValueTableColumnTypeSelect                 PluginSettingValueTableColumnType = "select"
+	PluginSettingValueTableColumnTypeSelectAIModel          PluginSettingValueTableColumnType = "selectAIModel"
+	PluginSettingValueTableColumnTypeQueryHotkeyQuery       PluginSettingValueTableColumnType = "queryHotkeyQuery"
+	PluginSettingValueTableColumnTypeAICommandPrompt        PluginSettingValueTableColumnType = "aiCommandPrompt"
+	PluginSettingValueTableColumnTypeDictationPrompt        PluginSettingValueTableColumnType = "dictationPrompt"
+	PluginSettingValueTableColumnTypeQueryVariable          PluginSettingValueTableColumnType = "queryVariable"
+	PluginSettingValueTableColumnTypeQueryVariableList      PluginSettingValueTableColumnType = "queryVariableList"
+	PluginSettingValueTableColumnTypeAIModelStatus          PluginSettingValueTableColumnType = "aiModelStatus"
+	PluginSettingValueTableColumnTypeAIMCPServerTools       PluginSettingValueTableColumnType = "aiMCPServerTools"
+	PluginSettingValueTableColumnTypeAISelectMCPServerTools PluginSettingValueTableColumnType = "aiSelectMCPServerTools"
+	PluginSettingValueTableColumnTypeAISelectSkills         PluginSettingValueTableColumnType = "aiSelectSkills"
+	PluginSettingValueTableColumnTypeWoxImage               PluginSettingValueTableColumnType = "woxImage"
+	PluginSettingValueTableColumnTypeApp                    PluginSettingValueTableColumnType = "app"
+)
+
+const (
+	PluginSettingValueTableSortOrderAsc  = "asc"
+	PluginSettingValueTableSortOrderDesc = "desc"
+)
+
+// PluginSettingValueTableColumnTypeIgnoredApps is the read-only app selection of an ignore rule.
+const PluginSettingValueTableColumnTypeIgnoredApps = "ignoredApps"
+
+const (
+	PluginSettingQueryVariableKindQueryHotkey = "queryHotkey"
+	PluginSettingQueryVariableKindAICommand   = "aiCommand"
+	PluginSettingQueryVariableKindDictation   = "dictation"
+	PluginSettingQueryVariableKindWebSearch   = "webSearch"
+)
+
+type PluginSettingValueTable struct {
+	Key             string
+	DefaultValue    string
+	Title           string
+	Tooltip         string
+	Columns         []PluginSettingValueTableColumn
+	SortColumnKey   string // The key of the column that should be used for sorting
+	SortOrder       string // asc or desc
+	SearchColumnKey string // Optional column to search and pin when table search is open
+	MaxHeight       int    // Max table height in px, <= 0 means use UI default
+	InlineTable     bool   // Render the table directly in settings instead of behind a separate editor row.
+	EnableSearch    bool   // Show a search icon before Add that expands a row filter
+	// Groups names collapsible sections in the add/edit row dialog. Columns
+	// reference a group by Key; empty Group stays ungrouped at the top.
+	Groups []PluginSettingValueTableGroup
+
+	Style PluginSettingValueStyle `json:"-"` // Deprecated: ignored on load so Wox keeps setting layouts consistent.
+}
+
+// PluginSettingValueTableGroup is a row-editor section. Title and collapse live
+// here so they are not duplicated on every column in the group.
+type PluginSettingValueTableGroup struct {
+	Key                string
+	Title              string
+	Tooltip            string
+	CollapsedByDefault bool
+}
+
+type PluginSettingValueTableColumn struct {
+	Key                string
+	Label              string
+	Tooltip            string
+	Width              int
+	Type               PluginSettingValueTableColumnType
+	Validators         []validator.PluginSettingValidator // validators for this setting, every validator should be satisfied
+	SelectOptions      []PluginSettingValueSelectOption   // Only used when Type is PluginSettingValueTableColumnTypeSelect
+	TextMaxLines       int                                // Only used by text-like table columns
+	HideInTable        bool                               // Hide this column in the table, but still show it in the setting dialog
+	HideInUpdate       bool                               // Hide this column in the update/add dialog, but still show it in the table
+	AllowedHotkeyKinds []string                           // Only used when Type is PluginSettingValueTableColumnTypeHotkey
+	PreviewMatchedApps bool                               // Show a live indexed-app preview under this text column
+	// QueryVariableKind selects the {wox:...} picker set for queryVariable columns.
+	QueryVariableKind string
+	// Group is a PluginSettingValueTableGroup.Key. Empty keeps the field ungrouped.
+	Group string
+	// EmptyAsZero maps blank editor text to persisted integer 0 (and the reverse on load).
+	EmptyAsZero bool
+}
+
+func (p *PluginSettingValueTable) GetPluginSettingType() PluginSettingDefinitionType {
+	return PluginSettingDefinitionTypeTable
+}
+
+func (p *PluginSettingValueTable) GetKey() string {
+	return p.Key
+}
+
+func (p *PluginSettingValueTable) GetDefaultValue() string {
+	return p.DefaultValue
+}
+
+func (p *PluginSettingValueTable) Translate(translator func(ctx context.Context, key string) string) PluginSettingDefinitionValue {
+	copy := *p
+	copy.Title = translator(context.Background(), p.Title)
+	copy.Tooltip = translator(context.Background(), p.Tooltip)
+	copy.Groups = make([]PluginSettingValueTableGroup, len(p.Groups))
+	for i := range p.Groups {
+		copy.Groups[i] = p.Groups[i]
+		copy.Groups[i].Title = translator(context.Background(), p.Groups[i].Title)
+		copy.Groups[i].Tooltip = translator(context.Background(), p.Groups[i].Tooltip)
+	}
+	// Deep copy Columns
+	copy.Columns = make([]PluginSettingValueTableColumn, len(p.Columns))
+	for i := range p.Columns {
+		copy.Columns[i] = p.Columns[i]
+		copy.Columns[i].Label = translator(context.Background(), p.Columns[i].Label)
+		copy.Columns[i].Tooltip = translator(context.Background(), p.Columns[i].Tooltip)
+		copy.Columns[i].AllowedHotkeyKinds = append([]string{}, p.Columns[i].AllowedHotkeyKinds...)
+		copy.Columns[i].SelectOptions = make([]PluginSettingValueSelectOption, len(p.Columns[i].SelectOptions))
+		for j := range p.Columns[i].SelectOptions {
+			copy.Columns[i].SelectOptions[j].Label = translator(context.Background(), p.Columns[i].SelectOptions[j].Label)
+			copy.Columns[i].SelectOptions[j].Value = p.Columns[i].SelectOptions[j].Value
+			copy.Columns[i].SelectOptions[j].Icon = p.Columns[i].SelectOptions[j].Icon
+			copy.Columns[i].SelectOptions[j].IsSelectAll = p.Columns[i].SelectOptions[j].IsSelectAll
+		}
+	}
+	return &copy
+}

@@ -1,0 +1,143 @@
+---
+name: wox-changelog-update
+description: Update Wox CHANGELOG.md and CHANGELOG.zh_CN.md based on commits since the last release. Use when the user asks to "update changelog", "write release notes", or "summarize changes since last release" and the output must follow the repository's existing changelog format.
+---
+
+# Wox Update Changelog
+
+## Overview
+
+Update `CHANGELOG.md` and `CHANGELOG.zh_CN.md` from the latest released version to `HEAD`, create a release cover, and keep wording, section order, and markdown style consistent with existing entries. The two files must describe the same release with the same structure; only the language of user-facing prose changes.
+
+## Workflow
+
+1. Identify the release boundary.
+
+- Read the top of `CHANGELOG.md` and `CHANGELOG.zh_CN.md` and detect the target section (usually newest version at the top).
+- Detect the last released tag with `git tag --sort=-creatordate`.
+- Use commit range `last_release_tag..HEAD` by default.
+- If changelog heading and git tag disagree, prefer changelog context and state the assumption.
+
+2. Collect candidate changes.
+
+- Run `git log --oneline --no-merges <range>`.
+- Open key commits with `git show --stat --oneline <sha>` to classify user-facing impact.
+- Check whether each included change came through a pull request. Inspect merge commits as well as the non-merge log, and use GitHub's commit-to-PR lookup or PR metadata for squash/rebase merges or unclear local history. Record the PR URL and the contributor's verified GitHub login; use the PR author, not the person who merged it. Do not infer a login from a commit display name or email. If attribution cannot be verified, report that gap instead of guessing or silently omitting it.
+- Ignore pure build/version bump commits unless they change user-visible behavior.
+- Collect store catalog additions separately from app/core commits. Compare `store-plugin.json` and `store-theme.json` at `last_release_tag` vs `HEAD`. A store item is new only when its `Id` (plugin) or `ThemeId` (theme) is absent from the last release file. Ignore version bumps, field edits, and other updates to existing store entries. Ignore bundled script plugin version bumps.
+- Do not put third-party store catalog changes in `Add`, `Improve`, or `Fix`. List only newly added store plugins and themes in `Store`.
+
+3. Classify into changelog buckets.
+
+- `Add`: major, clearly new user-visible capabilities, workflows, plugins, or standalone feature areas.
+- `Improve`: behavioral or UX improvements without new core capability.
+- `Fix`: user-facing bug fixes/regressions.
+- `Store`: plugins and themes newly listed in the Wox store during this range.
+- Omit the `Add` section when the release does not contain a substantial new feature. Prefer `Improve` for additions that extend an existing feature area rather than creating a new user workflow.
+- Omit the `Store` section when no new store plugin or theme IDs appeared in range.
+- Treat platform-specific implementations, provider additions, runtime dependency checks, searchable metadata, theme overrides, and similar support for existing systems as `Improve` unless the commit introduces a large new user-facing feature.
+- Exclude internal refactors/tests/docs/chore unless directly user-visible.
+- Exclude tiny UI-only polish by default (for example spacing, alignment, minor color/wording tweaks) unless it fixes a functional UX issue or the user explicitly asks to include small UI changes.
+
+4. Create a release cover.
+
+- Every changelog update must include a newly generated cover for the target release. Choose the single most important user-facing feature or improvement as its subject. Do not combine several headline features into one cover. If no change stands out as a main feature, use the title `Improvements` and a general Wox product visual.
+- Use the built-in image generation tool and follow the `imagegen` skill. Inspect the result and iterate if its text, visual quality, or relationship to the release is wrong. If generation is unavailable, finish the text updates and explicitly report the missing cover; do not add a broken image reference or silently substitute a different method.
+- Follow the approved release-cover style: a 2.85:1 landscape aspect ratio (57:20, for example 1710 × 600 pixels), restrained near-black background, generous negative space, a small outlined version capsule above a large white sans-serif title on the left, and one cropped product interface or feature visual on the right. Keep the composition clean and editorial, with subtle depth and no decorative glow, floating icons, busy scenery, or AI-looking effects. Keep the cover title short and use the actual release version. Fit or crop the generated image to the required aspect ratio without stretching or cutting off important content. Inspect `screenshots/changelog-v2.4.9.png`, when available, for the approved visual direction; it is a style reference, not an example of how many features to cover.
+- Prefer actual Wox screenshots or established product assets as visual references when available. Generated interface imagery is illustrative: do not invent or misrepresent feature behavior, and do not present a generated mockup as an actual screenshot.
+- Save the cover under `screenshots/` with a descriptive release-specific filename. If the filename already exists, use a distinct filename unless the user requested replacement. Insert the same cover image reference in both changelogs immediately after the highlight paragraph and before the sections; use the repository's GitHub raw image URL pattern. Replace an existing cover reference for the target release when needed, while preserving other screenshots and old release sections.
+
+5. Write changelog entries in repository style.
+
+- Preserve header pattern exactly (for example: `## v2.0.1 -`). Use the same heading, date, screenshots, issue links, and section keys in both files.
+- Keep section titles in English in both files: `- Add`, `- Improve`, `- Fix`, `- Store`. The client already localizes these labels.
+- Add a short highlight paragraph directly below every release heading you create or update, before screenshots and `Add`/`Improve`/`Fix`/`Store` sections. Follow the `v2.4.4` style: one or two short everyday sentences about the visible change, not the implementation. Example: a new Jade theme and Liquid Glass on macOS 26; Settings keep their own look so themes no longer change that window.
+- Write for ordinary users, not developers or reviewers. Describe what someone sees or can do after updating. Do not explain schemas, APIs, caches, indexes, host restarts, platform variants, or other internals unless that is the user-facing name of the feature (for example Liquid Glass, `cb paste`, `.wox`).
+- Prefer plain words over implementation labels: say "Settings keep their own look" instead of "independent chrome", "every word must match" instead of "AND matching", "theme previews match the launcher" instead of "schema v2 sparse authoring".
+- Keep section order: `Add`, `Improve`, `Fix`, `Store`.
+- Use bullet nesting style already used in file.
+- Keep wording concise, everyday, and factual. If a sentence needs a term a typical user would not know, rewrite it or drop that detail.
+- Match wording to the bucket. English `Improve` entries should say "Improve", "Expand", "Support", or similar, not "Add", unless the entry is intentionally describing a small added option inside an improvement.
+- For new `Add` features, explain what the feature is for and why a user would use it. Do not reduce major features to one terse implementation phrase.
+- Keep the same feature in one bullet whenever possible. For example, combine Screenshot scrolling capture, pinning, and plugin API changes into one `[`Screenshot`]` bullet instead of splitting them into separate bullets.
+- If a new feature needs screenshots but the images are not available yet, leave clearly named screenshot placeholder image lines in the same bullet so the screenshots can be added later.
+- Prefer plugin/module prefix when clear, e.g. ``[`Shell`]`` or ``[`Clipboard`]``.
+- Write issue references as Markdown links, e.g. `[#4339](https://github.com/Wox-launcher/Wox/issues/4339)`. Do not leave a bare `#4339` for the preview to rewrite later.
+- Every changelog item originating from a PR must credit its contributor with `[@username](https://github.com/username)` and link the PR as `[#1234](https://github.com/Wox-launcher/Wox/pull/1234)`. Apply this to `Add`, `Improve`, `Fix`, and `Store`, with identical attribution in both languages. When a bullet combines contributions from several PRs, credit each relevant PR author once. Keep store author credits; if that author is also the PR contributor, reuse the existing mention, otherwise append the PR contributor separately. For example: ``  - [`Notes`] Fix typing `- [ ] ` not creating a task. [#4618](https://github.com/Wox-launcher/Wox/pull/4618) [@lmgarret](https://github.com/lmgarret)``.
+- Keep existing feature screenshots. Add new feature screenshot lines when screenshots already exist, or when a user explicitly asks to reserve screenshot positions for upcoming images. The release cover is required separately as described above.
+- Write `Store` as two nested groups, omitting an empty group: `Plugin` then `Theme`. Each item is already-clickable Markdown: `[Name](page_url) Description [@github_username](https://github.com/github_username)`. Resolve `i18n:` names and descriptions from `I18n.en_US` in `CHANGELOG.md` and from `I18n.zh_CN` in `CHANGELOG.zh_CN.md` (`plugin_name`, `plugin_desc` or `plugin_description`). If a locale is missing, fall back to `en_US`, then `Name` / `Description`. Use `ThemeName` and `Description` for themes. Link the name to `Website` (plugin) or `ThemeUrl` (theme). If that URL is empty, write the plain name without a link. Append the author as a GitHub profile link. Prefer the username from a `github.com` / `gist.github.com` `Website` or `ThemeUrl`; otherwise use `Author` or `ThemeAuthor` when it is a single handle. Skip the author link when the author is only a display name. Do not add store screenshots, download URLs, or version numbers.
+
+  ```markdown
+  - Store
+    - Plugin
+      - [Color Picker](https://github.com/author/wox-plugin-color) Wox plugin to pick colors [@author](https://github.com/author)
+      - [Strava](https://github.com/author/wox-plugin-strava) A plugin to interact with Strava workouts [@author](https://github.com/author)
+    - Theme
+      - [Wox Dracula](https://github.com/author/wox-theme-dracula) Wox theme inspired by the Dracula color scheme [@author](https://github.com/author)
+  ```
+
+- Write the English file first, then produce the Chinese file as a line-for-line counterpart. Do not add or drop bullets in only one language.
+- Both files now contain the full version history. Keep new headings in both files and do not leave a new release in only one language.
+
+6. Keep README in sync only when the latest **stable** heading changes.
+
+- Update the line next to the Release badge to `Latest: vX.Y.Z · Mon YYYY`, matching that heading (for example `Latest: v2.4.3 · Sep 2026`). GitHub README is not generated.
+- Skip this when you only add bullets under an existing heading, or when the newest heading is a beta (`vX.Y.Z-beta.N`).
+- Do not hand-edit `www/docs`. Homepage version text, compare stamps, and `/changelog/*` pages are generated from `CHANGELOG.md` and `CHANGELOG.zh_CN.md` during `docs:dev` / `docs:build`.
+
+7. Validate before finishing.
+
+- Ensure no duplicate bullets.
+- Ensure every `Add`/`Improve`/`Fix` bullet maps to at least one commit in range.
+- Ensure every PR-derived item includes its PR link and verified contributor mention in both languages, including when the same feature combines direct commits and PR contributions. Check merge history or GitHub associations so `--no-merges` does not hide attribution.
+- Ensure every `Store` bullet maps to a plugin `Id` or theme `ThemeId` that is new since `last_release_tag`.
+- Ensure every release section you create or update has a biggest-highlight paragraph under the version heading in both files, written in everyday language a typical user can understand.
+- Verify the generated cover exists in the repository, matches the release version and 2.85:1 aspect ratio, presents one main feature or `Improvements`, and is referenced identically in both changelogs. Inspect it for legible text and the approved style.
+- Reread new bullets as a user: drop leftover implementation terms such as schema, chrome, prefetch, incremental index, DirectWrite, overlay, conversion mode, or host restart unless they are the feature name.
+- Ensure English and Chinese newest sections have the same headings, screenshots, issue links, and bullet count.
+- If the latest stable heading is new or its date changed, ensure README contains `Latest: vX.Y.Z · Mon YYYY` matching it (`docs:build` fails if this line is missing).
+- Ensure markdown renders cleanly and section spacing matches nearby versions.
+- Avoid rewriting old release sections unless explicitly requested.
+- If a commit set only contains tiny UI-only polish, keep it out of changelog by default.
+
+## Command Reference
+
+```bash
+git tag --sort=-creatordate | head -n 20
+sed -n '1,120p' CHANGELOG.md
+sed -n '1,120p' CHANGELOG.zh_CN.md
+git log --oneline --no-merges <last_tag>..HEAD
+git log --oneline --merges <last_tag>..HEAD
+git show --stat --oneline <sha>
+git show <last_tag>:store-plugin.json
+git show <last_tag>:store-theme.json
+git diff -- CHANGELOG.md CHANGELOG.zh_CN.md
+```
+
+Compare store catalogs by ID, not by file diff hunks. Example:
+
+```bash
+python -c "
+import json, subprocess, sys
+tag = sys.argv[1]
+def load(rev, path):
+    return json.loads(subprocess.check_output(['git', 'show', f'{rev}:{path}']))
+old_p = {p['Id'] for p in load(tag, 'store-plugin.json')}
+new_p = json.load(open('store-plugin.json', encoding='utf-8'))
+for p in new_p:
+    if p['Id'] not in old_p:
+        print('plugin', p.get('Name'), p.get('Description'), p.get('Author'), p.get('Website'), p.get('I18n'))
+old_t = {t['ThemeId'] for t in load(tag, 'store-theme.json')}
+new_t = json.load(open('store-theme.json', encoding='utf-8'))
+for t in new_t:
+    if t['ThemeId'] not in old_t:
+        print('theme', t.get('ThemeName'), t.get('Description'), t.get('ThemeAuthor'), t.get('ThemeUrl'))
+" <last_tag>
+```
+
+## Output Rules
+
+- Edit `CHANGELOG.md` and `CHANGELOG.zh_CN.md` together and include the generated release cover.
+- If the latest stable heading changed, also update the README `Latest: vX.Y.Z · Mon YYYY` line. Do not edit `www/docs` changelog pages or homepage copy.
+- Keep final response short: what section was updated and what categories were changed, including `Store` plugin/theme counts when present.
+- If commit intent is ambiguous, state the assumption briefly in the final response.

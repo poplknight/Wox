@@ -1,0 +1,1204 @@
+package plugin
+
+import (
+	"archive/zip"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/url"
+	"os"
+	"path"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+	"wox/cloudsync"
+	"wox/database"
+	"wox/i18n"
+	"wox/network"
+	"wox/setting"
+	"wox/util"
+	"wox/util/trash"
+
+	"github.com/Masterminds/semver/v3"
+	"github.com/samber/lo"
+)
+
+const pluginDownloadTimeout = 2 * time.Minute
+
+// OfficialPluginStoreID is the built-in plugin catalog. Settings lists it above other stores.
+const OfficialPluginStoreID = "wox"
+
+type storeManifest struct {
+	Name string
+	Url  string
+}
+
+type StorePluginManifest struct {
+	Id             string
+	Name           string // supported i18n
+	Author         string
+	Version        string
+	MinWoxVersion  string
+	Runtime        Runtime
+	Description    string // supported i18n
+	IconUrl        string
+	IconEmoji      string
+	Website        string
+	DownloadUrl    string
+	ScreenshotUrls []string
+	SupportedOS    []string
+	DateCreated    string
+	DateUpdated    string
+	// Store is the catalog that published this manifest. It is assigned while
+	// catalogs are merged and is not part of the downloaded JSON.
+	Store string `json:"-"`
+
+	// I18n holds inline translations for the store manifest.
+	// Map structure: langCode -> key -> translatedValue
+	// Example: {"en_US": {"plugin_name": "Hello"}, "zh_CN": {"plugin_name": "你好"}}
+	I18n map[string]map[string]string
+}
+
+func (m StorePluginManifest) translate(ctx context.Context, text string) string {
+	if !strings.HasPrefix(text, "i18n:") {
+		return text
+	}
+
+	return i18n.GetI18nManager().TranslateI18nMap(ctx, text, m.I18n)
+}
+
+func (m StorePluginManifest) translateWithLang(text string, langCode i18n.LangCode) string {
+	if !strings.HasPrefix(text, "i18n:") {
+		return text
+	}
+
+	key := strings.TrimPrefix(text, "i18n:")
+	if langMap, ok := m.I18n[string(langCode)]; ok {
+		if translated, ok := langMap[key]; ok {
+			return translated
+		}
+	}
+
+	return text
+}
+
+func (m StorePluginManifest) GetName(ctx context.Context) string {
+	return m.translate(ctx, m.Name)
+}
+
+func (m StorePluginManifest) GetNameEn(_ context.Context) string {
+	return m.translateEn(m.Name)
+}
+
+func (m StorePluginManifest) GetDescription(ctx context.Context) string {
+	return m.translate(ctx, m.Description)
+}
+
+func (m StorePluginManifest) GetDescriptionEn(_ context.Context) string {
+	return m.translateEn(m.Description)
+}
+
+func (m StorePluginManifest) translateEn(text string) string {
+	if !strings.HasPrefix(text, "i18n:") {
+		return text
+	}
+
+	translated := m.translateWithLang(text, i18n.LangCodeEnUs)
+	if translated != text {
+		return translated
+	}
+
+	return i18n.GetI18nManager().TranslateWoxEnUs(context.Background(), text)
+}
+
+func (m StorePluginManifest) GetNameEnUs() string {
+	return m.translateWithLang(m.Name, i18n.LangCodeEnUs)
+}
+
+func (m StorePluginManifest) GetDescriptionEnUs() string {
+	return m.translateWithLang(m.Description, i18n.LangCodeEnUs)
+}
+
+func IsVersionUpgradable(installedVersion string, availableVersion string) bool {
+	installed, installedErr := semver.NewVersion(installedVersion)
+	available, availableErr := semver.NewVersion(availableVersion)
+	if installedErr != nil || availableErr != nil || installed == nil || available == nil {
+		return false
+	}
+
+	return available.GreaterThan(installed)
+}
+
+// ensureStorePluginRuntimeReady checks the interpreter before download/load.
+// Script plugins do not start a persistent host, so they reuse the Python/Node
+// version floor instead of the always-ready script host status.
+func ensureStorePluginRuntimeReady(ctx context.Context, manifest StorePluginManifest) error {
+	if manifest.Runtime == PLUGIN_RUNTIME_SCRIPT {
+		return EnsureScriptInterpreterReady(ctx, manifest.DownloadUrl)
+	}
+	return GetPluginManager().EnsureHostStarted(ctx, manifest.Runtime)
+}
+
+var storeInstance *Store
+var storeOnce sync.Once
+
+type Store struct {
+	pluginManifests       []StorePluginManifest
+	lastManifestSignature string // to avoid notifying UI reload if no changes
+
+	// installMu serializes install and uninstall operations so that concurrent
+	// invocations (e.g. the user quickly installs two plugins in a row) cannot
+	// interleave their file-system and plugin-manager mutations, which previously
+	// caused loading-indicator flicker and potential data corruption.
+	installMu sync.Mutex
+}
+
+func GetStoreManager() *Store {
+	storeOnce.Do(func() {
+		storeInstance = &Store{}
+	})
+	return storeInstance
+}
+
+func (s *Store) getStoreManifests(ctx context.Context) []storeManifest {
+	return []storeManifest{
+		{
+			Name: "Wox Official Plugin Store",
+			Url:  "https://raw.githubusercontent.com/Wox-launcher/Wox/master/store-plugin.json",
+		},
+	}
+}
+
+// get plugin manifests from plugin stores, and update in the background every 10 minutes
+func (s *Store) Start(ctx context.Context) {
+	s.setPluginManifests(ctx, s.GetStorePluginManifests(ctx))
+
+	util.Go(ctx, "load store plugins immediately", func() {
+		pluginManifests := s.GetStorePluginManifests(util.NewTraceContext())
+		if len(pluginManifests) > 0 {
+			s.setPluginManifests(util.NewTraceContext(), pluginManifests)
+		}
+	})
+
+	util.Go(ctx, "load store plugins", func() {
+		for range time.NewTicker(time.Minute * 10).C {
+			traceCtx := util.NewTraceContext()
+			pluginManifests := s.GetStorePluginManifests(traceCtx)
+			if len(pluginManifests) > 0 {
+				s.setPluginManifests(traceCtx, pluginManifests)
+			}
+		}
+	})
+}
+
+func (s *Store) setPluginManifests(ctx context.Context, manifests []StorePluginManifest) {
+	s.pluginManifests = manifests
+
+	signature := s.buildManifestSignature(manifests)
+	if signature == s.lastManifestSignature {
+		return
+	}
+	s.lastManifestSignature = signature
+
+	reloadSettingPlugins(ctx)
+}
+
+func (s *Store) buildManifestSignature(manifests []StorePluginManifest) string {
+	items := make([]string, 0, len(manifests))
+	for _, m := range manifests {
+		items = append(items, fmt.Sprintf("%s@%s", m.Id, m.Version))
+	}
+	sort.Strings(items)
+	return strings.Join(items, ";")
+}
+
+func (s *Store) GetStorePluginManifests(ctx context.Context) []StorePluginManifest {
+	if network.IsOffline() {
+		return nil
+	}
+	var storePluginManifests []StorePluginManifest
+
+	for _, store := range s.getStoreManifests(ctx) {
+		pluginManifest, manifestErr := s.GetStorePluginManifest(ctx, store)
+		if manifestErr != nil {
+			logger.Error(ctx, fmt.Sprintf("failed to get plugin manifest from %s store: %s", store.Name, manifestErr.Error()))
+			continue
+		}
+
+		for _, manifest := range pluginManifest {
+			existingManifest, found := lo.Find(s.pluginManifests, func(m StorePluginManifest) bool {
+				return manifest.Id == m.Id
+			})
+			if found {
+				existingVersion, existingErr := semver.NewVersion(existingManifest.Version)
+				currentVersion, currentErr := semver.NewVersion(manifest.Version)
+				if existingErr != nil && currentErr != nil {
+					if existingVersion.GreaterThan(currentVersion) {
+						logger.Info(ctx, fmt.Sprintf("skip %s(%s) from %s store, because it's already exist(%s)", manifest.GetName(ctx), manifest.Version, store.Name, existingManifest.Version))
+						continue
+					}
+				}
+			}
+
+			if !IsAnySupportedInCurrentOS(manifest.SupportedOS) {
+				continue
+			}
+			if manifest.Store == "" {
+				manifest.Store = OfficialPluginStoreID
+			}
+
+			storePluginManifests = append(storePluginManifests, manifest)
+		}
+	}
+
+	// A catalog row for another operating system must not reach the settings list.
+	storePluginManifests = selectCurrentOSManifests(storePluginManifests)
+
+	logger.Info(ctx, fmt.Sprintf("found %d plugins from stores", len(storePluginManifests)))
+	return storePluginManifests
+}
+
+// selectCurrentOSManifests keeps plugins this machine can run.
+func selectCurrentOSManifests(manifests []StorePluginManifest) []StorePluginManifest {
+	filtered := make([]StorePluginManifest, 0, len(manifests))
+	for _, manifest := range manifests {
+		if IsAnySupportedInCurrentOS(manifest.SupportedOS) {
+			filtered = append(filtered, manifest)
+		}
+	}
+	return filtered
+}
+
+func (s *Store) GetStorePluginManifest(ctx context.Context, store storeManifest) ([]StorePluginManifest, error) {
+	logger.Info(ctx, fmt.Sprintf("start to get plugin manifest from %s(%s)", store.Name, store.Url))
+
+	response, getErr := util.HttpGet(ctx, store.Url)
+	if getErr != nil {
+		return nil, getErr
+	}
+
+	var storePluginManifests []StorePluginManifest
+	unmarshalErr := json.Unmarshal(response, &storePluginManifests)
+	if unmarshalErr != nil {
+		return nil, unmarshalErr
+	}
+
+	for i := range storePluginManifests {
+		if IsSupportedRuntime(string(storePluginManifests[i].Runtime)) {
+			storePluginManifests[i].Runtime = ConvertToRuntime(string(storePluginManifests[i].Runtime))
+		}
+	}
+
+	return storePluginManifests, nil
+}
+
+func (s *Store) GetStorePluginManifestById(ctx context.Context, id string) (StorePluginManifest, error) {
+	manifest, found := lo.Find(s.pluginManifests, func(manifest StorePluginManifest) bool {
+		return manifest.Id == id
+	})
+	if found {
+		return manifest, nil
+	}
+
+	return StorePluginManifest{}, fmt.Errorf("plugin %s not found", id)
+}
+
+// QueueInstalledPluginsForSync seeds current store-installed plugins into the oplog.
+func (s *Store) QueueInstalledPluginsForSync(ctx context.Context) {
+	for _, instance := range GetPluginManager().GetPluginInstances() {
+		if instance.IsSystemPlugin || instance.IsDevPlugin || s.isCloudSyncDisabled(ctx, instance.Metadata.Id) {
+			continue
+		}
+		manifest, ok := s.findSyncableStoreManifest(ctx, instance.Metadata.Id)
+		if !ok {
+			logger.Warn(ctx, fmt.Sprintf("skip plugin install sync for %s: store manifest not found", instance.Metadata.Id))
+			continue
+		}
+		s.logInstalledPluginUpsert(ctx, manifest)
+	}
+}
+
+// findSyncableStoreManifest resolves the downloadable store manifest required
+// to reproduce a plugin install on another device.
+func (s *Store) findSyncableStoreManifest(ctx context.Context, pluginID string) (StorePluginManifest, bool) {
+	if manifest, err := s.GetStorePluginManifestById(ctx, pluginID); err == nil {
+		return manifest, true
+	}
+
+	manifests := s.GetStorePluginManifests(ctx)
+	if len(manifests) > 0 {
+		s.setPluginManifests(ctx, manifests)
+	}
+	manifest, found := lo.Find(manifests, func(item StorePluginManifest) bool {
+		return item.Id == pluginID
+	})
+	return manifest, found
+}
+
+// logInstalledPluginUpsert records successful user-triggered plugin installs
+// without failing the already-completed install if oplog writing fails.
+func (s *Store) logInstalledPluginUpsert(ctx context.Context, manifest StorePluginManifest) {
+	if s.isCloudSyncDisabled(ctx, manifest.Id) {
+		return
+	}
+	manifestJSON, err := json.Marshal(manifest)
+	if err != nil {
+		logger.Warn(ctx, fmt.Sprintf("failed to encode installed plugin sync value for %s: %s", manifest.Id, err.Error()))
+		return
+	}
+	value := cloudsync.InstalledPluginValue{
+		ID:       manifest.Id,
+		Version:  manifest.Version,
+		Source:   cloudsync.InstallSyncSourceStore,
+		Manifest: manifestJSON,
+	}
+	if err := cloudsync.LogInstalledPluginUpsert(ctx, value); err != nil {
+		logger.Warn(ctx, fmt.Sprintf("failed to log installed plugin sync value for %s: %s", manifest.Id, err.Error()))
+	}
+}
+
+// logInstalledPluginDelete records successful user-triggered plugin uninstalls
+// without failing the already-completed uninstall if oplog writing fails.
+func (s *Store) logInstalledPluginDelete(ctx context.Context, pluginID string) {
+	if s.isCloudSyncDisabled(ctx, pluginID) {
+		return
+	}
+	if err := cloudsync.LogInstalledPluginDelete(ctx, pluginID); err != nil {
+		logger.Warn(ctx, fmt.Sprintf("failed to log installed plugin delete for %s: %s", pluginID, err.Error()))
+	}
+}
+
+// isCloudSyncDisabled keeps plugin install-list sync aligned with plugin
+// setting sync exclusions.
+func (s *Store) isCloudSyncDisabled(ctx context.Context, pluginID string) bool {
+	if setting.GetSettingManager() == nil {
+		return false
+	}
+	woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+	if woxSetting == nil {
+		return false
+	}
+	return lo.Contains(woxSetting.CloudSyncDisabledPlugins.Get(), pluginID)
+}
+
+// reloadSettingPlugins tolerates early restore flows before plugin manager UI
+// has been attached.
+func reloadSettingPlugins(ctx context.Context) {
+	sharedUI := GetPluginManager().GetUI()
+	if sharedUI == nil {
+		return
+	}
+	sharedUI.ReloadSettingPlugins(ctx)
+}
+
+func (s *Store) Search(ctx context.Context, keyword string) []StorePluginManifest {
+	return lo.Filter(s.pluginManifests, func(manifest StorePluginManifest, _ int) bool {
+		if !IsAnySupportedInCurrentOS(manifest.SupportedOS) {
+			return false
+		}
+
+		if keyword == "" {
+			return true
+		}
+
+		return IsStringMatch(ctx, manifest.GetName(ctx), keyword) ||
+			IsStringMatch(ctx, manifest.GetDescription(ctx), keyword) ||
+			IsStringMatch(ctx, manifest.GetNameEnUs(), keyword) ||
+			IsStringMatch(ctx, manifest.GetDescriptionEnUs(), keyword) ||
+			strings.EqualFold(manifest.Id, keyword)
+	})
+}
+
+// InstallProgressCallback is called during plugin installation to report progress
+// message: progress message (e.g., "Downloading: 50%", "Extracting files...", "Loading plugin...")
+type InstallProgressCallback func(message string)
+
+// UninstallProgressCallback is called during plugin uninstall to report progress
+// message: progress message (e.g., "Removing plugin...", "Cleaning settings...", "Unloading plugin...")
+type UninstallProgressCallback func(message string)
+
+func (s *Store) Install(ctx context.Context, manifest StorePluginManifest) error {
+	return s.InstallWithProgress(ctx, manifest, nil)
+}
+
+// InstallLocal installs a plugin without writing cloud-sync install oplogs.
+func (s *Store) InstallLocal(ctx context.Context, manifest StorePluginManifest) error {
+	return s.installWithProgress(ctx, manifest, nil, false)
+}
+
+func (s *Store) InstallWithProgress(ctx context.Context, manifest StorePluginManifest, progressCallback InstallProgressCallback) error {
+	return s.installWithProgress(ctx, manifest, progressCallback, true)
+}
+
+// installWithProgress keeps local restore and user-triggered installs on the
+// same file/runtime path while controlling whether the result is synced.
+func (s *Store) installWithProgress(ctx context.Context, manifest StorePluginManifest, progressCallback InstallProgressCallback, syncInstall bool) error {
+	if err := ensureThirdPartyPluginsEnabled(ctx); err != nil {
+		return err
+	}
+	// Serialize all install/uninstall operations. Without this lock, a user
+	// installing two plugins in quick succession causes the operations to race:
+	// both may try to unload/reload the same runtime host, write to overlapping
+	// directories, or toggle loading state concurrently — producing the
+	// "loading number alternate abnormally" symptom reported in issue #4401.
+	s.installMu.Lock()
+	defer s.installMu.Unlock()
+
+	if !IsSupportedRuntime(string(manifest.Runtime)) {
+		return fmt.Errorf("plugin runtime %s is not available", manifest.Runtime)
+	}
+
+	logger.Info(ctx, fmt.Sprintf("start to install plugin %s(%s)", manifest.GetName(ctx), manifest.Version))
+
+	// Store installs should reject incompatible manifests before runtime startup
+	// or download work. The previous flow kept MinWoxVersion as display metadata
+	// only, which allowed users to install plugins that this Wox build cannot run.
+	if err := ensureWoxVersionSupported(manifest.GetName(ctx), manifest.MinWoxVersion); err != nil {
+		logger.Error(ctx, fmt.Sprintf("failed to install plugin %s(%s): %s", manifest.GetName(ctx), manifest.Version, err.Error()))
+		return err
+	}
+	if err := ValidateStorePluginManifest(manifest); err != nil {
+		logger.Error(ctx, fmt.Sprintf("failed to install plugin %s(%s): %s", manifest.GetName(ctx), manifest.Version, err.Error()))
+		return err
+	}
+	kind, classifyErr := ClassifyPluginArtifact(manifest.Runtime, manifest.DownloadUrl)
+	if classifyErr != nil {
+		logger.Error(ctx, fmt.Sprintf("failed to install plugin %s(%s): %s", manifest.GetName(ctx), manifest.Version, classifyErr.Error()))
+		return classifyErr
+	}
+
+	if err := ensureStorePluginRuntimeReady(ctx, manifest); err != nil {
+		logger.Error(ctx, fmt.Sprintf("failed to prepare %s runtime for plugin %s(%s): %s", manifest.Runtime, manifest.GetName(ctx), manifest.Version, err.Error()))
+		return fmt.Errorf("failed to prepare %s runtime for plugin %s(%s): %w", manifest.Runtime, manifest.GetName(ctx), manifest.Version, err)
+	}
+
+	// check if installed newer version
+	installedPlugin, exist := lo.Find(GetPluginManager().GetPluginInstances(), func(item *Instance) bool {
+		return item.Metadata.Id == manifest.Id
+	})
+	if exist {
+		logger.Info(ctx, fmt.Sprintf("found this plugin has installed %s(%s)", installedPlugin.Metadata.GetName(ctx), installedPlugin.Metadata.Version))
+		existingKind := InstalledPluginArtifactKind(installedPlugin)
+		installedVersion, installedErr := semver.NewVersion(installedPlugin.Metadata.Version)
+		currentVersion, currentErr := semver.NewVersion(manifest.Version)
+		if installedErr == nil && currentErr == nil {
+			if installedVersion.GreaterThan(currentVersion) {
+				logger.Info(ctx, fmt.Sprintf("skip %s(%s) from %s store, because it's already installed(%s)", manifest.GetName(ctx), manifest.Version, manifest.GetName(ctx), installedPlugin.Metadata.Version))
+				return fmt.Errorf("skip %s(%s) from %s store, because it's already installed(%s)", manifest.GetName(ctx), manifest.Version, manifest.GetName(ctx), installedPlugin.Metadata.Version)
+			}
+		}
+		if existingKind != kind {
+			if err := s.migratePluginArtifact(ctx, installedPlugin, manifest, kind, progressCallback); err != nil {
+				return err
+			}
+			reloadSettingPlugins(ctx)
+			if syncInstall {
+				s.logInstalledPluginUpsert(ctx, manifest)
+			}
+			return nil
+		}
+
+		// Package plugins replace the directory. Script and single-file plugins
+		// keep the old file as a rollback backup until the new file loads.
+		if kind == PluginArtifactPackage {
+			uninstallErr := s.uninstallLocked(ctx, installedPlugin, true, true, nil)
+			if uninstallErr != nil {
+				logger.Error(ctx, fmt.Sprintf("failed to uninstall plugin %s(%s): %s", installedPlugin.Metadata.GetName(ctx), installedPlugin.Metadata.Version, uninstallErr.Error()))
+				return fmt.Errorf("failed to uninstall plugin %s(%s): %s", installedPlugin.Metadata.GetName(ctx), installedPlugin.Metadata.Version, uninstallErr.Error())
+			}
+		}
+	}
+
+	switch kind {
+	case PluginArtifactScript:
+		if err := s.installScriptPluginWithProgress(ctx, manifest, progressCallback); err != nil {
+			return err
+		}
+	case PluginArtifactSingleFile:
+		if err := s.installSingleFilePluginWithProgress(ctx, manifest, progressCallback); err != nil {
+			return err
+		}
+	default:
+		if err := s.installNormalPluginWithProgress(ctx, manifest, progressCallback); err != nil {
+			return err
+		}
+	}
+
+	reloadSettingPlugins(ctx)
+	if syncInstall {
+		s.logInstalledPluginUpsert(ctx, manifest)
+	}
+	return nil
+}
+
+func (s *Store) installNormalPluginWithProgress(ctx context.Context, manifest StorePluginManifest, progressCallback InstallProgressCallback) error {
+	return s.installNormalPlugin(ctx, manifest, progressCallback, false)
+}
+
+func (s *Store) installNormalPlugin(ctx context.Context, manifest StorePluginManifest, progressCallback InstallProgressCallback, validateManifest bool) error {
+	// download plugin
+	logger.Info(ctx, fmt.Sprintf("start to download plugin: %s", manifest.DownloadUrl))
+	if progressCallback != nil {
+		progressCallback(i18n.GetI18nManager().TranslateWox(ctx, "i18n:plugin_install_progress_starting_download"))
+	}
+
+	pluginDirectory := path.Join(util.GetLocation().GetPluginDirectory(), fmt.Sprintf("%s@%s", manifest.Id, manifest.Version))
+	directoryErr := util.GetLocation().EnsureDirectoryExist(pluginDirectory)
+	if directoryErr != nil {
+		logger.Error(ctx, fmt.Sprintf("failed to create plugin directory %s: %s", pluginDirectory, directoryErr.Error()))
+		return fmt.Errorf("failed to create plugin directory %s: %s", pluginDirectory, directoryErr.Error())
+	}
+	pluginZipPath := path.Join(pluginDirectory, "plugin.zip")
+
+	// Download with progress tracking
+	downloadErr := downloadPluginFile(ctx, manifest.DownloadUrl, pluginZipPath, pluginDownloadTimeout, func(downloaded int64, total int64) {
+		if progressCallback != nil {
+			if total > 0 {
+				percentage := float64(downloaded) / float64(total) * 100
+				progressCallback(fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "i18n:plugin_install_progress_downloading"), percentage))
+			} else {
+				// Total size unknown, just show downloaded bytes
+				progressCallback(fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "i18n:plugin_install_progress_downloaded_bytes"), downloaded))
+			}
+		}
+	})
+	if downloadErr != nil {
+		logger.Error(ctx, fmt.Sprintf("failed to download plugin %s(%s): %s", manifest.GetName(ctx), manifest.Version, downloadErr.Error()))
+		return fmt.Errorf("failed to download plugin %s(%s): %s", manifest.GetName(ctx), manifest.Version, downloadErr.Error())
+	}
+
+	if progressCallback != nil {
+		progressCallback(i18n.GetI18nManager().TranslateWox(ctx, "i18n:plugin_install_progress_download_complete"))
+	}
+
+	//unzip plugin
+	logger.Info(ctx, fmt.Sprintf("start to unzip plugin %s(%s)", manifest.GetName(ctx), manifest.Version))
+	if progressCallback != nil {
+		progressCallback(i18n.GetI18nManager().TranslateWox(ctx, "i18n:plugin_install_progress_extracting"))
+	}
+
+	unzipErr := util.Unzip(pluginZipPath, pluginDirectory)
+	if unzipErr != nil {
+		logger.Error(ctx, fmt.Sprintf("failed to unzip plugin %s(%s): %s", manifest.GetName(ctx), manifest.Version, unzipErr.Error()))
+		removeErr := os.Remove(pluginZipPath)
+		if removeErr != nil {
+			logger.Error(ctx, fmt.Sprintf("failed to remove plugin zip %s: %s", pluginZipPath, removeErr.Error()))
+		}
+		return fmt.Errorf("failed to unzip plugin %s(%s): %s", manifest.GetName(ctx), manifest.Version, unzipErr.Error())
+	}
+
+	if progressCallback != nil {
+		progressCallback(i18n.GetI18nManager().TranslateWox(ctx, "i18n:plugin_install_progress_extraction_complete"))
+	}
+
+	//load plugin
+	logger.Info(ctx, fmt.Sprintf("start to load plugin %s(%s)", manifest.GetName(ctx), manifest.Version))
+	if progressCallback != nil {
+		progressCallback(i18n.GetI18nManager().TranslateWox(ctx, "i18n:plugin_install_progress_loading"))
+	}
+
+	if validateManifest {
+		metadata, err := GetPluginManager().ParseMetadata(ctx, pluginDirectory)
+		if err != nil {
+			return fmt.Errorf("failed to parse plugin metadata: %w", err)
+		}
+		if err := ValidateSingleFileHeaderMatchesManifest(metadata, manifest); err != nil {
+			return fmt.Errorf("plugin package does not match store manifest: %w", err)
+		}
+	}
+	loadErr := GetPluginManager().LoadPlugin(ctx, pluginDirectory)
+	if loadErr != nil {
+		logger.Error(ctx, fmt.Sprintf("failed to load plugin %s(%s): %s", manifest.GetName(ctx), manifest.Version, loadErr.Error()))
+
+		// remove plugin zip and directory
+		removeErr := os.RemoveAll(pluginDirectory)
+		if removeErr != nil {
+			logger.Error(ctx, fmt.Sprintf("failed to remove plugin directory %s: %s", pluginDirectory, removeErr.Error()))
+		}
+		removeErr = os.Remove(pluginZipPath)
+		if removeErr != nil {
+			logger.Error(ctx, fmt.Sprintf("failed to remove plugin zip %s: %s", pluginZipPath, removeErr.Error()))
+		}
+
+		return fmt.Errorf("failed to load plugin %s(%s): %s", manifest.GetName(ctx), manifest.Version, loadErr.Error())
+	}
+
+	if progressCallback != nil {
+		progressCallback(i18n.GetI18nManager().TranslateWox(ctx, "i18n:plugin_install_progress_loaded"))
+	}
+
+	//remove plugin zip
+	removeErr := os.Remove(pluginZipPath)
+	if removeErr != nil {
+		logger.Error(ctx, fmt.Sprintf("failed to remove plugin zip %s: %s", pluginZipPath, removeErr.Error()))
+		return fmt.Errorf("failed to remove plugin zip %s: %s", pluginZipPath, removeErr.Error())
+	}
+
+	if progressCallback != nil {
+		progressCallback(i18n.GetI18nManager().TranslateWox(ctx, "i18n:plugin_install_progress_complete"))
+	}
+
+	return nil
+}
+
+func (s *Store) installScriptPlugin(ctx context.Context, manifest StorePluginManifest) error {
+	return s.installScriptPluginWithProgress(ctx, manifest, nil)
+}
+
+func (s *Store) installScriptPluginWithProgress(ctx context.Context, manifest StorePluginManifest, progressCallback InstallProgressCallback) error {
+	return s.installScriptPluginForStore(ctx, manifest, progressCallback, false)
+}
+
+func (s *Store) installScriptPluginForStore(ctx context.Context, manifest StorePluginManifest, progressCallback InstallProgressCallback, validateManifest bool) error {
+	logger.Info(ctx, fmt.Sprintf("detected script plugin, use script install flow: %s", manifest.GetName(ctx)))
+
+	if progressCallback != nil {
+		progressCallback(i18n.GetI18nManager().TranslateWox(ctx, "i18n:plugin_install_progress_preparing"))
+	}
+
+	userScriptDir := util.GetLocation().GetUserScriptPluginsDirectory()
+	if err := util.GetLocation().EnsureDirectoryExist(userScriptDir); err != nil {
+		logger.Error(ctx, fmt.Sprintf("failed to ensure user script plugin directory %s: %s", userScriptDir, err.Error()))
+		return fmt.Errorf("failed to ensure user script plugin directory %s: %s", userScriptDir, err.Error())
+	}
+
+	// 1) find existing script by plugin id
+	existingScriptPath := ""
+	entries, readErr := os.ReadDir(userScriptDir)
+	if readErr != nil {
+		logger.Error(ctx, fmt.Sprintf("failed to read user script plugin directory: %s", readErr.Error()))
+		return fmt.Errorf("failed to read user script plugin directory: %s", readErr.Error())
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if name == ".DS_Store" || name == "README.md" {
+			continue
+		}
+		scriptPath := path.Join(userScriptDir, name)
+		metadata, metaErr := GetPluginManager().ParseScriptMetadata(ctx, scriptPath)
+		if metaErr != nil {
+			continue
+		}
+		if strings.EqualFold(metadata.Id, manifest.Id) {
+			existingScriptPath = scriptPath
+			break
+		}
+	}
+
+	// 2) move existing script to a temp directory for rollback
+	backupDir := ""
+	backupPath := ""
+	hasBackup := false
+	if existingScriptPath != "" {
+		var mkErr error
+		backupDir, mkErr = os.MkdirTemp("", "wox_script_backup_*")
+		if mkErr != nil {
+			logger.Error(ctx, fmt.Sprintf("failed to create temp directory for backup: %s", mkErr.Error()))
+			return fmt.Errorf("failed to create temp directory for backup: %s", mkErr.Error())
+		}
+		backupPath = path.Join(backupDir, path.Base(existingScriptPath))
+
+		// try rename; if cross-device, fallback to copy+remove
+		if err := os.Rename(existingScriptPath, backupPath); err != nil {
+			// fallback to copy
+			srcF, cErr := os.Open(existingScriptPath)
+			if cErr != nil {
+				logger.Error(ctx, fmt.Sprintf("failed to open existing script for backup: %s", cErr.Error()))
+				_ = os.RemoveAll(backupDir)
+				return fmt.Errorf("failed to open existing script for backup: %s", cErr.Error())
+			}
+			defer srcF.Close()
+
+			dstF, cErr := os.Create(backupPath)
+			if cErr != nil {
+				logger.Error(ctx, fmt.Sprintf("failed to create backup file: %s", cErr.Error()))
+				_ = os.RemoveAll(backupDir)
+				return fmt.Errorf("failed to create backup file: %s", cErr.Error())
+			}
+			_, cErr = io.Copy(dstF, srcF)
+			closeErr := dstF.Close()
+			if cErr != nil {
+				logger.Error(ctx, fmt.Sprintf("failed to copy to backup file: %s", cErr.Error()))
+				_ = os.Remove(backupPath)
+				_ = os.RemoveAll(backupDir)
+				return fmt.Errorf("failed to copy to backup file: %s", cErr.Error())
+			}
+			if closeErr != nil {
+				logger.Warn(ctx, fmt.Sprintf("failed to close backup file: %s", closeErr.Error()))
+			}
+			if info, statErr := os.Stat(existingScriptPath); statErr == nil {
+				_ = os.Chmod(backupPath, info.Mode())
+			}
+			// remove original after copying to complete the move
+			if cErr = os.Remove(existingScriptPath); cErr != nil {
+				logger.Error(ctx, fmt.Sprintf("failed to remove original script after backup: %s", cErr.Error()))
+				_ = os.Remove(backupPath)
+				_ = os.RemoveAll(backupDir)
+				return fmt.Errorf("failed to remove original script after backup: %s", cErr.Error())
+			}
+		}
+		hasBackup = true
+	}
+
+	// 3) derive new file name from url, fallback
+	fileName := ""
+	if u, err := url.Parse(manifest.DownloadUrl); err == nil {
+		base := path.Base(u.Path)
+		if base != "" && base != "." && base != "/" {
+			fileName = base
+		}
+	}
+	if fileName == "" {
+		if existingScriptPath != "" {
+			fileName = path.Base(existingScriptPath)
+		} else {
+			fileName = strings.ReplaceAll(strings.ToLower(fmt.Sprintf("%s_%s", manifest.Id, manifest.GetName(ctx))), " ", "-") + ".sh"
+		}
+	}
+	newScriptPath := path.Join(userScriptDir, fileName)
+
+	// 4) download new script
+	logger.Info(ctx, fmt.Sprintf("start to download script plugin: %s", manifest.DownloadUrl))
+	if progressCallback != nil {
+		progressCallback(i18n.GetI18nManager().TranslateWox(ctx, "i18n:plugin_install_progress_starting_download"))
+	}
+
+	downloadErr := downloadPluginFile(ctx, manifest.DownloadUrl, newScriptPath, pluginDownloadTimeout, func(downloaded int64, total int64) {
+		if progressCallback != nil {
+			if total > 0 {
+				percentage := float64(downloaded) / float64(total) * 100
+				progressCallback(fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "i18n:plugin_install_progress_downloading"), percentage))
+			} else {
+				progressCallback(fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "i18n:plugin_install_progress_downloaded_bytes"), downloaded))
+			}
+		}
+	})
+	if downloadErr != nil {
+		logger.Error(ctx, fmt.Sprintf("failed to download script plugin %s(%s): %s", manifest.GetName(ctx), manifest.Version, downloadErr.Error()))
+		// rollback
+		if hasBackup {
+			_ = os.Remove(newScriptPath)
+			_ = os.Rename(backupPath, existingScriptPath)
+			_ = os.RemoveAll(backupDir)
+		}
+		return fmt.Errorf("failed to download script plugin %s(%s): %s", manifest.GetName(ctx), manifest.Version, downloadErr.Error())
+	}
+	_ = os.Chmod(newScriptPath, 0755)
+
+	if progressCallback != nil {
+		progressCallback(i18n.GetI18nManager().TranslateWox(ctx, "i18n:plugin_install_progress_download_complete"))
+	}
+
+	// 5) parse metadata from the new script
+	if progressCallback != nil {
+		progressCallback(i18n.GetI18nManager().TranslateWox(ctx, "i18n:plugin_install_progress_parsing"))
+	}
+
+	metadata, metaErr := GetPluginManager().ParseScriptMetadata(ctx, newScriptPath)
+	if metaErr != nil {
+		logger.Error(ctx, fmt.Sprintf("failed to parse script plugin metadata: %s", metaErr.Error()))
+		// rollback
+		if hasBackup {
+			_ = os.Remove(newScriptPath)
+			_ = os.Rename(backupPath, existingScriptPath)
+			_ = os.RemoveAll(backupDir)
+		}
+		return fmt.Errorf("failed to parse script plugin metadata: %s", metaErr.Error())
+	}
+	if validateManifest {
+		if err := ValidateSingleFileHeaderMatchesManifest(metadata, manifest); err != nil {
+			return fmt.Errorf("script plugin does not match store manifest: %w", err)
+		}
+	} else if manifest.Id != "" && metadata.Id != "" && !strings.EqualFold(manifest.Id, metadata.Id) {
+		logger.Warn(ctx, fmt.Sprintf("script metadata id(%s) not equal to store manifest id(%s), proceed with metadata id", metadata.Id, manifest.Id))
+	}
+
+	// 6) load (reload) the script plugin
+	if progressCallback != nil {
+		progressCallback(i18n.GetI18nManager().TranslateWox(ctx, "i18n:plugin_install_progress_loading"))
+	}
+
+	loadErr := GetPluginManager().ReloadPlugin(ctx, metadata)
+	if loadErr != nil {
+		logger.Error(ctx, fmt.Sprintf("failed to load script plugin %s(%s): %s", metadata.GetName(ctx), metadata.Version, loadErr.Error()))
+		// rollback
+		if hasBackup {
+			_ = os.Remove(newScriptPath)
+			_ = os.Rename(backupPath, existingScriptPath)
+			_ = os.RemoveAll(backupDir)
+		}
+		return fmt.Errorf("failed to load script plugin %s(%s): %s", metadata.GetName(ctx), metadata.Version, loadErr.Error())
+	}
+
+	// 7) success - cleanup backup
+	if hasBackup {
+		_ = os.RemoveAll(backupDir)
+	}
+
+	if progressCallback != nil {
+		progressCallback(i18n.GetI18nManager().TranslateWox(ctx, "i18n:plugin_install_progress_complete"))
+	}
+
+	logger.Info(ctx, fmt.Sprintf("script plugin %s(%s) installed", metadata.GetName(ctx), metadata.Version))
+	return nil
+}
+
+// downloadPluginFile bounds store downloads so a stalled network request cannot block plugin operations indefinitely.
+func downloadPluginFile(ctx context.Context, downloadURL string, dest string, timeout time.Duration, progressCallback func(downloaded int64, total int64)) error {
+	downloadCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	err := util.HttpDownloadWithProgress(downloadCtx, downloadURL, dest, progressCallback)
+	if err != nil {
+		if removeErr := os.Remove(dest); removeErr != nil && !os.IsNotExist(removeErr) {
+			logger.Warn(ctx, fmt.Sprintf("failed to remove incomplete plugin download %s: %s", dest, removeErr.Error()))
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+		return fmt.Errorf("plugin download timed out after %s: %w", timeout, err)
+	}
+	return err
+}
+
+func (s *Store) ParsePluginManifestFromLocal(ctx context.Context, filePath string) (Metadata, error) {
+	reader, err := zip.OpenReader(filePath)
+	if err != nil {
+		return Metadata{}, fmt.Errorf("failed to open wox plugin file: %s", err.Error())
+	}
+	defer reader.Close()
+
+	var pluginMetadata Metadata
+	for _, file := range reader.File {
+		if file.Name != "plugin.json" {
+			continue
+		}
+
+		rc, err := file.Open()
+		if err != nil {
+			return Metadata{}, fmt.Errorf("failed to read plugin.json: %s", err.Error())
+		}
+		defer rc.Close()
+
+		bytes, err := io.ReadAll(rc)
+		if err != nil {
+			return Metadata{}, fmt.Errorf("failed to read plugin.json content: %s", err.Error())
+		}
+
+		err = json.Unmarshal(bytes, &pluginMetadata)
+		if err != nil {
+			return Metadata{}, fmt.Errorf("failed to parse plugin.json: %s", err.Error())
+		}
+
+		break
+	}
+
+	if pluginMetadata.Id == "" {
+		return Metadata{}, fmt.Errorf("plugin.json not found or invalid")
+	}
+	if pluginMetadata.MinWoxVersion == "" {
+		// Local packages created before MinWoxVersion was enforced should keep the
+		// historical compatibility floor instead of failing with an empty version.
+		pluginMetadata.MinWoxVersion = defaultMinWoxVersion
+	}
+
+	return pluginMetadata, nil
+}
+
+func (s *Store) InstallFromLocal(ctx context.Context, filePath string) error {
+	return s.InstallFromLocalWithProgress(ctx, filePath, nil)
+}
+
+func (s *Store) InstallFromLocalWithProgress(ctx context.Context, filePath string, progressCallback InstallProgressCallback) error {
+	if err := ensureThirdPartyPluginsEnabled(ctx); err != nil {
+		return err
+	}
+	// Serialize local installs with remote installs and uninstalls for the same
+	// reasons as InstallWithProgress (issue #4401).
+	s.installMu.Lock()
+	defer s.installMu.Unlock()
+
+	pluginMetadata, err := s.ParsePluginManifestFromLocal(ctx, filePath)
+	if err != nil {
+		return err
+	}
+
+	// Check before unpacking so invalid or incompatible release packages cannot
+	// replace an existing plugin or leave a partial install behind.
+	if err := ensureWoxVersionSupported(pluginMetadata.GetName(ctx), pluginMetadata.MinWoxVersion); err != nil {
+		logger.Error(ctx, fmt.Sprintf("failed to install local plugin %s(%s): %s", pluginMetadata.GetName(ctx), pluginMetadata.Version, err.Error()))
+		return err
+	}
+
+	if err := GetPluginManager().EnsureHostStarted(ctx, ConvertToRuntime(pluginMetadata.Runtime)); err != nil {
+		logger.Error(ctx, fmt.Sprintf("failed to prepare %s runtime for local plugin %s(%s): %s", pluginMetadata.Runtime, pluginMetadata.GetName(ctx), pluginMetadata.Version, err.Error()))
+		return fmt.Errorf("failed to prepare %s runtime for local plugin %s(%s): %w", pluginMetadata.Runtime, pluginMetadata.GetName(ctx), pluginMetadata.Version, err)
+	}
+
+	// check if installed newer version
+	installedPlugin, exist := lo.Find(GetPluginManager().GetPluginInstances(), func(item *Instance) bool {
+		return item.Metadata.Id == pluginMetadata.Id
+	})
+	if exist {
+		logger.Info(ctx, fmt.Sprintf("found this plugin has installed %s(%s)", installedPlugin.Metadata.GetName(ctx), installedPlugin.Metadata.Version))
+		installedVersion, installedErr := semver.NewVersion(installedPlugin.Metadata.Version)
+		currentVersion, currentErr := semver.NewVersion(pluginMetadata.Version)
+		if installedErr == nil && currentErr == nil {
+			if installedVersion.GreaterThan(currentVersion) {
+				// if installed version is greater than local version, log it but allow installation to proceed (which will effectively downgrade the plugin)
+				logger.Info(ctx, fmt.Sprintf("installing older version %s(%s), because it's already installed with newer version(%s)", pluginMetadata.GetName(ctx), pluginMetadata.Version, installedPlugin.Metadata.Version))
+			}
+		}
+
+		uninstallErr := s.uninstallLocked(ctx, installedPlugin, true, true, nil)
+		if uninstallErr != nil {
+			logger.Error(ctx, fmt.Sprintf("failed to uninstall plugin %s(%s): %s", installedPlugin.Metadata.GetName(ctx), installedPlugin.Metadata.Version, uninstallErr.Error()))
+			return fmt.Errorf("failed to uninstall plugin %s(%s): %s", installedPlugin.Metadata.GetName(ctx), installedPlugin.Metadata.Version, uninstallErr.Error())
+		}
+	}
+
+	pluginDirectory := path.Join(util.GetLocation().GetPluginDirectory(), fmt.Sprintf("%s@%s", pluginMetadata.Id, pluginMetadata.Version))
+	directoryErr := util.GetLocation().EnsureDirectoryExist(pluginDirectory)
+	if directoryErr != nil {
+		logger.Error(ctx, fmt.Sprintf("failed to create plugin directory %s: %s", pluginDirectory, directoryErr.Error()))
+		return fmt.Errorf("failed to create plugin directory %s: %s", pluginDirectory, directoryErr.Error())
+	}
+
+	//unzip plugin
+	logger.Info(ctx, fmt.Sprintf("start to unzip plugin %s(%s)", pluginMetadata.GetName(ctx), pluginMetadata.Version))
+	if progressCallback != nil {
+		progressCallback(i18n.GetI18nManager().TranslateWox(ctx, "i18n:plugin_install_progress_extracting"))
+	}
+	unzipErr := util.Unzip(filePath, pluginDirectory)
+	if unzipErr != nil {
+		logger.Error(ctx, fmt.Sprintf("failed to unzip plugin %s(%s): %s", pluginMetadata.GetName(ctx), pluginMetadata.Version, unzipErr.Error()))
+		return fmt.Errorf("failed to unzip plugin %s(%s): %s", pluginMetadata.GetName(ctx), pluginMetadata.Version, unzipErr.Error())
+	}
+
+	//load plugin
+	logger.Info(ctx, fmt.Sprintf("start to load plugin %s(%s)", pluginMetadata.GetName(ctx), pluginMetadata.Version))
+	if progressCallback != nil {
+		progressCallback(i18n.GetI18nManager().TranslateWox(ctx, "i18n:plugin_install_progress_loading"))
+	}
+	loadErr := GetPluginManager().LoadPlugin(ctx, pluginDirectory)
+	if loadErr != nil {
+		logger.Error(ctx, fmt.Sprintf("failed to load plugin %s(%s): %s", pluginMetadata.GetName(ctx), pluginMetadata.Version, loadErr.Error()))
+
+		// remove plugin directory
+		// removeErr := os.RemoveAll(pluginDirectory)
+		// if removeErr != nil {
+		// 	logger.Error(ctx, fmt.Sprintf("failed to remove plugin directory %s: %s", pluginDirectory, removeErr.Error()))
+		// }
+
+		return fmt.Errorf("failed to load plugin %s(%s): %s", pluginMetadata.GetName(ctx), pluginMetadata.Version, loadErr.Error())
+	}
+
+	// notify UI to reload
+	reloadSettingPlugins(ctx)
+
+	if progressCallback != nil {
+		progressCallback(i18n.GetI18nManager().TranslateWox(ctx, "i18n:plugin_install_progress_complete"))
+	}
+
+	return nil
+}
+
+func (s *Store) Uninstall(ctx context.Context, plugin *Instance, skipCleanSetting bool) error {
+	return s.UninstallWithProgress(ctx, plugin, skipCleanSetting, nil)
+}
+
+// UninstallLocal removes a plugin without writing cloud-sync install oplogs.
+func (s *Store) UninstallLocal(ctx context.Context, plugin *Instance, skipCleanSetting bool) error {
+	return s.uninstallWithProgress(ctx, plugin, skipCleanSetting, nil, false)
+}
+
+func (s *Store) UninstallWithProgress(ctx context.Context, plugin *Instance, skipCleanSetting bool, progressCallback UninstallProgressCallback) error {
+	return s.uninstallWithProgress(ctx, plugin, skipCleanSetting, progressCallback, true)
+}
+
+// uninstallWithProgress shares the same uninstall path for UI actions and
+// cloud restores while controlling whether the removal is synced.
+func (s *Store) uninstallWithProgress(ctx context.Context, plugin *Instance, skipCleanSetting bool, progressCallback UninstallProgressCallback, syncInstall bool) error {
+	// Acquire the same lock used by InstallWithProgress so that an uninstall
+	// triggered directly from the UI cannot race with an in-progress install.
+	s.installMu.Lock()
+	defer s.installMu.Unlock()
+	if err := s.uninstallLocked(ctx, plugin, skipCleanSetting, false, progressCallback); err != nil {
+		return err
+	}
+	if syncInstall && !plugin.IsSystemPlugin && !plugin.IsDevPlugin {
+		s.logInstalledPluginDelete(ctx, plugin.Metadata.Id)
+	}
+	return nil
+}
+
+// uninstallLocked performs the actual uninstall work. It must only be called
+// while the caller already holds installMu, so it never tries to acquire the
+// lock itself. This lets InstallWithProgress call it internally without
+// deadlocking (InstallWithProgress already holds installMu).
+func (s *Store) uninstallLocked(ctx context.Context, plugin *Instance, skipCleanSetting bool, preserveCache bool, progressCallback UninstallProgressCallback) error {
+	// Compatibility plugins must not use the generic uninstall. Its failure path
+	// reloads the directory with ParseMetadata.
+	if plugin != nil {
+		for _, remover := range pluginRemovers {
+			handled, err := remover.Uninstall(ctx, plugin, skipCleanSetting, preserveCache, progressCallback)
+			if !handled {
+				continue
+			}
+			if err != nil {
+				logger.Error(ctx, fmt.Sprintf("failed to uninstall plugin %s(%s): %s", plugin.Metadata.GetName(ctx), plugin.Metadata.Version, err.Error()))
+				return err
+			}
+			reloadSettingPlugins(ctx)
+			return nil
+		}
+		if !IsSupportedRuntime(plugin.Metadata.Runtime) {
+			return fmt.Errorf("plugin runtime %s is not available", plugin.Metadata.Runtime)
+		}
+	}
+
+	logger.Info(ctx, fmt.Sprintf("start to uninstall plugin %s(%s)", plugin.Metadata.GetName(ctx), plugin.Metadata.Version))
+	pluginAlreadyUnloaded := false
+	reportProgress := func(key string, args ...any) {
+		if progressCallback == nil {
+			return
+		}
+		message := i18n.GetI18nManager().TranslateWox(ctx, "i18n:"+key)
+		if len(args) > 0 {
+			message = fmt.Sprintf(message, args...)
+		}
+		progressCallback(message)
+	}
+
+	reportProgress("plugin_uninstall_progress_preparing")
+
+	if plugin.IsDevPlugin {
+		reportProgress("plugin_uninstall_progress_removing")
+		var wpmPlugin *Instance
+		for _, instance := range GetPluginManager().GetPluginInstances() {
+			if instance.Metadata.Id == "e2c5f005-6c73-43c8-bc53-ab04def265b2" {
+				wpmPlugin = instance
+				break
+			}
+		}
+		if wpmPlugin != nil {
+			query, _ := newQueryInputWithPlugins("wpm dev.remove "+plugin.DevPluginDirectory, GetPluginManager().GetPluginInstances())
+			wpmPlugin.Plugin.Query(ctx, query)
+		}
+	} else {
+		// uninstall for non-dev plugins
+		if strings.EqualFold(plugin.Metadata.Runtime, string(PLUGIN_RUNTIME_SCRIPT)) {
+			reportProgress("plugin_uninstall_progress_removing")
+			// script plugin: delete the actual script file under user scripts directory
+			scriptPath := path.Join(util.GetLocation().GetUserScriptPluginsDirectory(), plugin.Metadata.Entry)
+			if util.IsFileExists(scriptPath) {
+				if removeErr := trash.MoveToTrash(scriptPath); removeErr != nil {
+					logger.Error(ctx, fmt.Sprintf("failed to remove script file %s: %s", scriptPath, removeErr.Error()))
+					return removeErr
+				}
+			}
+		} else if IsSingleFilePlugin(plugin.Metadata) {
+			reportProgress("plugin_uninstall_progress_unloading")
+			if removeErr := s.uninstallSingleFilePlugin(ctx, plugin); removeErr != nil {
+				return removeErr
+			}
+			pluginAlreadyUnloaded = true
+		} else {
+			reportProgress("plugin_uninstall_progress_unloading")
+			// Bug fix: native plugins can keep DLL/.node handles open until their unload callbacks run.
+			// Release the runtime first so Windows can move the plugin directory to trash successfully.
+			GetPluginManager().UnloadPlugin(ctx, plugin)
+			pluginAlreadyUnloaded = true
+
+			reportProgress("plugin_uninstall_progress_removing")
+			removeErr := trash.MoveToTrash(plugin.PluginDirectory)
+			if removeErr != nil {
+				runtime := ConvertToRuntime(plugin.Metadata.Runtime)
+				// Bug fix: the shared runtime process may keep native files mapped even after the plugin
+				// unload callback runs. Retry deletion while the host is stopped, then always start it back.
+				reportProgress("plugin_uninstall_progress_stopping_host")
+				plugin.Host.Stop(ctx)
+				reportProgress("plugin_uninstall_progress_retrying_removal")
+				removeErr = moveToTrashWithRetry(ctx, plugin.PluginDirectory)
+				restartErr := GetPluginManager().RestartHostForRuntime(ctx, runtime, []string{plugin.Metadata.Id}, progressCallback)
+				if restartErr != nil {
+					logger.Error(ctx, fmt.Sprintf("failed to restart %s host while uninstalling plugin %s(%s): %s", runtime, plugin.Metadata.GetName(ctx), plugin.Metadata.Version, restartErr.Error()))
+				}
+			}
+			if removeErr != nil {
+				logger.Error(ctx, fmt.Sprintf("failed to remove plugin directory %s: %s", plugin.PluginDirectory, removeErr.Error()))
+				// If deletion still fails, reload the plugin so the current session does not stay half-uninstalled.
+				reportProgress("plugin_uninstall_progress_restoring_plugin", plugin.Metadata.GetName(ctx))
+				if restoreErr := GetPluginManager().LoadPlugin(ctx, plugin.PluginDirectory); restoreErr != nil {
+					logger.Error(ctx, fmt.Sprintf("failed to restore plugin %s(%s) after uninstall rollback: %s", plugin.Metadata.GetName(ctx), plugin.Metadata.Version, restoreErr.Error()))
+				}
+				reloadSettingPlugins(ctx)
+				return removeErr
+			}
+		}
+	}
+
+	if !skipCleanSetting {
+		reportProgress("plugin_uninstall_progress_cleaning_settings")
+		if db := database.GetDB(); db != nil {
+			if err := setting.NewPluginSettingStore(db, plugin.Metadata.Id).DeleteAll(); err != nil {
+				logger.Error(ctx, fmt.Sprintf("failed to delete plugin settings %s(%s): %s", plugin.Metadata.GetName(ctx), plugin.Metadata.Version, err.Error()))
+			}
+		}
+	}
+
+	// Replacing plugin files during an upgrade or reinstall must retain the ID-based cache.
+	if !preserveCache {
+		reportProgress("plugin_uninstall_progress_cleaning_cache")
+		if cacheErr := util.GetLocation().RemovePluginCacheDirectory(plugin.Metadata.Id); cacheErr != nil {
+			logger.Error(ctx, fmt.Sprintf("failed to delete plugin cache %s(%s): %s", plugin.Metadata.GetName(ctx), plugin.Metadata.Version, cacheErr.Error()))
+		}
+	}
+
+	if !pluginAlreadyUnloaded {
+		reportProgress("plugin_uninstall_progress_unloading")
+		GetPluginManager().UnloadPlugin(ctx, plugin)
+	}
+	reloadSettingPlugins(ctx)
+
+	reportProgress("plugin_uninstall_progress_complete")
+
+	return nil
+}
+
+// moveToTrashWithRetry gives native runtime shutdown and Windows Shell time to release file handles.
+func moveToTrashWithRetry(ctx context.Context, pluginDirectory string) error {
+	const maxAttempts = 4
+	retryDelays := [...]time.Duration{
+		100 * time.Millisecond,
+		300 * time.Millisecond,
+		1 * time.Second,
+	}
+
+	var removeErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		removeErr = trash.MoveToTrash(pluginDirectory)
+		if removeErr == nil || attempt == maxAttempts {
+			return removeErr
+		}
+
+		delay := retryDelays[attempt-1]
+		logger.Warn(ctx, fmt.Sprintf("failed to move plugin directory %s to trash on attempt %d/%d: %s; retrying in %s", pluginDirectory, attempt, maxAttempts, removeErr, delay))
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return fmt.Errorf("trash retry canceled: %w", ctx.Err())
+		case <-timer.C:
+		}
+	}
+
+	return removeErr
+}

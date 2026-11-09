@@ -1,0 +1,837 @@
+package keyboard
+
+/*
+#include <stdint.h>
+
+int woxKeyboardEnsureThread(void);
+int woxKeyboardRegisterHotkey(int id, unsigned int modifiers, unsigned int vkCode, unsigned long *errorCodeOut);
+int woxKeyboardUnregisterHotkey(int id, unsigned long *errorCodeOut);
+int woxKeyboardSetRawKeyboardHookEnabled(int enabled, unsigned long *errorCodeOut);
+void woxKeyboardSendWinMaskKey(void);
+*/
+import "C"
+
+import (
+	"fmt"
+	"sync"
+	"time"
+	"wox/util"
+)
+
+const (
+	rawEventKeyDown = 0
+	rawEventKeyUp   = 1
+
+	// Retries cover a chord this process just released. Windows can still report
+	// it as registered for a short time. A chord another program owns is tried
+	// once, because later attempts do not succeed.
+	hotkeyRegistrationMaxAttempts       = 5
+	hotkeyRegistrationRetryDelay        = 75 * time.Millisecond
+	hotkeyReleaseRetryWindow            = time.Second
+	windowsErrorHotkeyAlreadyRegistered = 1409
+)
+
+type hotkeyRegistration struct {
+	id        int
+	modifiers Modifier
+	vk        uint32
+	once      sync.Once
+}
+
+type releasedHotkeyChord struct {
+	modifiers Modifier
+	vk        uint32
+}
+
+type rawKeySubscription struct {
+	id   int
+	once sync.Once
+}
+
+var (
+	managerMu        sync.Mutex
+	nextHotkeyID     = 1
+	nextListenerID   = 1
+	hotkeyCallbacks  = map[int]func(){}
+	rawKeyListeners  = map[int]RawKeyHandler{}
+	rawHookIsEnabled bool
+	// releasedHotkeys records chords this process unregistered, keyed by modifier and virtual key.
+	releasedHotkeys sync.Map
+)
+
+func RegisterGlobalHotkey(modifiers Modifier, key Key, callback func()) (HotkeyRegistration, error) {
+	return registerGlobalHotkey(modifiers, key, callback, hotkeyRegistrationMaxAttempts)
+}
+
+// registrationAttempts retries only a chord this process released within the last second.
+func registrationAttempts(modifiers Modifier, vk uint32, requested int) int {
+	if requested <= 1 || !hotkeyReleasedRecently(modifiers, vk) {
+		return 1
+	}
+	return requested
+}
+
+func noteHotkeyReleased(modifiers Modifier, vk uint32) {
+	releasedHotkeys.Store(releasedHotkeyChord{modifiers: modifiers, vk: vk}, time.Now())
+}
+
+func hotkeyReleasedRecently(modifiers Modifier, vk uint32) bool {
+	value, ok := releasedHotkeys.Load(releasedHotkeyChord{modifiers: modifiers, vk: vk})
+	if !ok {
+		return false
+	}
+	releasedAt, ok := value.(time.Time)
+	if !ok || time.Since(releasedAt) > hotkeyReleaseRetryWindow {
+		releasedHotkeys.Delete(releasedHotkeyChord{modifiers: modifiers, vk: vk})
+		return false
+	}
+	return true
+}
+
+// TryRegisterGlobalHotkey probes a combination once. Availability checks use
+// this so a combo already owned by another app is not retried as a stale release.
+func TryRegisterGlobalHotkey(modifiers Modifier, key Key, callback func()) (HotkeyRegistration, error) {
+	return registerGlobalHotkey(modifiers, key, callback, 1)
+}
+
+func registerGlobalHotkey(modifiers Modifier, key Key, callback func(), maxAttempts int) (HotkeyRegistration, error) {
+	vkCode, err := keyToWindowsVK(key)
+	if err != nil {
+		return nil, err
+	}
+	// winlogon locks the session on Win+L even when this process swallows L.
+	// Refuse the chord before RegisterHotKey so a successful OS registration
+	// cannot look like Wox owns the lock shortcut.
+	if key == KeyL && modifiers == ModifierSuper {
+		return nil, fmt.Errorf("failed to register hotkey (err=%d)", windowsErrorHotkeyAlreadyRegistered)
+	}
+
+	managerMu.Lock()
+	id := nextHotkeyID
+	nextHotkeyID++
+	managerMu.Unlock()
+
+	if err := ensureNativeKeyboardThread(); err != nil {
+		return nil, err
+	}
+
+	hookFallback := windowsWinHookFallbackCombo(modifiers, key)
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	maxAttempts = registrationAttempts(modifiers, uint32(vkCode), maxAttempts)
+
+	var errCode C.ulong
+	registered := false
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		ok := C.woxKeyboardRegisterHotkey(C.int(id), C.uint(modifiers), C.uint(vkCode), &errCode)
+		if ok != 0 {
+			registered = true
+			break
+		}
+		if uint32(errCode) != windowsErrorHotkeyAlreadyRegistered || attempt == maxAttempts {
+			break
+		}
+		// A Win chord the shell will not release is not a stale probe. Retrying
+		// only delays the hook fallback below.
+		if hookFallback {
+			break
+		}
+		// This process just released the chord. Windows may still report it as registered.
+		time.Sleep(hotkeyRegistrationRetryDelay)
+	}
+	if !registered {
+		if uint32(errCode) == windowsErrorHotkeyAlreadyRegistered && hookFallback {
+			util.GetLogger().Info(util.NewTraceContext(), fmt.Sprintf("hotkey is reserved by the Windows shell, falling back to keyboard hook: modifiers=%d key=%d", modifiers, key))
+			return registerHookHotkey(modifiers, key, callback)
+		}
+		return nil, fmt.Errorf("failed to register hotkey (err=%d)", uint32(errCode))
+	}
+
+	managerMu.Lock()
+	hotkeyCallbacks[id] = callback
+	managerMu.Unlock()
+
+	return &hotkeyRegistration{id: id, modifiers: modifiers, vk: uint32(vkCode)}, nil
+}
+
+// windowsWinHookFallbackCombo reports a Win chord that may be taken over by the
+// low-level hook when RegisterHotKey returns ERROR_HOTKEY_ALREADY_REGISTERED.
+// Exact Win+L is excluded: winlogon locks the workstation even if this process
+// swallows L, so accepting it would look successful while the machine still locks.
+func windowsWinHookFallbackCombo(modifiers Modifier, key Key) bool {
+	if modifiers&ModifierSuper == 0 {
+		return false
+	}
+	return !(key == KeyL && modifiers == ModifierSuper)
+}
+
+// probeRegisterHotkey asks RegisterHotKey once and releases the chord when the
+// OS accepts it. Tests use this to see a taken Win chord before the hook
+// fallback hides that 1409.
+func probeRegisterHotkey(modifiers Modifier, key Key) (bool, uint32, error) {
+	vkCode, err := keyToWindowsVK(key)
+	if err != nil {
+		return false, 0, err
+	}
+	if err := ensureNativeKeyboardThread(); err != nil {
+		return false, 0, err
+	}
+
+	managerMu.Lock()
+	id := nextHotkeyID
+	nextHotkeyID++
+	managerMu.Unlock()
+
+	var errCode C.ulong
+	ok := C.woxKeyboardRegisterHotkey(C.int(id), C.uint(modifiers), C.uint(vkCode), &errCode)
+	if ok == 0 {
+		return false, uint32(errCode), nil
+	}
+	var unregisterErr C.ulong
+	if C.woxKeyboardUnregisterHotkey(C.int(id), &unregisterErr) == 0 {
+		return true, uint32(unregisterErr), fmt.Errorf("failed to unregister probed hotkey (err=%d)", uint32(unregisterErr))
+	}
+	return true, 0, nil
+}
+
+// hookHotkey emulates RegisterHotKey through the WH_KEYBOARD_LL hook for Win
+// chords the shell refuses to hand out. It consumes the main key while the exact
+// modifier set is held, fires once per physical press (MOD_NOREPEAT semantics),
+// and masks the Win release so Explorer does not open the Start menu. Unbound
+// Win chords are left untouched, so Win+E and Win+R keep working until the user
+// assigns them.
+//
+// Unlike RegisterHotKey, the hook is subject to UIPI: it receives no events while
+// an elevated window is in the foreground unless Wox itself runs elevated.
+type hookHotkey struct {
+	modifiers    Modifier
+	key          Key
+	callback     func()
+	sendWinMask  func()
+	mu           sync.Mutex
+	keyHeld      bool
+	subscription RawKeySubscription
+	once         sync.Once
+}
+
+func registerHookHotkey(modifiers Modifier, key Key, callback func()) (HotkeyRegistration, error) {
+	hotkey := &hookHotkey{
+		modifiers:   modifiers,
+		key:         key,
+		callback:    callback,
+		sendWinMask: func() { C.woxKeyboardSendWinMaskKey() },
+	}
+	subscription, err := AddRawKeyListener(hotkey.handle)
+	if err != nil {
+		return nil, fmt.Errorf("failed to register hotkey through keyboard hook: %w", err)
+	}
+	hotkey.subscription = subscription
+	return hotkey, nil
+}
+
+// handle consumes both the press and the matching release of the main key so
+// the foreground application never sees half of the key sequence.
+func (h *hookHotkey) handle(event RawKeyEvent) bool {
+	if event.Key != h.key {
+		return false
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if event.Type == EventTypeKeyUp {
+		if !h.keyHeld {
+			return false
+		}
+		h.keyHeld = false
+		return true
+	}
+
+	// Auto-repeat while the key stays held: swallow it without re-triggering.
+	if h.keyHeld {
+		return true
+	}
+	if event.Modifiers != h.modifiers {
+		return false
+	}
+
+	h.keyHeld = true
+	h.sendWinMask()
+	util.Go(util.NewTraceContext(), "hook hotkey callback", h.callback)
+	return true
+}
+
+func (h *hookHotkey) Unregister() error {
+	if h == nil {
+		return nil
+	}
+
+	var unregisterErr error
+	h.once.Do(func() {
+		if h.subscription != nil {
+			unregisterErr = h.subscription.Close()
+		}
+	})
+	return unregisterErr
+}
+
+func (r *hotkeyRegistration) Unregister() error {
+	if r == nil {
+		return nil
+	}
+
+	var unregisterErr error
+	r.once.Do(func() {
+		managerMu.Lock()
+		delete(hotkeyCallbacks, r.id)
+		managerMu.Unlock()
+
+		var errCode C.ulong
+		ok := C.woxKeyboardUnregisterHotkey(C.int(r.id), &errCode)
+		if ok == 0 {
+			unregisterErr = fmt.Errorf("failed to unregister hotkey (err=%d)", uint32(errCode))
+			return
+		}
+		noteHotkeyReleased(r.modifiers, r.vk)
+	})
+	return unregisterErr
+}
+
+func AddRawKeyListener(handler RawKeyHandler) (RawKeySubscription, error) {
+	if handler == nil {
+		return nil, fmt.Errorf("raw key handler is required")
+	}
+
+	if err := ensureNativeKeyboardThread(); err != nil {
+		return nil, err
+	}
+
+	managerMu.Lock()
+	id := nextListenerID
+	nextListenerID++
+	rawKeyListeners[id] = handler
+	managerMu.Unlock()
+
+	// The native hook thread can be recreated independently of Go-side listener
+	// state in dev rebuild flows. Enabling is idempotent on the native side, so
+	// confirm it for every new listener instead of trusting the cached flag.
+	if err := setRawHookEnabled(true); err != nil {
+		managerMu.Lock()
+		delete(rawKeyListeners, id)
+		managerMu.Unlock()
+		return nil, err
+	}
+
+	return &rawKeySubscription{id: id}, nil
+}
+
+func (s *rawKeySubscription) Close() error {
+	if s == nil {
+		return nil
+	}
+
+	var closeErr error
+	s.once.Do(func() {
+		managerMu.Lock()
+		delete(rawKeyListeners, s.id)
+		needDisable := rawHookIsEnabled && len(rawKeyListeners) == 0
+		managerMu.Unlock()
+
+		if needDisable {
+			closeErr = setRawHookEnabled(false)
+		}
+	})
+	return closeErr
+}
+
+func ensureNativeKeyboardThread() error {
+	ok := C.woxKeyboardEnsureThread()
+	if ok == 0 {
+		return fmt.Errorf("failed to initialize native keyboard thread")
+	}
+	return nil
+}
+
+func setRawHookEnabled(enabled bool) error {
+	var errCode C.ulong
+	value := 0
+	if enabled {
+		value = 1
+	}
+	ok := C.woxKeyboardSetRawKeyboardHookEnabled(C.int(value), &errCode)
+	if ok == 0 {
+		return fmt.Errorf("failed to toggle raw keyboard hook (err=%d)", uint32(errCode))
+	}
+
+	managerMu.Lock()
+	rawHookIsEnabled = enabled
+	managerMu.Unlock()
+	return nil
+}
+
+//export keyboardHotkeyTriggeredCGO
+func keyboardHotkeyTriggeredCGO(id C.int) {
+	managerMu.Lock()
+	callback := hotkeyCallbacks[int(id)]
+	managerMu.Unlock()
+	if callback == nil {
+		return
+	}
+
+	util.Go(util.NewTraceContext(), fmt.Sprintf("global hotkey %d callback", int(id)), func() {
+		callback()
+	})
+}
+
+//export keyboardHookEventCGO
+func keyboardHookEventCGO(eventKind C.int, vkCode C.uint, modifiers C.uint, scanCode C.uint, flags C.uint) C.int {
+	key := refineWindowsModifierKey(windowsVKToKey(uint32(vkCode)), uint32(vkCode), uint32(scanCode), uint32(flags))
+	event := RawKeyEvent{
+		Key:           key,
+		Character:     key.Character(),
+		Modifiers:     Modifier(modifiers),
+		NativeKeyCode: uint32(vkCode),
+	}
+	if int(eventKind) == rawEventKeyUp {
+		event.Type = EventTypeKeyUp
+	} else {
+		event.Type = EventTypeKeyDown
+	}
+
+	managerMu.Lock()
+	listeners := make([]RawKeyHandler, 0, len(rawKeyListeners))
+	for _, listener := range rawKeyListeners {
+		listeners = append(listeners, listener)
+	}
+	managerMu.Unlock()
+
+	consume := false
+	for _, listener := range listeners {
+		if listener != nil && listener(event) {
+			consume = true
+		}
+	}
+
+	if consume {
+		return 1
+	}
+	return 0
+}
+
+func keyToWindowsVK(key Key) (uint32, error) {
+	switch key {
+	case KeyA:
+		return 'A', nil
+	case KeyB:
+		return 'B', nil
+	case KeyC:
+		return 'C', nil
+	case KeyD:
+		return 'D', nil
+	case KeyE:
+		return 'E', nil
+	case KeyF:
+		return 'F', nil
+	case KeyG:
+		return 'G', nil
+	case KeyH:
+		return 'H', nil
+	case KeyI:
+		return 'I', nil
+	case KeyJ:
+		return 'J', nil
+	case KeyK:
+		return 'K', nil
+	case KeyL:
+		return 'L', nil
+	case KeyM:
+		return 'M', nil
+	case KeyN:
+		return 'N', nil
+	case KeyO:
+		return 'O', nil
+	case KeyP:
+		return 'P', nil
+	case KeyQ:
+		return 'Q', nil
+	case KeyR:
+		return 'R', nil
+	case KeyS:
+		return 'S', nil
+	case KeyT:
+		return 'T', nil
+	case KeyU:
+		return 'U', nil
+	case KeyV:
+		return 'V', nil
+	case KeyW:
+		return 'W', nil
+	case KeyX:
+		return 'X', nil
+	case KeyY:
+		return 'Y', nil
+	case KeyZ:
+		return 'Z', nil
+	case Key0:
+		return '0', nil
+	case Key1:
+		return '1', nil
+	case Key2:
+		return '2', nil
+	case Key3:
+		return '3', nil
+	case Key4:
+		return '4', nil
+	case Key5:
+		return '5', nil
+	case Key6:
+		return '6', nil
+	case Key7:
+		return '7', nil
+	case Key8:
+		return '8', nil
+	case Key9:
+		return '9', nil
+	case KeySpace:
+		return 0x20, nil
+	case KeyReturn:
+		return 0x0D, nil
+	case KeyEscape:
+		return 0x1B, nil
+	case KeyTab:
+		return 0x09, nil
+	case KeyDelete:
+		return 0x2E, nil
+	case KeyLeft:
+		return 0x25, nil
+	case KeyRight:
+		return 0x27, nil
+	case KeyUp:
+		return 0x26, nil
+	case KeyDown:
+		return 0x28, nil
+	case KeyF1:
+		return 0x70, nil
+	case KeyF2:
+		return 0x71, nil
+	case KeyF3:
+		return 0x72, nil
+	case KeyF4:
+		return 0x73, nil
+	case KeyF5:
+		return 0x74, nil
+	case KeyF6:
+		return 0x75, nil
+	case KeyF7:
+		return 0x76, nil
+	case KeyF8:
+		return 0x77, nil
+	case KeyF9:
+		return 0x78, nil
+	case KeyF10:
+		return 0x79, nil
+	case KeyF11:
+		return 0x7A, nil
+	case KeyF12:
+		return 0x7B, nil
+	case KeyF13:
+		return 0x7C, nil
+	case KeyF14:
+		return 0x7D, nil
+	case KeyF15:
+		return 0x7E, nil
+	case KeyF16:
+		return 0x7F, nil
+	case KeyF17:
+		return 0x80, nil
+	case KeyF18:
+		return 0x81, nil
+	case KeyF19:
+		return 0x82, nil
+	case KeyF20:
+		return 0x83, nil
+	case KeyF21:
+		return 0x84, nil
+	case KeyF22:
+		return 0x85, nil
+	case KeyF23:
+		return 0x86, nil
+	case KeyF24:
+		return 0x87, nil
+	case KeyCapsLock:
+		return 0x14, nil
+	case KeyCtrl:
+		return 0x11, nil
+	case KeyShift:
+		return 0x10, nil
+	case KeyAlt:
+		return 0x12, nil
+	case KeySuper:
+		return 0x5B, nil
+	case KeyLeftCtrl:
+		return 0xA2, nil
+	case KeyRightCtrl:
+		return 0xA3, nil
+	case KeyLeftShift:
+		return 0xA0, nil
+	case KeyRightShift:
+		return 0xA1, nil
+	case KeyLeftAlt:
+		return 0xA4, nil
+	case KeyRightAlt:
+		return 0xA5, nil
+	case KeyLeftSuper:
+		return 0x5B, nil
+	case KeyRightSuper:
+		return 0x5C, nil
+	case KeyBackquote:
+		return 0xC0, nil
+	case KeyMinus:
+		return 0xBD, nil
+	case KeyEqual:
+		return 0xBB, nil
+	case KeyLeftBracket:
+		return 0xDB, nil
+	case KeyRightBracket:
+		return 0xDD, nil
+	case KeyBackslash:
+		return 0xDC, nil
+	case KeySemicolon:
+		return 0xBA, nil
+	case KeyApostrophe:
+		return 0xDE, nil
+	case KeyComma:
+		return 0xBC, nil
+	case KeyPeriod:
+		return 0xBE, nil
+	case KeySlash:
+		return 0xBF, nil
+	default:
+		return 0, fmt.Errorf("unsupported Windows hotkey key: %d", key)
+	}
+}
+
+func windowsVKToKey(vkCode uint32) Key {
+	switch vkCode {
+	case 'A':
+		return KeyA
+	case 'B':
+		return KeyB
+	case 'C':
+		return KeyC
+	case 'D':
+		return KeyD
+	case 'E':
+		return KeyE
+	case 'F':
+		return KeyF
+	case 'G':
+		return KeyG
+	case 'H':
+		return KeyH
+	case 'I':
+		return KeyI
+	case 'J':
+		return KeyJ
+	case 'K':
+		return KeyK
+	case 'L':
+		return KeyL
+	case 'M':
+		return KeyM
+	case 'N':
+		return KeyN
+	case 'O':
+		return KeyO
+	case 'P':
+		return KeyP
+	case 'Q':
+		return KeyQ
+	case 'R':
+		return KeyR
+	case 'S':
+		return KeyS
+	case 'T':
+		return KeyT
+	case 'U':
+		return KeyU
+	case 'V':
+		return KeyV
+	case 'W':
+		return KeyW
+	case 'X':
+		return KeyX
+	case 'Y':
+		return KeyY
+	case 'Z':
+		return KeyZ
+	case '0':
+		return Key0
+	case '1':
+		return Key1
+	case '2':
+		return Key2
+	case '3':
+		return Key3
+	case '4':
+		return Key4
+	case '5':
+		return Key5
+	case '6':
+		return Key6
+	case '7':
+		return Key7
+	case '8':
+		return Key8
+	case '9':
+		return Key9
+	case 0x20:
+		return KeySpace
+	case 0x0D:
+		return KeyReturn
+	case 0x1B:
+		return KeyEscape
+	case 0x09:
+		return KeyTab
+	case 0x2E:
+		return KeyDelete
+	case 0x25:
+		return KeyLeft
+	case 0x27:
+		return KeyRight
+	case 0x26:
+		return KeyUp
+	case 0x28:
+		return KeyDown
+	case 0x70:
+		return KeyF1
+	case 0x71:
+		return KeyF2
+	case 0x72:
+		return KeyF3
+	case 0x73:
+		return KeyF4
+	case 0x74:
+		return KeyF5
+	case 0x75:
+		return KeyF6
+	case 0x76:
+		return KeyF7
+	case 0x77:
+		return KeyF8
+	case 0x78:
+		return KeyF9
+	case 0x79:
+		return KeyF10
+	case 0x7A:
+		return KeyF11
+	case 0x7B:
+		return KeyF12
+	case 0x7C:
+		return KeyF13
+	case 0x7D:
+		return KeyF14
+	case 0x7E:
+		return KeyF15
+	case 0x7F:
+		return KeyF16
+	case 0x80:
+		return KeyF17
+	case 0x81:
+		return KeyF18
+	case 0x82:
+		return KeyF19
+	case 0x83:
+		return KeyF20
+	case 0x84:
+		return KeyF21
+	case 0x85:
+		return KeyF22
+	case 0x86:
+		return KeyF23
+	case 0x87:
+		return KeyF24
+	case 0x14:
+		return KeyCapsLock
+	case 0xA2:
+		return KeyLeftCtrl
+	case 0xA3:
+		return KeyRightCtrl
+	case 0x11:
+		return KeyCtrl
+	case 0xA0:
+		return KeyLeftShift
+	case 0xA1:
+		return KeyRightShift
+	case 0x10:
+		return KeyShift
+	case 0xA4:
+		return KeyLeftAlt
+	case 0xA5:
+		return KeyRightAlt
+	case 0x12:
+		return KeyAlt
+	case 0x5B:
+		return KeyLeftSuper
+	case 0x5C:
+		return KeyRightSuper
+	case 0xC0:
+		return KeyBackquote
+	case 0xBD:
+		return KeyMinus
+	case 0xBB:
+		return KeyEqual
+	case 0xDB:
+		return KeyLeftBracket
+	case 0xDD:
+		return KeyRightBracket
+	case 0xDC:
+		return KeyBackslash
+	case 0xBA:
+		return KeySemicolon
+	case 0xDE:
+		return KeyApostrophe
+	case 0xBC:
+		return KeyComma
+	case 0xBE:
+		return KeyPeriod
+	case 0xBF:
+		return KeySlash
+	default:
+		return KeyUnknown
+	}
+}
+
+const (
+	windowsVKShift        = 0x10
+	windowsVKControl      = 0x11
+	windowsVKMenu         = 0x12
+	windowsScanRightShift = 0x36
+	windowsLLKHFExtended  = 0x01
+)
+
+// refineWindowsModifierKey maps generic VK_SHIFT/CONTROL/MENU to the physical
+// left or right key. The low-level hook often reports 0x10 on Shift down and
+// VK_LSHIFT only on Shift up, which would otherwise break hold chords.
+func refineWindowsModifierKey(key Key, vkCode uint32, scanCode uint32, flags uint32) Key {
+	switch vkCode {
+	case windowsVKShift:
+		if scanCode == windowsScanRightShift {
+			return KeyRightShift
+		}
+		return KeyLeftShift
+	case windowsVKControl:
+		if flags&windowsLLKHFExtended != 0 {
+			return KeyRightCtrl
+		}
+		return KeyLeftCtrl
+	case windowsVKMenu:
+		if flags&windowsLLKHFExtended != 0 {
+			return KeyRightAlt
+		}
+		return KeyLeftAlt
+	default:
+		return key
+	}
+}

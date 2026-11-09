@@ -1,0 +1,1226 @@
+package sys
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path"
+	"runtime/pprof"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+	"wox/common"
+	"wox/common/icons"
+	"wox/i18n"
+	"wox/plugin"
+	"wox/setting"
+	"wox/ui"
+	"wox/updater"
+	"wox/util"
+	"wox/util/clipboard"
+	"wox/util/fuzzymatch"
+	"wox/util/notifier"
+	"wox/util/overlay/confettioverlay"
+	"wox/util/timetracking"
+
+	"github.com/google/uuid"
+)
+
+var sysIcon = icons.Get(icons.PluginSys)
+
+var setVolumeAliases = []string{"set volume", "volume", "音量", "设置音量"}
+
+const sysQueryResultLimit = 30
+
+func init() {
+	plugin.AllSystemPlugin = append(plugin.AllSystemPlugin, &SysPlugin{})
+}
+
+type SysPlugin struct {
+	api                  plugin.API
+	commandsMu           sync.RWMutex
+	commands             []SysCommand
+	commandSearchIndexMu sync.RWMutex
+	commandSearchIndexes map[i18n.LangCode][][]*fuzzymatch.PreparedText
+	// omarchyGuards re-checks Omarchy menu visibility without blocking a query.
+	omarchyGuards *omarchyGuardCache
+}
+
+type SysCommand struct {
+	QueryHint   *common.QueryHint
+	ID          string
+	Title       string
+	SubTitle    string
+	Icon        common.WoxImage
+	Aliases     []string
+	SupportedOS []string
+	IsAvailable func() bool
+	// SkipEmptyQuery keeps a large external catalog out of the unfiltered system list.
+	SkipEmptyQuery         bool
+	BuildContextData       func(query plugin.Query) common.ContextData
+	BuildTitle             func(ctx context.Context, query plugin.Query) string
+	BuildSubTitle          func(ctx context.Context, query plugin.Query) string
+	ActionName             string
+	ActionIcon             common.WoxImage
+	PreventHideAfterAction bool
+	Action                 func(ctx context.Context, actionContext plugin.ActionContext)
+}
+
+const (
+	sysCommandIDContextKey        = "commandId"
+	sysCommandConfirmedContextKey = "confirmed"
+	sysCommandVolumeContextKey    = "volume"
+)
+
+func (r *SysPlugin) GetMetadata() plugin.Metadata {
+	return plugin.Metadata{
+		Id:            common.SysPluginID,
+		Name:          "i18n:plugin_sys_plugin_name",
+		Author:        "Wox Launcher",
+		Website:       "https://github.com/Wox-launcher/Wox",
+		Version:       "1.0.0",
+		MinWoxVersion: "2.0.0",
+		Runtime:       "Go",
+		Description:   "i18n:plugin_sys_plugin_description",
+		Icon:          sysIcon.String(),
+		Entry:         "",
+		TriggerKeywords: []string{
+			"*",
+		},
+		Commands: r.getMetadataCommands(),
+		SupportedOS: []string{
+			"Windows",
+			"Macos",
+			"Linux",
+		},
+		Features: []plugin.MetadataFeature{
+			{
+				Name: plugin.MetadataFeatureMRU,
+			},
+		},
+	}
+}
+
+func (r *SysPlugin) getMetadataCommands() []plugin.MetadataCommand {
+	commands := r.buildCommands()
+	metadataCommands := make([]plugin.MetadataCommand, 0, len(commands))
+	for _, command := range commands {
+		if command.ID == "" || !r.isCommandAvailable(command) {
+			continue
+		}
+		metadataCommands = append(metadataCommands, plugin.MetadataCommand{
+			Command:     command.ID,
+			Aliases:     command.Aliases,
+			QueryHint:   command.QueryHint.Clone(),
+			Description: common.I18nString(command.Title),
+		})
+	}
+	return metadataCommands
+}
+
+func (r *SysPlugin) Init(ctx context.Context, initParams plugin.InitParams) {
+	r.api = initParams.API
+	r.commands = r.buildCommands()
+
+	if util.IsDev() {
+		r.commands = append(r.commands, r.buildDevCommands()...)
+	}
+	// Omarchy commands come from the installed menu, so they have to join the
+	// list before the search index is built.
+	r.appendOmarchyCommands(ctx)
+	r.commandsMu.RLock()
+	r.getCommandSearchIndex(ctx)
+	r.commandsMu.RUnlock()
+
+	r.api.OnMRURestore(ctx, r.handleMRURestore)
+}
+
+func (r *SysPlugin) buildCommands() []SysCommand {
+	return []SysCommand{
+		{
+			ID:      "confetti",
+			Title:   "i18n:plugin_sys_confetti",
+			Icon:    common.NewWoxImageEmoji("🎉"),
+			Aliases: []string{"confetti", "celebrate", "party", "撒花", "庆祝"},
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				if err := confettioverlay.Show(); err != nil {
+					r.api.Log(ctx, plugin.LogLevelError, "failed to show confetti: "+err.Error())
+				}
+			},
+		},
+		{
+			ID:          "lock_computer",
+			Title:       "i18n:plugin_sys_lock_computer",
+			Icon:        icons.Get(icons.ActionLock),
+			Aliases:     []string{"lock screen", "lock computer", "锁屏", "锁定"},
+			SupportedOS: []string{util.PlatformWindows, util.PlatformMacOS, util.PlatformLinux},
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				r.runSystemAction(ctx, "lock_computer", runLockCommand)
+			},
+		},
+		{
+			ID:          "empty_trash",
+			Title:       "i18n:plugin_sys_empty_trash",
+			Icon:        icons.Get(icons.ActionDelete),
+			Aliases:     []string{"empty recycle bin", "trash", "recycle bin", "清空回收站", "清空废纸篓"},
+			SupportedOS: []string{util.PlatformWindows, util.PlatformMacOS, util.PlatformLinux},
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				r.runSystemAction(ctx, "empty_trash", runEmptyTrashCommand)
+			},
+		},
+		{
+			ID:                     "restart_wox",
+			Title:                  "i18n:plugin_sys_restart_wox",
+			Icon:                   icons.Get(icons.ControlRefresh),
+			Aliases:                []string{"restart wox", "relaunch wox", "重启 Wox", "重新启动 Wox"},
+			PreventHideAfterAction: true,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				if err := ui.GetUIManager().RestartApp(ctx); err != nil {
+					util.GetLogger().Error(ctx, fmt.Sprintf("failed to restart Wox: %s", err))
+					r.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(r.api.GetTranslation(ctx, "plugin_sys_restart_wox_failed"), err.Error())})
+					return
+				}
+			},
+		},
+		{
+			ID:      "quit_wox",
+			Title:   "i18n:plugin_sys_quit_wox",
+			Icon:    icons.Get(icons.ActionExit),
+			Aliases: []string{"exit wox", "quit", "退出", "退出 wox"},
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				ui.GetUIManager().ExitApp(ctx)
+			},
+		},
+		{
+			ID:                     "shutdown_computer",
+			Title:                  "i18n:plugin_sys_shutdown_computer",
+			Icon:                   icons.Get(icons.SysShutdown),
+			Aliases:                []string{"shutdown", "shut down", "power off", "关机", "关闭电脑"},
+			PreventHideAfterAction: true,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				r.handleConfirmedSystemCommand(ctx, actionContext, "shutdown_computer")
+			},
+		},
+		{
+			ID:                     "restart_computer",
+			Title:                  "i18n:plugin_sys_restart_computer",
+			Icon:                   icons.Get(icons.ActionUpdate),
+			Aliases:                []string{"restart", "reboot", "重启", "重启电脑"},
+			PreventHideAfterAction: true,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				r.handleConfirmedSystemCommand(ctx, actionContext, "restart_computer")
+			},
+		},
+		{
+			ID:                     "open_wox_settings",
+			Title:                  "i18n:plugin_sys_open_wox_settings",
+			PreventHideAfterAction: true,
+			Icon:                   icons.Get(icons.BrandWox),
+			Aliases:                []string{"settings", "wox settings", "打开设置", "wox 设置"},
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				plugin.GetPluginManager().GetUI().OpenSettingWindow(ctx, common.DefaultSettingWindowContext)
+			},
+		},
+		{
+			ID:         "copy_wox_version",
+			Title:      "i18n:plugin_sys_copy_wox_version",
+			SubTitle:   updater.CURRENT_VERSION,
+			Icon:       icons.Get(icons.ActionCopy),
+			Aliases:    []string{"version", "copy version", "复制版本", "wox version"},
+			ActionName: "i18n:plugin_sys_copy",
+			ActionIcon: icons.Get(icons.ActionCopy),
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				if err := clipboard.WriteText(updater.CURRENT_VERSION); err != nil {
+					r.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("failed to copy Wox version: %s", err.Error()))
+				}
+			},
+		},
+		{
+			ID:          "open_system_settings",
+			Title:       "i18n:plugin_sys_open_system_settings",
+			Icon:        icons.Get(icons.ActionSettings),
+			Aliases:     []string{"system settings", "settings app", "control panel", "打开系统设置", "系统设置"},
+			SupportedOS: []string{util.PlatformWindows, util.PlatformMacOS, util.PlatformLinux},
+			IsAvailable: isOpenSystemSettingsCommandAvailable,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				r.runSystemAction(ctx, "open_system_settings", runOpenSystemSettingsCommand)
+			},
+		},
+		{
+			ID:               "set-volume",
+			QueryHint:        &common.QueryHint{Elements: []common.QueryElement{{Id: "volume", Kind: common.QueryElementArgument, Placeholder: "i18n:plugin_sys_set_volume_placeholder", Required: true}}},
+			Title:            "i18n:plugin_sys_set_volume",
+			SubTitle:         "i18n:plugin_sys_set_volume_subtitle",
+			Icon:             icons.Get(icons.SysVolume),
+			ActionIcon:       icons.Get(icons.ActionVolume),
+			Aliases:          setVolumeAliases,
+			SupportedOS:      []string{util.PlatformWindows, util.PlatformMacOS, util.PlatformLinux},
+			IsAvailable:      isVolumeCommandAvailable,
+			BuildContextData: buildSetVolumeContextData,
+			BuildTitle:       buildSetVolumeTitle,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				percent, ok := parseVolumeContext(actionContext.ContextData)
+				if !ok {
+					r.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_sys_set_volume_invalid"})
+					return
+				}
+				r.runSystemAction(ctx, "set-volume", func() (*exec.Cmd, error) {
+					return runSetVolumeCommand(percent)
+				})
+			},
+		},
+		r.fixedVolumeCommand(0),
+		r.fixedVolumeCommand(25),
+		r.fixedVolumeCommand(50),
+		r.fixedVolumeCommand(75),
+		r.fixedVolumeCommand(100),
+		{
+			ID:          "volume-up",
+			Title:       "i18n:plugin_sys_volume_up",
+			Icon:        icons.Get(icons.SysVolumeUp),
+			ActionIcon:  icons.Get(icons.ActionVolumeUp),
+			Aliases:     []string{"turn volume up", "volume up", "increase volume", "音量加", "调高音量"},
+			SupportedOS: []string{util.PlatformWindows, util.PlatformMacOS, util.PlatformLinux},
+			IsAvailable: isVolumeCommandAvailable,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				r.runSystemAction(ctx, "volume-up", runVolumeUpCommand)
+			},
+		},
+		{
+			ID:          "volume-down",
+			Title:       "i18n:plugin_sys_volume_down",
+			Icon:        icons.Get(icons.SysVolumeDown),
+			ActionIcon:  icons.Get(icons.ActionVolumeDown),
+			Aliases:     []string{"turn volume down", "volume down", "decrease volume", "音量减", "调低音量"},
+			SupportedOS: []string{util.PlatformWindows, util.PlatformMacOS, util.PlatformLinux},
+			IsAvailable: isVolumeCommandAvailable,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				r.runSystemAction(ctx, "volume-down", runVolumeDownCommand)
+			},
+		},
+		{
+			ID:          "toggle-mute",
+			Title:       "i18n:plugin_sys_toggle_mute",
+			Icon:        icons.Get(icons.SysMute),
+			ActionIcon:  icons.Get(icons.ActionMute),
+			Aliases:     []string{"mute", "toggle mute", "unmute", "静音", "切换静音"},
+			SupportedOS: []string{util.PlatformWindows, util.PlatformMacOS, util.PlatformLinux},
+			IsAvailable: isVolumeCommandAvailable,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				r.runSystemAction(ctx, "toggle-mute", runToggleMuteCommand)
+			},
+		},
+		{
+			ID:                     "sleep",
+			Title:                  "i18n:plugin_sys_sleep",
+			Icon:                   icons.Get(icons.SysSleep),
+			Aliases:                []string{"sleep computer", "suspend", "睡眠", "电脑睡眠"},
+			SupportedOS:            []string{util.PlatformWindows, util.PlatformMacOS, util.PlatformLinux},
+			IsAvailable:            isSleepCommandAvailable,
+			PreventHideAfterAction: true,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				r.handleConfirmedSystemCommand(ctx, actionContext, "sleep")
+			},
+		},
+		{
+			ID:          "sleep-displays",
+			Title:       "i18n:plugin_sys_sleep_displays",
+			Icon:        icons.Get(icons.SysDisplaySleep),
+			Aliases:     []string{"sleep displays", "turn off display", "monitor off", "关闭显示器", "显示器睡眠"},
+			SupportedOS: []string{util.PlatformWindows, util.PlatformMacOS, util.PlatformLinux},
+			IsAvailable: isSleepDisplaysCommandAvailable,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				r.runSystemAction(ctx, "sleep-displays", runSleepDisplaysCommand)
+			},
+		},
+		{
+			ID:                     "log-out",
+			Title:                  "i18n:plugin_sys_log_out",
+			Icon:                   icons.Get(icons.SysLogout),
+			Aliases:                []string{"logout", "sign out", "log out", "注销", "登出"},
+			SupportedOS:            []string{util.PlatformWindows, util.PlatformMacOS, util.PlatformLinux},
+			IsAvailable:            isLogoutCommandAvailable,
+			PreventHideAfterAction: true,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				r.handleConfirmedSystemCommand(ctx, actionContext, "log-out")
+			},
+		},
+		{
+			ID:          "eject-all-disks",
+			Title:       "i18n:plugin_sys_eject_all_disks",
+			Icon:        icons.Get(icons.SysEject),
+			Aliases:     []string{"eject disks", "eject all", "弹出磁盘", "弹出所有磁盘"},
+			SupportedOS: []string{util.PlatformWindows, util.PlatformMacOS},
+			IsAvailable: isEjectAllDisksCommandAvailable,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				r.runSystemAction(ctx, "eject-all-disks", runEjectAllDisksCommand)
+			},
+		},
+		{
+			ID:          "show-desktop",
+			Title:       "i18n:plugin_sys_show_desktop",
+			Icon:        icons.Get(icons.SysDesktop),
+			Aliases:     []string{"desktop", "show desktop", "显示桌面"},
+			SupportedOS: []string{util.PlatformWindows, util.PlatformMacOS, util.PlatformLinux},
+			IsAvailable: isShowDesktopCommandAvailable,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				r.runSystemAction(ctx, "show-desktop", runShowDesktopCommand)
+			},
+		},
+		{
+			ID:          "show-task-view",
+			Title:       "i18n:plugin_sys_show_task_view",
+			Icon:        icons.Get(icons.SysDesktop),
+			Aliases:     []string{"task view", "window switcher", "virtual desktop", "virtual desktops", "desktops", "任务视图", "虚拟桌面", "窗口选择", "窗口切换"},
+			SupportedOS: []string{util.PlatformWindows},
+			IsAvailable: isShowTaskViewCommandAvailable,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				r.runSystemAction(ctx, "show-task-view", runShowTaskViewCommand)
+			},
+		},
+		{
+			ID:          "show-screen-saver",
+			Title:       "i18n:plugin_sys_show_screen_saver",
+			Icon:        icons.Get(icons.SysScreenSaver),
+			Aliases:     []string{"screen saver", "screensaver", "显示屏保", "屏幕保护"},
+			SupportedOS: []string{util.PlatformWindows, util.PlatformMacOS, util.PlatformLinux},
+			IsAvailable: isShowScreenSaverCommandAvailable,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				r.runSystemAction(ctx, "show-screen-saver", runShowScreenSaverCommand)
+			},
+		},
+		{
+			ID:          "quit-all-applications",
+			Title:       "i18n:plugin_sys_quit_all_applications",
+			Icon:        icons.Get(icons.SysQuitApps),
+			Aliases:     []string{"quit all apps", "close all apps", "退出所有应用", "关闭所有应用"},
+			SupportedOS: []string{util.PlatformWindows, util.PlatformMacOS},
+			IsAvailable: isQuitAllApplicationsCommandAvailable,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				r.runSystemAction(ctx, "quit-all-applications", runQuitAllApplicationsCommand)
+			},
+		},
+		{
+			ID:          "hide-all-apps-except-frontmost",
+			Title:       "i18n:plugin_sys_hide_all_apps_except_frontmost",
+			Icon:        icons.Get(icons.SysHideApps),
+			Aliases:     []string{"hide all apps", "hide others", "隐藏其他应用", "只显示当前应用"},
+			SupportedOS: []string{util.PlatformMacOS},
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				r.runSystemAction(ctx, "hide-all-apps-except-frontmost", runHideAllAppsExceptFrontmostCommand)
+			},
+		},
+		{
+			ID:          "unhide-all-hidden-apps",
+			Title:       "i18n:plugin_sys_unhide_all_hidden_apps",
+			Icon:        icons.Get(icons.SysUnhideApps),
+			Aliases:     []string{"unhide all apps", "show hidden apps", "取消隐藏应用", "显示隐藏应用"},
+			SupportedOS: []string{util.PlatformMacOS},
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				r.runSystemAction(ctx, "unhide-all-hidden-apps", runUnhideAllHiddenAppsCommand)
+			},
+		},
+		{
+			ID:          "toggle-system-appearance",
+			Title:       "i18n:plugin_sys_toggle_system_appearance",
+			Icon:        icons.Get(icons.SysAppearance),
+			Aliases:     []string{"toggle appearance", "dark mode", "light mode", "切换外观", "深色模式", "浅色模式"},
+			SupportedOS: []string{util.PlatformWindows, util.PlatformMacOS, util.PlatformLinux},
+			IsAvailable: isToggleSystemAppearanceCommandAvailable,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				r.runSystemAction(ctx, "toggle-system-appearance", runToggleSystemAppearanceCommand)
+			},
+		},
+		{
+			ID:          "toggle-hidden-files",
+			Title:       "i18n:plugin_sys_toggle_hidden_files",
+			Icon:        icons.Get(icons.SysHiddenFiles),
+			Aliases:     []string{"hidden files", "show hidden files", "toggle hidden files", "隐藏文件", "显示隐藏文件"},
+			SupportedOS: []string{util.PlatformWindows, util.PlatformMacOS, util.PlatformLinux},
+			IsAvailable: isToggleHiddenFilesCommandAvailable,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				r.runSystemAction(ctx, "toggle-hidden-files", runToggleHiddenFilesCommand)
+			},
+		},
+		{
+			ID:         "clear_all_cache",
+			Title:      "i18n:plugin_sys_clear_all_cache",
+			SubTitle:   "i18n:plugin_sys_clear_all_cache_subtitle",
+			Icon:       common.NewWoxImageEmoji("🗑️"),
+			ActionIcon: icons.Get(icons.ActionDelete),
+			Aliases:    []string{"clear cache", "cache", "清理缓存", "清除缓存"},
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				location := util.GetLocation()
+				cacheDirectory := location.GetCacheDirectory()
+
+				// Remove the whole cache tree so stale generated assets cannot survive partial cleanup.
+				if _, err := os.Stat(cacheDirectory); err == nil {
+					removeErr := os.RemoveAll(cacheDirectory)
+					if removeErr != nil {
+						r.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("failed to remove cache directory: %s", removeErr.Error()))
+						r.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_sys_clear_cache_failed"})
+						return
+					}
+
+					// Recreate the cache directory structure expected by image conversion.
+					os.MkdirAll(location.GetImageCacheDirectory(), 0755)
+					common.ClearConvertIconPathExistenceCache()
+
+					r.api.Log(ctx, plugin.LogLevelInfo, "cache directory cleared successfully")
+					r.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_sys_clear_cache_success"})
+				}
+			},
+		},
+	}
+}
+
+func (r *SysPlugin) buildDevCommands() []SysCommand {
+	return []SysCommand{
+		{
+			ID:       "open_onboarding",
+			Title:    "Open onboarding",
+			SubTitle: "Open the first-run onboarding window",
+			Icon:     icons.Get(icons.SysOnboarding),
+			Aliases:  []string{"onboarding", "open onboarding", "first run", "setup guide", "引导", "打开引导"},
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				plugin.GetPluginManager().GetUI().OpenOnboardingWindow(ctx)
+			},
+		},
+		{
+			ID:                     "toggle_recording_mode",
+			Title:                  "Toggle recording mode",
+			SubTitle:               "Use a normal launcher window level so screen recording tools can capture Wox",
+			Icon:                   icons.Get(icons.BrandWox),
+			Aliases:                []string{"recording mode", "screen recording", "capture wox"},
+			SupportedOS:            []string{util.PlatformMacOS},
+			PreventHideAfterAction: true,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				enabled, err := ui.GetUIManager().ToggleRecordingMode(ctx)
+				if err != nil {
+					subtitle := "Failed to toggle recording mode: " + err.Error()
+					r.api.UpdateResult(ctx, plugin.UpdatableResult{Id: actionContext.ResultId, SubTitle: &subtitle})
+					return
+				}
+
+				title := "Enable recording mode"
+				subtitle := "Recording mode is disabled; Wox uses its normal always-on-top level"
+				if enabled {
+					title = "Disable recording mode"
+					subtitle = "Recording mode is enabled; Wox now uses a capture-friendly normal window level"
+				}
+				r.api.UpdateResult(ctx, plugin.UpdatableResult{Id: actionContext.ResultId, Title: &title, SubTitle: &subtitle})
+			},
+		},
+		{
+			ID:                     "toggle_repaint_debug",
+			Title:                  "Toggle repaint highlights",
+			SubTitle:               "Show rainbow outlines around repainted regions",
+			Icon:                   icons.Get(icons.ActionCPUProfile),
+			Aliases:                []string{"highlight repaints", "repaint debug", "rainbow repaint", "partial refresh", "damage debug", "局部刷新", "重绘调试"},
+			PreventHideAfterAction: true,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				mode, err := ui.GetUIManager().ToggleRepaintDebugMode(ctx)
+				if err != nil {
+					subtitle := "Failed to toggle repaint highlights: " + err.Error()
+					r.api.UpdateResult(ctx, plugin.UpdatableResult{Id: actionContext.ResultId, SubTitle: &subtitle})
+					return
+				}
+
+				title := "Toggle repaint highlights"
+				subtitle := repaintDebugModeSubtitle(mode)
+				r.api.UpdateResult(ctx, plugin.UpdatableResult{Id: actionContext.ResultId, Title: &title, SubTitle: &subtitle})
+			},
+		},
+		{
+			Title: "test notification long",
+			Icon:  icons.Get(icons.ActionCPUProfile),
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				img, _ := icons.Get(icons.BrandWox).ToImage()
+				notifier.Notify(img, "This is a very long notification message to test the notification system in Wox.\n"+
+					"If you see this message, the notification system is working properly.\n"+
+					"You can customize the duration, appearance, and behavior of notifications as needed.\n"+
+					"Enjoy using Wox!\n"+time.Now().String())
+			},
+		},
+
+		{
+			Title: "test notification short",
+			Icon:  icons.Get(icons.ActionCPUProfile),
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				img, _ := icons.Get(icons.BrandWox).ToImage()
+				notifier.Notify(img, `This is a very short notification.`+time.Now().String())
+			},
+		},
+
+		{
+			Title: "test attention",
+			Icon:  icons.Get(icons.SysAttention),
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				now := time.Now().Format(time.RFC3339)
+				attentionIcon := icons.Get(icons.SysAttention)
+				r.api.PushAttention(ctx, plugin.PushAttentionRequest{
+					Key:         "sys_test_attention",
+					Title:       "Test attention " + now,
+					Description: "This is a persistent attention item pushed from the system test command.",
+					Icon:        &attentionIcon,
+					Action: &plugin.AttentionAction{
+						Type:  plugin.AttentionActionTypeChangeQuery,
+						Query: "attention ",
+					},
+				})
+			},
+		},
+
+		{
+			ID:                     "test_toolbar_progress",
+			Title:                  "test toolbar progress",
+			SubTitle:               "Preview indeterminate and determinate toolbar progress",
+			Icon:                   icons.Get(icons.ActionCPUProfile),
+			Aliases:                []string{"toolbar progress", "progress animation", "loading animation"},
+			PreventHideAfterAction: true,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				toolbarMsgId := uuid.New().String()
+				toolbarUI := plugin.GetPluginManager().GetUI()
+				// Global sys results do not own the wildcard query, so the dev preview targets the action's session directly.
+				toolbarUI.ShowToolbarMsg(ctx, plugin.ToolbarMsgUI{
+					Id:            toolbarMsgId,
+					Title:         "Testing indeterminate toolbar progress",
+					Icon:          sysIcon,
+					Indeterminate: true,
+				})
+				util.Go(ctx, "test toolbar progress", func() {
+					time.Sleep(2 * time.Second)
+
+					for progress := 0; progress <= 100; progress += 10 {
+						current := progress
+						toolbarUI.ShowToolbarMsg(ctx, plugin.ToolbarMsgUI{
+							Id:       toolbarMsgId,
+							Title:    "Testing determinate toolbar progress",
+							Icon:     sysIcon,
+							Progress: &current,
+						})
+						time.Sleep(300 * time.Millisecond)
+					}
+
+					time.Sleep(500 * time.Millisecond)
+					toolbarUI.ClearToolbarMsg(ctx, toolbarMsgId)
+				})
+			},
+		},
+
+		{
+			ID:    "cpu_profiling",
+			Title: "i18n:plugin_sys_performance_cpu_profiling",
+			Icon:  icons.Get(icons.ActionCPUProfile),
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				cpuProfPath := path.Join(util.GetLocation().GetWoxDataDirectory(), "cpu.prof")
+				f, err := os.Create(cpuProfPath)
+				if err != nil {
+					util.GetLogger().Info(ctx, "failed to create cpu profile file: "+err.Error())
+					return
+				}
+
+				util.GetLogger().Info(ctx, "start cpu profile")
+				profileErr := pprof.StartCPUProfile(f)
+				if profileErr != nil {
+					util.GetLogger().Info(ctx, "failed to start cpu profile: "+profileErr.Error())
+					return
+				}
+
+				time.AfterFunc(30*time.Second, func() {
+					pprof.StopCPUProfile()
+					util.GetLogger().Info(ctx, "cpu profile saved to "+cpuProfPath)
+				})
+			},
+		},
+	}
+}
+
+func (r *SysPlugin) fixedVolumeCommand(percent int) SysCommand {
+	return SysCommand{
+		ID:          fmt.Sprintf("set-volume-%d", percent),
+		Title:       fmt.Sprintf("i18n:plugin_sys_set_volume_%d", percent),
+		Icon:        icons.Get(icons.SysVolume),
+		ActionIcon:  icons.Get(icons.ActionVolume),
+		Aliases:     []string{fmt.Sprintf("set volume %d", percent), fmt.Sprintf("volume %d", percent), fmt.Sprintf("音量 %d", percent), fmt.Sprintf("设置音量 %d", percent)},
+		SupportedOS: []string{util.PlatformWindows, util.PlatformMacOS, util.PlatformLinux},
+		IsAvailable: isVolumeCommandAvailable,
+		Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+			r.runSystemAction(ctx, fmt.Sprintf("set-volume-%d", percent), func() (*exec.Cmd, error) {
+				return runSetVolumeCommand(percent)
+			})
+		},
+	}
+}
+
+func (r *SysPlugin) Query(ctx context.Context, query plugin.Query) plugin.QueryResponse {
+	r.commandsMu.RLock()
+	defer r.commandsMu.RUnlock()
+	if r.omarchyGuards != nil {
+		r.omarchyGuards.refreshIfStale(ctx)
+	}
+	// Automatic command suggestions also attach a hint. Only the volume argument is the set-volume form.
+	if hasSetVolumeArgument(query.QueryHint) {
+		command, ok := r.findCommand("set-volume")
+		if !ok || !r.isCommandAvailable(command) {
+			return plugin.QueryResponse{}
+		}
+		result := r.buildCommandResult(ctx, query, command, 1000)
+		value := query.QueryHint.Argument("volume")
+		if _, valid := parseVolumePercent(value); !valid {
+			result.Actions = nil
+			if value != "" {
+				result.SubTitle = "i18n:plugin_sys_set_volume_invalid"
+			}
+		}
+		return plugin.NewQueryResponse([]plugin.QueryResult{result})
+	}
+	if query.Command != "" {
+		if command, ok := r.findCommand(query.Command); ok {
+			return plugin.NewQueryResponse([]plugin.QueryResult{r.buildCommandResult(ctx, query, command, 1000)})
+		}
+		return plugin.QueryResponse{}
+	}
+
+	queryStart := time.Now()
+	usePinyin := setting.GetSettingManager().GetWoxSetting(ctx).UsePinYin.Get()
+	search := strings.TrimSpace(query.Search)
+	var preparedPattern *fuzzymatch.PreparedPattern
+	var commandSearchIndex [][]*fuzzymatch.PreparedText
+	if search != "" {
+		preparedPattern = fuzzymatch.PreparePattern(search)
+		commandSearchIndex = r.getCommandSearchIndex(ctx)
+	}
+	var results []plugin.QueryResult
+	commandMatchStart := time.Now()
+	for i, command := range r.commands {
+		var candidates []*fuzzymatch.PreparedText
+		if commandSearchIndex != nil {
+			candidates = commandSearchIndex[i]
+		}
+		if matched, score := r.commandMatches(command, search, candidates, preparedPattern, usePinyin); matched {
+			results = append(results, r.buildCommandResult(ctx, query, command, score))
+		}
+	}
+	commandMatchUs := time.Since(commandMatchStart).Microseconds()
+
+	pluginSettingMatchStart := time.Now()
+	pluginInstances := []*plugin.Instance{}
+	// A real trigger keyword is choosing among this plugin's commands. Plugin-settings rows stay on global search.
+	if query.IsGlobalQuery() {
+		pluginSettingsFormat := i18n.GetI18nManager().TranslateWox(ctx, "plugin_sys_open_plugin_settings")
+		pluginInstances = plugin.GetPluginManager().GetPluginInstances()
+		for _, instance := range pluginInstances {
+			pluginName := instance.GetName(ctx)
+			title := fmt.Sprintf(pluginSettingsFormat, pluginName)
+			matchResult := fuzzymatch.FuzzyMatch(title, query.Search, usePinyin)
+			isNameMatch := matchResult.IsMatch
+			matchScore := matchResult.Score
+			isTriggerKeywordMatch := slices.Contains(instance.GetTriggerKeywords(), query.Search)
+			if isNameMatch || isTriggerKeywordMatch {
+				pluginIcon := icons.Get(icons.ActionSettings)
+				iconImg, parseErr := common.ParseWoxImage(instance.Metadata.Icon)
+				if parseErr == nil {
+					pluginIcon = common.ConvertRelativePathToAbsolutePath(ctx, iconImg, instance.PluginDirectory)
+				}
+
+				results = append(results, plugin.QueryResult{
+					Title:       title,
+					IdentityKey: "plugin-settings:" + instance.Metadata.Id,
+					Score:       matchScore,
+					Icon:        pluginIcon,
+					Actions: []plugin.QueryResultAction{
+						{
+							Name: "i18n:plugin_sys_execute",
+							Icon: icons.Get(icons.ActionExecute),
+							Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+								plugin.GetPluginManager().GetUI().OpenSettingWindow(ctx, common.SettingWindowContext{
+									Path:  "/plugin/setting",
+									Param: instance.Metadata.Id,
+								})
+							},
+							PreventHideAfterAction: true,
+						},
+					},
+				})
+			}
+		}
+	}
+	pluginSettingMatchUs := time.Since(pluginSettingMatchStart).Microseconds()
+	if tracker := timetracking.New("sys_query"); tracker.Enabled() {
+		tracker.SetRawString("queryId", query.Id)
+		tracker.SetString("search", query.Search)
+		tracker.SetBool("usePinyin", usePinyin)
+		tracker.SetInt("commandCount", len(r.commands))
+		tracker.SetInt("pluginCount", len(pluginInstances))
+		tracker.SetInt("resultCount", len(results))
+		tracker.SetInt64("commandMatchUs", commandMatchUs)
+		tracker.SetInt64("pluginSettingMatchUs", pluginSettingMatchUs)
+		tracker.SetInt64("totalUs", time.Since(queryStart).Microseconds())
+		tracker.Log(ctx)
+	}
+
+	if query.IsGlobalQuery() {
+		results = limitSysQueryResults(results)
+	}
+	return plugin.NewQueryResponse(results)
+}
+
+// limitSysQueryResults caps broad matches before core performs per-result polishing.
+func limitSysQueryResults(results []plugin.QueryResult) []plugin.QueryResult {
+	if len(results) <= sysQueryResultLimit {
+		return results
+	}
+
+	sort.SliceStable(results, func(left, right int) bool {
+		return results[left].Score > results[right].Score
+	})
+	return results[:sysQueryResultLimit]
+}
+
+func (r *SysPlugin) findCommand(commandID string) (SysCommand, bool) {
+	for _, command := range r.commands {
+		if command.ID == commandID && r.isCommandAvailable(command) {
+			return command, true
+		}
+	}
+	return SysCommand{}, false
+}
+
+func (r *SysPlugin) commandMatches(command SysCommand, search string, candidates []*fuzzymatch.PreparedText, preparedPattern *fuzzymatch.PreparedPattern, usePinyin bool) (bool, int64) {
+	if !r.isCommandAvailable(command) {
+		return false, 0
+	}
+	if _, hasCommand := cutSetVolumeArgument(search); hasCommand {
+		if _, valid := parseVolumePercent(search); valid {
+			switch {
+			case command.ID == "set-volume":
+				return true, 1000
+			case strings.HasPrefix(command.ID, "set-volume-"):
+				return false, 0
+			}
+		}
+	}
+
+	if search == "" {
+		if command.SkipEmptyQuery {
+			return false, 0
+		}
+		return true, 100
+	}
+
+	var bestScore int64
+	for _, candidate := range candidates {
+		matchResult := fuzzymatch.FuzzyMatchPrepared(candidate, preparedPattern, usePinyin)
+		if matchResult.IsMatch && matchResult.Score > bestScore {
+			bestScore = matchResult.Score
+		}
+	}
+
+	if bestScore > 0 {
+		return true, bestScore
+	}
+	return false, 0
+}
+
+// ReleasePreparedSearchText drops precomputed system-command text after a long hide.
+// The next query rebuilds it for the current language.
+func (r *SysPlugin) ReleasePreparedSearchText() {
+	r.commandSearchIndexMu.Lock()
+	r.commandSearchIndexes = nil
+	r.commandSearchIndexMu.Unlock()
+}
+
+// getCommandSearchIndex prepares static command candidates once per UI language.
+func (r *SysPlugin) getCommandSearchIndex(ctx context.Context) [][]*fuzzymatch.PreparedText {
+	langCode := i18n.GetI18nManager().GetCurrentLangCode()
+	r.commandSearchIndexMu.RLock()
+	index, ok := r.commandSearchIndexes[langCode]
+	r.commandSearchIndexMu.RUnlock()
+	if ok {
+		return index
+	}
+
+	index = make([][]*fuzzymatch.PreparedText, len(r.commands))
+	for i, command := range r.commands {
+		candidateStrings := make([]string, 0, len(command.Aliases)+3)
+		candidateStrings = append(candidateStrings,
+			command.ID,
+			i18n.GetI18nManager().TranslateWox(ctx, command.Title),
+			i18n.GetI18nManager().TranslateWoxEnUs(ctx, command.Title),
+		)
+		candidateStrings = append(candidateStrings, command.Aliases...)
+
+		candidates := make([]*fuzzymatch.PreparedText, 0, len(candidateStrings))
+		for _, candidate := range candidateStrings {
+			candidates = append(candidates, fuzzymatch.PrepareText(candidate))
+		}
+		index[i] = candidates
+	}
+
+	r.commandSearchIndexMu.Lock()
+	if r.commandSearchIndexes == nil {
+		r.commandSearchIndexes = make(map[i18n.LangCode][][]*fuzzymatch.PreparedText)
+	}
+	if existing, exists := r.commandSearchIndexes[langCode]; exists {
+		index = existing
+	} else {
+		r.commandSearchIndexes[langCode] = index
+	}
+	r.commandSearchIndexMu.Unlock()
+	return index
+}
+
+func (r *SysPlugin) isCommandAvailable(command SysCommand) bool {
+	if len(command.SupportedOS) > 0 && !slices.Contains(command.SupportedOS, util.GetCurrentPlatform()) {
+		return false
+	}
+	if command.IsAvailable != nil && !command.IsAvailable() {
+		return false
+	}
+	return true
+}
+
+func (r *SysPlugin) buildCommandResult(ctx context.Context, query plugin.Query, command SysCommand, score int64) plugin.QueryResult {
+	title := command.Title
+	if command.BuildTitle != nil {
+		title = command.BuildTitle(ctx, query)
+	}
+	subtitle := command.SubTitle
+	if command.BuildSubTitle != nil {
+		subtitle = command.BuildSubTitle(ctx, query)
+	}
+
+	contextData := common.ContextData{sysCommandIDContextKey: command.ID}
+	if command.BuildContextData != nil {
+		for key, value := range command.BuildContextData(query) {
+			contextData[key] = value
+		}
+	}
+
+	result := plugin.QueryResult{
+		Title:       title,
+		SubTitle:    subtitle,
+		IdentityKey: sysCommandIdentityKey(command, contextData),
+		Score:       score,
+		Icon:        command.Icon,
+	}
+	if action := r.buildCommandAction(query, command, contextData); action.Action != nil {
+		result.Actions = []plugin.QueryResultAction{action}
+	}
+	return result
+}
+
+// sysCommandIdentityKey keeps a system command stable across translated titles.
+// Set Volume includes the entered percent so each volume is its own result.
+func sysCommandIdentityKey(command SysCommand, contextData common.ContextData) string {
+	id := strings.TrimSpace(command.ID)
+	if id == "" {
+		return ""
+	}
+	if id == "set-volume" {
+		if volume := strings.TrimSpace(contextData[sysCommandVolumeContextKey]); volume != "" {
+			return id + ":" + volume
+		}
+	}
+	return id
+}
+
+func (r *SysPlugin) handleMRURestore(ctx context.Context, mruData plugin.MRUData) (*plugin.QueryResult, error) {
+	r.commandsMu.RLock()
+	defer r.commandsMu.RUnlock()
+	commandID := mruData.ContextData["commandId"]
+	if commandID == "" {
+		return nil, fmt.Errorf("empty commandId in context data")
+	}
+
+	// Find the command by ID
+	var foundCommand *SysCommand
+	for _, command := range r.commands {
+		if command.ID == commandID {
+			foundCommand = &command
+			break
+		}
+	}
+
+	if foundCommand == nil {
+		return nil, fmt.Errorf("system command no longer exists: %s", commandID)
+	}
+	if !r.isCommandAvailable(*foundCommand) {
+		return nil, fmt.Errorf("system command is not available on this platform: %s", commandID)
+	}
+
+	result := &plugin.QueryResult{
+		Title:       foundCommand.Title,
+		SubTitle:    foundCommand.SubTitle,
+		IdentityKey: sysCommandIdentityKey(*foundCommand, mruData.ContextData),
+		Icon:        foundCommand.Icon,
+		Actions:     []plugin.QueryResultAction{r.buildCommandAction(plugin.Query{}, *foundCommand, mruData.ContextData)},
+	}
+
+	return result, nil
+}
+
+// commandRequiresArgument reports a command whose query hint still needs user input.
+func commandRequiresArgument(command SysCommand) bool {
+	if command.QueryHint == nil {
+		return false
+	}
+	for _, element := range command.QueryHint.Elements {
+		if element.Required {
+			return true
+		}
+	}
+	return false
+}
+
+// commandArgumentReady reports whether a required argument is present and usable.
+func commandArgumentReady(query plugin.Query, command SysCommand, contextData common.ContextData) bool {
+	if !commandRequiresArgument(command) {
+		return true
+	}
+	if command.ID == "set-volume" {
+		_, valid := parseVolumeContext(contextData)
+		return valid
+	}
+	return strings.TrimSpace(query.Search) != ""
+}
+
+// commandArgumentQueryText is the trigger query that waits for the next argument.
+func commandArgumentQueryText(triggerKeyword, commandID string) string {
+	return strings.TrimSpace(triggerKeyword) + " " + commandID + " "
+}
+
+func commandContinueIcon(command SysCommand) common.WoxImage {
+	if !command.ActionIcon.IsEmpty() {
+		return command.ActionIcon
+	}
+	if command.ID == "set-volume" {
+		return icons.Get(icons.ActionVolume)
+	}
+	return icons.Get(icons.ActionExecute)
+}
+
+func (r *SysPlugin) buildCommandAction(query plugin.Query, command SysCommand, contextData common.ContextData) plugin.QueryResultAction {
+	if commandRequiresArgument(command) && !commandArgumentReady(query, command, contextData) {
+		// The command was chosen from the keyword list, so keep that keyword and wait for the argument.
+		if strings.TrimSpace(query.TriggerKeyword) != "" && query.Command == "" {
+			trigger := query.TriggerKeyword
+			commandID := command.ID
+			hint := command.QueryHint
+			return plugin.QueryResultAction{
+				Name:                   command.Title,
+				Icon:                   commandContinueIcon(command),
+				IsDefault:              true,
+				PreventHideAfterAction: true,
+				ContextData:            contextData,
+				Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+					structure := hint.Clone()
+					structure.Elements = append([]common.QueryElement{{Id: "command", Kind: common.QueryElementText, Text: commandArgumentQueryText(trigger, commandID)}}, structure.Elements...)
+					r.api.ChangeQuery(ctx, common.PlainQuery{QueryType: plugin.QueryTypeInput, QueryText: structure.PlainText(), QueryHint: structure})
+				},
+			}
+		}
+		// The argument query is already open. Typing the value completes it.
+		if strings.TrimSpace(query.TriggerKeyword) != "" {
+			return plugin.QueryResultAction{}
+		}
+		if command.ID == "set-volume" {
+			return plugin.QueryResultAction{
+				Name:                   command.Title,
+				Icon:                   icons.Get(icons.ActionVolume),
+				PreventHideAfterAction: true,
+				ContextData:            contextData,
+				Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+					structure := command.QueryHint.Clone()
+					structure.Elements = append([]common.QueryElement{{Id: "command", Kind: common.QueryElementText, Text: "set volume "}}, structure.Elements...)
+					r.api.ChangeQuery(ctx, common.PlainQuery{QueryType: plugin.QueryTypeInput, QueryText: structure.PlainText(), QueryHint: structure})
+				},
+			}
+		}
+	}
+
+	actionName := command.ActionName
+	if actionName == "" {
+		actionName = "i18n:plugin_sys_execute"
+	}
+	actionIcon := command.ActionIcon
+	if actionIcon.IsEmpty() {
+		actionIcon = icons.Get(icons.ActionExecute)
+	}
+
+	return plugin.QueryResultAction{
+		Name:                   actionName,
+		Icon:                   actionIcon,
+		Action:                 command.Action,
+		PreventHideAfterAction: command.PreventHideAfterAction,
+		ContextData:            contextData,
+	}
+}
+
+func (r *SysPlugin) handleConfirmedSystemCommand(ctx context.Context, actionContext plugin.ActionContext, commandID string) {
+	if actionContext.ContextData[sysCommandConfirmedContextKey] == "true" {
+		r.executeConfirmedSystemCommand(ctx, commandID)
+		return
+	}
+
+	updatable := r.api.GetUpdatableResult(ctx, actionContext.ResultId)
+	if updatable == nil {
+		return
+	}
+
+	titleKey, subtitleKey := r.getSystemPowerConfirmationText(commandID)
+	updatedTitle := titleKey
+	updatedSubtitle := subtitleKey
+	updatable.Title = &updatedTitle
+	updatable.SubTitle = &updatedSubtitle
+
+	if updatable.Actions != nil {
+		actions := *updatable.Actions
+		for i := range actions {
+			if actions[i].Id != actionContext.ResultActionId {
+				continue
+			}
+			if actions[i].ContextData == nil {
+				actions[i].ContextData = common.ContextData{}
+			}
+			actions[i].ContextData[sysCommandIDContextKey] = commandID
+			actions[i].ContextData[sysCommandConfirmedContextKey] = "true"
+			actions[i].PreventHideAfterAction = true
+		}
+		updatable.Actions = &actions
+	}
+
+	r.api.UpdateResult(ctx, *updatable)
+}
+
+func (r *SysPlugin) getSystemPowerConfirmationText(commandID string) (string, string) {
+	switch commandID {
+	case "restart_computer":
+		return "i18n:plugin_sys_restart_confirm_title", "i18n:plugin_sys_restart_confirm_subtitle"
+	case "sleep":
+		return "i18n:plugin_sys_sleep_confirm_title", "i18n:plugin_sys_sleep_confirm_subtitle"
+	case "log-out":
+		return "i18n:plugin_sys_log_out_confirm_title", "i18n:plugin_sys_log_out_confirm_subtitle"
+	default:
+		return "i18n:plugin_sys_shutdown_confirm_title", "i18n:plugin_sys_shutdown_confirm_subtitle"
+	}
+}
+
+func (r *SysPlugin) executeConfirmedSystemCommand(ctx context.Context, commandID string) {
+	var err error
+
+	switch commandID {
+	case "restart_computer":
+		_, err = runRestartCommand()
+	case "sleep":
+		_, err = runSleepCommand()
+	case "log-out":
+		_, err = runLogoutCommand()
+	default:
+		_, err = runShutdownCommand()
+	}
+
+	if err != nil {
+		r.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("failed to execute %s: %s", commandID, err.Error()))
+		r.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: err.Error()})
+		return
+	}
+}
+
+func (r *SysPlugin) runSystemAction(ctx context.Context, commandID string, action func() (*exec.Cmd, error)) {
+	_, err := action()
+	if err != nil {
+		r.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("failed to execute %s: %s", commandID, err.Error()))
+		r.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: err.Error()})
+	}
+}
+
+// hasSetVolumeArgument reports the structured set-volume form.
+// A real trigger keyword installs command suggestions as a query hint, and that hint must not hide the other commands.
+func hasSetVolumeArgument(hint *common.QueryHint) bool {
+	if hint == nil || hint.CommandSuggestions {
+		return false
+	}
+	for _, element := range hint.Elements {
+		if element.Id == "volume" && element.Kind == common.QueryElementArgument {
+			return true
+		}
+	}
+	return false
+}
+
+// volumeQueryValue preserves legacy text parsing while keeping structured argument boundaries.
+func volumeQueryValue(query plugin.Query) string {
+	if hasSetVolumeArgument(query.QueryHint) {
+		return query.QueryHint.Argument("volume")
+	}
+	return query.Search
+}
+
+func buildSetVolumeContextData(query plugin.Query) common.ContextData {
+	if percent, ok := parseVolumePercent(volumeQueryValue(query)); ok {
+		return common.ContextData{sysCommandVolumeContextKey: strconv.Itoa(percent)}
+	}
+	return common.ContextData{}
+}
+
+func buildSetVolumeTitle(ctx context.Context, query plugin.Query) string {
+	if percent, ok := parseVolumePercent(volumeQueryValue(query)); ok {
+		return fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "plugin_sys_set_volume_to_percent"), percent)
+	}
+	return "i18n:plugin_sys_set_volume"
+}
+
+func parseVolumeContext(contextData common.ContextData) (int, bool) {
+	return parseVolumePercent(contextData[sysCommandVolumeContextKey])
+}
+
+func parseVolumePercent(raw string) (int, bool) {
+	if argument, ok := cutSetVolumeArgument(raw); ok {
+		raw = argument
+	}
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimSuffix(raw, "%")
+	if raw == "" {
+		return 0, false
+	}
+
+	percent, err := strconv.Atoi(raw)
+	if err != nil || percent < 0 || percent > 100 {
+		return 0, false
+	}
+	return percent, true
+}
+
+// cutSetVolumeArgument extracts the percentage following a complete volume command alias.
+func cutSetVolumeArgument(raw string) (string, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(raw))
+	for _, alias := range setVolumeAliases {
+		if argument, ok := strings.CutPrefix(normalized, alias+" "); ok {
+			return strings.TrimSpace(argument), true
+		}
+	}
+	return "", false
+}
+
+func runShutdownCommand() (*exec.Cmd, error) {
+	return runPlatformShutdownCommand()
+}
+
+func runRestartCommand() (*exec.Cmd, error) {
+	return runPlatformRestartCommand()
+}
+
+func repaintDebugModeSubtitle(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "rainbow":
+		return "Repaint highlights: rainbow outlines show repainted regions"
+	default:
+		return "Repaint highlights: off"
+	}
+}

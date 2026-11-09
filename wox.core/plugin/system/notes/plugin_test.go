@@ -1,0 +1,435 @@
+package notes
+
+import (
+	"context"
+	"image"
+	"image/png"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"wox/common"
+	"wox/common/icons"
+	"wox/plugin"
+	"wox/util"
+	"wox/util/fuzzymatch"
+)
+
+func TestCreateNoteToolCancelledBeforeImport(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	// An uninitialized repository is intentional: cancelled work must never reach it.
+	result := (&Plugin{}).createNoteTool(ctx, plugin.InvokePluginToolHandlerOption{Arguments: map[string]any{"text": "cancelled note"}})
+	if result.Error == nil || result.Error.Code != plugin.PluginToolErrorCancelled {
+		t.Fatalf("cancelled create = %+v", result)
+	}
+}
+
+func TestPluginQueryRoutesListNewAndSearch(t *testing.T) {
+	repository, _ := newRepositoryForTest(t)
+	p := &Plugin{repository: repository}
+	empty, err := repository.Create()
+	if err != nil {
+		t.Fatalf("create empty note: %v", err)
+	}
+	if err := repository.write(common.NoteRecord{ID: empty.ID, Document: EmptyDocument(), Revision: empty.Revision}); err != nil {
+		t.Fatalf("seed empty note: %v", err)
+	}
+	created, err := repository.Create()
+	if err != nil {
+		t.Fatalf("create note: %v", err)
+	}
+	if _, _, err := repository.Save(created.ID, created.Revision, common.NoteDocument{Blocks: []common.NoteBlock{{Text: "中文 Roadmap"}}}); err != nil {
+		t.Fatalf("save searchable note: %v", err)
+	}
+	list := p.Query(context.Background(), plugin.Query{})
+	if len(list.Results) != 1 || list.Results[0].Id != created.ID {
+		t.Fatalf("root query listed empty drafts: %#v", list.Results)
+	}
+	search := p.Query(context.Background(), plugin.Query{Command: "search"})
+	if len(search.Results) != 1 || search.Results[0].Id != created.ID {
+		t.Fatalf("search did not return note: %#v", search.Results)
+	}
+	if _, err := repository.Delete(created.ID); err != nil {
+		t.Fatalf("delete note: %v", err)
+	}
+	list = p.Query(context.Background(), plugin.Query{})
+	if len(list.Results) != 1 || list.Results[0].Id == created.ID {
+		t.Fatalf("deleted note remains in results: %#v", list.Results)
+	}
+	newResult := p.Query(context.Background(), plugin.Query{Command: "new"})
+	if len(newResult.Results) != 1 || newResult.Results[0].Id != "notes:new" {
+		t.Fatalf("new query mismatch: %#v", newResult.Results)
+	}
+	exactNewResult := p.Query(context.Background(), plugin.Query{Search: "new"})
+	if len(exactNewResult.Results) != 1 || exactNewResult.Results[0].Id == "notes:new" {
+		t.Fatalf("new without command delimiter must remain a note search: %#v", exactNewResult.Results)
+	}
+}
+
+func TestNoteResultsShowTitleAndUpdatedAtSubtitle(t *testing.T) {
+	repository, _ := newRepositoryForTest(t)
+	p := &Plugin{repository: repository}
+	created, err := repository.Create()
+	if err != nil {
+		t.Fatalf("create note: %v", err)
+	}
+	saved, _, err := repository.Save(created.ID, created.Revision, common.NoteDocument{Blocks: []common.NoteBlock{{Text: "Roadmap\nmore body"}}})
+	if err != nil {
+		t.Fatalf("save note: %v", err)
+	}
+	list := p.Query(context.Background(), plugin.Query{})
+	if len(list.Results) != 1 {
+		t.Fatalf("expected one note result, got %#v", list.Results)
+	}
+	result := list.Results[0]
+	if result.Title != "Roadmap" {
+		t.Fatalf("note result title = %q", result.Title)
+	}
+	if result.SubTitle != util.FormatTimestamp(saved.UpdatedAt) {
+		t.Fatalf("note result subtitle = %q", result.SubTitle)
+	}
+	if len(result.Tails) != 0 {
+		t.Fatalf("note result tail = %#v", result.Tails)
+	}
+	if result.Preview.PreviewType != plugin.WoxPreviewTypeMarkdown || result.Preview.DefaultHidden {
+		t.Fatalf("note preview = %#v, want open markdown", result.Preview)
+	}
+	if !strings.Contains(result.Preview.PreviewData, "Roadmap") || !strings.Contains(result.Preview.PreviewData, "more body") {
+		t.Fatalf("note preview data = %q", result.Preview.PreviewData)
+	}
+}
+
+func TestNoteResultPreviewRewritesLocalImages(t *testing.T) {
+	previous := util.GetLocation().GetUserDataDirectory()
+	util.GetLocation().UpdateUserDataDirectory(t.TempDir())
+	t.Cleanup(func() { util.GetLocation().UpdateUserDataDirectory(previous) })
+
+	document := common.NoteDocument{Blocks: []common.NoteBlock{
+		{Text: "Shot"},
+		{Type: common.NoteBlockImage, Image: &common.NoteImage{ID: "abc.png", FileName: "capture.png", Scale: 60}},
+		{Type: common.NoteBlockImage, Image: &common.NoteImage{URL: "https://example.com/remote.png", FileName: "remote.png"}},
+	}}
+	markdown := noteResultPreviewMarkdown(document)
+	wantPath := filepath.ToSlash(ResolveNoteImagePath(common.NoteImage{ID: "abc.png"}))
+	if strings.Contains(markdown, "notes-image:") || strings.Contains(markdown, "scale=") || !strings.Contains(markdown, wantPath) {
+		t.Fatalf("local image preview = %q, want %s", markdown, wantPath)
+	}
+	if !strings.Contains(markdown, "https://example.com/remote.png") {
+		t.Fatalf("remote image preview = %q", markdown)
+	}
+}
+
+func TestNoteResultsPinActionAndPinnedGroup(t *testing.T) {
+	repository, _ := newRepositoryForTest(t)
+	p := &Plugin{repository: repository}
+	created, err := repository.Create()
+	if err != nil {
+		t.Fatalf("create note: %v", err)
+	}
+	saved, _, err := repository.Save(created.ID, created.Revision, common.NoteDocument{Blocks: []common.NoteBlock{{Text: "Pinned note"}}})
+	if err != nil {
+		t.Fatalf("save note: %v", err)
+	}
+	unpinned := p.Query(context.Background(), plugin.Query{})
+	if len(unpinned.Results) != 1 {
+		t.Fatalf("expected one note result, got %#v", unpinned.Results)
+	}
+	if unpinned.Results[0].Group != "i18n:plugin_notes_group_today" || unpinned.Results[0].GroupScore != 90 {
+		t.Fatalf("unpinned note group = %#v", unpinned.Results[0])
+	}
+	assertNoteActionIcons(t, unpinned.Results[0].Actions)
+	if unpinned.Results[0].Actions[1].Name != "i18n:plugin_notes_action_add_favorite" || unpinned.Results[0].Actions[1].Icon.String() != icons.Get(icons.ActionStar).String() {
+		t.Fatalf("add favorite action = %#v", unpinned.Results[0].Actions[1])
+	}
+
+	if _, err := repository.SetPinned(saved.ID, true); err != nil {
+		t.Fatalf("pin note: %v", err)
+	}
+	pinned := p.Query(context.Background(), plugin.Query{})
+	if len(pinned.Results) != 1 {
+		t.Fatalf("expected pinned note result, got %#v", pinned.Results)
+	}
+	if pinned.Results[0].Group != "i18n:plugin_notes_group_favorites" || pinned.Results[0].GroupScore != 100 {
+		t.Fatalf("pinned note group = %#v", pinned.Results[0])
+	}
+	if pinned.Results[0].Actions[1].Name != "i18n:plugin_notes_action_remove_favorite" || pinned.Results[0].Actions[1].Icon.String() != icons.Get(icons.ActionUnstar).String() {
+		t.Fatalf("remove favorite action = %#v", pinned.Results[0].Actions[1])
+	}
+}
+
+func assertNoteActionIcons(t *testing.T, actions []plugin.QueryResultAction) {
+	t.Helper()
+	want := map[string]string{
+		"open":            icons.Get(icons.ActionOpen).String(),
+		"pin":             icons.Get(icons.ActionStar).String(),
+		"copy-link":       icons.Get(icons.ActionCopy).String(),
+		"export-markdown": icons.Get(icons.ActionInstall).String(),
+		"export-text":     icons.Get(icons.ActionText).String(),
+		"export-html":     icons.Get(icons.ActionInstall).String(),
+		"delete":          icons.Get(icons.ActionDelete).String(),
+	}
+	if len(actions) != len(want) {
+		t.Fatalf("actions = %#v", actions)
+	}
+	for _, action := range actions {
+		icon, ok := want[action.Id]
+		if !ok || action.Icon.String() != icon || action.Icon.String() == "" {
+			t.Fatalf("action %s icon = %q, want %q", action.Id, action.Icon.String(), icon)
+		}
+	}
+}
+
+func TestNoteResultGroupUsesClipboardStyleBuckets(t *testing.T) {
+	now := util.GetSystemTimestamp()
+	cases := []struct {
+		record    common.NoteRecord
+		wantGroup string
+		wantScore int64
+	}{
+		{common.NoteRecord{PinnedAt: now, UpdatedAt: now}, "i18n:plugin_notes_group_favorites", 100},
+		{common.NoteRecord{UpdatedAt: now}, "i18n:plugin_notes_group_today", 90},
+		{common.NoteRecord{UpdatedAt: now - 1000*60*60*25}, "i18n:plugin_notes_group_yesterday", 80},
+		{common.NoteRecord{UpdatedAt: now - 1000*60*60*48}, "i18n:plugin_notes_group_history", 10},
+		{common.NoteRecord{PinnedAt: now, DeletedAt: now, UpdatedAt: now}, "i18n:plugin_notes_group_today", 90},
+	}
+	for _, testCase := range cases {
+		group, score := noteResultGroup(testCase.record)
+		if group != testCase.wantGroup || score != testCase.wantScore {
+			t.Fatalf("group(%#v) = %q/%d, want %q/%d", testCase.record, group, score, testCase.wantGroup, testCase.wantScore)
+		}
+	}
+}
+
+func TestNotesSearchMatcherSupportsPinyin(t *testing.T) {
+	if result := fuzzymatch.FuzzyMatch("中文 Roadmap", "zhongwen", true); !result.IsMatch {
+		t.Fatal("Notes pinyin search matcher did not match Chinese title")
+	}
+}
+
+func TestCreateNoteCommandPersistsTextAndOpensDocument(t *testing.T) {
+	repository, _ := newRepositoryForTest(t)
+	p := &Plugin{repository: repository}
+	result := p.createNoteTool(context.Background(), plugin.InvokePluginToolHandlerOption{
+		Arguments: map[string]any{
+			"title": "Roadmap",
+			"text":  "Ship the folder browse handoff",
+		},
+	})
+	if result.Error != nil {
+		t.Fatalf("create note tool = %#v", result)
+	}
+	records, err := repository.List(false)
+	if err != nil || len(records) != 1 {
+		t.Fatalf("saved notes = %#v, err=%v", records, err)
+	}
+	if NoteTitle(records[0].Document) != "Roadmap" {
+		t.Fatalf("note title = %q", NoteTitle(records[0].Document))
+	}
+	if !strings.Contains(ToPlainText(records[0].Document), "Ship the folder browse handoff") {
+		t.Fatalf("note text = %q", ToPlainText(records[0].Document))
+	}
+}
+
+func TestCreateNoteCommandImportsImageWithoutOCR(t *testing.T) {
+	util.GetLocation().UpdateUserDataDirectory(t.TempDir())
+	repository, _ := newRepositoryForTest(t)
+	p := &Plugin{repository: repository}
+	imagePath := filepath.Join(t.TempDir(), "20260827_wox_snapshots.jpg")
+	writeTestNotePNG(t, imagePath)
+
+	result := p.createNoteTool(context.Background(), plugin.InvokePluginToolHandlerOption{
+		Arguments: map[string]any{
+			"path": imagePath,
+			"text": "master Public 0 + 5 Branches",
+		},
+	})
+	if result.Error != nil {
+		t.Fatalf("create note from image = %#v", result)
+	}
+	records, err := repository.List(false)
+	if err != nil || len(records) != 1 {
+		t.Fatalf("saved notes = %#v, err=%v", records, err)
+	}
+	body := ToPlainText(records[0].Document)
+	if strings.Contains(body, "master Public") || strings.Contains(body, imagePath) {
+		t.Fatalf("image note kept OCR or absolute path: %q", body)
+	}
+	found := false
+	for _, block := range records[0].Document.Blocks {
+		if block.Type == common.NoteBlockImage && block.Image != nil && block.Image.ID != "" {
+			found = true
+			if _, err := os.Stat(ResolveNoteImagePath(*block.Image)); err != nil {
+				t.Fatalf("attachment missing: %v", err)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("image block missing: %#v", records[0].Document.Blocks)
+	}
+	if NoteTitle(records[0].Document) != "20260827_wox_snapshots" {
+		t.Fatalf("image note title = %q", NoteTitle(records[0].Document))
+	}
+}
+
+func TestCreateNoteCommandImportsFilePath(t *testing.T) {
+	repository, _ := newRepositoryForTest(t)
+	p := &Plugin{repository: repository}
+	filePath := filepath.Join(t.TempDir(), "main.go")
+	if err := os.WriteFile(filePath, []byte("package main\n"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	result := p.createNoteTool(context.Background(), plugin.InvokePluginToolHandlerOption{
+		Arguments: map[string]any{"path": filePath},
+	})
+	if result.Error != nil {
+		t.Fatalf("create note from path = %#v", result)
+	}
+	records, err := repository.List(false)
+	if err != nil || len(records) != 1 {
+		t.Fatalf("saved notes = %#v, err=%v", records, err)
+	}
+	body := ToPlainText(records[0].Document)
+	if !strings.Contains(body, "main.go") || !strings.Contains(body, "package main") {
+		t.Fatalf("imported note = %q", body)
+	}
+}
+
+func TestCreateNoteActionUsesPluginTool(t *testing.T) {
+	action := CreateNoteAction(nil, "Title", "Body", "/tmp/file.go")
+	if action.Name != "i18n:plugin_notes_action_save" {
+		t.Fatalf("action name = %q", action.Name)
+	}
+	if action.Icon.String() != icons.Get(icons.ActionAdd).String() {
+		t.Fatalf("action icon = %q", action.Icon.String())
+	}
+}
+
+func TestCreateNoteCommandRequiresContent(t *testing.T) {
+	result := (&Plugin{}).createNoteTool(context.Background(), plugin.InvokePluginToolHandlerOption{})
+	if result.Error == nil {
+		t.Fatalf("empty create note tool = %#v", result)
+	}
+}
+
+func TestOpenNoteToolRequiresExistingNote(t *testing.T) {
+	repository, _ := newRepositoryForTest(t)
+	result := (&Plugin{repository: repository}).openNoteTool(context.Background(), plugin.InvokePluginToolHandlerOption{
+		Arguments: map[string]any{"noteId": "missing"},
+	})
+	if result.Error == nil || result.Error.Code != "NOTE_NOT_FOUND" {
+		t.Fatalf("missing note = %#v", result)
+	}
+}
+
+func TestNoteDeepLinkUsesStablePluginID(t *testing.T) {
+	if got := noteDeepLink("note-id"); got != "wox://plugin/"+common.NotesPluginID+"?action=open&id=note-id" {
+		t.Fatalf("unexpected deep link: %s", got)
+	}
+}
+
+func TestNotesMetadataEnablesMRU(t *testing.T) {
+	metadata := (&Plugin{}).GetMetadata()
+	if !metadata.IsSupportFeature(plugin.MetadataFeatureMRU) {
+		t.Fatal("notes plugin must declare the MRU feature")
+	}
+	params, err := metadata.GetFeatureParamsForMRU()
+	if err != nil || params.HashBy != "identitykey" {
+		t.Fatalf("MRU hash params = %#v, err=%v", params, err)
+	}
+}
+
+func TestNotesQueryActionsCarryMRUContext(t *testing.T) {
+	repository, _ := newRepositoryForTest(t)
+	p := &Plugin{repository: repository}
+	created, err := repository.Create()
+	if err != nil {
+		t.Fatalf("create note: %v", err)
+	}
+	if _, _, err := repository.Save(created.ID, created.Revision, common.NoteDocument{Blocks: []common.NoteBlock{{Text: "Roadmap"}}}); err != nil {
+		t.Fatalf("save note: %v", err)
+	}
+	list := p.Query(context.Background(), plugin.Query{})
+	if len(list.Results) != 1 {
+		t.Fatalf("expected one note result, got %#v", list.Results)
+	}
+	for _, action := range list.Results[0].Actions {
+		if action.ContextData[notesMRUContextKey] != created.ID {
+			t.Fatalf("action %s context = %#v", action.Id, action.ContextData)
+		}
+	}
+	newResult := p.Query(context.Background(), plugin.Query{Command: "new"})
+	if len(newResult.Results) != 1 || newResult.Results[0].IdentityKey != "note:new" {
+		t.Fatalf("new result = %#v", newResult.Results)
+	}
+	if newResult.Results[0].Actions[0].ContextData[notesMRUContextKey] != notesMRUNewID {
+		t.Fatalf("new action context = %#v", newResult.Results[0].Actions[0].ContextData)
+	}
+}
+
+func TestNotesMRURestoreRebuildsCurrentNote(t *testing.T) {
+	repository, _ := newRepositoryForTest(t)
+	p := &Plugin{repository: repository}
+	created, err := repository.Create()
+	if err != nil {
+		t.Fatalf("create note: %v", err)
+	}
+	saved, _, err := repository.Save(created.ID, created.Revision, common.NoteDocument{Blocks: []common.NoteBlock{{Text: "Updated title"}}})
+	if err != nil {
+		t.Fatalf("save note: %v", err)
+	}
+
+	restored, err := p.handleMRURestore(context.Background(), plugin.MRUData{
+		ContextData: common.ContextData{notesMRUContextKey: saved.ID},
+	})
+	if err != nil {
+		t.Fatalf("restore note: %v", err)
+	}
+	if restored.Id != saved.ID || restored.Title != "Updated title" || restored.Group != "" {
+		t.Fatalf("restored note = %#v", restored)
+	}
+	if restored.IdentityKey != "note:"+saved.ID || restored.Actions[0].ContextData[notesMRUContextKey] != saved.ID {
+		t.Fatalf("restored note identity = %#v", restored)
+	}
+
+	newResult, err := p.handleMRURestore(context.Background(), plugin.MRUData{
+		ContextData: common.ContextData{notesMRUContextKey: notesMRUNewID},
+	})
+	if err != nil || newResult.Id != "notes:new" {
+		t.Fatalf("restore new note = %#v, err=%v", newResult, err)
+	}
+
+	if _, err := p.handleMRURestore(context.Background(), plugin.MRUData{}); err == nil {
+		t.Fatal("empty context should fail restore")
+	}
+	if _, err := p.handleMRURestore(context.Background(), plugin.MRUData{
+		ContextData: common.ContextData{notesMRUContextKey: "missing"},
+	}); err == nil {
+		t.Fatal("missing note should fail restore")
+	}
+	if _, err := repository.Delete(saved.ID); err != nil {
+		t.Fatalf("delete note: %v", err)
+	}
+	if _, err := p.handleMRURestore(context.Background(), plugin.MRUData{
+		ContextData: common.ContextData{notesMRUContextKey: saved.ID},
+	}); err == nil {
+		t.Fatal("deleted note should fail restore")
+	}
+}
+
+func writeTestNotePNG(t *testing.T, path string) {
+	t.Helper()
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create image: %v", err)
+	}
+	if err := png.Encode(file, image.NewRGBA(image.Rect(0, 0, 8, 6))); err != nil {
+		file.Close()
+		t.Fatalf("encode image: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close image: %v", err)
+	}
+}

@@ -1,0 +1,925 @@
+package launcher
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"runtime"
+	"sort"
+	"strings"
+	"time"
+
+	launcherview "wox/ui/launcher/view"
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+	"wox/util"
+)
+
+const (
+	actionRowHeight = launcherview.ActionRowHeight
+)
+
+type actionPanelSource uint8
+
+const (
+	actionPanelSourceResult actionPanelSource = iota
+	actionPanelSourceToolbar
+	actionPanelSourceLocal
+)
+
+// actionPanelPurpose is which list the shared panel is showing. It is not the
+// per-entry execution source (actionPanelSource).
+type actionPanelPurpose uint8
+
+const (
+	actionPanelPurposeResult actionPanelPurpose = iota
+	actionPanelPurposeAbout
+)
+
+const (
+	localActionWebViewReloadID        = "webview-reload"
+	localActionWebViewGoBackID        = "webview-go-back"
+	localActionWebViewGoForwardID     = "webview-go-forward"
+	localActionWebViewOpenInBrowserID = "webview-open-in-browser"
+	localActionWebViewHidePageID      = "webview-hide-page"
+	localActionWebViewClosePageID     = "webview-close-page"
+	localActionWebViewOpenDevToolsID  = "webview-open-dev-tools"
+)
+
+// actionPanelEntry keeps the unified picker presentation tied to its original execution target.
+type actionPanelEntry struct {
+	Key                  string
+	ID                   string
+	Name                 string
+	SearchAliases        []string
+	Icon                 woxImage
+	Hotkey               string
+	Tail                 string
+	TailIcon             woxImage
+	IsDefault            bool
+	ShowInToolbar        bool
+	Source               actionPanelSource
+	ResultIndex          int
+	ActionIndex          int
+	ToolbarMessageID     string
+	ToolbarMessageAction toolbarMessageAction
+	IsSystemAction       bool
+	IsGroupHeader        bool
+}
+
+func actionPanelBaseHeightForPalette(palette uiPalette) float32 {
+	return launcherview.ActionPanelBaseHeight(palette.actionPadding)
+}
+
+// webViewLocalActionPanelEntries exposes preview-owned browser commands without adding them to plugin results.
+func webViewLocalActionPanelEntries(results []queryResult, selected int, goos string, hidePage bool) []actionPanelEntry {
+	if (goos != "darwin" && goos != "windows") || selected < 0 || selected >= len(results) || results[selected].IsGroup || results[selected].Preview.PreviewType != "webview" {
+		return nil
+	}
+	entries := []actionPanelEntry{
+		{
+			Key: "local:webview:reload", ID: localActionWebViewReloadID, Name: "i18n:ui_action_webview_refresh",
+			Icon: settingControlIconSource("refresh"), Hotkey: primaryHotkey("r"), Source: actionPanelSourceLocal,
+		},
+		{
+			Key: "local:webview:go-back", ID: localActionWebViewGoBackID, Name: "i18n:ui_action_webview_go_back",
+			Icon: settingControlIconSource("arrow-left"), Hotkey: primaryHotkey("["), Source: actionPanelSourceLocal,
+		},
+		{
+			Key: "local:webview:go-forward", ID: localActionWebViewGoForwardID, Name: "i18n:ui_action_webview_go_forward",
+			Icon: settingControlIconSource("arrow-right"), Hotkey: primaryHotkey("]"), Source: actionPanelSourceLocal,
+		},
+		{
+			Key: "local:webview:open-in-browser", ID: localActionWebViewOpenInBrowserID, Name: "i18n:ui_action_webview_open_in_browser",
+			Icon: settingControlIconSource("external"), Hotkey: primaryHotkey("o"), Source: actionPanelSourceLocal,
+		},
+	}
+	if hidePage {
+		entries = append(entries, actionPanelEntry{
+			Key: "local:webview:hide-page", ID: localActionWebViewHidePageID, Name: "i18n:ui_action_webview_hide_page",
+			Icon: settingControlIconSource("window-minimize"), Hotkey: primaryHotkey("h"), Source: actionPanelSourceLocal,
+		})
+	}
+	return append(entries,
+		actionPanelEntry{
+			Key: "local:webview:close-page", ID: localActionWebViewClosePageID, Name: "i18n:ui_action_webview_close_page",
+			Icon: settingControlIconSource("close"), Hotkey: primaryHotkey("w"), Source: actionPanelSourceLocal,
+		},
+		actionPanelEntry{
+			Key: "local:webview:open-dev-tools", ID: localActionWebViewOpenDevToolsID, Name: "i18n:ui_action_webview_open_inspector",
+			Icon: settingControlIconSource("build"), Source: actionPanelSourceLocal,
+		},
+	)
+}
+
+// toolbarActionEntries selects the shortcut chips shown on the launcher footer.
+func toolbarActionEntries(entries []actionPanelEntry, toolbarMessageVisible bool) []actionPanelEntry {
+	sources := []actionPanelSource{actionPanelSourceLocal, actionPanelSourceResult}
+	if toolbarMessageVisible {
+		sources = []actionPanelSource{actionPanelSourceResult, actionPanelSourceLocal, actionPanelSourceToolbar}
+	}
+	return toolbarActionEntriesBySources(entries, sources)
+}
+
+// toolbarActionEntriesBySources keeps shortcut chips from the requested sources in that order.
+func toolbarActionEntriesBySources(entries []actionPanelEntry, sources []actionPanelSource) []actionPanelEntry {
+	ordered := make([]actionPanelEntry, 0, len(entries))
+	for _, source := range sources {
+		for _, entry := range entries {
+			if entry.Source == source && (entry.ShowInToolbar || toolbarPinnedAction(entry)) {
+				ordered = append(ordered, entry)
+			}
+		}
+	}
+	return ordered
+}
+
+// toolbarPinnedAction keeps default Enter on the footer while a status message is visible.
+func toolbarPinnedAction(entry actionPanelEntry) bool {
+	return entry.IsDefault || isBareEnterHotkey(entry.Hotkey)
+}
+
+func isBareEnterHotkey(hotkey string) bool {
+	key := normalizeToolbarHotkey(hotkey)
+	return key == "enter" || key == "return"
+}
+
+// currentActionPanelEntries includes Hide Webpage only for cacheable full-preview windows.
+func (a *actionPanelController) currentActionPanelEntries() []actionPanelEntry {
+	if a.actionPanelPurpose == actionPanelPurposeAbout {
+		return aboutMenuEntries(a.runningVersion())
+	}
+	return a.resultActionPanelEntries()
+}
+
+// resultActionPanelEntries is the right-hand Action Panel list, independent of About Menu.
+func (a *App) resultActionPanelEntries() []actionPanelEntry {
+	return unifiedActionPanelEntriesWithHide(a.resultList.results, a.resultList.selected, a.toolbar.toolbarMsg, a.webView.canHideWebViewPage())
+}
+
+// unifiedActionPanelEntries mirrors Flutter's local-and-toolbar-before-plugin ordering and hotkey conflict handling.
+func unifiedActionPanelEntries(results []queryResult, selected int, message *toolbarMessage) []actionPanelEntry {
+	return unifiedActionPanelEntriesWithHide(results, selected, message, false)
+}
+
+// unifiedActionPanelEntriesWithHide builds the picker and optionally includes Hide Webpage.
+func unifiedActionPanelEntriesWithHide(results []queryResult, selected int, message *toolbarMessage, hidePage bool) []actionPanelEntry {
+	localEntries := webViewLocalActionPanelEntries(results, selected, runtime.GOOS, hidePage)
+	toolbarCount := 0
+	if message != nil {
+		toolbarCount = len(message.Actions)
+	}
+	resultCount := 0
+	if selected >= 0 && selected < len(results) && !results[selected].IsGroup {
+		resultCount = len(results[selected].Actions)
+	}
+	entries := make([]actionPanelEntry, 0, len(localEntries)+toolbarCount+resultCount)
+	entries = append(entries, localEntries...)
+	reservedHotkeys := make(map[string]struct{}, len(localEntries)+toolbarCount)
+	for _, action := range localEntries {
+		reservedHotkeys[normalizeToolbarHotkey(action.Hotkey)] = struct{}{}
+	}
+	if message != nil {
+		for index, action := range message.Actions {
+			entries = append(entries, actionPanelEntry{
+				Key: fmt.Sprintf("toolbar:%s:%s:%d", message.ID, action.ID, index), ID: fmt.Sprintf("toolbar-%s-%d", action.ID, index),
+				Name: action.Name, Icon: action.Icon, Hotkey: action.Hotkey, IsDefault: action.IsDefault, Source: actionPanelSourceToolbar,
+				// Toolbar message actions are explicitly supplied for the footer.
+				ShowInToolbar: true, ToolbarMessageID: message.ID, ToolbarMessageAction: action,
+			})
+			if hotkey := normalizeToolbarHotkey(action.Hotkey); hotkey != "" {
+				reservedHotkeys[hotkey] = struct{}{}
+			}
+		}
+	}
+	if selected < 0 || selected >= len(results) || results[selected].IsGroup {
+		return entries
+	}
+	result := results[selected]
+	var pluginActions, systemActions []int
+	for index, action := range result.Actions {
+		if action.IsSystemAction {
+			systemActions = append(systemActions, index)
+		} else {
+			pluginActions = append(pluginActions, index)
+		}
+	}
+	appendResultAction := func(index int) {
+		action := result.Actions[index]
+		hotkey := action.Hotkey
+		if _, conflicted := reservedHotkeys[normalizeToolbarHotkey(hotkey)]; conflicted && strings.TrimSpace(hotkey) != "" {
+			hotkey = ""
+		}
+		entries = append(entries, actionPanelEntry{
+			Key: fmt.Sprintf("result:%s:%s:%d", result.ID, action.ID, index), ID: fmt.Sprintf("result-%s-%d", action.ID, index),
+			Name: action.Name, SearchAliases: action.SearchAliases, Icon: action.Icon, Tail: action.Tail, TailIcon: action.TailIcon, Hotkey: hotkey, IsDefault: action.IsDefault, Source: actionPanelSourceResult,
+			ResultIndex: selected, ActionIndex: index, IsSystemAction: action.IsSystemAction, ShowInToolbar: action.ShowInToolbar,
+		})
+	}
+	for _, index := range pluginActions {
+		appendResultAction(index)
+	}
+	for _, index := range systemActions {
+		appendResultAction(index)
+	}
+	return entries
+}
+
+// actionPanelDisplayItems keeps plugin and local/toolbar actions above system actions
+// and separates their sources only when browsing without a search filter.
+func actionPanelDisplayItems(entries []actionPanelEntry, indices []int, searching bool, makeItem func(int, actionPanelEntry) launcherview.ActionItem) []launcherview.ActionItem {
+	hasPrimary, hasSystem := false, false
+	groups := actionPanelGroupIndices(entries)
+	for _, index := range indices {
+		if index < 0 || index >= len(entries) {
+			continue
+		}
+		if entries[index].IsGroupHeader {
+			continue
+		}
+		if entries[index].IsSystemAction {
+			hasSystem = true
+		} else {
+			hasPrimary = true
+		}
+	}
+	items := make([]launcherview.ActionItem, 0, len(indices)+2)
+	insertedDivider := false
+	lastHeader := -1
+	for _, index := range indices {
+		if index < 0 || index >= len(entries) {
+			continue
+		}
+		entry := entries[index]
+		if entry.IsGroupHeader {
+			continue
+		}
+		if headerIndex := groups[index]; headerIndex >= 0 && headerIndex != lastHeader {
+			items = append(items, actionPanelGroupHeaderItem(entries[headerIndex], headerIndex, makeItem))
+			lastHeader = headerIndex
+		}
+		if !searching && hasPrimary && hasSystem && entry.IsSystemAction && !insertedDivider {
+			items = append(items, launcherview.ActionItem{Kind: launcherview.ActionItemKindSeparator})
+			insertedDivider = true
+		}
+		if makeItem != nil {
+			items = append(items, makeItem(index, entry))
+			continue
+		}
+		items = append(items, launcherview.ActionItem{Kind: launcherview.ActionItemKindAction, Index: index, ID: entry.ID})
+	}
+	return items
+}
+
+// actionPanelGroupIndices associates each action with its preceding section header.
+func actionPanelGroupIndices(entries []actionPanelEntry) []int {
+	groups := make([]int, len(entries))
+	header := -1
+	for index, entry := range entries {
+		if entry.IsGroupHeader {
+			header = index
+		}
+		groups[index] = header
+	}
+	return groups
+}
+
+// actionPanelGroupHeaderItem is chrome only: it is never selected or executed.
+func actionPanelGroupHeaderItem(entry actionPanelEntry, index int, makeItem func(int, actionPanelEntry) launcherview.ActionItem) launcherview.ActionItem {
+	item := launcherview.ActionItem{Kind: launcherview.ActionItemKindGroupHeader, ID: entry.ID, Index: -1}
+	if makeItem != nil {
+		item.Label = makeItem(index, entry).Label
+	}
+	return item
+}
+
+// actionPanelIcons tints only monochrome verb SVGs (and local white masks) so
+// they follow the row label. Brand and plugin SVGs stay as authored; a source-in
+// tint would flatten their filled shapes into a solid blob.
+func (a *App) actionPanelIcons(action actionPanelEntry, palette uiPalette, iconSize int) (*woxui.Image, *woxui.Image) {
+	if action.Source == actionPanelSourceLocal || svgUsesThemeIconColor(action.Icon) {
+		return a.imageForTint(action.Icon, &palette.actionText, iconSize), a.imageForTint(action.Icon, &palette.actionSelectedText, iconSize)
+	}
+	icon := a.imageForSize(action.Icon, iconSize)
+	return icon, icon
+}
+
+func svgUsesThemeIconColor(source woxImage) bool {
+	switch source.ImageType {
+	case "svg":
+		return strings.Contains(source.ImageData, "var(--wox-theme-icon-color)")
+	case "base64":
+		return strings.Contains(strings.ToLower(source.ImageData), "image/svg+xml") && strings.Contains(source.ImageData, "var(--wox-theme-icon-color)")
+	default:
+		return false
+	}
+}
+
+// actionPanelVisibleListHeight sizes the scroll list from filtered entries, including a visible group divider.
+func actionPanelVisibleListHeight(entries []actionPanelEntry, indices []int) float32 {
+	return launcherview.ActionPanelListHeight(actionPanelDisplayItems(entries, indices, false, nil))
+}
+
+// actionPanelUnfilteredIndices reserves window height for the full action list
+// so typing in the filter cannot shrink the launcher and move the search box.
+func actionPanelUnfilteredIndices(entries []actionPanelEntry) []int {
+	indices := make([]int, 0, len(entries))
+	for index, entry := range entries {
+		if entry.IsGroupHeader {
+			continue
+		}
+		indices = append(indices, index)
+	}
+	return indices
+}
+
+// actionPanelFloatingPlacement pins the search box to the toolbar so a shorter
+// filtered list, or a group divider appearing, cannot move the filter field.
+func actionPanelFloatingPlacement(left, windowHeight, queryHeight, toolbarHeight, panelWidth, panelHeight, bottomOffset float32) (launcherview.LauncherFloatingView, woxui.Rect) {
+	return launcherview.LauncherFloatingView{
+		Left: left, Bottom: toolbarHeight + bottomOffset, AnchorBottom: true,
+	}, woxui.Rect{
+		X: left, Y: max(queryHeight+launcherview.ActionPanelTopGap, windowHeight-toolbarHeight-panelHeight-bottomOffset),
+		Width: panelWidth, Height: panelHeight,
+	}
+}
+
+// buildActionPanel resolves action labels and icons before delegating to the pure panel view.
+func (a *App) buildActionPanel(snapshot viewSnapshot, windowWidth, windowHeight, queryHeight, toolbarHeight, imageScale float32) (woxwidget.Widget, float32, float32) {
+	if len(snapshot.actionEntries) == 0 {
+		return nil, 0, 0
+	}
+	items := actionPanelDisplayItems(snapshot.actionEntries, snapshot.actionIndices, snapshot.actionFilter != "", func(index int, action actionPanelEntry) launcherview.ActionItem {
+		iconSize := float32(launcherview.ActionIconSize)
+		var paintedIconSize float32
+		if isAboutMenuCommunityEntry(action) {
+			iconSize = launcherview.ActionBrandIconSize
+			paintedIconSize = iconSize
+		}
+		icon, selectedIcon := a.actionPanelIcons(action, snapshot.palette, physicalImageSize(int(snapshot.densityMetrics.scaled(iconSize)), imageScale))
+		item := launcherview.ActionItem{
+			Kind: launcherview.ActionItemKindAction, Index: index, ID: action.ID, Label: a.language.translate(action.Name), Icon: icon, SelectedIcon: selectedIcon, IconSize: paintedIconSize,
+			Tail: aboutMenuItemTail(action, a.language.translate), TailIcon: a.imageForSize(action.TailIcon, physicalImageSize(int(snapshot.densityMetrics.scaled(launcherview.ActionTailIconSize)), imageScale)),
+			HotkeyLabels: formatHotkeyLabels(action.Hotkey),
+		}
+		return item
+	})
+	return launcherview.ActionsBoundary(launcherview.ActionsProps{
+		ResultsRevision: snapshot.resultsRevision, ToolbarRevision: snapshot.toolbarRevision,
+		Window: a.window, WindowWidth: windowWidth, WindowHeight: windowHeight, QueryHeight: queryHeight, ToolbarHeight: toolbarHeight, DensityScale: snapshot.densityMetrics.scale,
+		Theme: snapshot.palette.componentTheme(), ActionHeader: snapshot.palette.actionHeader,
+		ActionQueryBackground: snapshot.palette.actionQueryBackground, ActionQueryText: snapshot.palette.actionQueryText,
+		ResultTail: snapshot.palette.resultTail, SelectedTail: snapshot.palette.selectedTail,
+		ActionQueryRadius: snapshot.palette.actionQueryRadius,
+		ActionPadding:     snapshot.palette.actionPadding,
+		BottomOffset:      launcherview.ActionPanelBottomOffset(snapshot.palette.appPadding.Bottom),
+		HeaderLabel:       actionPanelHeaderLabel(snapshot, a.language.translate("i18n:ui_actions"), a.language.translate("i18n:ui_about")), NoMatchesLabel: a.language.translate("i18n:ui_no_matches"),
+		ListHeightLimit: actionPanelVisibleListHeight(snapshot.actionEntries, actionPanelUnfilteredIndices(snapshot.actionEntries)),
+		Items:           items, Selected: snapshot.actionSelected, Filter: snapshot.actionFilter,
+		OnSelect: a.actions.selectAction, OnActivate: a.actions.activateSelectedAction,
+		OnFilterChanged: a.actions.setActionFilterValue, OnFilterKey: a.actions.onActionKey,
+	})
+}
+
+func aboutMenuItemTail(action actionPanelEntry, translate func(string) string) string {
+	if action.ID == aboutMenuDiscordID {
+		return aboutMenuDiscordTail(translate(action.Tail))
+	}
+	return translate(action.Tail)
+}
+
+func actionPanelHeaderLabel(snapshot viewSnapshot, actionsLabel, aboutLabel string) string {
+	if snapshot.actionPanelPurpose == actionPanelPurposeAbout {
+		if snapshot.aboutMenuError != "" {
+			return snapshot.aboutMenuError
+		}
+		return aboutLabel
+	}
+	return actionsLabel
+}
+
+func (a *actionPanelController) onActionKey(event woxui.KeyEvent) bool {
+	if !event.Down || event.Composing {
+		return false
+	}
+	if hotkeyMatches(aboutMenuHotkey(), event) {
+		if event.Repeat {
+			return true
+		}
+		a.toggleAboutMenu()
+		return true
+	}
+	if hotkeyMatches(a.actionPanelHotkey(), event) {
+		if event.Repeat {
+			return true
+		}
+		a.toggleActionPanel()
+		return true
+	}
+	open := a.actionPanel
+	if !open {
+		return false
+	}
+	if a.navigationBindings != nil {
+		switch navigationDirection(a.navigationBindings(), event) {
+		case woxui.KeyArrowUp:
+			a.moveActionSelection(-1)
+			return true
+		case woxui.KeyArrowDown:
+			a.moveActionSelection(1)
+			return true
+		}
+	}
+	if event.Key == woxui.KeyTab {
+		return true
+	}
+	if event.Modifiers == 0 {
+		switch event.Key {
+		case woxui.KeyEscape:
+			a.hideActionPanel()
+			return true
+		case woxui.KeyArrowUp:
+			a.moveActionSelection(-1)
+			return true
+		case woxui.KeyArrowDown:
+			a.moveActionSelection(1)
+			return true
+		case woxui.KeyEnter:
+			a.activateSelectedAction()
+			return true
+		}
+	}
+	if event.Modifiers == woxui.KeyModifierControl {
+		switch event.Key {
+		case woxui.Key("n"):
+			a.moveActionSelection(1)
+			return true
+		case woxui.Key("p"):
+			a.moveActionSelection(-1)
+			return true
+		}
+	}
+
+	if !a.actionPanel || a.actionFilter == nil {
+		return false
+	}
+	entries := a.currentActionPanelEntries()
+	indices := filteredActionIndices(entries, a.actionFilter.State().Text, a.language.translationSnapshot(), a.usePinYin())
+	for _, index := range indices {
+		if hotkeyMatches(entries[index].Hotkey, event) {
+			a.actionSelected = index
+			a.actionSelectionKey = entries[index].Key
+			a.activateSelectedAction()
+			return true
+		}
+	}
+	return false
+}
+
+// onResultActionHotkey executes a visible action without opening the action panel.
+func (a *actionPanelController) onResultActionHotkey(event woxui.KeyEvent) bool {
+	if a.actionPanel {
+		return false
+	}
+	if event.Modifiers == 0 {
+		switch event.Key {
+		case woxui.KeyEscape, woxui.KeyEnter, woxui.KeyArrowUp, woxui.KeyArrowDown, woxui.KeyArrowLeft, woxui.KeyArrowRight, woxui.KeyTab, woxui.KeyHome, woxui.KeyEnd:
+			return false
+		}
+	}
+	entry, matched := actionPanelEntryForHotkey(a.currentActionPanelEntries(), event)
+	if !matched {
+		return false
+	}
+	a.activateActionPanelEntry(entry)
+	return true
+}
+
+// actionPanelEntryForHotkey resolves launcher-wide actions in their displayed priority order.
+func actionPanelEntryForHotkey(entries []actionPanelEntry, event woxui.KeyEvent) (actionPanelEntry, bool) {
+	for _, entry := range entries {
+		if hotkeyMatches(entry.Hotkey, event) {
+			return entry, true
+		}
+	}
+	return actionPanelEntry{}, false
+}
+
+func (a *actionPanelController) toggleActionPanel() {
+	if a.actionPanel && a.actionPanelPurpose == actionPanelPurposeAbout {
+		if len(a.resultActionPanelEntries()) == 0 {
+			return
+		}
+		a.openActionPanel(actionPanelPurposeResult)
+		return
+	}
+	if a.actionPanel {
+		a.hideActionPanel()
+		return
+	}
+	if len(a.resultActionPanelEntries()) == 0 {
+		return
+	}
+	a.openActionPanel(actionPanelPurposeResult)
+}
+
+// openActionPanel switches the shared panel to one purpose and clears retained filter state.
+func (a *actionPanelController) openActionPanel(purpose actionPanelPurpose) {
+	a.beforeOpen()
+	a.actionPanel = true
+	a.actionPanelPurpose = purpose
+	a.aboutMenuError = ""
+	a.actionSelected = -1
+	a.actionSelectionKey = ""
+	a.actionFilter = woxui.NewTextEditor("")
+	a.normalizeActionSelectionLocked()
+	if a.window() != nil {
+		_ = a.applyWindowBounds()
+		_ = a.window().Invalidate()
+	}
+}
+
+// openResultActionPanel selects the pointer target before opening its actions.
+func (a *App) openResultActionPanel(index int) {
+	a.selectResult(index)
+	if !a.actions.actionPanel {
+		a.actions.toggleActionPanel()
+	}
+}
+
+// hideActionPanel clears filter state and returns keyboard ownership to the query editor.
+func (a *actionPanelController) hideActionPanel() bool {
+	changed := a.resetActionPanelLocked()
+	if !changed {
+		return false
+	}
+	a.dismissAboutMenuTooltip()
+	if a.window() != nil {
+		_ = a.applyWindowBounds()
+		_ = a.window().Invalidate()
+	}
+	a.restoreQueryTextInput()
+	return true
+}
+
+func (a *actionPanelController) resetActionPanelLocked() bool {
+	if !a.actionPanel {
+		return false
+	}
+	a.clearActionPanelStateLocked()
+	return true
+}
+
+// clearActionPanelStateLocked drops both the open flag and the panel purpose.
+func (a *actionPanelController) clearActionPanelStateLocked() {
+	a.actionPanel = false
+	a.actionPanelPurpose = actionPanelPurposeResult
+	a.aboutMenuError = ""
+	a.actionSelected = 0
+	a.actionSelectionKey = ""
+	a.actionFilter = nil
+}
+
+// shouldSyncActionPanelWithResults is false while About Menu is open so result and
+// toolbar updates cannot close the panel or rewrite its selection.
+func (a *actionPanelController) shouldSyncActionPanelWithResults() bool {
+	return a.actionPanel && a.actionPanelPurpose != actionPanelPurposeAbout
+}
+
+func (a *actionPanelController) moveActionSelection(delta int) {
+	if !a.actionPanel || a.actionFilter == nil {
+		return
+	}
+	entries := a.currentActionPanelEntries()
+	indices := filteredActionIndices(entries, a.actionFilter.State().Text, a.language.translationSnapshot(), a.usePinYin())
+	if len(indices) == 0 {
+		return
+	}
+	position := 0
+	for index, actionIndex := range indices {
+		if actionIndex == a.actionSelected {
+			position = index
+			break
+		}
+	}
+	position = (position + delta + len(indices)) % len(indices)
+	a.actionSelected = indices[position]
+	a.actionSelectionKey = entries[a.actionSelected].Key
+	a.invalidateActionPanel()
+}
+
+func (a *actionPanelController) onActionTextInput(_ woxui.TextInputEvent) bool {
+	open := a.actionPanel
+	return open
+}
+
+func (a *actionPanelController) setActionFilterValue(value string) {
+	if a.actionPanel && a.actionFilter != nil {
+		actionFilterChanged := a.actionFilter.State().Text != value
+		a.actionFilter.SetText(value, false)
+		if actionFilterChanged {
+			a.selectFirstFilteredActionLocked()
+		}
+	}
+	// Window height is based on unfiltered actions; only the floating panel changes size.
+	a.invalidateActionPanel()
+}
+
+// invalidateActionPanel covers both panel sizes when filtering changes its height.
+func (a *actionPanelController) invalidateActionPanel() {
+	if a.host() != nil && a.host().InvalidateKey("action-panel-surface") {
+		return
+	}
+	if a.window() != nil {
+		_ = a.window().Invalidate()
+	}
+}
+
+// normalizeActionSelectionLocked preserves the same unified action across live result and toolbar refreshes.
+func (a *actionPanelController) normalizeActionSelectionLocked() {
+	if !a.actionPanel || a.actionFilter == nil {
+		return
+	}
+	entries := a.currentActionPanelEntries()
+	indices := filteredActionIndices(entries, a.actionFilter.State().Text, a.language.translationSnapshot(), a.usePinYin())
+	if len(indices) == 0 {
+		a.actionSelected = -1
+		a.actionSelectionKey = ""
+		return
+	}
+	if a.actionSelectionKey != "" {
+		for _, index := range indices {
+			if entries[index].Key == a.actionSelectionKey {
+				a.actionSelected = index
+				return
+			}
+		}
+	}
+	for _, index := range indices {
+		if entries[index].IsDefault {
+			a.actionSelected = index
+			a.actionSelectionKey = entries[index].Key
+			return
+		}
+	}
+	a.actionSelected = indices[0]
+	a.actionSelectionKey = entries[a.actionSelected].Key
+}
+
+func (a *actionPanelController) selectFirstFilteredActionLocked() {
+	entries := a.currentActionPanelEntries()
+	indices := filteredActionIndices(entries, a.actionFilter.State().Text, a.language.translationSnapshot(), a.usePinYin())
+	if len(indices) == 0 {
+		a.actionSelected = -1
+		a.actionSelectionKey = ""
+		return
+	}
+	a.actionSelected = indices[0]
+	a.actionSelectionKey = entries[a.actionSelected].Key
+}
+
+// filteredActionIndices keeps source order for an empty filter. A nonempty query
+// ranks by fuzzy score so a prefix such as Uninstall beats a scattered hit like
+// Run as Administrator for "uninsta". Plugin actions stay above system actions
+// so the group divider still lands between the two sets.
+func filteredActionIndices(actions []actionPanelEntry, query string, translations map[string]string, usePinYin bool) []int {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return actionPanelUnfilteredIndices(actions)
+	}
+	type rankedAction struct {
+		index  int
+		score  int64
+		system bool
+	}
+	matches := make([]rankedAction, 0, len(actions))
+	for index, action := range actions {
+		if action.IsGroupHeader {
+			continue
+		}
+		score, matched := actionFilterMatchScore(action, query, translations, usePinYin)
+		if matched {
+			matches = append(matches, rankedAction{index: index, score: score, system: action.IsSystemAction})
+		}
+	}
+	groups := actionPanelGroupIndices(actions)
+	sort.SliceStable(matches, func(left, right int) bool {
+		if leftGroup, rightGroup := groups[matches[left].index], groups[matches[right].index]; leftGroup != rightGroup {
+			return leftGroup < rightGroup
+		}
+		if matches[left].system != matches[right].system {
+			return !matches[left].system
+		}
+		if matches[left].score != matches[right].score {
+			return matches[left].score > matches[right].score
+		}
+		return matches[left].index < matches[right].index
+	})
+	indices := make([]int, len(matches))
+	for index, match := range matches {
+		indices[index] = match.index
+	}
+	return indices
+}
+
+// actionFilterMatchScore returns the best fuzzy score across the localized label and search aliases.
+func actionFilterMatchScore(action actionPanelEntry, query string, translations map[string]string, usePinYin bool) (int64, bool) {
+	best := int64(0)
+	matched := false
+	consider := func(text string) {
+		if text == "" {
+			return
+		}
+		ok, score := util.IsStringMatchScore(text, query, usePinYin)
+		if ok && (!matched || score > best) {
+			matched = true
+			best = score
+		}
+	}
+	consider(translatedActionLabel(action.Name, translations))
+	for _, alias := range action.SearchAliases {
+		consider(alias)
+	}
+	return best, matched
+}
+
+func translatedActionLabel(value string, translations map[string]string) string {
+	if !strings.HasPrefix(value, "i18n:") {
+		return value
+	}
+	key := strings.TrimPrefix(value, "i18n:")
+	if translated := translations[key]; translated != "" {
+		return translated
+	}
+	return strings.ReplaceAll(key, "_", " ")
+}
+
+func (a *actionPanelController) selectAction(index int) {
+	entries := a.currentActionPanelEntries()
+	if a.actionPanel && index >= 0 && index < len(entries) {
+		a.actionSelected = index
+		a.actionSelectionKey = entries[index].Key
+	}
+	a.invalidateActionPanel()
+}
+
+func (a *actionPanelController) activateSelectedAction() {
+	entries := a.currentActionPanelEntries()
+	selected := a.actionSelected
+	if selected < 0 || selected >= len(entries) {
+		return
+	}
+	entry := entries[selected]
+	a.activateActionPanelEntry(entry)
+}
+
+func (a *App) activateActionPanelEntry(entry actionPanelEntry) {
+	if entry.Source == actionPanelSourceLocal {
+		a.activateLocalActionPanelEntry(entry)
+		return
+	}
+	if entry.Source == actionPanelSourceToolbar {
+		a.toolbar.activateToolbarActionForMessage(entry.ToolbarMessageID, entry.ToolbarMessageAction)
+		return
+	}
+	a.activateAction(entry.ResultIndex, entry.ActionIndex)
+}
+
+// activateLocalActionPanelEntry dispatches preview-owned actions without crossing the plugin action API.
+func (a *App) activateLocalActionPanelEntry(entry actionPanelEntry) {
+	if a.activateAboutMenuEntry(entry) {
+		return
+	}
+	if entry.ID == localActionWebViewClosePageID {
+		a.webView.closeWebViewPage()
+		return
+	}
+	if entry.ID == localActionWebViewHidePageID {
+		a.webView.hideWebViewPage()
+		return
+	}
+	if a.window == nil {
+		return
+	}
+	var err error
+	switch entry.ID {
+	case localActionWebViewReloadID:
+		err = a.window.WebViewReload()
+	case localActionWebViewGoBackID:
+		err = a.window.WebViewGoBack()
+	case localActionWebViewGoForwardID:
+		err = a.window.WebViewGoForward()
+	case localActionWebViewOpenInBrowserID:
+		a.webView.openWebViewInSystemBrowser()
+		return
+	case localActionWebViewOpenDevToolsID:
+		err = a.window.WebViewOpenDevTools()
+	default:
+		return
+	}
+	if err != nil {
+		util.GetLogger().Error(a.lifecycleCtx, fmt.Sprintf("execute local action %s: %v", entry.ID, err))
+	}
+	a.actions.hideActionPanel()
+}
+
+// activateResultActionByID resolves preview-owned controls against the latest result snapshot.
+func (a *App) activateResultActionByID(queryID, resultID, actionID string) {
+	resultIndex := -1
+	actionIndex := -1
+	for index, result := range a.resultList.results {
+		if result.QueryID != queryID || result.ID != resultID {
+			continue
+		}
+		resultIndex = index
+		for candidate, action := range result.Actions {
+			if action.ID == actionID {
+				actionIndex = candidate
+				break
+			}
+		}
+		break
+	}
+	if resultIndex >= 0 && actionIndex >= 0 {
+		a.activateAction(resultIndex, actionIndex)
+	}
+}
+
+func (a *App) activateAction(resultIndex, actionIndex int) {
+	if resultIndex < 0 || resultIndex >= len(a.resultList.results) || actionIndex < 0 || actionIndex >= len(a.resultList.results[resultIndex].Actions) || a.resultList.results[resultIndex].IsGroup {
+		return
+	}
+	result := a.resultList.results[resultIndex]
+	action := result.Actions[actionIndex]
+	if action.ID == enterChatModeActionID {
+		a.actions.hideActionPanel()
+		a.chat.enterChatMode()
+		return
+	}
+	if action.ID == openWebViewPreviewActionID {
+		a.actions.hideActionPanel()
+		a.webView.enterWebViewPreviewMode(resultIndex, action.ContextData)
+		return
+	}
+	if action.Type == "form" {
+		a.forms.openFormAction(result, action)
+		return
+	}
+	if action.Type == "local" {
+		log.Printf("Go UI local action %q is not implemented yet", action.ID)
+		return
+	}
+	util.Go(a.lifecycleCtx, "execute result action", func() {
+		if err := a.services.ExecuteAction(context.Background(), a.sessionID, result.QueryID, result.ID, action.ID); err != nil {
+			log.Printf("execute result action: %v", err)
+			return
+		}
+		if err := a.runOnUI("finish result action", func() {
+			a.actions.hideActionPanel()
+			if !action.PreventHideAfterAction {
+				if err := a.hideWindow(true); err != nil {
+					log.Printf("hide launcher after action: %v", err)
+				}
+			}
+		}); err != nil {
+			log.Printf("dispatch result action completion: %v", err)
+		}
+	})
+}
+
+// onQueryFocusChanged mirrors Flutter's query-focus notification after panel focus returns.
+func (a *App) onQueryFocusChanged(focused bool) {
+	if !focused {
+		return
+	}
+	if state := a.chat.chatPreview; state != nil {
+		state.active = false
+	}
+	formVisible := a.forms.form != nil
+	if formVisible {
+		return
+	}
+	a.actions.hideActionPanel()
+	a.querySession.queryFocusNotifiedInActiveWindow = true
+	a.notifyQueryBoxFocus()
+}
+
+// notifyQueryBoxFocusOnWindowActivation covers reactivation when Host retains logical query focus.
+func (a *App) notifyQueryBoxFocusOnWindowActivation() {
+	if !a.visible || a.querySession.queryFocusNotifiedInActiveWindow || a.host == nil || !a.queryCanFocus() || !a.host.HasFocus(launcherview.LauncherQueryInputKey) {
+		return
+	}
+	a.querySession.queryFocusNotifiedInActiveWindow = true
+	a.notifyQueryBoxFocus()
+}
+
+// notifyQueryBoxFocus sends the core lifecycle event that applies the input-method setting.
+func (a *App) notifyQueryBoxFocus() {
+	util.Go(a.lifecycleCtx, "notify query box focus", func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := a.services.QueryBoxFocused(ctx, a.sessionID); err != nil {
+			log.Printf("notify query box focus: %v", err)
+		}
+	})
+}

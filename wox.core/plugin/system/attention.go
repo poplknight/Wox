@@ -1,0 +1,250 @@
+package system
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"wox/common"
+	"wox/common/icons"
+	"wox/database"
+	"wox/plugin"
+	"wox/util"
+)
+
+var attentionIcon = icons.Get(icons.PluginAttention)
+
+const (
+	attentionOpenActionID       = "attention-open"
+	attentionMarkReadActionID   = "attention-mark-read"
+	attentionMarkUnreadActionID = "attention-mark-unread"
+)
+
+func init() {
+	// plugin.AllSystemPlugin = append(plugin.AllSystemPlugin, &AttentionPlugin{})
+}
+
+type AttentionPlugin struct {
+	api     plugin.API
+	manager *plugin.AttentionManager
+}
+
+func (a *AttentionPlugin) GetMetadata() plugin.Metadata {
+	return plugin.Metadata{
+		Id:            plugin.AttentionPluginID,
+		Name:          "i18n:plugin_attention_plugin_name",
+		Author:        "Wox Launcher",
+		Website:       "https://github.com/Wox-launcher/Wox",
+		Version:       "1.0.0",
+		MinWoxVersion: "2.0.0",
+		Runtime:       "Go",
+		Description:   "i18n:plugin_attention_plugin_description",
+		Icon:          attentionIcon.String(),
+		Entry:         "",
+		TriggerKeywords: []string{
+			"attention",
+		},
+		SupportedOS: []string{
+			"Windows",
+			"Macos",
+			"Linux",
+		},
+	}
+}
+
+func (a *AttentionPlugin) Init(ctx context.Context, initParams plugin.InitParams) {
+	a.api = initParams.API
+	// Replay persisted unread items so the query-box decoration appears after restart.
+	plugin.PublishAttentionUnreadCount(ctx)
+}
+
+func (a *AttentionPlugin) Query(ctx context.Context, query plugin.Query) plugin.QueryResponse {
+	items, err := a.getManager().List(ctx)
+	if err != nil {
+		return plugin.QueryResponse{Results: []plugin.QueryResult{
+			{
+				Title:    "i18n:plugin_attention_load_failed",
+				SubTitle: err.Error(),
+				Icon:     attentionIcon,
+				Score:    100,
+			},
+		}}
+	}
+
+	search := strings.TrimSpace(query.Search)
+	results := []plugin.QueryResult{}
+	results = append(results, a.buildItemResults(ctx, items.Unread, search, "i18n:plugin_attention_group_unread", 1000)...)
+	results = append(results, a.buildItemResults(ctx, items.Read, search, "i18n:plugin_attention_group_read", 500)...)
+
+	if len(results) == 0 {
+		results = append(results, plugin.QueryResult{
+			Title:      "i18n:plugin_attention_no_items",
+			Icon:       attentionIcon,
+			Score:      1,
+			Group:      "i18n:plugin_attention_plugin_name",
+			GroupScore: 1,
+		})
+	}
+
+	return plugin.QueryResponse{Results: results}
+}
+
+// buildItemResults maps stored attention items to query results while preserving group ordering.
+func (a *AttentionPlugin) buildItemResults(ctx context.Context, items []database.AttentionItem, search string, group string, groupScore int64) []plugin.QueryResult {
+	results := []plugin.QueryResult{}
+	for index, item := range items {
+		match, matchScore := matchAttentionItem(ctx, item, search)
+		if !match {
+			continue
+		}
+
+		itemCopy := item
+		score := int64(len(items) - index)
+		if matchScore > score {
+			score = matchScore
+		}
+
+		results = append(results, plugin.QueryResult{
+			Id:          item.IdentityKey,
+			IdentityKey: item.IdentityKey,
+			Title:       item.Title,
+			SubTitle:    item.Description,
+			Icon:        plugin.ParseAttentionIcon(item.Icon),
+			Score:       score,
+			Group:       group,
+			GroupScore:  groupScore,
+			Tails:       a.buildItemTails(ctx, item),
+			Actions:     a.buildItemActions(ctx, itemCopy),
+		})
+	}
+	return results
+}
+
+func (a *AttentionPlugin) buildItemTails(ctx context.Context, item database.AttentionItem) []plugin.QueryResultTail {
+	tails := []plugin.QueryResultTail{}
+	if pluginName := getAttentionPluginName(ctx, item.PluginID); pluginName != "" {
+		tails = append(tails, plugin.NewQueryResultTailText(pluginName))
+	}
+	if item.IsRead && item.ReadTimestamp > 0 {
+		tails = append(tails, plugin.NewQueryResultTailText(util.FormatTimestamp(item.ReadTimestamp)))
+	} else if item.UpdatedTimestamp > 0 {
+		tails = append(tails, plugin.NewQueryResultTailText(util.FormatTimestamp(item.UpdatedTimestamp)))
+	}
+	return tails
+}
+
+func (a *AttentionPlugin) buildItemActions(ctx context.Context, item database.AttentionItem) []plugin.QueryResultAction {
+	actions := []plugin.QueryResultAction{}
+	storedAction, actionErr := plugin.ParseAttentionAction(item.Action)
+	if actionErr != nil {
+		util.GetLogger().Warn(ctx, fmt.Sprintf("failed to parse attention action: %v", actionErr))
+	}
+	if storedAction != nil && (storedAction.Type == plugin.AttentionActionTypeChangeQuery || storedAction.Type == plugin.AttentionActionTypeOpenPluginSettings) {
+		query := storedAction.Query
+		actions = append(actions, plugin.QueryResultAction{
+			Id:                     attentionOpenActionID,
+			Name:                   "i18n:plugin_attention_action_open",
+			Icon:                   icons.Get(icons.ActionRun),
+			IsDefault:              true,
+			PreventHideAfterAction: true,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				a.markReadAndPublish(ctx, item.IdentityKey)
+				if storedAction.Type == plugin.AttentionActionTypeOpenPluginSettings {
+					plugin.GetPluginManager().GetUI().OpenSettingWindow(ctx, common.SettingWindowContext{Path: "/plugin/setting", Param: item.PluginID})
+					return
+				}
+				a.api.ChangeQuery(ctx, common.PlainQuery{
+					QueryType: plugin.QueryTypeInput,
+					QueryText: query,
+				})
+			},
+		})
+	}
+
+	if !item.IsRead {
+		actions = append(actions, plugin.QueryResultAction{
+			Id:                     attentionMarkReadActionID,
+			Name:                   "i18n:plugin_attention_action_mark_read",
+			Icon:                   icons.Get(icons.ActionCorrect),
+			IsDefault:              len(actions) == 0,
+			PreventHideAfterAction: true,
+			Hotkey:                 util.PrimaryHotkey("enter"),
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				a.setReadAndPublish(ctx, item.IdentityKey, true)
+				a.api.RefreshQuery(ctx, plugin.RefreshQueryParam{PreserveSelectedIndex: true})
+			},
+		})
+	} else {
+		actions = append(actions, plugin.QueryResultAction{
+			Id:                     attentionMarkUnreadActionID,
+			Name:                   "i18n:plugin_attention_action_mark_unread",
+			Icon:                   icons.Get(icons.ControlInbox),
+			IsDefault:              len(actions) == 0,
+			PreventHideAfterAction: true,
+			Hotkey:                 util.PrimaryHotkey("enter"),
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				a.setReadAndPublish(ctx, item.IdentityKey, false)
+				a.api.RefreshQuery(ctx, plugin.RefreshQueryParam{PreserveSelectedIndex: true})
+			},
+		})
+	}
+
+	return actions
+}
+
+func (a *AttentionPlugin) markReadAndPublish(ctx context.Context, identityKey string) {
+	a.setReadAndPublish(ctx, identityKey, true)
+}
+
+// setReadAndPublish updates one item and refreshes the query-box unread badge.
+func (a *AttentionPlugin) setReadAndPublish(ctx context.Context, identityKey string, read bool) {
+	var err error
+	if read {
+		err = a.getManager().MarkRead(ctx, identityKey)
+	} else {
+		err = a.getManager().MarkUnread(ctx, identityKey)
+	}
+	if err != nil {
+		state := "read"
+		if !read {
+			state = "unread"
+		}
+		util.GetLogger().Warn(ctx, fmt.Sprintf("failed to mark attention item %s: %v", state, err))
+		return
+	}
+	if a.manager != nil {
+		return
+	}
+	plugin.PublishAttentionUnreadCount(ctx)
+}
+
+func (a *AttentionPlugin) getManager() *plugin.AttentionManager {
+	if a.manager != nil {
+		return a.manager
+	}
+	return plugin.GetAttentionManager()
+}
+
+func matchAttentionItem(ctx context.Context, item database.AttentionItem, search string) (bool, int64) {
+	if search == "" {
+		return true, 0
+	}
+
+	titleMatch, titleScore := plugin.IsStringMatchScore(ctx, item.Title, search)
+	descriptionMatch, descriptionScore := plugin.IsStringMatchScore(ctx, item.Description, search)
+	if titleMatch || descriptionMatch {
+		return true, max(titleScore, descriptionScore)
+	}
+
+	pluginName := getAttentionPluginName(ctx, item.PluginID)
+	pluginMatch, pluginScore := plugin.IsStringMatchScore(ctx, pluginName, search)
+	return pluginMatch, pluginScore
+}
+
+func getAttentionPluginName(ctx context.Context, pluginID string) string {
+	for _, instance := range plugin.GetPluginManager().GetPluginInstances() {
+		if instance.Metadata.Id == pluginID {
+			return instance.GetName(ctx)
+		}
+	}
+	return pluginID
+}

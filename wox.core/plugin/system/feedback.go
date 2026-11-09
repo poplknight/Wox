@@ -1,0 +1,451 @@
+package system
+
+import (
+	"context"
+	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+	"wox/common"
+	"wox/common/icons"
+	"wox/plugin"
+	"wox/supervisor"
+	"wox/ui"
+	"wox/updater"
+	"wox/util"
+	"wox/util/shell"
+)
+
+func init() {
+	// plugin.AllSystemPlugin = append(plugin.AllSystemPlugin, &FeedbackPlugin{})
+}
+
+type FeedbackPlugin struct {
+	api plugin.API
+}
+
+const (
+	feedbackGitHubNewIssueURL  = "https://github.com/Wox-launcher/Wox/issues/new"
+	feedbackBugTemplate        = "bug_report.yml"
+	feedbackFeatureTemplate    = "feature_request.yml"
+	feedbackBugTitlePrefix     = "[Bug]: "
+	feedbackFeatureTitlePrefix = "[Feature Request]: "
+	feedbackCommandCrash       = "crash"
+)
+
+func (p *FeedbackPlugin) GetMetadata() plugin.Metadata {
+	return plugin.Metadata{
+		Id:            common.FeedbackPluginID,
+		Name:          "i18n:plugin_feedback_plugin_name",
+		Author:        "Wox Launcher",
+		Website:       "https://github.com/Wox-launcher/Wox",
+		Version:       "1.0.0",
+		MinWoxVersion: "2.0.0",
+		Runtime:       "Go",
+		Description:   "i18n:plugin_feedback_plugin_description",
+		Icon:          icons.Get(icons.PluginFeedback).String(),
+		Entry:         "",
+		TriggerKeywords: []string{
+			"feedback",
+		},
+		Commands: []plugin.MetadataCommand{
+			{
+				Command:     feedbackCommandCrash,
+				Description: "i18n:plugin_feedback_command_crash",
+			},
+		},
+		SupportedOS: []string{"Windows", "Macos", "Linux"},
+		Features: []plugin.MetadataFeature{
+			{Name: plugin.MetadataFeatureDisableAutoCommandHint},
+			{
+				Name: plugin.MetadataFeatureIgnoreAutoScore,
+			},
+		},
+	}
+}
+
+func (p *FeedbackPlugin) Init(ctx context.Context, initParams plugin.InitParams) {
+	p.api = initParams.API
+}
+
+func (p *FeedbackPlugin) Query(ctx context.Context, query plugin.Query) plugin.QueryResponse {
+	if query.Command == feedbackCommandCrash {
+		return plugin.NewQueryResponse(p.buildCrashResults(ctx))
+	}
+	if query.Command != "" {
+		return plugin.QueryResponse{}
+	}
+	return plugin.NewQueryResponse(p.buildDefaultResults())
+}
+
+// buildDefaultResults lists feedback and troubleshooting actions supported by this build.
+func (p *FeedbackPlugin) buildDefaultResults() []plugin.QueryResult {
+	results := []plugin.QueryResult{
+		p.buildBugResult(),
+		p.buildFeatureResult(),
+		p.buildClearLogsResult(),
+	}
+	if !util.IsDev() {
+		results = append(results, p.buildRestartResult())
+	}
+	results = append(results, p.buildDebugResult())
+	return results
+}
+
+// buildRestartResult switches between troubleshooting and normal startup without changing plugin settings.
+func (p *FeedbackPlugin) buildRestartResult() plugin.QueryResult {
+	title := "i18n:plugin_feedback_restart_without_plugins_title"
+	subtitle := "i18n:plugin_feedback_restart_without_plugins_subtitle"
+	if util.IsThirdPartyPluginsDisabled() {
+		title = "i18n:plugin_feedback_restart_title"
+		subtitle = "i18n:plugin_feedback_restart_subtitle"
+	}
+	return plugin.QueryResult{
+		Title:       title,
+		SubTitle:    subtitle,
+		IdentityKey: "feedback:restart",
+		Group:       "i18n:plugin_feedback_group_debugging",
+		GroupScore:  100,
+		Icon:        icons.Get(icons.ControlRefresh),
+		Score:       50,
+		Actions: []plugin.QueryResultAction{
+			{
+				Name:                   title,
+				Icon:                   icons.Get(icons.ActionExecute),
+				IsDefault:              true,
+				PreventHideAfterAction: true,
+				Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+					p.restart(ctx, supervisor.DebugModeEnabled(), !util.IsThirdPartyPluginsDisabled())
+				},
+			},
+		},
+	}
+}
+
+// buildDebugResult starts or ends a diagnostic session without persisting user settings.
+func (p *FeedbackPlugin) buildDebugResult() plugin.QueryResult {
+	title := "i18n:plugin_feedback_debug_enable_title"
+	subtitle := "i18n:plugin_feedback_debug_enable_subtitle"
+	if supervisor.DebugModeEnabled() {
+		title = "i18n:plugin_feedback_debug_disable_title"
+		subtitle = "i18n:plugin_feedback_debug_disable_subtitle"
+	}
+	return plugin.QueryResult{
+		Title: title, SubTitle: subtitle, IdentityKey: "feedback:debug-mode",
+		Group: "i18n:plugin_feedback_group_debugging", GroupScore: 100,
+		Icon: icons.Get(icons.ActionDebug), Score: 40,
+		Actions: []plugin.QueryResultAction{{
+			Name: title, Icon: icons.Get(icons.ActionExecute), IsDefault: true, PreventHideAfterAction: true,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				p.restart(ctx, !supervisor.DebugModeEnabled(), util.IsThirdPartyPluginsDisabled())
+			},
+		}},
+	}
+}
+
+// feedbackRestartArgs preserves independent diagnostic modes without replaying startup files or deep links.
+func feedbackRestartArgs(debugMode, disablePlugins bool) []string {
+	args := []string{supervisor.ArgChild}
+	if debugMode {
+		args = append(args, supervisor.ArgDebugMode)
+	}
+	if disablePlugins {
+		args = append(args, util.ArgNoThirdPartyPlugins)
+	}
+	return args
+}
+
+// restart leaves the current session running if the replacement supervisor cannot start.
+func (p *FeedbackPlugin) restart(ctx context.Context, debugMode, disablePlugins bool) {
+	util.GetLogger().Info(ctx, fmt.Sprintf("restarting diagnostic session: debugMode=%t thirdPartyPluginsDisabled=%t", debugMode, disablePlugins))
+	if err := supervisor.GetManager().StartSupervisorDetached(ctx, true, feedbackRestartArgs(debugMode, disablePlugins)...); err != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("failed to restart Wox: %s", err))
+		p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(p.api.GetTranslation(ctx, "plugin_feedback_restart_failed"), err.Error())})
+		return
+	}
+	ui.GetUIManager().ExitApp(ctx)
+}
+
+// buildCrashResults lists retained crash events under the explicit crash command.
+func (p *FeedbackPlugin) buildCrashResults(ctx context.Context) []plugin.QueryResult {
+	incidents := supervisor.GetManager().ListCrashIncidents()
+	if len(incidents) == 0 {
+		return []plugin.QueryResult{p.buildNoCrashResult()}
+	}
+
+	results := make([]plugin.QueryResult, 0, len(incidents))
+	for _, incident := range incidents {
+		results = append(results, p.buildCrashIncidentResult(ctx, incident))
+	}
+	return results
+}
+
+func (p *FeedbackPlugin) buildBugResult() plugin.QueryResult {
+	return plugin.QueryResult{
+		Title:       "i18n:plugin_feedback_bug_title",
+		SubTitle:    "i18n:plugin_feedback_bug_subtitle",
+		IdentityKey: "feedback:bug",
+		Group:       "i18n:plugin_feedback_group_feedback",
+		GroupScore:  200,
+		Icon:        icons.Get(icons.PluginFeedback),
+		Score:       300,
+		Actions: []plugin.QueryResultAction{
+			{
+				Name:      "i18n:plugin_feedback_bug_title",
+				Icon:      icons.Get(icons.ActionOpen),
+				IsDefault: true,
+				Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+					p.exportDiagnostics(ctx)
+				},
+			},
+		},
+	}
+}
+
+func (p *FeedbackPlugin) buildFeatureResult() plugin.QueryResult {
+	return plugin.QueryResult{
+		Title:       "i18n:plugin_feedback_feature_title",
+		SubTitle:    "i18n:plugin_feedback_feature_subtitle",
+		IdentityKey: "feedback:feature",
+		Group:       "i18n:plugin_feedback_group_feedback",
+		GroupScore:  200,
+		Icon:        icons.Get(icons.PluginNotes),
+		Score:       200,
+		Actions: []plugin.QueryResultAction{
+			{
+				Name:      "i18n:plugin_feedback_feature_title",
+				Icon:      icons.Get(icons.ActionOpen),
+				IsDefault: true,
+				Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+					p.openFeatureRequest(ctx)
+				},
+			},
+		},
+	}
+}
+
+func (p *FeedbackPlugin) buildClearLogsResult() plugin.QueryResult {
+	return plugin.QueryResult{
+		Title:       "i18n:plugin_feedback_clear_logs_title",
+		IdentityKey: "feedback:clear-logs",
+		Group:       "i18n:plugin_feedback_group_debugging",
+		GroupScore:  100,
+		SubTitle:    "i18n:plugin_feedback_clear_logs_subtitle",
+		Icon:        icons.Get(icons.ActionDelete),
+		Score:       100,
+		Actions: []plugin.QueryResultAction{
+			{
+				Name:                   "i18n:plugin_feedback_clear_logs_title",
+				Icon:                   icons.Get(icons.ActionDelete),
+				IsDefault:              true,
+				PreventHideAfterAction: true,
+				Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+					p.clearLogs(ctx)
+				},
+			},
+		},
+	}
+}
+
+func (p *FeedbackPlugin) buildNoCrashResult() plugin.QueryResult {
+	return plugin.QueryResult{
+		Title:    "i18n:plugin_feedback_no_crashes_title",
+		SubTitle: "i18n:plugin_feedback_no_crashes_description",
+		Icon:     icons.Get(icons.PluginFeedback),
+		Preview: plugin.WoxPreview{
+			PreviewType: plugin.WoxPreviewTypeMarkdown,
+			PreviewData: "i18n:plugin_feedback_no_crashes_preview",
+		},
+	}
+}
+
+// buildCrashIncidentResult creates one actionable result for a retained crash event.
+func (p *FeedbackPlugin) buildCrashIncidentResult(ctx context.Context, incident supervisor.CrashIncident) plugin.QueryResult {
+	signal := incident.Signal
+	if signal == "" {
+		signal = p.api.GetTranslation(ctx, "plugin_feedback_crash_signal_none")
+	}
+	title := fmt.Sprintf(p.api.GetTranslation(ctx, "plugin_feedback_crash_title"), incident.ID)
+	subtitle := fmt.Sprintf(p.api.GetTranslation(ctx, "plugin_feedback_crash_subtitle"), util.FormatTimestampWithMs(incident.DetectedAt))
+	preview := fmt.Sprintf(
+		"## %s\n\n%s\n\n- %s: `%d`\n- %s: `%d`\n- %s: `%s`\n- %s: `%s`\n- %s: `%s`\n- %s: `%s`\n- %s: `%s`",
+		title,
+		subtitle,
+		p.api.GetTranslation(ctx, "plugin_feedback_crash_pid"),
+		incident.PID,
+		p.api.GetTranslation(ctx, "plugin_feedback_crash_exit_code"),
+		incident.ExitCode,
+		p.api.GetTranslation(ctx, "plugin_feedback_crash_signal"),
+		signal,
+		p.api.GetTranslation(ctx, "plugin_feedback_crash_duration"),
+		formatCrashDuration(incident.DurationMs),
+		p.api.GetTranslation(ctx, "plugin_feedback_crash_version"),
+		incident.Version,
+		p.api.GetTranslation(ctx, "plugin_feedback_crash_id"),
+		incident.ID,
+		p.api.GetTranslation(ctx, "plugin_feedback_crash_package"),
+		incident.ReportPath,
+	)
+	return plugin.QueryResult{
+		Title:       title,
+		SubTitle:    subtitle,
+		IdentityKey: incident.ID,
+		Icon:        icons.Get(icons.PluginFeedback),
+		// The launcher re-sorts cached results by score, so preserve newest-first event ordering here.
+		Score: incident.DetectedAt,
+		Preview: plugin.WoxPreview{
+			PreviewType: plugin.WoxPreviewTypeMarkdown,
+			PreviewData: preview,
+		},
+		Actions: p.buildCrashIncidentActions(incident),
+	}
+}
+
+// buildCrashIncidentActions provides event-scoped packaging and issue actions.
+func (p *FeedbackPlugin) buildCrashIncidentActions(incident supervisor.CrashIncident) []plugin.QueryResultAction {
+	return []plugin.QueryResultAction{
+		{
+			Name:                   "i18n:plugin_feedback_action_package_issue",
+			Icon:                   icons.Get(icons.ActionOpenContainingFolder),
+			IsDefault:              true,
+			PreventHideAfterAction: true,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				p.openCrashIssue(ctx, incident)
+			},
+		},
+		{
+			Name:                   "i18n:plugin_feedback_action_open_package",
+			Icon:                   icons.Get(icons.ActionOpenContainingFolder),
+			PreventHideAfterAction: true,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				reportPath, _, err := p.ensureCrashReport(ctx, incident)
+				if err != nil {
+					p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(p.api.GetTranslation(ctx, "plugin_feedback_notify_export_failed"), err.Error())})
+					return
+				}
+				if err := shell.OpenFileInFolder(reportPath); err != nil {
+					util.GetLogger().Warn(ctx, fmt.Sprintf("failed to open crash report package: %s", err.Error()))
+				}
+			},
+		},
+	}
+}
+
+// openCrashIssue prepares the selected package and opens its GitHub issue form.
+func (p *FeedbackPlugin) openCrashIssue(ctx context.Context, incident supervisor.CrashIncident) {
+	reportPath, created, err := p.ensureCrashReport(ctx, incident)
+	if err != nil {
+		p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(p.api.GetTranslation(ctx, "plugin_feedback_notify_export_failed"), err.Error())})
+		return
+	}
+	p.openGitHubThenRevealFile(ctx, crashIssueURL(incident), reportPath)
+	if created {
+		p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(p.api.GetTranslation(ctx, "plugin_feedback_notify_exported"), reportPath)})
+	}
+}
+
+// ensureCrashReport reuses an automatic package or creates one if it was removed.
+func (p *FeedbackPlugin) ensureCrashReport(ctx context.Context, incident supervisor.CrashIncident) (string, bool, error) {
+	if info, err := os.Stat(incident.ReportPath); err == nil && !info.IsDir() {
+		return incident.ReportPath, false, nil
+	}
+	reportPath, err := supervisor.GetManager().ExportCrash(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	incident.ReportPath = reportPath
+	if err := supervisor.GetManager().SaveCrashIncident(incident); err != nil {
+		util.GetLogger().Warn(ctx, fmt.Sprintf("failed to update crash incident package path: %s", err.Error()))
+	}
+	return reportPath, true, nil
+}
+
+// githubIssueURL opens a GitHub issue form and prefills text fields that the form supports.
+func githubIssueURL(template, title string) string {
+	query := url.Values{}
+	query.Set("template", template)
+	if title != "" {
+		query.Set("title", title)
+	}
+	query.Set("wox_version", updater.CURRENT_VERSION)
+	if template == feedbackBugTemplate {
+		platform := "Linux"
+		if util.IsWindows() {
+			platform = "Windows"
+		} else if util.IsMacOS() {
+			platform = "macOS"
+		}
+		query.Set("platform", platform)
+	}
+	if template == feedbackBugTemplate && util.IsLinux() {
+		var environment []string
+		for _, envName := range []string{"XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP", "DESKTOP_SESSION", "GDMSESSION"} {
+			if value := os.Getenv(envName); value != "" {
+				environment = append(environment, value)
+				break
+			}
+		}
+		if util.IsLinuxWaylandSession() {
+			environment = append(environment, "Wayland")
+		} else if os.Getenv("DISPLAY") != "" {
+			environment = append(environment, "X11 (Xorg)")
+		}
+		if len(environment) > 0 {
+			query.Set("linux_environment", strings.Join(environment, " / "))
+		}
+	}
+	return feedbackGitHubNewIssueURL + "?" + query.Encode()
+}
+
+// crashIssueURL pre-fills the GitHub issue title with the selected event time.
+func crashIssueURL(incident supervisor.CrashIncident) string {
+	return githubIssueURL(feedbackBugTemplate, fmt.Sprintf("[Crash] %s", util.FormatTimestampWithMs(incident.DetectedAt)))
+}
+
+// formatCrashDuration keeps short startup crashes readable in result subtitles.
+func formatCrashDuration(durationMs int64) string {
+	if durationMs < 1000 {
+		return fmt.Sprintf("%d ms", durationMs)
+	}
+	return (time.Duration(durationMs) * time.Millisecond).Round(time.Millisecond).String()
+}
+
+func (p *FeedbackPlugin) exportDiagnostics(ctx context.Context) {
+	exportPath, err := supervisor.GetManager().Export(ctx)
+	if err != nil {
+		p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(p.api.GetTranslation(ctx, "plugin_feedback_notify_export_failed"), err.Error())})
+		return
+	}
+	p.openGitHubThenRevealFile(ctx, githubIssueURL(feedbackBugTemplate, feedbackBugTitlePrefix), exportPath)
+	p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(p.api.GetTranslation(ctx, "plugin_feedback_notify_exported"), exportPath)})
+}
+
+// openGitHubThenRevealFile opens the issue page first so Explorer is not covered by the browser.
+func (p *FeedbackPlugin) openGitHubThenRevealFile(ctx context.Context, issueURL, filePath string) {
+	if err := shell.Open(issueURL); err != nil {
+		util.GetLogger().Warn(ctx, fmt.Sprintf("failed to open GitHub issue page: %s", err.Error()))
+	} else {
+		time.Sleep(500 * time.Millisecond)
+	}
+	if err := shell.OpenFileInFolder(filePath); err != nil {
+		util.GetLogger().Warn(ctx, fmt.Sprintf("failed to reveal exported file: %s", err.Error()))
+	}
+}
+
+func (p *FeedbackPlugin) openFeatureRequest(ctx context.Context) {
+	if err := shell.Open(githubIssueURL(feedbackFeatureTemplate, feedbackFeatureTitlePrefix)); err != nil {
+		util.GetLogger().Warn(ctx, fmt.Sprintf("failed to open GitHub feature request page: %s", err.Error()))
+	}
+}
+
+func (p *FeedbackPlugin) clearLogs(ctx context.Context) {
+	// The supervisor retains this handle for child output; deleting it also
+	// disconnects that output from diagnostic exports on platforms that allow unlink.
+	if err := util.GetLogger().ClearHistory(filepath.Base(supervisor.GetManager().SupervisorLogPath())); err != nil {
+		p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(p.api.GetTranslation(ctx, "plugin_feedback_notify_clear_failed"), err.Error())})
+		return
+	}
+	p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: p.api.GetTranslation(ctx, "plugin_feedback_notify_logs_cleared")})
+}

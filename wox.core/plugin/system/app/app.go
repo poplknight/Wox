@@ -1,0 +1,3122 @@
+package app
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"wox/analytics"
+	"wox/common"
+	"wox/common/icons"
+	"wox/plugin"
+	"wox/setting"
+	"wox/setting/definition"
+	"wox/setting/validator"
+	"wox/util"
+	"wox/util/clipboard"
+	"wox/util/filesearch"
+	"wox/util/fuzzymatch"
+	"wox/util/nativecontextmenu"
+	"wox/util/shell"
+	"wox/util/timetracking"
+	"wox/util/window"
+
+	"github.com/fsnotify/fsnotify"
+	"github.com/google/uuid"
+	"github.com/samber/lo"
+)
+
+var appIcon = icons.Get(icons.PluginApp)
+
+var errSkipAppIndexing = errors.New("skip app indexing")
+
+const appIndexToolbarMsgID = "app-index-status"
+
+type AppType = string
+
+const (
+	AppTypeDesktop        AppType = "desktop"
+	AppTypeUWP            AppType = "uwp"
+	AppTypeAppsFolder     AppType = "apps_folder"
+	AppTypeWindowsSetting AppType = "windows_setting"
+)
+
+type appInfo struct {
+	Name string `json:"name"`
+	// SearchableNames keeps extra aliases for matching when Name alone is not stable enough.
+	// On macOS without Spotlight metadata, the searchable value may come from the localized bundle name,
+	// Info.plist, or the .app filename, and those names can differ for non-Latin apps.
+	SearchableNames []string        `json:"searchable_names,omitempty"`
+	Identity        string          `json:"identity,omitempty"`
+	Path            string          `json:"path"`
+	Icon            common.WoxImage `json:"icon"`
+	// IconSource survives plugin image cache invalidation so the list icon can be rebuilt.
+	IconSource *common.WoxImage `json:"icon_source,omitempty"`
+	// ResolvedIconPath preserves full-size Shell artwork before list preprocessing.
+	// Reopening its resource file would lose the shortcut's resource index or Shell customization.
+	ResolvedIconPath string `json:"resolved_icon_path,omitempty"`
+	// IconSourcePath records the real file used to render Icon. Windows shortcuts
+	// can keep their own mtime while the target executable changes, so cache reuse
+	// must compare this source in addition to the indexed shortcut path.
+	IconSourcePath         string  `json:"icon_source_path,omitempty"`
+	IconSourceModifiedUnix int64   `json:"icon_source_modified_unix,omitempty"`
+	Type                   AppType `json:"type,omitempty"`
+	LastModifiedUnix       int64   `json:"last_modified_unix,omitempty"`
+	// Packaged desktop apps share the UWP index path but can expose the Windows runas verb.
+	CanRunAsAdministrator bool `json:"can_run_as_administrator,omitempty"`
+
+	Pid int `json:"-"`
+	// Derived from the current launch semantics, never persisted or confused with process Identity.
+	launchKey string
+	// Used only to prefer an original shortcut over its bare executable in search results.
+	shortcutTarget string
+	// Derived when rebuilding query entries; filtering must not query the shell while typing.
+	launchpadHidden bool
+	// IsDefaultIcon is persisted so launchpad can hide entries whose icon fell
+	// back to a generic/default asset after a restart. Normal app search still
+	// keeps these entries visible.
+	IsDefaultIcon bool `json:"is_default_icon,omitempty"`
+	// HasDedicatedIcon records Windows native icon classification during indexing.
+	// Keep it separate from IsDefaultIcon, which also affects ordinary search ranking.
+	HasDedicatedIcon bool `json:"has_dedicated_icon,omitempty"`
+}
+
+// equals compares index metadata, including derived launch semantics. Pid is intentionally ignored.
+func (info appInfo) equals(other appInfo) bool {
+	return info.Name == other.Name &&
+		info.launchKey == other.launchKey &&
+		info.shortcutTarget == other.shortcutTarget &&
+		info.launchpadHidden == other.launchpadHidden &&
+		slices.Equal(info.SearchableNames, other.SearchableNames) &&
+		info.Identity == other.Identity &&
+		info.Path == other.Path &&
+		info.Icon == other.Icon &&
+		((info.IconSource == nil && other.IconSource == nil) ||
+			(info.IconSource != nil && other.IconSource != nil && *info.IconSource == *other.IconSource)) &&
+		info.ResolvedIconPath == other.ResolvedIconPath &&
+		info.IconSourcePath == other.IconSourcePath &&
+		info.IconSourceModifiedUnix == other.IconSourceModifiedUnix &&
+		info.Type == other.Type &&
+		info.LastModifiedUnix == other.LastModifiedUnix &&
+		info.CanRunAsAdministrator == other.CanRunAsAdministrator &&
+		info.IsDefaultIcon == other.IsDefaultIcon &&
+		info.HasDedicatedIcon == other.HasDedicatedIcon
+}
+
+type appCacheFile struct {
+	Version int       `json:"version"`
+	Apps    []appInfo `json:"apps"`
+}
+
+// Bump this when cached appInfo fields or preprocessed icon semantics change.
+// Reindex persisted fallback icons after the Windows icon resolver upgrade.
+const appCacheVersion = 17
+
+const (
+	appCommandLaunchpad = "launchpad"
+)
+
+const (
+	// Optimization: broad global app queries used to return hundreds of
+	// applications, making result action creation and manager/UI polish dominate
+	// latency while adding little value to the aggregated result list. The
+	// returned rows are polished as one response before they can join the first
+	// flush, so 25 keeps that work inside the first-batch window. Plugin
+	// context and launchpad remain full browsing surfaces.
+	appQueryResultLimitInGloablQuery = 25
+)
+
+const (
+	appChangeDebounceWindow       = 3 * time.Second
+	appChangeMaxWait              = 20 * time.Second
+	appFallbackReconcileInterval  = 30 * time.Second
+	appExtraAppsReconcileInterval = 15 * time.Second
+)
+
+type appPendingChange struct {
+	Path         string
+	SemanticKind filesearch.ChangeSemanticKind
+	PathIsDir    bool
+}
+
+type appIndexStatus struct {
+	titleKey  string
+	processed int64
+	total     int64
+	startedAt time.Time
+}
+
+type appContextData struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+	Type string `json:"type"`
+}
+
+// appQueryEntry keeps query-only derived data so typing does not rebuild the same
+// candidate lists for every app on every keystroke.
+type appQueryEntry struct {
+	info                     appInfo
+	preparedSearchCandidates []*fuzzymatch.PreparedText
+}
+
+// Query results usually shrink as the user extends the same search text.
+// Reusing the previous matched subset avoids rescanning the full app list.
+type appQuerySessionCache struct {
+	generation uint64
+	search     string
+	matches    []int
+	startedAt  int64
+}
+
+// appQueryMatch is a lightweight matched candidate. Query builds full
+// QueryResult objects only after capping so broad searches do not pay action,
+// icon, and result-cache costs for rows the UI will not need.
+type appQueryMatch struct {
+	entryIndex  int
+	entry       appQueryEntry
+	displayName string
+	displayPath string
+	score       int64
+}
+
+// appResultIdentityKey prefers the indexed app identity, then the launch path.
+func appResultIdentityKey(info appInfo) string {
+	if identity := strings.TrimSpace(info.Identity); identity != "" {
+		return identity
+	}
+	return strings.TrimSpace(info.Path)
+}
+
+func (a *appInfo) GetDisplayPath() string {
+	if a.Type == AppTypeUWP || a.Type == AppTypeAppsFolder || a.Type == AppTypeWindowsSetting {
+		return ""
+	}
+	return a.Path
+}
+
+func (a *appInfo) GetSearchCandidates(displayName string) []string {
+	candidates := []string{displayName, a.Name}
+	candidates = append(candidates, a.SearchableNames...)
+
+	baseName := filepath.Base(a.Path)
+	candidates = append(candidates, baseName)
+	if ext := filepath.Ext(baseName); ext != "" {
+		candidates = append(candidates, strings.TrimSuffix(baseName, ext))
+	}
+
+	var filtered []string
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		filtered = append(filtered, candidate)
+	}
+
+	return util.UniqueStrings(filtered)
+}
+
+func (a *appInfo) IsRunning() bool {
+	return a.Pid > 0
+}
+
+func isMacPrefPanePath(appPath string) bool {
+	return util.IsMacOS() && strings.HasSuffix(strings.ToLower(appPath), ".prefpane")
+}
+
+func isMacSystemSettingsPath(appPath string) bool {
+	if !util.IsMacOS() {
+		return false
+	}
+	if isMacPrefPanePath(appPath) {
+		return true
+	}
+	return strings.HasPrefix(strings.ToLower(appPath), "x-apple.systempreferences:")
+}
+
+type appDirectory struct {
+	Path              string
+	Recursive         bool
+	RecursiveDepth    int
+	RecursiveExcludes []string
+	excludeAbsPaths   []string // internal: absolute paths of excluded directories
+	trackChanges      bool     // internal: true for roots whose precise file changes should update the app cache
+}
+
+func init() {
+	plugin.AllSystemPlugin = append(plugin.AllSystemPlugin, &ApplicationPlugin{})
+}
+
+type ApplicationPlugin struct {
+	api              plugin.API
+	pluginDirectory  string
+	convertIcon      func(context.Context, common.WoxImage) common.WoxImage
+	runtimeCtx       context.Context
+	appChangeMu      sync.Mutex
+	appChangeCancel  context.CancelFunc
+	appChangeDone    <-chan struct{}
+	appIndexMu       sync.Mutex
+	indexing         atomic.Bool
+	appIndexStatusMu sync.RWMutex
+	appIndexStatus   appIndexStatus
+	// Full scans record source ownership so directory edits preserve apps also
+	// discovered by platform catalogs or overlapping default directories.
+	indexedUserDirectories []appDirectory
+	extraAppPathKeys       map[string]bool
+
+	apps      []appInfo
+	retriever Retriever
+
+	hotkeyAppCandidates []setting.IgnoredHotkeyApp
+
+	// These caches move stable work out of the query hot path.
+	queryEntries           []appQueryEntry
+	queryEntriesMutex      sync.RWMutex
+	queryEntriesGeneration uint64
+	queryEntriesPrepared   bool
+	querySessionCache      *util.HashMap[string, appQuerySessionCache]
+	ignoreMatchers         []appIgnoreMatcher
+	ignoredApps            []ignoredApp
+
+	// Track results that need periodic refresh (running apps with CPU/memory stats)
+	trackedResults *util.HashMap[string, appInfo] // resultId -> appInfo
+
+	// unparsableApps remembers paths whose ParseAppInfo failed, keyed by path cache key
+	// with the file mtime seen at failure. Shell-namespace shortcuts such as "Run.lnk"
+	// never resolve to a file, so without this the change-feed reconciliation would
+	// retry them (with backoff sleeps) on every cycle. The entry is dropped once the
+	// file mtime changes so a repaired shortcut is parsed again.
+	unparsableApps *util.HashMap[string, int64]
+}
+
+func (a *ApplicationPlugin) GetMetadata() plugin.Metadata {
+	return plugin.Metadata{
+		Id:            common.AppPluginID,
+		Name:          "i18n:plugin_app_plugin_name",
+		Author:        "Wox Launcher",
+		Website:       "https://github.com/Wox-launcher/Wox",
+		Version:       "1.0.0",
+		MinWoxVersion: "2.0.0",
+		Runtime:       "Go",
+		Description:   "i18n:plugin_app_plugin_description",
+		Icon:          appIcon.String(),
+		Entry:         "",
+		TriggerKeywords: []string{
+			"*",
+			"app",
+		},
+		SupportedOS: []string{
+			"Windows",
+			"Macos",
+			"Linux",
+		},
+		Features: []plugin.MetadataFeature{
+			{
+				Name: plugin.MetadataFeatureMRU,
+			},
+		},
+		Commands: []plugin.MetadataCommand{
+			{
+				Command:     appCommandLaunchpad,
+				Description: "i18n:plugin_app_command_launchpad",
+			},
+		},
+		SettingDefinitions: []definition.PluginSettingDefinitionItem{
+			{
+				Type:               definition.PluginSettingDefinitionTypeTable,
+				IsPlatformSpecific: true,
+				Value: &definition.PluginSettingValueTable{
+					Key:          "AppDirectories",
+					DefaultValue: defaultAppDirectories(),
+					Title:        "i18n:plugin_app_directories",
+					Tooltip:      "i18n:plugin_app_directories_tooltip",
+					Columns: []definition.PluginSettingValueTableColumn{
+						{
+							Key:   "Path",
+							Label: "i18n:plugin_app_path",
+							Type:  definition.PluginSettingValueTableColumnTypeDirPath,
+							Validators: []validator.PluginSettingValidator{
+								{
+									Type:  validator.PluginSettingValidatorTypeNotEmpty,
+									Value: &validator.PluginSettingValidatorNotEmpty{},
+								},
+							},
+						},
+					},
+				},
+			},
+			{
+				Type:               definition.PluginSettingDefinitionTypeTable,
+				IsPlatformSpecific: true,
+				Value: &definition.PluginSettingValueTable{
+					Key:             ignoreRulesSettingKey,
+					Title:           "i18n:plugin_app_ignore_rules",
+					Tooltip:         "i18n:plugin_app_ignore_rules_tooltip",
+					EnableSearch:    true,
+					SearchColumnKey: "Pattern",
+					Columns: []definition.PluginSettingValueTableColumn{
+						{
+							Key:                "Pattern",
+							Label:              "i18n:plugin_app_ignore_rule_pattern",
+							Tooltip:            "i18n:plugin_app_ignore_rule_pattern_tooltip",
+							Type:               definition.PluginSettingValueTableColumnTypeText,
+							Width:              160,
+							PreviewMatchedApps: true,
+							Validators: []validator.PluginSettingValidator{
+								{
+									Type:  validator.PluginSettingValidatorTypeNotEmpty,
+									Value: &validator.PluginSettingValidatorNotEmpty{},
+								},
+							},
+						},
+						{
+							Key:         "IncludeFuture",
+							Label:       "i18n:plugin_app_ignore_rule_include_future",
+							Tooltip:     "i18n:plugin_app_ignore_rule_include_future_tooltip",
+							Type:        definition.PluginSettingValueTableColumnTypeCheckbox,
+							HideInTable: true,
+						},
+						{
+							Key:          "Apps",
+							Label:        "i18n:plugin_app_ignore_rule_apps",
+							Type:         definition.PluginSettingValueTableColumnTypeIgnoredApps,
+							HideInUpdate: true,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func (a *ApplicationPlugin) Init(ctx context.Context, initParams plugin.InitParams) {
+	a.api = initParams.API
+	a.pluginDirectory = initParams.PluginDirectory
+	a.convertIcon = initParams.ConvertIcon
+	runtimeCtx, cancelRuntime := context.WithCancel(util.NewTraceContext())
+	a.runtimeCtx = runtimeCtx
+	a.retriever = a.getRetriever(ctx)
+	a.retriever.UpdateAPI(a.api)
+	a.trackedResults = util.NewHashMap[string, appInfo]()
+	a.querySessionCache = util.NewHashMap[string, appQuerySessionCache]()
+	a.unparsableApps = util.NewHashMap[string, int64]()
+	a.rebuildIgnoreRuleMatchers(ctx)
+	a.api.OnEnterPluginQuery(ctx, a.syncAppIndexToolbar)
+
+	appCache, cacheErr := a.loadAppCache(ctx)
+	if cacheErr == nil {
+		a.apps = appCache
+		a.rebuildHotkeyAppCandidates(ctx)
+		a.rebuildQueryEntries(ctx)
+	}
+
+	util.Go(runtimeCtx, "index apps", func() {
+		a.rebuildAppIndex(runtimeCtx, false)
+	})
+	util.Go(runtimeCtx, "refresh running apps", func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-runtimeCtx.Done():
+				return
+			case <-ticker.C:
+				a.refreshRunningApps(runtimeCtx)
+			}
+		}
+	})
+
+	a.api.OnSettingChanged(ctx, func(callbackCtx context.Context, key string, value string) {
+		if key == "AppDirectories" {
+			util.Go(a.runtimeCtx, "update app directories", func() {
+				a.refreshUserAppDirectories(a.runtimeCtx)
+			})
+			return
+		}
+		if key == ignoreRulesSettingKey {
+			a.rebuildIgnoreRuleMatchers(callbackCtx)
+			a.rebuildQueryEntries(callbackCtx)
+			return
+		}
+	})
+
+	a.api.OnMRURestore(ctx, a.handleMRURestore)
+	a.api.OnUnload(ctx, func(ctx context.Context) {
+		cancelRuntime()
+		a.stopAppChangeWatcher()
+	})
+}
+
+func (a *ApplicationPlugin) pathCacheKey(appPath string) string {
+	if a.retriever.GetPlatform() == util.PlatformWindows {
+		// Windows paths are case-insensitive; normalize to avoid duplicate cache entries.
+		return strings.ToLower(appPath)
+	}
+	return appPath
+}
+
+func (a *ApplicationPlugin) populateAppMetadata(ctx context.Context, appPath string, info *appInfo, fileInfo os.FileInfo) {
+	if strings.TrimSpace(info.Path) == "" {
+		info.Path = appPath
+	}
+	populateAppLaunchKey(ctx, info)
+	if strings.TrimSpace(info.Identity) == "" {
+		info.Identity = strings.TrimSpace(resolveAppIdentityForPlatform(ctx, *info))
+	}
+
+	if fileInfo == nil {
+		stat, err := os.Stat(appPath)
+		if err == nil {
+			fileInfo = stat
+		} else {
+			info.LastModifiedUnix = 0
+			info.Pid = 0
+			return
+		}
+	}
+
+	info.LastModifiedUnix = a.getAppModifiedUnix(appPath, fileInfo)
+	info.Pid = 0
+	a.populateIconSourceMetadata(ctx, info)
+}
+
+// getAppModifiedUnix includes metadata files that do not update the app directory mtime.
+func (a *ApplicationPlugin) getAppModifiedUnix(appPath string, fileInfo os.FileInfo) int64 {
+	if retriever, ok := a.retriever.(appModifiedUnixRetriever); ok {
+		return retriever.GetAppModifiedUnix(appPath, fileInfo)
+	}
+	return fileInfo.ModTime().UnixNano()
+}
+
+func (a *ApplicationPlugin) populateIconSourceMetadata(ctx context.Context, info *appInfo) {
+	iconSourcePath := strings.TrimSpace(info.IconSourcePath)
+	if iconSourcePath == "" {
+		info.IconSourceModifiedUnix = 0
+		return
+	}
+
+	iconSourcePath = filepath.Clean(iconSourcePath)
+	fileInfo, statErr := os.Stat(iconSourcePath)
+	if statErr != nil {
+		// Record the missing source with a zero mtime. The cache stays reusable while
+		// the source is still missing, and is reparsed once installers finish moving
+		// files into place because the real mtime then differs from zero.
+		a.api.Log(ctx, plugin.LogLevelDebug, fmt.Sprintf("app icon source stat failed: path=%s err=%s", iconSourcePath, statErr.Error()))
+		info.IconSourcePath = iconSourcePath
+		info.IconSourceModifiedUnix = 0
+		return
+	}
+
+	info.IconSourcePath = iconSourcePath
+	info.IconSourceModifiedUnix = fileInfo.ModTime().UnixNano()
+}
+
+func (a *ApplicationPlugin) reuseAppFromCache(ctx context.Context, appPath string, fileInfo os.FileInfo, cache map[string]appInfo) (appInfo, bool) {
+	key := a.pathCacheKey(appPath)
+	cached, ok := cache[key]
+	if !ok {
+		return appInfo{}, false
+	}
+
+	if cached.LastModifiedUnix == 0 || fileInfo == nil {
+		return appInfo{}, false
+	}
+
+	if cached.LastModifiedUnix != a.getAppModifiedUnix(appPath, fileInfo) {
+		return appInfo{}, false
+	}
+
+	if !a.isCachedIconSourceFresh(ctx, cached) {
+		return appInfo{}, false
+	}
+	if cached.ResolvedIconPath != "" {
+		if _, err := os.Stat(cached.ResolvedIconPath); err != nil {
+			return appInfo{}, false
+		}
+	}
+
+	if cached.Icon.ImageType == common.WoxImageTypeAbsolutePath && cached.Icon.ImageData != "" {
+		if _, err := os.Stat(cached.Icon.ImageData); err != nil {
+			a.api.Log(ctx, plugin.LogLevelDebug, fmt.Sprintf("cached icon missing for %s, rebuilding index entry", appPath))
+			return appInfo{}, false
+		}
+	}
+	if cached.IconSource == nil || cached.Icon == *cached.IconSource {
+		a.prepareIndexedIcon(ctx, &cached)
+	}
+
+	cached.Pid = 0
+	if strings.TrimSpace(cached.Identity) == "" {
+		cached.Identity = strings.TrimSpace(resolveAppIdentityForPlatform(ctx, cached))
+	}
+	return cached, true
+}
+
+func (a *ApplicationPlugin) isCachedIconSourceFresh(ctx context.Context, cached appInfo) bool {
+	iconSourcePath := strings.TrimSpace(cached.IconSourcePath)
+	if iconSourcePath == "" {
+		return cached.IconSourceModifiedUnix == 0
+	}
+
+	fileInfo, statErr := os.Stat(iconSourcePath)
+	if statErr != nil {
+		// Bug fix: a cache entry indexed while the icon source was already missing
+		// records IconSourceModifiedUnix == 0. Reparsing it produces the same entry,
+		// so treating it as stale made the fallback reconciliation rebuild the whole
+		// query index and rewrite the cache file every cycle for shortcuts whose
+		// target no longer exists. Only a source that disappeared after indexing
+		// (or reappears later, handled below) needs a reparse.
+		if cached.IconSourceModifiedUnix == 0 {
+			return true
+		}
+		a.api.Log(ctx, plugin.LogLevelDebug, fmt.Sprintf("cached icon source missing for %s, rebuilding index entry: %s", cached.Path, statErr.Error()))
+		return false
+	}
+
+	if cached.IconSourceModifiedUnix == 0 || cached.IconSourceModifiedUnix != fileInfo.ModTime().UnixNano() {
+		// Bug fix: shortcut entries can keep the same .lnk mtime after the target
+		// app updates. Treat the icon source mtime as part of app cache freshness
+		// so stale appInfo records are reparsed and the new fileicon cache key is used.
+		a.api.Log(ctx, plugin.LogLevelDebug, fmt.Sprintf("cached icon source changed for %s, rebuilding index entry", cached.Path))
+		return false
+	}
+
+	return true
+}
+
+func (a *ApplicationPlugin) Query(ctx context.Context, query plugin.Query) plugin.QueryResponse {
+	queryTimingStart := time.Now()
+	isLaunchpadQuery := query.Command == appCommandLaunchpad
+	queryStartedAt := util.GetSystemTimestamp()
+	usePinyin := setting.GetSettingManager().GetWoxSetting(ctx).UsePinYin.Get()
+	preparedPattern := fuzzymatch.PreparePattern(query.Search)
+
+	// Query against a stable snapshot so index rebuilds or settings changes do not
+	// force extra work in the middle of a keystroke. A long hide drops only prepared text.
+	snapshotStart := time.Now()
+	a.ensureQueryEntries(ctx)
+	entries, generation := a.getQueryEntriesSnapshot()
+	snapshotUs := time.Since(snapshotStart).Microseconds()
+	startedAt := time.Now().UnixNano()
+
+	// When the user grows the same search prefix, most fuzzy searches can reuse
+	// the previous matched subset. Pinyin has a separate guard inside
+	// getReusableQueryMatches because syllable-boundary typing is not monotonic.
+	reuseStart := time.Now()
+	cachedMatches, canReuseCachedMatches := a.getReusableQueryMatches(ctx, query, generation)
+	reuseUs := time.Since(reuseStart).Microseconds()
+
+	matchedIndexes := make([]int, 0, len(entries))
+	matchCapacity := len(entries)
+	if matchCapacity > appQueryResultLimitInGloablQuery {
+		matchCapacity = appQueryResultLimitInGloablQuery
+	}
+	matches := make([]appQueryMatch, 0, matchCapacity)
+	var scannedEntries int
+	var resolveDisplayUs int64
+	var scoreMatchUs int64
+	var scoreCandidateCount int
+
+	matchStart := time.Now()
+	matchEntry := func(entryIndex int) {
+		scannedEntries++
+		entry := entries[entryIndex]
+		if isLaunchpadQuery && !a.shouldShowInLaunchpad(entry.info) {
+			return
+		}
+
+		resolveDisplayStart := time.Now()
+		displayName, displayPath, searchCandidates := a.resolveQueryEntryDisplay(ctx, entry)
+		resolveDisplayUs += time.Since(resolveDisplayStart).Microseconds()
+
+		isMatch := false
+		bestScore := int64(0)
+		for _, candidate := range searchCandidates {
+			scoreCandidateCount++
+			scoreMatchStart := time.Now()
+			matchResult := fuzzymatch.FuzzyMatchPrepared(candidate, preparedPattern, usePinyin)
+			scoreMatchUs += time.Since(scoreMatchStart).Microseconds()
+			if !matchResult.IsMatch {
+				continue
+			}
+
+			if !isMatch || matchResult.Score > bestScore {
+				isMatch = true
+				bestScore = matchResult.Score
+			}
+		}
+
+		if !isMatch {
+			return
+		}
+
+		matches = append(matches, appQueryMatch{
+			entryIndex:  entryIndex,
+			entry:       entry,
+			displayName: displayName,
+			displayPath: displayPath,
+			score:       bestScore,
+		})
+		matchedIndexes = append(matchedIndexes, entryIndex)
+	}
+
+	if canReuseCachedMatches {
+		for _, entryIndex := range cachedMatches {
+			if entryIndex < 0 || entryIndex >= len(entries) {
+				continue
+			}
+			matchEntry(entryIndex)
+		}
+	} else {
+		for entryIndex := range entries {
+			matchEntry(entryIndex)
+		}
+	}
+	matchUs := time.Since(matchStart).Microseconds()
+
+	limitGlobalQueryResults := query.IsGlobalQuery()
+	selectStart := time.Now()
+	selectedMatches, droppedDefaultIconCount := selectAppQueryMatches(matches, limitGlobalQueryResults)
+	selectUs := time.Since(selectStart).Microseconds()
+	if limitGlobalQueryResults && len(matches) > len(selectedMatches) {
+		a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf(
+			"app global query capped results: matched=%d returned=%d limit=%d dropped_default_icon=%d cost=%dms",
+			len(matches),
+			len(selectedMatches),
+			appQueryResultLimitInGloablQuery,
+			droppedDefaultIconCount,
+			util.GetSystemTimestamp()-queryStartedAt,
+		))
+	}
+
+	buildResultsStart := time.Now()
+	var actionBuildUs int64
+	var iconSelectUs int64
+	var trackedStoreUs int64
+	var maxBuildResultUs int64
+	var maxBuildResultTitle string
+	var maxBuildActionUs int64
+	var maxBuildIconUs int64
+	var maxBuildTrackUs int64
+	results := make([]plugin.QueryResult, 0, len(selectedMatches))
+	for _, match := range selectedMatches {
+		resultBuildStart := time.Now()
+		var resultTrackStoreUs int64
+		entry := match.entry
+		resultID := uuid.NewString()
+		contextData := common.ContextData{
+			"name": entry.info.Name,
+			"path": entry.info.Path,
+			"type": entry.info.Type,
+		}
+		actionBuildStart := time.Now()
+		actions := a.buildAppActions(entry.info, match.displayName, contextData)
+		resultActionBuildUs := time.Since(actionBuildStart).Microseconds()
+		actionBuildUs += resultActionBuildUs
+		iconSelectStart := time.Now()
+		icon := a.getQueryResultIcon(entry.info, isLaunchpadQuery)
+		resultIconSelectUs := time.Since(iconSelectStart).Microseconds()
+		iconSelectUs += resultIconSelectUs
+		result := plugin.QueryResult{
+			Id:          resultID,
+			Title:       match.displayName,
+			SubTitle:    match.displayPath,
+			IdentityKey: appResultIdentityKey(entry.info),
+			Icon:        icon,
+			Score:       match.score,
+			Actions:     actions,
+		}
+
+		// Launchpad mode is a static app grid that replaces macOS Launchpad's removed entry point.
+		// The normal app query tracks visible rows so CPU/memory tails and terminate actions stay fresh,
+		// but those running-state updates make a Launchpad-style grid noisy and can resize cells while browsing.
+		if !isLaunchpadQuery {
+			trackedStoreStart := time.Now()
+			a.trackedResults.Store(result.Id, entry.info)
+			resultTrackStoreUs = time.Since(trackedStoreStart).Microseconds()
+			trackedStoreUs += resultTrackStoreUs
+		}
+
+		results = append(results, result)
+		resultBuildUs := time.Since(resultBuildStart).Microseconds()
+		if resultBuildUs > maxBuildResultUs {
+			maxBuildResultUs = resultBuildUs
+			maxBuildResultTitle = match.displayName
+			maxBuildActionUs = resultActionBuildUs
+			maxBuildIconUs = resultIconSelectUs
+			maxBuildTrackUs = resultTrackStoreUs
+		}
+	}
+	buildResultsUs := time.Since(buildResultsStart).Microseconds()
+
+	storeCacheStart := time.Now()
+	a.storeQueryMatches(query, appQuerySessionCache{
+		generation: generation,
+		search:     query.Search,
+		matches:    matchedIndexes,
+		startedAt:  startedAt,
+	})
+	storeCacheUs := time.Since(storeCacheStart).Microseconds()
+
+	response := plugin.NewQueryResponse(results)
+	layoutStart := time.Now()
+	if isLaunchpadQuery {
+		gridLayout := plugin.MetadataFeatureParamsGridLayout{
+			Columns:     7,
+			ShowTitle:   true,
+			ItemPadding: 10,
+			ItemMargin:  4,
+		}
+		response.Layout = plugin.QueryLayout{GridLayout: &gridLayout}
+	}
+	layoutUs := time.Since(layoutStart).Microseconds()
+	queryTracker := timetracking.New("app_query_done")
+	if queryTracker.Enabled() {
+		queryTracker.SetRawString("queryId", query.Id)
+		queryTracker.SetString("search", query.Search)
+		queryTracker.SetInt("entries", len(entries))
+		queryTracker.SetInt("scanned", scannedEntries)
+		queryTracker.SetBool("reused", canReuseCachedMatches)
+		queryTracker.SetInt("cachedMatches", len(cachedMatches))
+		queryTracker.SetInt("matched", len(matches))
+		queryTracker.SetInt("selected", len(selectedMatches))
+		queryTracker.SetInt("droppedDefaultIcon", droppedDefaultIconCount)
+		queryTracker.SetInt64("snapshotUs", snapshotUs)
+		queryTracker.SetInt64("reuseUs", reuseUs)
+		queryTracker.SetInt64("matchUs", matchUs)
+		queryTracker.SetInt64("resolveDisplayUs", resolveDisplayUs)
+		queryTracker.SetInt64("scoreMatchUs", scoreMatchUs)
+		queryTracker.SetInt("scoreCandidates", scoreCandidateCount)
+		queryTracker.SetInt64("selectUs", selectUs)
+		queryTracker.SetInt64("buildResultsUs", buildResultsUs)
+		queryTracker.SetInt64("actionBuildUs", actionBuildUs)
+		queryTracker.SetInt64("iconSelectUs", iconSelectUs)
+		queryTracker.SetInt64("trackedStoreUs", trackedStoreUs)
+		queryTracker.SetInt64("storeCacheUs", storeCacheUs)
+		queryTracker.SetInt64("layoutUs", layoutUs)
+		queryTracker.SetInt64("maxBuildResultUs", maxBuildResultUs)
+		queryTracker.SetString("maxBuildResultTitle", maxBuildResultTitle)
+		queryTracker.SetInt64("maxBuildActionUs", maxBuildActionUs)
+		queryTracker.SetInt64("maxBuildIconUs", maxBuildIconUs)
+		queryTracker.SetInt64("maxBuildTrackUs", maxBuildTrackUs)
+		queryTracker.SetInt64("totalUs", time.Since(queryTimingStart).Microseconds())
+		queryTracker.SetInt64("totalMs", util.GetSystemTimestamp()-queryStartedAt)
+		queryTracker.Log(ctx)
+	}
+	return response
+}
+
+func selectAppQueryMatches(matches []appQueryMatch, shouldLimit bool) ([]appQueryMatch, int) {
+	if !shouldLimit || len(matches) <= appQueryResultLimitInGloablQuery {
+		return matches, 0
+	}
+
+	selected := make([]appQueryMatch, len(matches))
+	copy(selected, matches)
+	sort.SliceStable(selected, func(i, j int) bool {
+		leftDefaultIcon := selected[i].entry.info.IsDefaultIcon
+		rightDefaultIcon := selected[j].entry.info.IsDefaultIcon
+		if leftDefaultIcon != rightDefaultIcon {
+			// Optimization: when broad searches must be capped, prefer keeping apps
+			// with real icons because default-icon entries are usually lower-signal
+			// executables discovered from broad Windows roots.
+			return !leftDefaultIcon
+		}
+		if selected[i].score != selected[j].score {
+			return selected[i].score > selected[j].score
+		}
+		if selected[i].displayName != selected[j].displayName {
+			return selected[i].displayName < selected[j].displayName
+		}
+		return selected[i].displayPath < selected[j].displayPath
+	})
+
+	selected = selected[:appQueryResultLimitInGloablQuery]
+	selectedDefaultIcons := 0
+	for _, match := range selected {
+		if match.entry.info.IsDefaultIcon {
+			selectedDefaultIcons++
+		}
+	}
+
+	totalDefaultIcons := 0
+	for _, match := range matches {
+		if match.entry.info.IsDefaultIcon {
+			totalDefaultIcons++
+		}
+	}
+
+	return selected, totalDefaultIcons - selectedDefaultIcons
+}
+
+func (a *ApplicationPlugin) buildAppActions(info appInfo, displayName string, contextData map[string]string) []plugin.QueryResultAction {
+	actions := []plugin.QueryResultAction{
+		{
+			Name:        "i18n:plugin_app_open",
+			Icon:        icons.Get(icons.ActionOpen),
+			ContextData: contextData,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				launchStart := time.Now()
+				util.GetLogger().Info(ctx, fmt.Sprintf("app_launch_timing stage=start app=%q path=%q", info.Name, info.Path))
+				defer func() {
+					util.GetLogger().Info(ctx, fmt.Sprintf("app_launch_timing stage=done path=%q totalMs=%d", info.Path, time.Since(launchStart).Milliseconds()))
+				}()
+				analytics.TrackAppLaunched(ctx, fmt.Sprintf("%s:%s", info.Type, info.Name), displayName)
+
+				// macOS activates the running app when its bundle is opened.
+				// Windows and Linux raise an existing window before starting another process.
+				if util.IsWindows() {
+					util.GetLogger().Info(ctx, fmt.Sprintf("app_launch_timing stage=get_pid_start path=%q elapsedMs=%d", info.Path, time.Since(launchStart).Milliseconds()))
+					pidStart := time.Now()
+					currentPid := a.retriever.GetPid(ctx, info)
+					util.GetLogger().Info(ctx, fmt.Sprintf("app_launch_timing stage=get_pid_done path=%q pid=%d costMs=%d", info.Path, currentPid, time.Since(pidStart).Milliseconds()))
+					if currentPid > 0 {
+						// App is running, try to activate its window
+						util.GetLogger().Info(ctx, fmt.Sprintf("app_launch_timing stage=activate_start path=%q pid=%d", info.Path, currentPid))
+						activateStart := time.Now()
+						activated := window.ActivateWindowByPid(currentPid)
+						util.GetLogger().Info(ctx, fmt.Sprintf("app_launch_timing stage=activate_done path=%q pid=%d activated=%t costMs=%d", info.Path, currentPid, activated, time.Since(activateStart).Milliseconds()))
+						if activated {
+							a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("Activated existing window for %s (PID: %d)", info.Name, currentPid))
+							return
+						}
+						// If activation failed, fall through to launch new instance
+						a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("Could not activate window for %s, launching new instance", info.Name))
+					}
+				}
+				if util.IsLinux() {
+					util.GetLogger().Info(ctx, fmt.Sprintf("app_launch_timing stage=activate_start path=%q", info.Path))
+					activateStart := time.Now()
+					activated := tryActivateExistingLinuxApp(ctx, a.api, info)
+					util.GetLogger().Info(ctx, fmt.Sprintf("app_launch_timing stage=activate_done path=%q activated=%t costMs=%d", info.Path, activated, time.Since(activateStart).Milliseconds()))
+					if activated {
+						a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("Activated existing window for %s", info.Name))
+						return
+					}
+				}
+
+				// Bug fix: Linux app indexing now returns .desktop launcher files instead of raw
+				// executables. Launching them through gio preserves the desktop entry's Exec
+				// handling and environment wrappers; xdg-open remains the compatibility fallback.
+				var runErr error
+				util.GetLogger().Info(ctx, fmt.Sprintf("app_launch_timing stage=shell_open_start path=%q", info.Path))
+				shellStart := time.Now()
+				if util.IsLinux() && strings.HasSuffix(strings.ToLower(info.Path), ".desktop") {
+					_, runErr = shell.Run("gio", "launch", info.Path)
+					if runErr != nil {
+						a.api.Log(ctx, plugin.LogLevelWarning, fmt.Sprintf("gio launch failed for %s: %s", info.Path, runErr.Error()))
+						runErr = shell.Open(info.Path)
+					}
+				} else {
+					runErr = shell.Open(info.Path)
+				}
+				// Shell return time does not include asynchronous work or the application's window startup.
+				util.GetLogger().Info(ctx, fmt.Sprintf("app_launch_timing stage=shell_open_done path=%q costMs=%d error=%v", info.Path, time.Since(shellStart).Milliseconds(), runErr))
+				if runErr != nil {
+					a.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("error opening app %s: %s", info.Path, runErr.Error()))
+					a.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(a.api.GetTranslation(ctx, "plugin_app_open_failed_description"), runErr.Error())})
+				}
+			},
+		},
+	}
+
+	actions = append(actions, a.buildNewWindowAction(info, displayName, contextData, actions[0]))
+
+	if util.IsWindows() {
+		extension := strings.ToLower(filepath.Ext(info.Path))
+		canRunAsAdministrator := info.Type == AppTypeDesktop && (extension == ".exe" || extension == ".lnk")
+		canRunAsAdministrator = canRunAsAdministrator || info.Type == AppTypeUWP && info.CanRunAsAdministrator
+		if canRunAsAdministrator {
+			actions = append(actions, plugin.QueryResultAction{
+				Name:        "i18n:plugin_app_open_as_administrator",
+				Icon:        icons.Get(icons.ActionRunAsAdministrator),
+				ContextData: contextData,
+				Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+					analytics.TrackAppLaunched(ctx, fmt.Sprintf("%s:%s", info.Type, info.Name), displayName)
+
+					if err := openAppAsAdministrator(info.Path); err != nil {
+						a.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("error opening app as administrator %s: %s", info.Path, err.Error()))
+						a.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(a.api.GetTranslation(ctx, "plugin_app_open_failed_description"), err.Error())})
+					}
+				},
+			})
+		}
+	}
+
+	if info.Type != AppTypeWindowsSetting && info.Type != AppTypeAppsFolder {
+		actions = append(actions, plugin.QueryResultAction{
+			Name:        "i18n:plugin_app_open_containing_folder",
+			Icon:        icons.Get(icons.ActionOpenContainingFolder),
+			ContextData: contextData,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				if err := a.retriever.OpenAppFolder(ctx, info); err != nil {
+					a.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("error opening folder: %s", err.Error()))
+					a.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(a.api.GetTranslation(ctx, "plugin_app_open_failed_description"), err.Error())})
+				}
+			},
+		})
+	}
+
+	actions = append(actions, plugin.QueryResultAction{
+		Name:        "i18n:plugin_app_copy_path",
+		Icon:        icons.Get(icons.ActionCopy),
+		ContextData: contextData,
+		Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+			if err := clipboard.WriteText(info.Path); err != nil {
+				a.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("error copying app path: %s", err.Error()))
+				a.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: err.Error()})
+			}
+		},
+	})
+
+	actions = append(actions, plugin.QueryResultAction{
+		Name:        "i18n:plugin_app_copy_name",
+		Icon:        icons.Get(icons.ActionCopy),
+		ContextData: contextData,
+		Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+			if err := clipboard.WriteText(appCopyName(displayName, info)); err != nil {
+				a.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("error copying app name: %s", err.Error()))
+				a.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: err.Error()})
+			}
+		},
+	})
+
+	actions = append(actions, plugin.QueryResultAction{
+		Name:        "i18n:plugin_app_hide",
+		Icon:        icons.Get(icons.ActionHide),
+		ContextData: contextData,
+		Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+			a.hideAppFromSearch(ctx, info, displayName)
+		},
+	})
+
+	if uninstallAction, ok := a.buildUninstallAction(info, displayName, contextData); ok {
+		actions = append(actions, uninstallAction)
+	}
+
+	// Bug fix: Linux cannot show the true system context menu behind this action,
+	// so keep the entry only on platforms where nativecontextmenu can honor the
+	// label instead of exposing a file-manager fallback as if it were equivalent.
+	if info.Type != AppTypeUWP && info.Type != AppTypeAppsFolder && info.Type != AppTypeWindowsSetting && nativecontextmenu.IsSupported() {
+		actions = append(actions, plugin.QueryResultAction{
+			Name:        "i18n:plugin_file_show_context_menu",
+			Icon:        icons.Get(icons.ActionContextMenu),
+			ContextData: contextData,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				a.api.Log(ctx, plugin.LogLevelInfo, "Showing context menu for: "+info.Path)
+				err := nativecontextmenu.ShowContextMenu(info.Path)
+				if err != nil {
+					a.api.Log(ctx, plugin.LogLevelError, err.Error())
+					a.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: err.Error()})
+				}
+			},
+			Hotkey:                 util.PrimaryHotkey("m"),
+			PreventHideAfterAction: true,
+		})
+	}
+
+	// Manual indexing lives on the action panel, matching file search,
+	// so a missed Store/PWA install can be recovered without leaving the query.
+	actions = append(actions, a.buildIndexAppsAction())
+
+	return actions
+}
+
+// appCopyName prefers the visible result title and falls back to the path leaf.
+func appCopyName(displayName string, info appInfo) string {
+	if trimmed := strings.TrimSpace(displayName); trimmed != "" {
+		return trimmed
+	}
+	if trimmed := strings.TrimSpace(info.Name); trimmed != "" && !strings.HasPrefix(trimmed, "i18n:") {
+		return trimmed
+	}
+	clean := filepath.Clean(strings.TrimSpace(info.Path))
+	base := filepath.Base(clean)
+	if base == "" || base == "." || base == string(os.PathSeparator) {
+		return clean
+	}
+	return base
+}
+
+// buildIndexAppsAction exposes the shared full-index operation on each app result.
+func (a *ApplicationPlugin) buildIndexAppsAction() plugin.QueryResultAction {
+	return plugin.QueryResultAction{
+		Name:                   "i18n:plugin_app_index",
+		Icon:                   icons.Get(icons.ActionExecute),
+		PreventHideAfterAction: true,
+		Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+			a.startAppIndex()
+		},
+	}
+}
+
+// startAppIndex starts one lifecycle-bound rebuild independent of the query session.
+func (a *ApplicationPlugin) startAppIndex() {
+	if a.runtimeCtx == nil || a.runtimeCtx.Err() != nil || !a.indexing.CompareAndSwap(false, true) {
+		return
+	}
+	util.Go(a.runtimeCtx, "index apps", func() {
+		defer a.indexing.Store(false)
+		elapsed, completed := a.rebuildAppIndex(a.runtimeCtx, true)
+		if !completed {
+			return
+		}
+		a.api.ShowToastMsg(a.runtimeCtx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(a.api.GetTranslation(a.runtimeCtx, "plugin_app_index_completed"), appIndexElapsedSeconds(elapsed))})
+		a.api.RefreshQuery(a.runtimeCtx, plugin.RefreshQueryParam{PreserveSelectedIndex: true})
+	})
+}
+
+// rebuildAppIndex serializes full scans and restarts change monitoring around them.
+func (a *ApplicationPlugin) rebuildAppIndex(ctx context.Context, clearCache bool) (time.Duration, bool) {
+	a.appIndexMu.Lock()
+	defer a.appIndexMu.Unlock()
+
+	a.stopAppChangeWatcher()
+	if ctx.Err() != nil {
+		return 0, false
+	}
+	if clearCache {
+		if err := os.Remove(a.getAppCachePath()); err == nil {
+			a.api.Log(ctx, plugin.LogLevelInfo, "app cache file removed")
+		}
+		// Keep shared image files alive while the old query snapshot is visible.
+		// The icon cache already keys filesystem apps by source mtime, so an index
+		// rebuild does not need to invalidate images used by the running UI.
+		a.apps = nil
+		a.hotkeyAppCandidates = nil
+	}
+
+	started := time.Now()
+	a.indexApps(ctx)
+	elapsed := time.Since(started)
+	if ctx.Err() != nil {
+		return 0, false
+	}
+	a.startAppChangeWatcher()
+	return elapsed, true
+}
+
+func (a *ApplicationPlugin) getQueryResultIcon(info appInfo, isLaunchpadQuery bool) common.WoxImage {
+	if !isLaunchpadQuery {
+		return info.Icon
+	}
+
+	if util.IsWindows() {
+		if info.ResolvedIconPath != "" {
+			return common.NewWoxImageAbsolutePath(info.ResolvedIconPath)
+		}
+		// Launch paths can be shortcuts or shell:AppsFolder IDs, not icon sources.
+		// Reuse the retriever's resolved executable/resource for full-size extraction;
+		// packaged apps and generated settings icons already have dedicated artwork.
+		if source := strings.TrimSpace(info.IconSourcePath); source != "" && info.Type != AppTypeUWP && info.Type != AppTypeWindowsSetting {
+			return common.NewWoxImageFileIcon(source)
+		}
+		return info.Icon
+	}
+
+	// Launchpad uses the generic grid icon polish path. Return the app path as a file icon source
+	// instead of the indexed list icon so Manager.PolishResult can resolve it at the core grid size.
+	if strings.TrimSpace(info.Path) != "" && info.Type != AppTypeWindowsSetting && !isMacSystemSettingsPath(info.Path) {
+		return common.NewWoxImageFileIcon(info.Path)
+	}
+
+	// Generated settings icons and pathless entries cannot be resolved from the file icon API,
+	// so they fall back to the already indexed icon and use the same grid-size polish as other results.
+	return info.Icon
+}
+
+func (a *ApplicationPlugin) shouldShowInLaunchpad(info appInfo) bool {
+	// Launchpad is a visual app grid, so entries with no usable icon create
+	// noise and look broken. Keep the regular app query unchanged because users
+	// may still need to find and open those apps by name.
+	if info.launchpadHidden || info.IsDefaultIcon || info.Icon.IsEmpty() {
+		return false
+	}
+	return true
+}
+
+func (a *ApplicationPlugin) getRunningProcessResult(app appInfo) (tails []plugin.QueryResultTail) {
+	ctx := context.Background()
+	stat, err := a.retriever.GetProcessStat(ctx, app)
+	if err != nil {
+		a.api.Log(ctx, plugin.LogLevelDebug, fmt.Sprintf("error getting process stat for %s: %s", app.Name, err.Error()))
+		return
+	}
+
+	// Show CPU usage
+	cpuLabel := a.api.GetTranslation(ctx, "i18n:plugin_app_cpu")
+	tails = append(tails, plugin.QueryResultTail{
+		Type: plugin.QueryResultTailTypeText,
+		Text: fmt.Sprintf("%s: %.1f%%", cpuLabel, stat.CPU),
+	})
+
+	// Format memory size
+	memSize := stat.Memory
+	unit := "B"
+	if memSize > 1024*1024*1024 {
+		memSize = memSize / 1024 / 1024 / 1024
+		unit = "GB"
+	} else if memSize > 1024*1024 {
+		memSize = memSize / 1024 / 1024
+		unit = "MB"
+	} else if memSize > 1024 {
+		memSize = memSize / 1024
+		unit = "KB"
+	}
+
+	memLabel := a.api.GetTranslation(ctx, "i18n:plugin_app_memory")
+	tails = append(tails, plugin.QueryResultTail{
+		Type: plugin.QueryResultTailTypeText,
+		Text: fmt.Sprintf("%s: %.1f %s", memLabel, memSize, unit),
+	})
+
+	return
+}
+
+func (a *ApplicationPlugin) getRetriever(ctx context.Context) Retriever {
+	return appRetriever
+}
+
+// startAppChangeWatcher binds app-directory monitoring to the current plugin lifecycle.
+func (a *ApplicationPlugin) startAppChangeWatcher() {
+	a.stopAppChangeWatcher()
+	if a.runtimeCtx == nil || a.runtimeCtx.Err() != nil {
+		return
+	}
+
+	watchCtx, cancel := context.WithCancel(a.runtimeCtx)
+	done := make(chan struct{})
+	a.appChangeMu.Lock()
+	a.appChangeCancel = cancel
+	a.appChangeDone = done
+	a.appChangeMu.Unlock()
+	util.Go(watchCtx, "watch app changes", func() {
+		defer close(done)
+		a.watchAppChanges(watchCtx)
+	})
+}
+
+// stopAppChangeWatcher releases active watchers before rebuilding the index or unloading the plugin.
+func (a *ApplicationPlugin) stopAppChangeWatcher() {
+	a.appChangeMu.Lock()
+	cancel := a.appChangeCancel
+	done := a.appChangeDone
+	a.appChangeCancel = nil
+	a.appChangeDone = nil
+	a.appChangeMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
+}
+
+func (a *ApplicationPlugin) watchAppChanges(ctx context.Context) {
+	directories := a.getAppDirectories(ctx)
+	appExtensions := a.retriever.GetAppExtensions(ctx)
+	a.watchRootOnlyAppChanges(ctx, directories, appExtensions)
+
+	roots := a.getAppChangeRoots(ctx)
+	if len(roots) == 0 {
+		a.api.Log(ctx, plugin.LogLevelInfo, "app change feed skipped: no tracked app directories")
+		return
+	}
+
+	feed := filesearch.NewChangeFeed()
+	defer feed.Close()
+	if filtered, ok := feed.(filesearch.DirectoryWatchFilterSetter); ok {
+		filtered.SetDirectoryWatchFilter(func(_ filesearch.RootRecord, path string) bool {
+			return a.appWatchDirectoryAllowed(path, directories, appExtensions)
+		})
+	}
+	if refreshErr := feed.Refresh(ctx, roots); refreshErr != nil {
+		a.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("failed to start app change feed: %s", refreshErr.Error()))
+		return
+	}
+	a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("app change feed started: roots=%d mode=%s", len(roots), feed.Mode()))
+	// Coverage can change after startup when the service disconnects or catches up.
+	fallbackTicker := time.NewTicker(appFallbackReconcileInterval)
+	defer fallbackTicker.Stop()
+	rootPaths := map[string]string{}
+	for _, root := range roots {
+		rootPaths[root.ID] = root.Path
+	}
+
+	pending := map[string]appPendingChange{}
+	var firstPendingAt time.Time
+	var timer *time.Timer
+	var timerC <-chan time.Time
+	var extraTickerC <-chan time.Time
+	if _, ok := a.retriever.(extraAppLister); ok {
+		// ponytail: polling avoids a native message window; add shell notifications only if sub-15-second discovery is required.
+		extraTicker := time.NewTicker(appExtraAppsReconcileInterval)
+		defer extraTicker.Stop()
+		extraTickerC = extraTicker.C
+	}
+
+	stopTimer := func() {
+		if timer == nil {
+			return
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer = nil
+		timerC = nil
+	}
+
+	scheduleFlush := func(now time.Time) {
+		if len(pending) == 0 {
+			stopTimer()
+			firstPendingAt = time.Time{}
+			return
+		}
+		if firstPendingAt.IsZero() {
+			firstPendingAt = now
+		}
+		delay := appChangeDebounceWindow
+		if elapsed := now.Sub(firstPendingAt); elapsed >= appChangeMaxWait {
+			delay = 0
+		} else if remaining := appChangeMaxWait - elapsed; remaining < delay {
+			delay = remaining
+		}
+		if delay <= 0 {
+			stopTimer()
+			a.applyPendingAppChanges(ctx, pending)
+			pending = map[string]appPendingChange{}
+			firstPendingAt = time.Time{}
+			return
+		}
+		stopTimer()
+		timer = time.NewTimer(delay)
+		timerC = timer.C
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			stopTimer()
+			return
+		case <-timerC:
+			a.applyPendingAppChanges(ctx, pending)
+			pending = map[string]appPendingChange{}
+			firstPendingAt = time.Time{}
+			stopTimer()
+		case <-extraTickerC:
+			a.reconcileExtraApps(ctx)
+		case <-fallbackTicker.C:
+			a.reconcileFallbackAppDirectories(ctx, a.getFallbackReconcileDirectories(ctx, feed, roots, directories))
+		case signal, ok := <-feed.Signals():
+			if !ok {
+				stopTimer()
+				return
+			}
+
+			signal, inScope := a.scopedAppSignal(signal, directories, appExtensions)
+			if !inScope {
+				continue
+			}
+			a.logAppChangeFeedSignal(ctx, signal, rootPaths)
+			change, ok := a.getActionableAppChange(signal, appExtensions, rootPaths)
+			if !ok {
+				continue
+			}
+			// A queued directory repair reads current disk state. Keep stale child
+			// events from undoing that repair in the map's arbitrary flush order.
+			covered := false
+			for key, queued := range pending {
+				if queued.PathIsDir && queued.SemanticKind != filesearch.ChangeSemanticKindRemove && a.isPathAtOrUnderDirectory(change.Path, queued.Path) {
+					covered = true
+					break
+				}
+				if change.PathIsDir && change.SemanticKind != filesearch.ChangeSemanticKindRemove && a.isPathAtOrUnderDirectory(queued.Path, change.Path) {
+					delete(pending, key)
+				}
+			}
+			if covered {
+				continue
+			}
+			pending[a.appChangeTaskKey(change)] = change
+			a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("app change feed accepted: path=%s semantic=%s isDir=%t pending=%d", change.Path, change.SemanticKind, change.PathIsDir, len(pending)))
+			scheduleFlush(time.Now())
+		}
+	}
+}
+
+// getFallbackReconcileDirectories selects tracked roots whose platform feed cannot observe subdirectories recursively.
+func (a *ApplicationPlugin) getFallbackReconcileDirectories(ctx context.Context, feed filesearch.ChangeFeed, roots []filesearch.RootRecord, directories []appDirectory) []appDirectory {
+	directoriesByPath := make(map[string]appDirectory, len(directories))
+	for _, directory := range directories {
+		if directory.trackChanges {
+			directoriesByPath[a.pathCacheKey(filepath.Clean(directory.Path))] = directory
+		}
+	}
+
+	snapshotter, ok := feed.(filesearch.RootFeedSnapshotter)
+	selected := make([]appDirectory, 0)
+	seen := make(map[string]bool)
+	for _, root := range roots {
+		if ok {
+			snapshot, snapshotErr := snapshotter.SnapshotRootFeed(ctx, root)
+			if snapshotErr == nil && snapshot.FeedType != filesearch.RootFeedTypeFallback {
+				continue
+			}
+			if snapshotErr != nil {
+				util.GetLogger().Warn(ctx, fmt.Sprintf("failed to inspect app change feed for %s, enabling fallback reconciliation: %s", root.Path, snapshotErr.Error()))
+			}
+		}
+
+		key := a.pathCacheKey(filepath.Clean(root.Path))
+		directory, exists := directoriesByPath[key]
+		if !exists || seen[key] {
+			continue
+		}
+		seen[key] = true
+		selected = append(selected, directory)
+	}
+	return selected
+}
+
+func (a *ApplicationPlugin) logAppChangeFeedSignal(ctx context.Context, signal filesearch.ChangeSignal, rootPaths map[string]string) {
+	rootPath := rootPaths[signal.RootID]
+	if rootPath == "" {
+		rootPath = "<unknown>"
+	}
+	at := ""
+	if !signal.At.IsZero() {
+		at = signal.At.Format(time.RFC3339Nano)
+	}
+	// Diagnostic logging only: the app change feed crosses from filesearch into
+	// the app plugin here, so log the raw signal before filtering to verify
+	// installer/uninstaller flows without changing indexing behavior.
+	a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf(
+		"app change feed signal: kind=%s semantic=%s feed=%s root=%s rootPath=%s path=%s isDir=%t pathTypeKnown=%t reason=%s cursor=%s at=%s",
+		signal.Kind,
+		signal.SemanticKind,
+		signal.FeedType,
+		signal.RootID,
+		rootPath,
+		signal.Path,
+		signal.PathIsDir,
+		signal.PathTypeKnown,
+		signal.Reason,
+		signal.Cursor,
+		at,
+	))
+}
+
+func (a *ApplicationPlugin) watchRootOnlyAppChanges(ctx context.Context, appDirectories []appDirectory, appExtensions []string) {
+	for _, d := range appDirectories {
+		if d.trackChanges {
+			continue
+		}
+
+		directory := d
+		util.WatchDirectoryChanges(ctx, directory.Path, func(e fsnotify.Event) {
+			appPath := filepath.Clean(e.Name)
+			if !a.isAppPathExtensionMatch(appPath, appExtensions) {
+				return
+			}
+
+			a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("app %s changed (%s)", appPath, e.Op))
+			changed := false
+			if e.Op&fsnotify.Remove == fsnotify.Remove || e.Op&fsnotify.Rename == fsnotify.Rename {
+				changed = a.removeIndexedAppByPath(ctx, appPath)
+			} else if e.Op&fsnotify.Create == fsnotify.Create || e.Op&fsnotify.Write == fsnotify.Write {
+				// Bug fix: keep the legacy root-only watcher as a compatibility path for
+				// untracked roots, but apply the same local update strategy as the precise
+				// change feed so root-level changes never trigger a full app index.
+				time.Sleep(appChangeDebounceWindow)
+				changed = a.upsertIndexedAppByPath(ctx, appPath)
+			}
+
+			if changed {
+				a.rebuildHotkeyAppCandidates(ctx)
+				a.rebuildQueryEntries(ctx)
+				a.saveAppToCache(ctx)
+			}
+		})
+	}
+}
+
+func (a *ApplicationPlugin) getAppChangeRoots(ctx context.Context) []filesearch.RootRecord {
+	directories := a.getAppDirectories(ctx)
+	roots := make([]filesearch.RootRecord, 0, len(directories))
+	seen := make(map[string]bool)
+	now := util.GetSystemTimestamp()
+	for _, directory := range directories {
+		if !directory.trackChanges || strings.TrimSpace(directory.Path) == "" {
+			continue
+		}
+		cleanPath := filepath.Clean(directory.Path)
+		key := a.pathCacheKey(cleanPath)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		info, statErr := os.Stat(cleanPath)
+		if statErr != nil {
+			a.api.Log(ctx, plugin.LogLevelDebug, fmt.Sprintf("skip app change root %s: %s", cleanPath, statErr.Error()))
+			continue
+		}
+		if !info.IsDir() {
+			continue
+		}
+		roots = append(roots, filesearch.RootRecord{
+			ID:        uuid.NewString(),
+			Path:      cleanPath,
+			Kind:      filesearch.RootKindDefault,
+			Status:    filesearch.RootStatusIdle,
+			CreatedAt: now,
+			UpdatedAt: now,
+		})
+	}
+
+	return roots
+}
+
+func (a *ApplicationPlugin) appChangeTaskKey(change appPendingChange) string {
+	prefix := "file:"
+	if change.PathIsDir {
+		prefix = "dir:"
+	}
+	return prefix + a.pathCacheKey(change.Path)
+}
+
+func (a *ApplicationPlugin) getActionableAppChange(signal filesearch.ChangeSignal, appExtensions []string, rootPaths map[string]string) (appPendingChange, bool) {
+	if signal.Kind != filesearch.ChangeSignalKindDirtyPath {
+		// Queue overflow and source switches lose precise paths. Repair only the
+		// affected app root through the existing debounced directory reconciliation.
+		if signal.Kind == filesearch.ChangeSignalKindHistoryLost {
+			if rootPath := rootPaths[signal.RootID]; rootPath != "" {
+				return appPendingChange{Path: rootPath, PathIsDir: true, SemanticKind: filesearch.ChangeSemanticKindModify}, true
+			}
+		}
+		return appPendingChange{}, false
+	}
+	if signal.Path == "" {
+		a.api.Log(context.Background(), plugin.LogLevelInfo, fmt.Sprintf("app change feed skipped: empty path semantic=%s reason=%s", signal.SemanticKind, signal.Reason))
+		return appPendingChange{}, false
+	}
+	changePath := filepath.Clean(signal.Path)
+	if !signal.PathTypeKnown && (signal.SemanticKind == filesearch.ChangeSemanticKindRemove || signal.SemanticKind == filesearch.ChangeSemanticKindRename) {
+		if rootPath := rootPaths[signal.RootID]; rootPath != "" && a.pathCacheKey(filepath.Clean(rootPath)) == a.pathCacheKey(changePath) {
+			// Updating every cached app under a removed root would be a hidden full
+			// reconcile, so only removals below the root are handled here.
+			a.api.Log(context.Background(), plugin.LogLevelInfo, fmt.Sprintf("app change feed skipped: removed path is the root path=%s", changePath))
+			return appPendingChange{}, false
+		}
+
+		// Bug fix: fallback notifications report deletes without a path type
+		// because the path is already gone. Treat that as a local remove only for
+		// concrete app files or a cached subdirectory, avoiding the expensive full
+		// indexApps fallback while keeping uninstall cleanup live.
+		if a.isAppPathExtensionMatch(changePath, appExtensions) {
+			return appPendingChange{Path: changePath, SemanticKind: filesearch.ChangeSemanticKindRemove}, true
+		}
+		if a.hasIndexedAppsUnderDirectory(changePath) {
+			return appPendingChange{Path: changePath, SemanticKind: filesearch.ChangeSemanticKindRemove, PathIsDir: true}, true
+		}
+		a.api.Log(context.Background(), plugin.LogLevelInfo, fmt.Sprintf("app change feed skipped: removed path did not match cached app path=%s", changePath))
+		return appPendingChange{}, false
+	}
+	if signal.PathIsDir {
+		switch signal.SemanticKind {
+		case filesearch.ChangeSemanticKindCreate,
+			filesearch.ChangeSemanticKindModify,
+			filesearch.ChangeSemanticKindRename,
+			filesearch.ChangeSemanticKindRemove:
+			// Bug fix: installers often create a vendor folder under Start Menu and the
+			// fallback feed only reports that directory, not each nested .lnk. Reconcile
+			// just this directory so nested shortcuts update without a full app scan.
+			return appPendingChange{Path: changePath, SemanticKind: signal.SemanticKind, PathIsDir: true}, true
+		default:
+			a.api.Log(context.Background(), plugin.LogLevelInfo, fmt.Sprintf("app change feed skipped: directory path=%s semantic=%s reason=%s", signal.Path, signal.SemanticKind, signal.Reason))
+			return appPendingChange{}, false
+		}
+	}
+	if !a.isAppPathExtensionMatch(changePath, appExtensions) {
+		a.api.Log(context.Background(), plugin.LogLevelInfo, fmt.Sprintf("app change feed skipped: extension mismatch path=%s semantic=%s reason=%s", signal.Path, signal.SemanticKind, signal.Reason))
+		return appPendingChange{}, false
+	}
+
+	switch signal.SemanticKind {
+	case filesearch.ChangeSemanticKindCreate,
+		filesearch.ChangeSemanticKindRemove,
+		filesearch.ChangeSemanticKindRename,
+		filesearch.ChangeSemanticKindModify:
+		return appPendingChange{Path: changePath, SemanticKind: signal.SemanticKind}, true
+	default:
+		a.api.Log(context.Background(), plugin.LogLevelInfo, fmt.Sprintf("app change feed skipped: semantic=%s path=%s reason=%s", signal.SemanticKind, signal.Path, signal.Reason))
+		return appPendingChange{}, false
+	}
+}
+
+func (a *ApplicationPlugin) applyPendingAppChanges(ctx context.Context, pending map[string]appPendingChange) {
+	if len(pending) == 0 {
+		return
+	}
+
+	a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("app change feed flushing pending changes: count=%d", len(pending)))
+	changed := false
+	for _, change := range pending {
+		if change.PathIsDir {
+			switch change.SemanticKind {
+			case filesearch.ChangeSemanticKindRemove:
+				changed = a.removeIndexedAppsUnderDirectory(ctx, change.Path) || changed
+			case filesearch.ChangeSemanticKindCreate, filesearch.ChangeSemanticKindModify, filesearch.ChangeSemanticKindRename:
+				changed = a.reconcileIndexedAppsInDirectory(ctx, change.Path) || changed
+			}
+			continue
+		}
+
+		switch change.SemanticKind {
+		case filesearch.ChangeSemanticKindRemove:
+			changed = a.removeIndexedAppByPath(ctx, change.Path) || changed
+		case filesearch.ChangeSemanticKindCreate, filesearch.ChangeSemanticKindModify, filesearch.ChangeSemanticKindRename:
+			if _, statErr := os.Stat(change.Path); statErr != nil {
+				a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("app change feed stat failed, removing cached entry if present: path=%s err=%s", change.Path, statErr.Error()))
+				changed = a.removeIndexedAppByPath(ctx, change.Path) || changed
+				continue
+			}
+			changed = a.upsertIndexedAppByPath(ctx, change.Path) || changed
+		}
+	}
+
+	if !changed {
+		return
+	}
+
+	// Bug fix: runtime app changes previously updated a.apps/cache only for root-level
+	// fsnotify events, while searches read the prebuilt queryEntries snapshot. Rebuilding
+	// once per debounced batch keeps newly installed apps searchable without a full scan.
+	a.rebuildHotkeyAppCandidates(ctx)
+	a.rebuildQueryEntries(ctx)
+	a.saveAppToCache(ctx)
+}
+
+func (a *ApplicationPlugin) removeIndexedAppByPath(ctx context.Context, appPath string) bool {
+	for i, app := range a.apps {
+		if a.pathCacheKey(app.Path) != a.pathCacheKey(appPath) {
+			continue
+		}
+		a.apps = append(a.apps[:i], a.apps[i+1:]...)
+		a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("app %s removed by change feed", appPath))
+		return true
+	}
+	a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("app %s remove requested by change feed but no cached entry matched", appPath))
+	return false
+}
+
+func (a *ApplicationPlugin) hasIndexedAppsUnderDirectory(directoryPath string) bool {
+	for _, app := range a.apps {
+		if a.isPathAtOrUnderDirectory(app.Path, directoryPath) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *ApplicationPlugin) removeIndexedAppsUnderDirectory(ctx context.Context, directoryPath string) bool {
+	kept := make([]appInfo, 0, len(a.apps))
+	removed := 0
+	for _, app := range a.apps {
+		if a.isPathAtOrUnderDirectory(app.Path, directoryPath) {
+			removed++
+			continue
+		}
+		kept = append(kept, app)
+	}
+	if removed == 0 {
+		a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("app directory %s remove requested by change feed but no cached entries matched", directoryPath))
+		return false
+	}
+
+	a.apps = kept
+	a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("app directory %s removed %d cached apps by change feed", directoryPath, removed))
+	return true
+}
+
+func (a *ApplicationPlugin) reconcileIndexedAppsInDirectory(ctx context.Context, directoryPath string) bool {
+	changed := false
+	for _, directory := range a.getLocalAppDirectoriesForChange(directoryPath, a.getAppDirectories(ctx)) {
+		changed = a.reconcileIndexedAppsInAppDirectory(ctx, directory) || changed
+	}
+	return changed
+}
+
+// reconcileIndexedAppsInAppDirectory compares one bounded scan scope with the current app cache.
+func (a *ApplicationPlugin) reconcileIndexedAppsInAppDirectory(ctx context.Context, directory appDirectory) bool {
+	info, statErr := os.Stat(directory.Path)
+	if statErr != nil {
+		a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("app change feed directory stat failed, removing cached entries if present: path=%s err=%s", directory.Path, statErr.Error()))
+		return a.removeIndexedAppsUnderDirectory(ctx, directory.Path)
+	}
+	if !info.IsDir() {
+		return false
+	}
+
+	// Bug fix: directory-only notifications from Start Menu installers need a
+	// bounded local reconciliation. Scanning just the changed directory preserves
+	// the user's no-full-index requirement while discovering nested shortcuts.
+	paths := a.getAppPaths(ctx, []appDirectory{directory})
+	currentPaths := make(map[string]bool, len(paths))
+	cachedByPath := make(map[string]appInfo, len(a.apps))
+	for _, app := range a.apps {
+		cachedByPath[a.pathCacheKey(app.Path)] = app
+	}
+	changed := false
+	for _, appPath := range paths {
+		key := a.pathCacheKey(appPath)
+		currentPaths[key] = true
+		if fileInfo, statErr := os.Stat(appPath); statErr == nil {
+			if _, fresh := a.reuseAppFromCache(ctx, appPath, fileInfo, cachedByPath); fresh {
+				continue
+			}
+		}
+		changed = a.upsertIndexedAppByPath(ctx, appPath) || changed
+	}
+
+	for _, app := range append([]appInfo(nil), a.apps...) {
+		if !a.isAppPathInDirectoryScope(app.Path, directory) {
+			continue
+		}
+		if currentPaths[a.pathCacheKey(app.Path)] {
+			continue
+		}
+		changed = a.removeIndexedAppByPath(ctx, app.Path) || changed
+	}
+
+	message := fmt.Sprintf("app directory %s reconciled by change feed: paths=%d changed=%t", directory.Path, len(paths), changed)
+	if changed {
+		a.api.Log(ctx, plugin.LogLevelInfo, message)
+	} else {
+		a.api.Log(ctx, plugin.LogLevelDebug, message)
+	}
+	return changed
+}
+
+// isAppPathInDirectoryScope applies the same recursion depth and exclusions used by getAppPaths.
+func (a *ApplicationPlugin) isAppPathInDirectoryScope(appPath string, directory appDirectory) bool {
+	relativePath, err := filepath.Rel(filepath.Clean(directory.Path), filepath.Clean(appPath))
+	if err != nil || relativePath == "." || relativePath == "" || relativePath == ".." || strings.HasPrefix(relativePath, ".."+string(os.PathSeparator)) {
+		return false
+	}
+
+	parentPath := filepath.Dir(relativePath)
+	depth := 0
+	if parentPath != "." {
+		depth = len(strings.Split(parentPath, string(os.PathSeparator)))
+	}
+	if depth > 0 && (!directory.Recursive || depth > directory.RecursiveDepth) {
+		return false
+	}
+	// Recursive exclusions prune traversed parents; an app bundle itself is
+	// a leaf match, just as in scanAppPaths.
+	for _, exclude := range directory.RecursiveExcludes {
+		if a.isPathAtOrUnderDirectory(filepath.Dir(appPath), filepath.Join(directory.Path, exclude)) {
+			return false
+		}
+	}
+	for _, exclude := range directory.excludeAbsPaths {
+		if a.isPathAtOrUnderDirectory(filepath.Dir(appPath), exclude) {
+			return false
+		}
+	}
+	return true
+}
+
+// reconcileFallbackAppDirectories provides eventual subtree updates without allocating one watcher per directory.
+func (a *ApplicationPlugin) reconcileFallbackAppDirectories(ctx context.Context, directories []appDirectory) {
+	changed := false
+	for _, directory := range directories {
+		changed = a.reconcileIndexedAppsInAppDirectory(ctx, directory) || changed
+	}
+	if !changed {
+		return
+	}
+
+	a.rebuildHotkeyAppCandidates(ctx)
+	a.rebuildQueryEntries(ctx)
+	a.saveAppToCache(ctx)
+}
+
+func (a *ApplicationPlugin) upsertIndexedAppByPath(ctx context.Context, appPath string) bool {
+	// Feature change: precise change-feed paths let us refresh one app entry instead
+	// of calling indexApps(). This keeps installer bursts cheap while still reusing
+	// the existing platform parser and icon conversion behavior.
+	key := a.pathCacheKey(appPath)
+	var modifiedUnix int64
+	if fileInfo, statErr := os.Stat(appPath); statErr == nil {
+		modifiedUnix = a.getAppModifiedUnix(appPath, fileInfo)
+		if failedUnix, known := a.unparsableApps.Load(key); known && failedUnix == modifiedUnix {
+			return false
+		}
+	}
+
+	var info appInfo
+	var getErr error
+	// Hidden, NoDisplay, and missing-TryExec launchers return errSkipAppIndexing.
+	// That result is stable until the file mtime changes, so the installer retry
+	// below must not apply. Sleeping on each one blocks the single change-feed
+	// goroutine; a few hundred such desktop files stalled new apps for many minutes.
+	for i := 0; i < 3; i++ {
+		info, getErr = a.retriever.ParseAppInfo(ctx, appPath)
+		if getErr == nil || errors.Is(getErr, errSkipAppIndexing) {
+			break
+		}
+		time.Sleep(time.Second * time.Duration(i+1))
+	}
+	if getErr != nil {
+		if !errors.Is(getErr, errSkipAppIndexing) {
+			a.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("error getting app info for %s: %s", appPath, getErr.Error()))
+		}
+		if modifiedUnix != 0 {
+			a.unparsableApps.Store(key, modifiedUnix)
+		}
+		// If a path is still locked or otherwise unreadable after a short retry,
+		// skip the local update rather than falling back to the expensive full index.
+		return false
+	}
+	a.unparsableApps.Delete(key)
+
+	a.populateAppMetadata(ctx, appPath, &info, nil)
+	a.prepareIndexedIcon(ctx, &info)
+
+	for i, app := range a.apps {
+		if a.pathCacheKey(app.Path) != key {
+			continue
+		}
+		// Reparsing can yield an identical entry, for example when only the cache
+		// freshness check failed. Reporting that as a change would rebuild the query
+		// index and rewrite the cache file for nothing.
+		if app.equals(info) {
+			a.api.Log(ctx, plugin.LogLevelDebug, fmt.Sprintf("app %s reparsed by change feed without changes", appPath))
+			return false
+		}
+		a.apps[i] = info
+		a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("app %s updated by change feed", appPath))
+		return true
+	}
+
+	a.apps = append(a.apps, info)
+	a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("app %s added by change feed", appPath))
+	return true
+}
+
+func (a *ApplicationPlugin) isAppPathExtensionMatch(appPath string, appExtensions []string) bool {
+	lowerPath := strings.ToLower(filepath.Clean(appPath))
+	return lo.ContainsBy(appExtensions, func(ext string) bool {
+		return strings.HasSuffix(lowerPath, fmt.Sprintf(".%s", strings.ToLower(ext)))
+	})
+}
+
+func (a *ApplicationPlugin) isPathAtOrUnderDirectory(appPath string, directoryPath string) bool {
+	cleanAppPath := a.pathCacheKey(filepath.Clean(appPath))
+	cleanDirectoryPath := a.pathCacheKey(filepath.Clean(directoryPath))
+	if cleanAppPath == cleanDirectoryPath {
+		return true
+	}
+	if !strings.HasSuffix(cleanDirectoryPath, string(os.PathSeparator)) {
+		cleanDirectoryPath += string(os.PathSeparator)
+	}
+	return strings.HasPrefix(cleanAppPath, cleanDirectoryPath)
+}
+
+func (a *ApplicationPlugin) indexApps(ctx context.Context) {
+	startTimestamp := util.GetSystemTimestamp()
+	phaseStarted := time.Now()
+	tracker := timetracking.New("app_index_done")
+	a.api.Log(ctx, plugin.LogLevelInfo, "start to get apps")
+	a.updateAppIndexStatus(ctx, "plugin_app_index_scanning", 0, 0)
+	statusCtx, cancelStatus := context.WithCancel(ctx)
+	statusDone := make(chan struct{})
+	util.Go(statusCtx, "refresh app index elapsed time", func() {
+		defer close(statusDone)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-statusCtx.Done():
+				return
+			case <-ticker.C:
+				a.syncAppIndexToolbar(statusCtx)
+			}
+		}
+	})
+	defer func() {
+		// Join the timer before clearing so a late tick cannot replace the completion message.
+		cancelStatus()
+		<-statusDone
+		a.clearAppIndexStatus(ctx)
+	}()
+
+	var extraAppPaths []string
+	if retriever, ok := a.retriever.(extraAppPathRetriever); ok {
+		paths, err := retriever.GetExtraAppPaths(ctx)
+		if err != nil {
+			a.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("error getting extra app paths: %s", err.Error()))
+		} else {
+			extraAppPaths = paths
+		}
+	}
+	tracker.SetElapsedMs("extraPathsMs", phaseStarted.UnixMilli())
+	phaseStarted = time.Now()
+	userDirectories := a.getUserAddedPaths(ctx)
+	directories := append(append([]appDirectory(nil), userDirectories...), a.retriever.GetAppDirectories(ctx)...)
+	appPaths := a.getAppPaths(ctx, directories)
+	appPaths = a.deduplicateAppPaths(append(appPaths, extraAppPaths...))
+	tracker.SetElapsedMs("scanMs", phaseStarted.UnixMilli())
+	tracker.SetInt("paths", len(appPaths))
+	phaseStarted = time.Now()
+	extraApps, err := a.retriever.GetExtraApps(ctx)
+	if err != nil {
+		a.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("error getting extra apps: %s", err.Error()))
+	}
+	tracker.SetElapsedMs("extraDiscoveryMs", phaseStarted.UnixMilli())
+	tracker.SetInt("extraApps", len(extraApps))
+
+	total := int64(len(appPaths) + len(extraApps))
+	var processed atomic.Int64
+	lastPercent := -1
+	var progressMu sync.Mutex
+	if total > 0 {
+		a.updateAppIndexStatus(ctx, "plugin_app_indexing_progress", 0, total)
+	}
+	progress := func() {
+		current := processed.Add(1)
+		percent := int(current * 100 / total)
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		if percent <= lastPercent {
+			return
+		}
+		lastPercent = percent
+		a.updateAppIndexStatus(ctx, "plugin_app_indexing_progress", current, total)
+	}
+	if total == 0 {
+		progress = nil
+	}
+	phaseStarted = time.Now()
+	// Platform catalog metadata and filesystem entries are independent. Prepare
+	// both before publishing the index instead of serializing their native I/O.
+	var extraIndexMs int64
+	var extraIndexComplete bool
+	var extraIndexWait sync.WaitGroup
+	extraIndexWait.Add(1)
+	util.Go(ctx, "index extra apps", func() {
+		defer extraIndexWait.Done()
+		started := time.Now()
+		extraApps = a.indexExtraApps(ctx, extraApps, progress)
+		extraIndexMs = time.Since(started).Milliseconds()
+		extraIndexComplete = true
+	})
+	appInfos := a.indexAppsByPaths(ctx, appPaths, progress)
+	tracker.SetElapsedMs("parseMs", phaseStarted.UnixMilli())
+	extraIndexWait.Wait()
+	if !extraIndexComplete {
+		return
+	}
+	tracker.SetInt64("extraMetadataMs", extraIndexMs)
+	tracker.SetElapsedMs("parallelIndexMs", phaseStarted.UnixMilli())
+	phaseStarted = time.Now()
+
+	//merge extra apps
+	for _, extraApp := range extraApps {
+		var isExist = false
+		for _, app := range appInfos {
+			// Check both Name and Path to support aliases (same path, different name)
+			if app.Name == extraApp.Name && app.Path == extraApp.Path {
+				isExist = true
+				break
+			}
+		}
+		if !isExist {
+			appInfos = append(appInfos, extraApp)
+		}
+	}
+
+	// Remove duplicates with same Name and Path
+	appInfos = a.removeDuplicateApps(ctx, appInfos)
+
+	a.apps = appInfos
+	a.indexedUserDirectories = userDirectories
+	a.extraAppPathKeys = make(map[string]bool, len(extraAppPaths)+len(extraApps))
+	for _, appPath := range extraAppPaths {
+		a.extraAppPathKeys[a.pathCacheKey(appPath)] = true
+	}
+	for _, extraApp := range extraApps {
+		a.extraAppPathKeys[a.pathCacheKey(extraApp.Path)] = true
+	}
+	a.rebuildHotkeyAppCandidates(ctx)
+	a.rebuildQueryEntries(ctx)
+	tracker.SetElapsedMs("publishMs", phaseStarted.UnixMilli())
+	phaseStarted = time.Now()
+	a.saveAppToCache(ctx)
+	tracker.SetElapsedMs("saveMs", phaseStarted.UnixMilli())
+	tracker.SetInt64("totalMs", util.GetSystemTimestamp()-startTimestamp)
+	tracker.Log(ctx)
+
+	a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("indexed %d apps, cost %d ms", len(a.apps), util.GetSystemTimestamp()-startTimestamp))
+}
+
+// updateAppIndexStatus stores the global indexing snapshot before pushing it to an active app query.
+func (a *ApplicationPlugin) updateAppIndexStatus(ctx context.Context, titleKey string, processed int64, total int64) {
+	a.appIndexStatusMu.Lock()
+	startedAt := a.appIndexStatus.startedAt
+	if startedAt.IsZero() || titleKey == "plugin_app_index_scanning" {
+		startedAt = time.Now()
+	}
+	a.appIndexStatus = appIndexStatus{titleKey: titleKey, processed: processed, total: total, startedAt: startedAt}
+	a.appIndexStatusMu.Unlock()
+	a.syncAppIndexToolbar(ctx)
+}
+
+// syncAppIndexToolbar replays the current indexing snapshot when an app query becomes active.
+func (a *ApplicationPlugin) syncAppIndexToolbar(ctx context.Context) {
+	a.appIndexStatusMu.RLock()
+	status := a.appIndexStatus
+	a.appIndexStatusMu.RUnlock()
+	if status.titleKey == "" {
+		return
+	}
+
+	msg := plugin.ToolbarMsg{Id: appIndexToolbarMsgID, Title: a.api.GetTranslation(ctx, status.titleKey), Icon: appIcon}
+	seconds := appIndexElapsedSeconds(time.Since(status.startedAt))
+	if status.total <= 0 {
+		msg.Indeterminate = true
+		msg.Title = fmt.Sprintf(msg.Title, seconds)
+	} else {
+		percent := int(status.processed * 100 / status.total)
+		msg.Progress = &percent
+		msg.Title = fmt.Sprintf(msg.Title, status.processed, status.total, seconds)
+	}
+	a.api.ShowToolbarMsg(ctx, msg)
+}
+
+// appIndexElapsedSeconds follows the file index's rounded-up, minimum-one-second display.
+func appIndexElapsedSeconds(elapsed time.Duration) int64 {
+	return max(1, int64((elapsed+time.Second-1)/time.Second))
+}
+
+// clearAppIndexStatus removes the completed run snapshot and any visible toolbar message.
+func (a *ApplicationPlugin) clearAppIndexStatus(ctx context.Context) {
+	a.appIndexStatusMu.Lock()
+	a.appIndexStatus = appIndexStatus{}
+	a.appIndexStatusMu.Unlock()
+	a.api.ClearToolbarMsg(ctx, appIndexToolbarMsgID)
+}
+
+func (a *ApplicationPlugin) getUserAddedPaths(ctx context.Context) []appDirectory {
+	userAddedPaths := a.api.GetSetting(ctx, "AppDirectories")
+	if userAddedPaths == "" {
+		return []appDirectory{}
+	}
+
+	var appDirectories []appDirectory
+	unmarshalErr := json.Unmarshal([]byte(userAddedPaths), &appDirectories)
+	if unmarshalErr != nil {
+		return []appDirectory{}
+	}
+
+	for i := range appDirectories {
+		appDirectories[i].Recursive = true
+		appDirectories[i].RecursiveDepth = 3
+		// Feature change: user-added app directories are explicit, bounded roots.
+		// Track their precise file changes so custom app folders update locally
+		// without falling back to the expensive full app index.
+		appDirectories[i].trackChanges = true
+	}
+
+	return appDirectories
+}
+
+func (a *ApplicationPlugin) getAppDirectories(ctx context.Context) []appDirectory {
+	return append(a.getUserAddedPaths(ctx), a.getRetriever(ctx).GetAppDirectories(ctx)...)
+}
+
+// indexAppsByPaths parses the application paths collected from every directory source.
+func (a *ApplicationPlugin) indexAppsByPaths(ctx context.Context, appPaths []string, progress func()) []appInfo {
+	cacheByPath := make(map[string]appInfo, len(a.apps))
+	for _, cached := range a.apps {
+		cacheByPath[a.pathCacheKey(cached.Path)] = cached
+	}
+
+	// split into groups, so we can index apps in parallel
+	var appPathGroups [][]string
+	var groupSize = 25
+	for i := 0; i < len(appPaths); i += groupSize {
+		var end = i + groupSize
+		if end > len(appPaths) {
+			end = len(appPaths)
+		}
+		appPathGroups = append(appPathGroups, appPaths[i:end])
+	}
+	a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("found %d apps in %d groups", len(appPaths), len(appPathGroups)))
+
+	var appInfos []appInfo
+	var waitGroup sync.WaitGroup
+	var lock sync.Mutex
+	var cacheHits int64
+	var parsedCount int64
+	// File and COM calls block native threads even for cached entries. Bound
+	// indexing fan-out so large app collections do not leave an oversized Go
+	// thread pool (and every loaded DLL's per-thread storage) resident afterward.
+	groupSlots := make(chan struct{}, 4)
+	waitGroup.Add(len(appPathGroups))
+	for groupIndex := range appPathGroups {
+		var appPathGroup = appPathGroups[groupIndex]
+		groupSlots <- struct{}{}
+		util.Go(ctx, fmt.Sprintf("index app group: %d", groupIndex), func() {
+			defer func() {
+				<-groupSlots
+				waitGroup.Done()
+			}()
+			for _, appPath := range appPathGroup {
+				func() {
+					started := time.Now()
+					defer func() {
+						if elapsed := time.Since(started); elapsed >= 250*time.Millisecond {
+							util.GetLogger().Info(ctx, fmt.Sprintf("app_index_slow_path path=%q costMs=%d", appPath, elapsed.Milliseconds()))
+						}
+					}()
+					if progress != nil {
+						defer progress()
+					}
+
+					fileInfo, statErr := os.Stat(appPath)
+					if statErr != nil {
+						a.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("error stating %s: %s", appPath, statErr.Error()))
+						return
+					}
+
+					if cachedInfo, ok := a.reuseAppFromCache(ctx, appPath, fileInfo, cacheByPath); ok {
+						atomic.AddInt64(&cacheHits, 1)
+						lock.Lock()
+						appInfos = append(appInfos, cachedInfo)
+						lock.Unlock()
+						return
+					}
+
+					info, getErr := a.retriever.ParseAppInfo(ctx, appPath)
+					if getErr != nil {
+						if errors.Is(getErr, errSkipAppIndexing) {
+							a.api.Log(ctx, plugin.LogLevelDebug, fmt.Sprintf("skip indexing app %s: %s", appPath, getErr.Error()))
+							return
+						}
+						a.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("error getting app info for %s: %s", appPath, getErr.Error()))
+						return
+					}
+
+					a.populateAppMetadata(ctx, appPath, &info, fileInfo)
+
+					// preprocess icon
+					a.prepareIndexedIcon(ctx, &info)
+					atomic.AddInt64(&parsedCount, 1)
+
+					lock.Lock()
+					appInfos = append(appInfos, info)
+					lock.Unlock()
+				}()
+			}
+		})
+	}
+
+	waitGroup.Wait()
+
+	totalProcessed := cacheHits + parsedCount
+	var cacheRatio float64
+	if totalProcessed > 0 {
+		cacheRatio = float64(cacheHits) / float64(totalProcessed) * 100
+	}
+	a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf(
+		"app indexing stats: total=%d cache_hits=%d parsed=%d cache_ratio=%.2f%%",
+		totalProcessed,
+		cacheHits,
+		parsedCount,
+		cacheRatio,
+	))
+	return appInfos
+}
+
+// deduplicateAppPaths prevents overlapping discovery sources from parsing the same app twice.
+func (a *ApplicationPlugin) deduplicateAppPaths(appPaths []string) []string {
+	seen := make(map[string]struct{}, len(appPaths))
+	uniquePaths := make([]string, 0, len(appPaths))
+	for _, appPath := range appPaths {
+		key := a.pathCacheKey(appPath)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		uniquePaths = append(uniquePaths, appPath)
+	}
+	return uniquePaths
+}
+
+// reconcileExtraApps updates virtual AppsFolder entries without a full directory scan.
+func (a *ApplicationPlugin) reconcileExtraApps(ctx context.Context) bool {
+	lister, ok := a.retriever.(extraAppLister)
+	if !ok {
+		return false
+	}
+
+	existingByPath := make(map[string]appInfo)
+	for _, app := range a.apps {
+		if isAppsFolderIndexedApp(app) {
+			existingByPath[a.pathCacheKey(app.Path)] = app
+		}
+	}
+
+	desired, err := lister.ListExtraApps(ctx, existingByPath)
+	if err != nil {
+		a.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("error listing extra apps: %s", err.Error()))
+		return false
+	}
+	if len(desired) == 0 && len(existingByPath) > 0 {
+		a.api.Log(ctx, plugin.LogLevelError, "AppsFolder reconcile ignored an empty snapshot")
+		return false
+	}
+
+	kept, added, removed, changed := mergeExtraApps(a.apps, desired, a.pathCacheKey)
+	if !changed {
+		return false
+	}
+	added = a.indexExtraApps(ctx, added, nil)
+	for _, addedApp := range added {
+		kept = append(kept, addedApp)
+		a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("extra app added by AppsFolder reconcile: %s", addedApp.Name))
+	}
+	for _, name := range removed {
+		a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("extra app removed by AppsFolder reconcile: %s", name))
+	}
+
+	a.apps = kept
+	a.rebuildHotkeyAppCandidates(ctx)
+	a.rebuildQueryEntries(ctx)
+	a.saveAppToCache(ctx)
+	return true
+}
+
+// mergeExtraApps replaces only AppsFolder-backed entries and preserves directory-indexed apps.
+func mergeExtraApps(current []appInfo, desired []appInfo, pathKey func(string) string) (kept []appInfo, added []appInfo, removed []string, changed bool) {
+	desiredByPath := make(map[string]appInfo, len(desired))
+	for _, extra := range desired {
+		desiredByPath[pathKey(extra.Path)] = extra
+	}
+	existingExtra := make(map[string]struct{})
+	kept = make([]appInfo, 0, len(current)+len(desired))
+	for _, app := range current {
+		if !isAppsFolderIndexedApp(app) {
+			kept = append(kept, app)
+			continue
+		}
+		key := pathKey(app.Path)
+		existingExtra[key] = struct{}{}
+		next, stillPresent := desiredByPath[key]
+		if !stillPresent {
+			removed = append(removed, app.Name)
+			changed = true
+			continue
+		}
+		if !app.equals(next) {
+			kept = append(kept, next)
+			changed = true
+			continue
+		}
+		kept = append(kept, app)
+	}
+	for key, extra := range desiredByPath {
+		if _, exists := existingExtra[key]; exists {
+			continue
+		}
+		added = append(added, extra)
+		changed = true
+	}
+	return kept, added, removed, changed
+}
+
+func (a *ApplicationPlugin) indexExtraApps(ctx context.Context, apps []appInfo, progress func()) []appInfo {
+	for i := range apps {
+		if apps[i].IconSource != nil {
+			apps[i].Icon = *apps[i].IconSource
+			apps[i].IconSource = nil
+		}
+	}
+	apps = a.retriever.PrepareExtraApps(ctx, apps)
+
+	//preprocess icon
+	for i := range apps {
+		if isAppsFolderIndexedApp(apps[i]) {
+			// Classify the final platform icon before conversion changes its representation.
+			apps[i].IsDefaultIcon = apps[i].Icon.IsEmpty() || apps[i].Icon.ImageData == appIcon.ImageData
+		}
+		populateLaunchpadIconMetadata(ctx, &apps[i])
+		a.populateAppMetadata(ctx, apps[i].Path, &apps[i], nil)
+		a.prepareIndexedIcon(ctx, &apps[i])
+		if progress != nil {
+			progress()
+		}
+	}
+
+	return apps
+}
+
+// prepareIndexedIcon uses the same plugin-owned cache as result processing.
+func (a *ApplicationPlugin) prepareIndexedIcon(ctx context.Context, info *appInfo) {
+	source := info.Icon
+	info.IconSource = &source
+	if a.convertIcon != nil {
+		info.Icon = a.convertIcon(ctx, source)
+	} else {
+		info.Icon = common.ConvertIcon(ctx, source, a.pluginDirectory)
+	}
+}
+
+func (a *ApplicationPlugin) rebuildQueryEntries(ctx context.Context) {
+	// Ignore rules depend on app metadata and current settings, not on the user's
+	// search text, so filter them once here instead of on every query.
+	visibleApps := make([]appInfo, 0, len(a.apps))
+	ignoreMatchers := a.getIgnoreRuleMatchersSnapshot()
+	ignoredApps := a.getIgnoredAppsSnapshot()
+	for _, info := range a.apps {
+		displayName := info.Name
+		if strings.HasPrefix(displayName, "i18n:") {
+			displayName = a.api.GetTranslation(ctx, displayName)
+		}
+		if _, ignored := a.matchIgnoreRuleCandidates(info.Path, buildIgnoreRuleCandidates(info, displayName), ignoreMatchers); ignored {
+			continue
+		}
+		if isIgnoredApp(info, ignoredApps) {
+			continue
+		}
+		visibleApps = append(visibleApps, info)
+	}
+	// Keep every source in a.apps/cache so incremental removal can promote another entry and
+	// deleted aliases disappear on rebuild. Filter before merging to preserve per-path ignore rules.
+	visibleApps = deduplicateAppLaunches(visibleApps)
+	userDirectories := a.indexedUserDirectories
+	if a.api != nil {
+		userDirectories = a.getUserAddedPaths(ctx)
+	}
+	entries := make([]appQueryEntry, 0, len(visibleApps))
+	for _, info := range visibleApps {
+		populateLaunchpadVisibility(ctx, &info, userDirectories...)
+		entries = append(entries, a.buildQueryEntry(info))
+	}
+
+	a.queryEntriesMutex.Lock()
+	a.queryEntries = entries
+	a.queryEntriesGeneration++
+	a.queryEntriesPrepared = true
+	a.queryEntriesMutex.Unlock()
+	a.clearQuerySessionCache()
+
+}
+
+func (a *ApplicationPlugin) buildQueryEntry(info appInfo) appQueryEntry {
+	entry := appQueryEntry{
+		info: info,
+	}
+
+	if strings.HasPrefix(info.Name, "i18n:") {
+		// Translated titles are prepared with the current locale during matching.
+		return entry
+	}
+
+	searchCandidates := info.GetSearchCandidates(info.Name)
+	entry.preparedSearchCandidates = make([]*fuzzymatch.PreparedText, 0, len(searchCandidates))
+	for _, candidate := range searchCandidates {
+		entry.preparedSearchCandidates = append(entry.preparedSearchCandidates, fuzzymatch.PrepareText(candidate))
+	}
+	return entry
+}
+
+// ReleasePreparedSearchText drops precomputed app names after a long hide,
+// retaining index metadata so the next query does not repeat native icon classification.
+func (a *ApplicationPlugin) ReleasePreparedSearchText() {
+	a.queryEntriesMutex.Lock()
+	// Readers may still hold the previous snapshot, so never clear its fields in place.
+	entries := slices.Clone(a.queryEntries)
+	for i := range entries {
+		entries[i].preparedSearchCandidates = nil
+	}
+	a.queryEntries = entries
+	a.queryEntriesGeneration++
+	a.queryEntriesPrepared = false
+	a.queryEntriesMutex.Unlock()
+	a.clearQuerySessionCache()
+}
+
+// ensureQueryEntries restores only search text, coalescing concurrent cold queries.
+func (a *ApplicationPlugin) ensureQueryEntries(ctx context.Context) {
+	a.queryEntriesMutex.RLock()
+	ready := a.queryEntriesPrepared
+	a.queryEntriesMutex.RUnlock()
+	if ready {
+		return
+	}
+
+	a.queryEntriesMutex.Lock()
+	defer a.queryEntriesMutex.Unlock()
+	if a.queryEntriesPrepared {
+		return
+	}
+	// Only indexing/settings rebuilds may classify apps. Restoring prepared text
+	// uses the retained immutable metadata and publishes one snapshot for all waiters.
+	entries := make([]appQueryEntry, len(a.queryEntries))
+	for i, entry := range a.queryEntries {
+		entries[i] = a.buildQueryEntry(entry.info)
+	}
+	a.queryEntries = entries
+	a.queryEntriesGeneration++
+	a.queryEntriesPrepared = true
+}
+
+func (a *ApplicationPlugin) getQueryEntriesSnapshot() ([]appQueryEntry, uint64) {
+	a.queryEntriesMutex.RLock()
+	entries := a.queryEntries
+	generation := a.queryEntriesGeneration
+	a.queryEntriesMutex.RUnlock()
+	return entries, generation
+}
+
+// appDisplayPath shows a localized catalog name for virtual Windows and macOS settings.
+func (a *ApplicationPlugin) appDisplayPath(ctx context.Context, info appInfo) string {
+	if key := windowsResultSubtitleKey(info); key != "" {
+		return a.api.GetTranslation(ctx, key)
+	}
+	if isMacSystemSettingsPath(info.Path) {
+		return a.api.GetTranslation(ctx, "i18n:plugin_app_macos_system_settings_subtitle")
+	}
+	return info.GetDisplayPath()
+}
+
+func (a *ApplicationPlugin) resolveQueryEntryDisplay(ctx context.Context, entry appQueryEntry) (displayName string, displayPath string, searchCandidates []*fuzzymatch.PreparedText) {
+	displayName = entry.info.Name
+	if strings.HasPrefix(displayName, "i18n:") {
+		displayName = a.api.GetTranslation(ctx, displayName)
+		candidateTexts := entry.info.GetSearchCandidates(displayName)
+		searchCandidates = make([]*fuzzymatch.PreparedText, 0, len(candidateTexts))
+		for _, candidate := range candidateTexts {
+			searchCandidates = append(searchCandidates, fuzzymatch.PrepareText(candidate))
+		}
+	} else {
+		searchCandidates = entry.preparedSearchCandidates
+	}
+
+	displayPath = a.appDisplayPath(ctx, entry.info)
+
+	return displayName, displayPath, searchCandidates
+}
+
+func normalizeQueryCacheKey(search string) string {
+	// Bug fix: query-cache reuse must preserve whitespace because fuzzy matching
+	// treats spaces as real pattern characters. The previous TrimSpace-based key
+	// made "qqyy " and "qqyy" identical, so deleting the trailing space reused the
+	// empty match set from the spaced query instead of rescanning apps. Lowercase
+	// normalization keeps case-insensitive reuse while respecting real search text.
+	return strings.ToLower(search)
+}
+
+func (a *ApplicationPlugin) getReusableQueryMatches(ctx context.Context, query plugin.Query, generation uint64) ([]int, bool) {
+	if query.SessionId == "" {
+		return nil, false
+	}
+
+	cached, ok := a.querySessionCache.Load(query.SessionId)
+	if !ok || cached.generation != generation {
+		return nil, false
+	}
+
+	currentSearch := normalizeQueryCacheKey(query.Search)
+	previousSearch := normalizeQueryCacheKey(cached.search)
+	if previousSearch == "" {
+		return nil, false
+	}
+	if shouldBypassPinyinQueryCache(ctx, previousSearch, currentSearch) {
+		return nil, false
+	}
+	// Reuse only when the current query keeps growing from the same prefix and
+	// still points at the same entry snapshot.
+	if currentSearch == previousSearch || strings.HasPrefix(currentSearch, previousSearch) {
+		return cached.matches, true
+	}
+
+	return nil, false
+}
+
+func shouldBypassPinyinQueryCache(ctx context.Context, previousSearch string, currentSearch string) bool {
+	if !setting.GetSettingManager().GetWoxSetting(ctx).UsePinYin.Get() {
+		return false
+	}
+	if !isAsciiLetterSearch(previousSearch) || !isAsciiLetterSearch(currentSearch) {
+		return false
+	}
+
+	// Bug fix: pinyin matching is intentionally non-monotonic while the user is
+	// typing across syllable boundaries. A Chinese title can match "xian", miss
+	// "xians", and match again at "xianshi". Reusing the empty subset from the
+	// intermediate query would hide the valid final match, so plain letter
+	// searches must rescan when pinyin is enabled.
+	return true
+}
+
+func isAsciiLetterSearch(search string) bool {
+	if search == "" {
+		return false
+	}
+	for i := 0; i < len(search); i++ {
+		ch := search[i]
+		if (ch < 'a' || ch > 'z') && (ch < 'A' || ch > 'Z') {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *ApplicationPlugin) storeQueryMatches(query plugin.Query, cache appQuerySessionCache) {
+	if query.SessionId == "" {
+		return
+	}
+
+	existing, ok := a.querySessionCache.Load(query.SessionId)
+	if ok && existing.startedAt > cache.startedAt {
+		return
+	}
+
+	a.querySessionCache.Store(query.SessionId, cache)
+}
+
+func (a *ApplicationPlugin) clearQuerySessionCache() {
+	if a.querySessionCache == nil {
+		return
+	}
+	a.querySessionCache.Clear()
+}
+
+// getAppPaths records each root separately so a broad filesystem crawl can be
+// distinguished from application parsing and platform catalog discovery.
+func (a *ApplicationPlugin) getAppPaths(ctx context.Context, appDirectories []appDirectory) (appPaths []string) {
+	for _, directory := range appDirectories {
+		started := time.Now()
+		paths := a.scanAppPaths(ctx, []appDirectory{directory})
+		appPaths = append(appPaths, paths...)
+		tracker := timetracking.New("app_index_scan")
+		tracker.SetString("root", directory.Path)
+		tracker.SetInt("paths", len(paths))
+		tracker.SetInt64("costMs", time.Since(started).Milliseconds())
+		tracker.Log(ctx)
+	}
+	return
+}
+
+// scanAppPaths follows the configured recursion, exclusions and ignore rules.
+func (a *ApplicationPlugin) scanAppPaths(ctx context.Context, appDirectories []appDirectory) (appPaths []string) {
+	extensions := a.retriever.GetAppExtensions(ctx)
+	appExtensions := make([]string, len(extensions))
+	for i, extension := range extensions {
+		appExtensions[i] = "." + strings.ToLower(extension)
+	}
+	for _, dir := range appDirectories {
+
+		// Initialize excludeAbsPaths on first call
+		if len(dir.RecursiveExcludes) > 0 && len(dir.excludeAbsPaths) == 0 {
+			dir.excludeAbsPaths = make([]string, 0, len(dir.RecursiveExcludes))
+			for _, exclude := range dir.RecursiveExcludes {
+				excludeAbsPath := filepath.Join(dir.Path, exclude)
+				cleanExcludePath := filepath.Clean(excludeAbsPath)
+				dir.excludeAbsPaths = append(dir.excludeAbsPaths, a.pathCacheKey(cleanExcludePath))
+			}
+		}
+
+		appPath, readErr := os.ReadDir(dir.Path)
+		if readErr != nil {
+			a.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("error reading directory %s: %s", dir.Path, readErr.Error()))
+			continue
+		}
+		ignoreMatchers := a.getIgnoreRuleMatchersSnapshot()
+
+		for _, entry := range appPath {
+			name := strings.ToLower(entry.Name())
+			isExtensionMatch := lo.ContainsBy(appExtensions, func(ext string) bool {
+				return strings.HasSuffix(name, ext)
+			})
+			if isExtensionMatch {
+				fullPath := filepath.Join(dir.Path, entry.Name())
+				if _, ignored := a.matchIgnoreRuleCandidates(fullPath, []string{fullPath}, ignoreMatchers); ignored {
+					// Bug fix: IgnoreRules previously filtered query results only after the full app
+					// crawl had already parsed every ignored file. Skipping matching paths here keeps
+					// deterministic smoke fixtures from waiting on large default Windows directories
+					// while preserving the same pattern contract used by query filtering.
+					continue
+				}
+				appPaths = append(appPaths, fullPath)
+
+				continue
+			}
+
+			if !dir.Recursive || dir.RecursiveDepth <= 0 {
+				continue
+			}
+
+			subDir := filepath.Join(dir.Path, entry.Name())
+			// ReadDir already reports ordinary file/directory types. Stat only links
+			// to preserve directory symlink/junction traversal without reopening every
+			// unrelated file in broad roots such as AppData\Local.
+			isDirectory := entry.IsDir()
+			if !isDirectory && entry.Type()&os.ModeSymlink != 0 {
+				isDirectory, _ = util.IsDirectory(subDir)
+			}
+			if !isDirectory {
+				continue
+			}
+			if _, ignored := a.matchIgnoreRuleCandidates(subDir, []string{subDir}, ignoreMatchers); ignored {
+				// Bug fix: directory-wide ignore patterns such as "C:\Program Files\*" should stop
+				// recursion before expensive default roots are walked. Filtering only leaf apps was
+				// correct functionally but not enough for bounded smoke-test indexing.
+				continue
+			}
+
+			// Check if this directory should be excluded
+			if len(dir.excludeAbsPaths) > 0 {
+				cleanSubDir := a.pathCacheKey(filepath.Clean(subDir))
+				isExcluded := lo.ContainsBy(dir.excludeAbsPaths, func(excludePath string) bool {
+					// Match a whole directory, not similarly prefixed siblings.
+					return a.isPathAtOrUnderDirectory(cleanSubDir, excludePath)
+				})
+				if isExcluded {
+					a.api.Log(ctx, plugin.LogLevelDebug, fmt.Sprintf("skipping excluded directory: %s", subDir))
+					continue
+				}
+			}
+
+			if dir.Recursive && dir.RecursiveDepth > 0 {
+				appPaths = append(appPaths, a.scanAppPaths(ctx, []appDirectory{{
+					Path:            subDir,
+					Recursive:       true,
+					RecursiveDepth:  dir.RecursiveDepth - 1,
+					excludeAbsPaths: dir.excludeAbsPaths,
+				}})...)
+			}
+		}
+
+	}
+
+	return
+}
+
+// saveAppToCache persists the result of a completed indexing pass, including an empty
+// one. Skipping the write for an empty index made "found no applications" and "never
+// finished indexing" look identical on disk, so such a machine re-ran the full scan on
+// every start and no observer could tell that indexing had settled.
+func (a *ApplicationPlugin) saveAppToCache(ctx context.Context) {
+	var cachePath = a.getAppCachePath()
+	cacheContent, marshalErr := json.Marshal(appCacheFile{
+		Version: appCacheVersion,
+		Apps:    a.apps,
+	})
+	if marshalErr != nil {
+		a.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("error marshalling app cache: %s", marshalErr.Error()))
+		return
+	}
+	writeErr := os.WriteFile(cachePath, cacheContent, 0644)
+	if writeErr != nil {
+		a.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("error writing app cache: %s", writeErr.Error()))
+		return
+	}
+	a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("wrote app cache to %s", cachePath))
+}
+
+func (a *ApplicationPlugin) getAppCachePath() string {
+	return path.Join(util.GetLocation().GetCacheDirectory(), "wox-app-cache.json")
+}
+
+func parseAppCacheContent(cacheContent []byte) ([]appInfo, error) {
+	var cacheFile appCacheFile
+	if err := json.Unmarshal(cacheContent, &cacheFile); err != nil {
+		return nil, fmt.Errorf("error unmarshalling app cache file: %w", err)
+	}
+
+	if cacheFile.Version != appCacheVersion {
+		return nil, fmt.Errorf("app cache version mismatch: got %d want %d", cacheFile.Version, appCacheVersion)
+	}
+
+	return cacheFile.Apps, nil
+}
+
+func (a *ApplicationPlugin) loadAppCache(ctx context.Context) ([]appInfo, error) {
+	startTimestamp := util.GetSystemTimestamp()
+	a.api.Log(ctx, plugin.LogLevelInfo, "start to load app cache")
+	var cachePath = a.getAppCachePath()
+	if _, err := os.Stat(cachePath); os.IsNotExist(err) {
+		a.api.Log(ctx, plugin.LogLevelWarning, "app cache file not found")
+		return nil, err
+	}
+
+	cacheContent, readErr := os.ReadFile(cachePath)
+	if readErr != nil {
+		a.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("error reading app cache file: %s", readErr.Error()))
+		return nil, readErr
+	}
+
+	apps, err := parseAppCacheContent(cacheContent)
+	if err != nil {
+		a.api.Log(ctx, plugin.LogLevelWarning, err.Error())
+		return nil, err
+	}
+
+	for i := range apps {
+		apps[i].Pid = 0
+		if apps[i].IconSource != nil && apps[i].Icon.ImageType == common.WoxImageTypeAbsolutePath {
+			if _, err := os.Stat(apps[i].Icon.ImageData); err != nil {
+				apps[i].Icon = *apps[i].IconSource
+			}
+		}
+		populateAppLaunchKey(ctx, &apps[i])
+		if strings.TrimSpace(apps[i].Identity) == "" {
+			apps[i].Identity = strings.TrimSpace(resolveAppIdentityForPlatform(ctx, apps[i]))
+		}
+	}
+
+	a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("loaded %d apps from cache, cost %d ms", len(apps), util.GetSystemTimestamp()-startTimestamp))
+	return apps, nil
+}
+
+// removeDuplicateApps removes duplicate apps with same Name and Path, keeping only one
+func (a *ApplicationPlugin) removeDuplicateApps(ctx context.Context, apps []appInfo) []appInfo {
+	seen := make(map[string]bool)
+	var result []appInfo
+
+	for _, app := range apps {
+		// Create a unique key combining Name and Path
+		key := app.Name + "|" + app.Path
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, app)
+		} else {
+			a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("removed duplicate app: %s (%s)", app.Name, app.Path))
+		}
+	}
+
+	a.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("removed %d duplicate apps, %d apps remaining", len(apps)-len(result), len(result)))
+	return result
+}
+
+func (a *ApplicationPlugin) handleMRURestore(ctx context.Context, mruData plugin.MRUData) (*plugin.QueryResult, error) {
+	contextData := appContextData{
+		Name: mruData.ContextData["name"],
+		Path: mruData.ContextData["path"],
+		Type: mruData.ContextData["type"],
+	}
+	if contextData.Path == "" && contextData.Name == "" {
+		return nil, fmt.Errorf("empty app context data")
+	}
+
+	var appInfo *appInfo
+	for _, info := range a.apps {
+		if info.Name == contextData.Name && info.Path == contextData.Path {
+			appInfo = &info
+			break
+		}
+	}
+
+	if appInfo == nil {
+		return nil, fmt.Errorf("app not found: %s", contextData.Name)
+	}
+	if isIgnoredApp(*appInfo, a.getIgnoredAppsSnapshot()) {
+		return nil, fmt.Errorf("app is hidden: %s", contextData.Name)
+	}
+
+	displayName := appInfo.Name
+	if strings.HasPrefix(displayName, "i18n:") {
+		displayName = a.api.GetTranslation(ctx, displayName)
+	}
+
+	displayPath := a.appDisplayPath(ctx, *appInfo)
+	result := &plugin.QueryResult{
+		Id:          uuid.NewString(),
+		Title:       displayName,
+		SubTitle:    displayPath,
+		IdentityKey: appResultIdentityKey(*appInfo),
+		Icon:        appInfo.Icon, // Use current icon instead of cached MRU icon to handle cache invalidation
+		Actions:     a.buildAppActions(*appInfo, displayName, mruData.ContextData),
+	}
+
+	// Track this result for periodic refresh (refreshRunningApps will handle running state)
+	a.trackedResults.Store(result.Id, *appInfo)
+
+	return result, nil
+}
+
+func (a *ApplicationPlugin) refreshRunningApps(ctx context.Context) {
+	// Skip refresh unless the primary launcher is visible.
+	if !a.api.IsVisible(context.Background()) {
+		return
+	}
+
+	// Copy tracked results first so query writes are not blocked by the refresh walk.
+	trackedResultsSnapshot := a.trackedResults.ToMap()
+	if len(trackedResultsSnapshot) == 0 {
+		return
+	}
+
+	type updateItem struct {
+		resultId string
+		app      appInfo
+	}
+
+	var toRemove []string
+	var toUpdate []updateItem
+
+	for resultId, appInfo := range trackedResultsSnapshot {
+		// Try to get the result, if it returns nil, the result is no longer visible
+		updatableResult := a.api.GetUpdatableResult(ctx, resultId)
+		if updatableResult == nil {
+			// Mark for removal from tracking queue
+			toRemove = append(toRemove, resultId)
+			continue
+		}
+
+		// Update Pid first (app may have been restarted with a new Pid, or started for the first time)
+		currentPid := a.retriever.GetPid(ctx, appInfo)
+		pidChanged := currentPid != appInfo.Pid
+		appInfo.Pid = currentPid
+
+		if pidChanged {
+			// Don't call Store here (would cause deadlock), collect for later update
+			toUpdate = append(toUpdate, updateItem{resultId, appInfo})
+		}
+
+		// Only populate fields changed by this refresh tick. GetUpdatableResult
+		// returns all current fields as non-nil, and passing that full payload back
+		// would repolish unchanged icons/actions on every CPU/memory refresh.
+		update := plugin.UpdatableResult{Id: resultId}
+		// Track if we need to update the UI
+		needsUpdate := false
+
+		// Update CPU/memory data and actions based on running state
+		if appInfo.Pid > 0 {
+			// App is running - update CPU/memory tails
+			tails := a.getRunningProcessResult(appInfo)
+			update.Tails = &tails
+			needsUpdate = true // Always update when running (CPU/memory changes)
+
+			// Add terminate action if not exists
+			hasTerminateAction := false
+			if updatableResult.Actions != nil {
+				for _, action := range *updatableResult.Actions {
+					if action.ContextData["action"] == "terminate" {
+						hasTerminateAction = true
+						break
+					}
+				}
+			}
+
+			if !hasTerminateAction {
+				actions := []plugin.QueryResultAction{}
+				if updatableResult.Actions != nil {
+					actions = append(actions, (*updatableResult.Actions)...)
+				}
+				// Capture current Pid for the closure
+				currentAppPid := appInfo.Pid
+				actions = append(actions, plugin.QueryResultAction{
+					Name:          "i18n:plugin_app_terminate",
+					SearchAliases: []string{"kill"},
+					Icon:          icons.Get(icons.ActionTerminate),
+					ContextData: common.ContextData{
+						"name":   appInfo.Name,
+						"path":   appInfo.Path,
+						"type":   appInfo.Type,
+						"action": "terminate",
+					},
+					Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+						// peacefully kill the process
+						p, getErr := os.FindProcess(currentAppPid)
+						if getErr != nil {
+							a.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("error finding process %d: %s", currentAppPid, getErr.Error()))
+							return
+						}
+
+						killErr := p.Kill()
+						if killErr != nil {
+							a.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("error killing process %d: %s", currentAppPid, killErr.Error()))
+						}
+					},
+				})
+				update.Actions = &actions
+			}
+		} else if pidChanged {
+			// App just stopped running - clear tails and remove terminate action
+			emptyTails := []plugin.QueryResultTail{}
+			update.Tails = &emptyTails
+			needsUpdate = true
+
+			// Remove terminate action if exists
+			if updatableResult.Actions != nil {
+				originalLen := len(*updatableResult.Actions)
+				actions := lo.Filter(*updatableResult.Actions, func(action plugin.QueryResultAction, _ int) bool {
+					return action.ContextData["action"] != "terminate"
+				})
+				// Only mark as needing update if we actually removed an action
+				if len(actions) != originalLen {
+					update.Actions = &actions
+					needsUpdate = true
+				}
+			}
+		}
+
+		// Only push update to UI if something actually changed
+		if needsUpdate {
+			// If UpdateResult returns false, the result is no longer visible in UI
+			if !a.api.UpdateResult(ctx, update) {
+				toRemove = append(toRemove, resultId)
+			}
+		}
+	}
+
+	// Write back after the snapshot walk so query-time stores are not blocked by
+	// refresh work.
+	for _, item := range toUpdate {
+		a.trackedResults.Store(item.resultId, item.app)
+	}
+
+	// Clean up results that are no longer visible
+	for _, resultId := range toRemove {
+		a.trackedResults.Delete(resultId)
+	}
+}
+
+func GetHotkeyAppCandidates(ctx context.Context) []setting.IgnoredHotkeyApp {
+	manager := plugin.GetPluginManager()
+	if manager == nil {
+		return []setting.IgnoredHotkeyApp{}
+	}
+
+	for _, instance := range manager.GetPluginInstances() {
+		appPlugin, ok := instance.Plugin.(*ApplicationPlugin)
+		if !ok {
+			continue
+		}
+
+		return appPlugin.getHotkeyAppCandidates(ctx)
+	}
+
+	return []setting.IgnoredHotkeyApp{}
+}
+
+// GetIndexedApps returns indexed apps matching the ignore pattern, including
+// distinct shortcuts that launch the same executable.
+func GetIndexedApps(ctx context.Context, pattern string) []setting.IgnoredHotkeyApp {
+	manager := plugin.GetPluginManager()
+	if manager == nil {
+		return []setting.IgnoredHotkeyApp{}
+	}
+
+	for _, instance := range manager.GetPluginInstances() {
+		appPlugin, ok := instance.Plugin.(*ApplicationPlugin)
+		if !ok {
+			continue
+		}
+
+		return appPlugin.indexedAppsForPreview(ctx, pattern)
+	}
+
+	return []setting.IgnoredHotkeyApp{}
+}
+
+func GetUsageAppIcons(ctx context.Context, usageSubjectIds []string) map[string]common.WoxImage {
+	manager := plugin.GetPluginManager()
+	if manager == nil || len(usageSubjectIds) == 0 {
+		return map[string]common.WoxImage{}
+	}
+
+	neededIds := map[string]struct{}{}
+	for _, id := range usageSubjectIds {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			neededIds[id] = struct{}{}
+		}
+	}
+	if len(neededIds) == 0 {
+		return map[string]common.WoxImage{}
+	}
+
+	for _, instance := range manager.GetPluginInstances() {
+		appPlugin, ok := instance.Plugin.(*ApplicationPlugin)
+		if !ok {
+			continue
+		}
+
+		icons := map[string]common.WoxImage{}
+		for _, info := range appPlugin.apps {
+			// Analytics stores app launches as "<type>:<name>" instead of duplicating icon payloads
+			// into every event. Resolve those stable subject ids against the current app index so
+			// the usage dashboard can show fresh icons without growing the analytics table.
+			usageSubjectId := fmt.Sprintf("%s:%s", info.Type, info.Name)
+			if _, ok := neededIds[usageSubjectId]; !ok || info.Icon.IsEmpty() {
+				continue
+			}
+			icons[usageSubjectId] = info.Icon
+		}
+		return icons
+	}
+
+	return map[string]common.WoxImage{}
+}
+
+func (a *ApplicationPlugin) getHotkeyAppCandidates(ctx context.Context) []setting.IgnoredHotkeyApp {
+	if len(a.hotkeyAppCandidates) == 0 && len(a.apps) > 0 {
+		a.rebuildHotkeyAppCandidates(ctx)
+	}
+
+	candidates := make([]setting.IgnoredHotkeyApp, len(a.hotkeyAppCandidates))
+	copy(candidates, a.hotkeyAppCandidates)
+	return candidates
+}
+
+func (a *ApplicationPlugin) rebuildHotkeyAppCandidates(ctx context.Context) {
+	candidates := make([]setting.IgnoredHotkeyApp, 0, len(a.apps))
+	candidateIndexes := make(map[string]int)
+	candidateInfos := make([]appInfo, 0, len(a.apps))
+
+	for _, info := range a.apps {
+		if strings.TrimSpace(info.Identity) == "" {
+			info.Identity = strings.TrimSpace(resolveAppIdentityForPlatform(ctx, info))
+		}
+
+		candidate, ok := a.toIgnoredHotkeyApp(info)
+		if !ok {
+			continue
+		}
+
+		key := strings.ToLower(strings.TrimSpace(candidate.Identity))
+		if key == "" {
+			continue
+		}
+
+		if existingIndex, ok := candidateIndexes[key]; ok {
+			existingInfo := candidateInfos[existingIndex]
+			// UWP entries are the real app launcher when they share the same process identity with helper executables.
+			preferCandidate := info.Type == AppTypeUWP && existingInfo.Type != AppTypeUWP
+			if !preferCandidate && existingInfo.Icon.IsEmpty() && !info.Icon.IsEmpty() {
+				preferCandidate = true
+			}
+			if !preferCandidate && existingInfo.IsDefaultIcon && !info.IsDefaultIcon {
+				preferCandidate = true
+			}
+			if preferCandidate {
+				candidateInfos[existingIndex] = info
+				candidates[existingIndex] = candidate
+			}
+			continue
+		}
+
+		candidateIndexes[key] = len(candidates)
+		candidateInfos = append(candidateInfos, info)
+		candidates = append(candidates, candidate)
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		leftName := strings.ToLower(candidates[i].Name)
+		rightName := strings.ToLower(candidates[j].Name)
+		if leftName == rightName {
+			return strings.ToLower(candidates[i].Identity) < strings.ToLower(candidates[j].Identity)
+		}
+		return leftName < rightName
+	})
+
+	a.hotkeyAppCandidates = candidates
+}
+
+func (a *ApplicationPlugin) toIgnoredHotkeyApp(info appInfo) (setting.IgnoredHotkeyApp, bool) {
+	identity := strings.TrimSpace(info.Identity)
+	if identity == "" {
+		return setting.IgnoredHotkeyApp{}, false
+	}
+
+	name := strings.TrimSpace(info.Name)
+	if name == "" {
+		name = strings.TrimSpace(info.Path)
+	}
+	if name == "" {
+		name = identity
+	}
+
+	icon := info.Icon
+	if icon.IsEmpty() {
+		icon = icons.Get(icons.PluginApp)
+	}
+
+	return setting.IgnoredHotkeyApp{
+		Name:     name,
+		Identity: identity,
+		Path:     info.Path,
+		Icon:     icon,
+	}, true
+}
+
+// indexedAppsForPreview uses the same candidates as filtering and retains distinct paths.
+func (a *ApplicationPlugin) indexedAppsForPreview(ctx context.Context, pattern string) []setting.IgnoredHotkeyApp {
+	compiled, err := compileAppIgnorePattern(pattern)
+	if err != nil {
+		return nil
+	}
+	apps := make([]setting.IgnoredHotkeyApp, 0, len(a.apps))
+	seen := make(map[string]bool, len(a.apps))
+	for _, info := range a.apps {
+		key := ignoredAppMatchKey(info.Path, info.Identity)
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+
+		name := strings.TrimSpace(info.Name)
+		if strings.HasPrefix(name, "i18n:") && a.api != nil {
+			name = strings.TrimSpace(a.api.GetTranslation(ctx, name))
+		}
+		if name == "" {
+			name = strings.TrimSpace(info.Path)
+		}
+		if name == "" {
+			name = strings.TrimSpace(info.Identity)
+		}
+
+		if !appMatchesCompiledIgnorePattern(pattern, compiled, info, name) {
+			continue
+		}
+		icon := info.Icon
+		if icon.IsEmpty() {
+			icon = icons.Get(icons.PluginApp)
+		}
+		apps = append(apps, setting.IgnoredHotkeyApp{
+			Name:     name,
+			Identity: strings.TrimSpace(info.Identity),
+			Path:     strings.TrimSpace(info.Path),
+			Icon:     icon,
+		})
+	}
+
+	sort.Slice(apps, func(i, j int) bool {
+		leftName := strings.ToLower(apps[i].Name)
+		rightName := strings.ToLower(apps[j].Name)
+		if leftName == rightName {
+			return strings.ToLower(apps[i].Path) < strings.ToLower(apps[j].Path)
+		}
+		return leftName < rightName
+	})
+	return apps
+}

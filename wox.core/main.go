@@ -1,0 +1,579 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime/debug"
+	"strconv"
+	"wox/ai"
+	"wox/analytics"
+	"wox/appcontrol"
+	"wox/cloudsync"
+	"wox/database"
+	"wox/migration"
+	"wox/network"
+	"wox/privacy"
+	"wox/supervisor"
+	"wox/telemetry"
+
+	"runtime"
+	"strings"
+	"wox/common"
+	"wox/common/icons"
+	"wox/i18n"
+	"wox/plugin"
+	"wox/resource"
+	"wox/setting"
+	"wox/ui"
+	"wox/ui/automation"
+	"wox/updater"
+	"wox/util"
+	"wox/util/clipboard"
+	"wox/util/imagecache"
+	"wox/util/mainthread"
+	"wox/util/overlay"
+	"wox/util/overlay/imageoverlay"
+	"wox/util/permission"
+	"wox/util/selection"
+
+	golauncher "wox/ui/launcher"
+	woxui "wox/ui/runtime"
+
+	_ "wox/plugin/host"
+	_ "wox/plugin/thirdparty"
+
+	// import all hosts
+
+	// import all system plugins
+	_ "wox/plugin/system"
+
+	_ "wox/plugin/system/sys"
+
+	_ "wox/plugin/system/app"
+
+	_ "wox/plugin/system/chat"
+
+	_ "wox/plugin/system/calculator"
+
+	_ "wox/plugin/system/converter"
+
+	_ "wox/plugin/system/clipboard"
+
+	_ "wox/plugin/system/mediaplayer"
+
+	_ "wox/plugin/system/notes"
+
+	_ "wox/plugin/system/shell"
+
+	_ "wox/plugin/system/emoji"
+
+	_ "wox/plugin/system/quickjump"
+
+	_ "wox/plugin/system/browser_bookmark"
+
+	_ "wox/plugin/system/websearch"
+
+	_ "wox/plugin/system/file_search"
+
+	_ "wox/plugin/system/glance"
+
+	_ "wox/plugin/system/info"
+
+	_ "wox/plugin/system/window_manager"
+
+	_ "wox/plugin/system/dictation"
+
+	_ "wox/plugin/system/wox_memory"
+)
+
+var embeddedGoUIApp *golauncher.App
+
+func configureSupervisor() {
+	supervisor.SetVersion(updater.CURRENT_VERSION)
+	supervisor.PreserveArgOnRestart(util.ArgNoThirdPartyPlugins)
+	supervisor.Register(supervisor.TaskRestore, runSupervisorRestore)
+}
+
+func runSupervisorRestore(ctx context.Context, payload json.RawMessage) error {
+	var request struct {
+		BackupPath  string `json:"backupPath"`
+		UserDataDir string `json:"userDataDir"`
+	}
+	if err := json.Unmarshal(payload, &request); err != nil {
+		return err
+	}
+	if err := setting.RestoreUserDataDirectory(ctx, request.BackupPath, request.UserDataDir); err != nil {
+		return err
+	}
+	// The marker sits outside the replaced user data directory, so the next launch can push this backup before pulling.
+	return cloudsync.MarkPendingRestoreSnapshot()
+}
+
+func crashCaptureAssets() supervisor.CrashCaptureAssets {
+	var assets supervisor.CrashCaptureAssets
+	if !util.IsWindows() {
+		return assets
+	}
+	data, err := resource.OthersFS.ReadFile("others/crash_handler/WoxCrashHandler64.dll")
+	if err != nil {
+		return assets
+	}
+	assets.WindowsHandler = data
+	return assets
+}
+
+func main() {
+	// VS Code's debugger can pass its Node-mode flag to Wox. Wox is not an
+	// Electron CLI host: inheriting this flag makes launched Electron apps exit
+	// without opening their UI. Clear it once, before spawning any child processes,
+	// rather than changing the process environment around concurrent Shell launches.
+	_ = os.Unsetenv("ELECTRON_RUN_AS_NODE")
+	configureSupervisor()
+	if privacy.IsCleanupProcess(os.Args) {
+		os.Exit(privacy.RunCleanupProcess(os.Args))
+	}
+
+	// Permission APIs cache an initial denial for the lifetime of a process. Run the
+	// passive checks before AppKit and the normal Wox lifecycle initialize so the
+	// parent can observe permissions granted while it is already running.
+	if permission.IsMacOSPermissionProbeProcess() {
+		if err := json.NewEncoder(os.Stdout).Encode(permission.GetMacOSPermissionStatusDirect(context.Background())); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+	if supervisor.GetManager().IsSupervisorArg(os.Args) {
+		ctx := util.NewTraceContext()
+		if locationErr := util.GetLocation().Init(); locationErr != nil {
+			os.Exit(1)
+		}
+		supervisor.SetDataDirectory(util.GetLocation().GetWoxDataDirectory())
+		os.Exit(supervisor.GetManager().RunSupervisor(ctx, os.Args))
+	}
+	// Query workloads have a small live Go heap but high allocation churn.
+	// Keep the default heap growth bounded while preserving GOGC as a diagnostic override.
+	if os.Getenv("GOGC") == "" {
+		debug.SetGCPercent(50)
+	}
+	// Bound per-P runtime caches on high-core systems while preserving explicit
+	// overrides and smaller defaults selected for CPU affinity or quota limits.
+	// Measured on 2026-10-11 with Go 1.27.1, GOGC=50 and 22 logical CPUs on Windows:
+	// three paired 22-vs-8 runs reduced median hidden private working set from
+	// 75.5 to 64.6 MiB and Go retained memory from 36.7 to 27.7 MiB. Completed-frame
+	// p95 stayed at 75.6 vs 75.7 ms; average query CPU fell from 37.0% to 32.5%
+	// (one core = 100%). Direct production runs confirmed 60.2 to 52.3 MiB after
+	// 45s hidden, with completed-frame p95 at 75.0 vs 74.6 ms.
+	if os.Getenv("GOMAXPROCS") == "" && runtime.GOMAXPROCS(0) > 8 {
+		runtime.GOMAXPROCS(8)
+	}
+	// Heap profiling samples every allocation and keeps a stack-hash table that only
+	// grows (about 1.5 MB after a normal session). Production builds do not need it
+	// unless a heap profile is being captured; GODEBUG=memprofilerate=N restores it.
+	if util.IsProd() && !strings.Contains(os.Getenv("GODEBUG"), "memprofilerate") {
+		runtime.MemProfileRate = 0
+	}
+	if (util.IsProd() || supervisor.DebugModeEnabled()) && util.IsWindows() {
+		// Let Windows Error Reporting observe fatal Go runtime failures so the
+		// registered out-of-process crash module can preserve a minidump.
+		debug.SetTraceback("wer")
+	} else if supervisor.DebugModeEnabled() {
+		debug.SetTraceback("system")
+	}
+	// GTK loads this file inside gtk_init, before run() reaches EnsureLinuxDesktopIcon.
+	resource.InstallLinuxDesktopIcon()
+	mainthread.SetDispatcher(func(fn func()) {
+		if err := woxui.Call(fn); err != nil {
+			panic(err)
+		}
+	})
+	err := woxui.Run(func() error {
+		run()
+		if embeddedGoUIApp == nil {
+			return fmt.Errorf("embedded Go UI did not start")
+		}
+		return nil
+	})
+	mainthread.SetDispatcher(nil)
+	if embeddedGoUIApp != nil {
+		_ = embeddedGoUIApp.Close()
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func run() {
+	// Private mode cleanup must run before location initialization creates files or the logger opens them.
+	if err := privacy.PrepareAtStartup(); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "failed to prepare private Wox session: %v\n", err)
+		os.Exit(1)
+	}
+
+	// logger depends on location, so location must be initialized first
+	locationErr := util.GetLocation().Init()
+	if locationErr != nil {
+		panic(locationErr)
+	}
+	supervisor.SetDataDirectory(util.GetLocation().GetWoxDataDirectory())
+
+	defer util.GoRecover(context.Background(), "main panic", func(err error) {
+		util.GetLogger().Error(context.Background(), fmt.Sprintf("main panic: %s\n%s", err.Error(), debug.Stack()))
+	})
+
+	ctx := util.NewTraceContext()
+	if supervisor.DebugModeEnabled() {
+		util.GetLogger().SetLevel("debug")
+	}
+	util.GetLogger().Info(ctx, "------------------------------")
+	util.GetLogger().Info(ctx, fmt.Sprintf("Wox starting: %s", updater.CURRENT_VERSION))
+	util.GetLogger().Info(ctx, fmt.Sprintf("diagnostic debug mode: enabled=%t", supervisor.DebugModeEnabled()))
+	util.GetLogger().Info(ctx, fmt.Sprintf("golang version: %s", strings.ReplaceAll(runtime.Version(), "go", "")))
+	util.GetLogger().Info(ctx, fmt.Sprintf("wox data location: %s", util.GetLocation().GetWoxDataDirectory()))
+	util.GetLogger().Info(ctx, fmt.Sprintf("user data location: %s", util.GetLocation().GetUserDataDirectory()))
+	if util.GetLocation().IsPortableUserData() {
+		util.GetLogger().Info(ctx, "portable user data: using the wox-user directory beside the executable")
+	}
+	updater.CleanupStaleBackup(ctx)
+	if execPath, execErr := os.Executable(); execErr == nil {
+		util.GetLogger().Info(ctx, fmt.Sprintf("startup pid: %d, executable: %s, args: %v", os.Getpid(), execPath, os.Args))
+	} else {
+		util.GetLogger().Info(ctx, fmt.Sprintf("startup pid: %d, executable: <error>, args: %v", os.Getpid(), os.Args))
+	}
+	// Keep cold-start protocol URLs and .wox file opens until the embedded UI is
+	// ready. A second process already forwards these to the running instance.
+	startupDeepLinks := util.CollectStartupDeepLinks(os.Args[1:])
+
+	// Check for an existing instance BEFORE doing any heavy initialization (database, analytics,
+	// migrations). When this process is launched as a one-shot deeplink forwarder (e.g. via the
+	// desktop URL-scheme handler on Linux), we just need to forward the request and exit.
+	// Running the full startup sequence in that case wastes time and leaves an orphan process,
+	// because the native UI event loop keeps the main goroutine alive even after run()
+	// returns. Using os.Exit(0) is the only reliable way to terminate cleanly here.
+	if existingPort := getExistingInstancePort(ctx); existingPort > 0 {
+		util.GetLogger().Info(ctx, fmt.Sprintf("there is existing instance running, port: %d", existingPort))
+
+		// if args has deeplink, post it to the existing instance and exit immediately
+		for _, deeplink := range startupDeepLinks {
+			_, postDeepLinkErr := util.HttpPost(ctx, fmt.Sprintf("http://127.0.0.1:%d/deeplink", existingPort), map[string]string{
+				"deeplink": deeplink,
+			})
+			if postDeepLinkErr != nil {
+				util.GetLogger().Error(ctx, fmt.Sprintf("failed to post deeplink to existing instance: %s", postDeepLinkErr.Error()))
+			} else {
+				util.GetLogger().Info(ctx, "post deeplink to existing instance successfully, bye~")
+			}
+			// Exit regardless of success/failure: this process has no further role.
+			os.Exit(0)
+		}
+
+		// show existing instance if no deeplink is provided
+		_, postShowErr := util.HttpPost(ctx, fmt.Sprintf("http://127.0.0.1:%d/show", existingPort), "")
+		if postShowErr != nil {
+			util.GetLogger().Error(ctx, fmt.Sprintf("failed to show existing instance: %s", postShowErr.Error()))
+		} else {
+			util.GetLogger().Info(ctx, "show existing instance successfully, bye~")
+		}
+		// Exit regardless: the main goroutine is blocked in mainthread's event loop and will
+		// never terminate on its own, so os.Exit is required to avoid a zombie process.
+		os.Exit(0)
+	}
+
+	if util.IsProd() || supervisor.DebugModeEnabled() {
+		if captureErr := supervisor.GetManager().ConfigureCrashCapture(ctx, crashCaptureAssets()); captureErr != nil {
+			util.GetLogger().Warn(ctx, fmt.Sprintf("failed to configure crash capture: %s", captureErr.Error()))
+		}
+	}
+	// Production and diagnostic launches run under an external supervisor so native crashes
+	// can still be recorded after the Go process is no longer able to write logs.
+	if (util.IsProd() || supervisor.DebugModeEnabled()) && !supervisor.GetManager().IsChildArg(os.Args) {
+		if supervisorErr := supervisor.GetManager().StartSupervisorDetached(ctx, true); supervisorErr != nil {
+			util.GetLogger().Error(ctx, fmt.Sprintf("failed to start crash supervisor; continuing without supervision: %s", supervisorErr.Error()))
+		} else {
+			util.GetLogger().Info(ctx, "crash supervisor started, exiting bootstrap process")
+			os.Exit(0)
+		}
+	}
+
+	resource.EnsureLinuxDesktopIcon(ctx)
+	if desktopEntryReady := util.EnsureDeepLinkProtocolHandler(ctx); desktopEntryReady && util.ShouldRelaunchLinuxFromDesktopEntry(os.Args[1:]) {
+		util.GetLogger().Info(ctx, "Wayland session started without stable desktop identity, relaunching from Linux desktop entry")
+		if relaunchErr := util.RelaunchLinuxFromDesktopEntry(ctx); relaunchErr != nil {
+			util.GetLogger().Warn(ctx, fmt.Sprintf("failed to relaunch from Linux desktop entry: %s", relaunchErr.Error()))
+		} else {
+			util.GetLogger().Info(ctx, "relaunched from Linux desktop entry, exiting current process")
+			supervisor.GetManager().MarkCleanExit(ctx)
+			os.Exit(0)
+		}
+	}
+
+	supervisor.GetManager().RecordRunStart(ctx, supervisor.GetManager().IsChildArg(os.Args))
+
+	util.GetLogger().Info(ctx, "no existing instance found, proceeding with full startup")
+	util.LogPlatformDiagnostics(ctx)
+
+	if err := database.Init(ctx); err != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("failed to initialize database: %s", err.Error()))
+		return
+	}
+
+	if err := analytics.Init(ctx, database.GetDB()); err != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("failed to initialize analytics: %s", err.Error()))
+	}
+
+	if err := migration.Run(ctx); err != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("failed to run migration: %s", err.Error()))
+		// In some cases, we might want to exit if migration fails, but for now we just log it.
+	}
+
+	serverPort, serverPortErr := resolveServerPort(ctx)
+	if serverPortErr != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("failed to get server port: %s", serverPortErr.Error()))
+		return
+	}
+	util.GetLogger().Info(ctx, fmt.Sprintf("server port: %d", serverPort))
+	ui.GetUIManager().UpdateServerPort(serverPort)
+	common.SetServerPort(serverPort)
+
+	writeErr := os.WriteFile(util.GetLocation().GetAppLockPath(), []byte(fmt.Sprintf("%d", serverPort)), 0644)
+	if writeErr != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("failed to write lock file: %s", writeErr.Error()))
+	}
+
+	extractErr := resource.Extract(ctx)
+	if extractErr != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("failed to extract embed file: %s", extractErr.Error()))
+		return
+	}
+
+	settingErr := setting.GetSettingManager().Init(ctx)
+	if settingErr != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("failed to initialize settings: %s", settingErr.Error()))
+		return
+	}
+	woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+	if err := privacy.ApplyPreservedSettings(woxSetting); err != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("failed to restore private mode settings: %s", err.Error()))
+		return
+	}
+	// Apply the persisted backend before the first native renderer is created.
+	woxui.ConfigureSoftwareRendering(woxSetting.UseSoftwareRendering.Get())
+	if !supervisor.DebugModeEnabled() {
+		util.GetLogger().SetLevel(woxSetting.LogLevel.Get())
+	}
+
+	network.Default.SetOffline(woxSetting.EnableOfflineMode.Get())
+
+	woxSetting.ApplyHTTPProxy(ctx)
+
+	network.SetErrorTranslator(func() string {
+		return i18n.GetI18nManager().TranslateWox(context.Background(), "ui_offline_unavailable")
+	})
+	initCloudSync(ctx)
+
+	langErr := i18n.GetI18nManager().UpdateLang(ctx, woxSetting.LangCode.Get())
+	if langErr != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("failed to initialize lang(%s): %s", woxSetting.LangCode.Get(), langErr.Error()))
+		return
+	}
+
+	util.Go(ctx, "start ai command store manager", func() {
+		ai.GetStoreManager().Start(util.NewTraceContext())
+	})
+
+	for _, arg := range os.Args {
+		if arg == "--updated" {
+			ui.GetUIManager().SetStartupNotify(common.NotifyMsg{
+				Icon:           icons.Get(icons.StatusInstalled).String(),
+				Text:           i18n.GetI18nManager().TranslateWox(ctx, "ui_update_success"),
+				DisplaySeconds: 5,
+				Confetti:       true,
+			})
+			break
+		}
+	}
+	if incident, ok := supervisor.GetManager().TakePendingCrashIncident(); ok {
+		ui.GetUIManager().SetStartupNotify(common.NotifyMsg{
+			Text:           i18n.GetI18nManager().TranslateWox(ctx, "ui_previous_crash_github_issue"),
+			DisplaySeconds: 60,
+		})
+		util.GetLogger().Info(ctx, fmt.Sprintf("pending crash report is ready for a GitHub issue: %s", incident.ReportPath))
+	}
+	if result, ok := supervisor.TakeTaskResult(); ok && result.Type == supervisor.TaskRestore {
+		if result.OK {
+			ui.GetUIManager().SetStartupNotify(common.NotifyMsg{
+				Icon:           icons.Get(icons.StatusInstalled).String(),
+				Text:           i18n.GetI18nManager().TranslateWox(ctx, "ui_data_backup_restore_restarted"),
+				DisplaySeconds: 5,
+			})
+		} else {
+			ui.GetUIManager().SetStartupNotify(common.NotifyMsg{
+				Text:           fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "ui_data_backup_restore_failed"), result.Error),
+				DisplaySeconds: 8,
+			})
+		}
+	}
+
+	themeErr := ui.GetUIManager().Start(ctx)
+	if themeErr != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("failed to initialize themes: %s", themeErr.Error()))
+		return
+	}
+
+	if woxSetting.ShowTray.Get() {
+		ui.GetUIManager().ShowTray()
+	}
+
+	shareUI := ui.GetUIManager().GetUI(ctx)
+	clipboard.SetNativeImageFileWriter(shareUI.WriteClipboardImageFile)
+
+	// Discovery phase: publish Wox-setting hotkeys (main, selection, query) to
+	// the hotkey service. Dictation hotkeys are collected during plugin loading
+	// (dictation.Init calls reloadActions).
+	ui.GetUIManager().CollectWoxSettingHotkeys(ctx, woxSetting)
+
+	// Start plugins (dictation.Init collects dictation hotkeys via the registrar;
+	// registration stays deferred until the unified pass below).
+	plugin.GetPluginManager().Start(ctx, shareUI)
+
+	selection.InitSelection()
+
+	// Daily automatic backup. The loop itself checks the setting and whether today already has one.
+	setting.GetSettingManager().StartAutoBackup(ctx)
+
+	// Start MRU cleanup
+	setting.GetSettingManager().StartMRUCleanup(ctx)
+
+	// Start image cache cleanup
+	imagecache.StartCleanupRoutine(ctx)
+
+	// Start auto update checker if enabled
+	// updater.StartAutoUpdateChecker(ctx)
+
+	if util.ShouldDisableTelemetryForTest() {
+		util.GetLogger().Info(ctx, "skip telemetry in test mode")
+	} else {
+		// Send anonymous usage telemetry if enabled
+		telemetry.SendPresenceIfNeeded(ctx)
+
+		// Start periodic telemetry heartbeat for long-running processes
+		telemetry.StartPeriodicHeartbeat(ctx)
+	}
+
+	// Registration phase: bind all collected hotkeys to the platform in one pass.
+	// This runs after plugin.Start so dictation hotkeys are already in the
+	// collector. On Wayland-portal, all normal combos go into one portal session
+	// (one permission dialog). On other platforms, each hotkey is registered
+	// individually.
+	registerErr := ui.GetUIManager().RegisterAllHotkeys(ctx)
+	if registerErr != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("failed to register hotkeys: %s", registerErr.Error()))
+	}
+
+	if util.IsWindows() {
+		loaderPath := filepath.Join(util.GetLocation().GetOthersDirectory(), "webview", "WebView2Loader.dll")
+		if util.IsFileExists(loaderPath) {
+			if err := os.Setenv("WOX_WEBVIEW2_LOADER_PATH", loaderPath); err != nil {
+				util.GetLogger().Warn(ctx, fmt.Sprintf("failed to configure embedded WebView2 loader: %s", err.Error()))
+			}
+		}
+	}
+	coreServices := ui.NewCoreServices()
+	embeddedGoUIApp = golauncher.New(util.IsDev(), coreServices)
+	overlay.SetWindowManager(embeddedGoUIApp.WindowManager())
+	themeProvider := func() common.Theme {
+		return ui.GetUIManager().GetCurrentTheme(context.Background())
+	}
+	overlay.SetThemeProvider(themeProvider)
+	imageoverlay.SetThemeProvider(themeProvider)
+	coreServices.AttachView(embeddedGoUIApp)
+	// Wire text-field copy/cut/paste to the cross-platform clipboard backend.
+	golauncher.SetClipboardProvider(golauncher.NewUtilClipboardProvider())
+	if err := embeddedGoUIApp.Start(); err != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("failed to start embedded Go UI: %s", err.Error()))
+		coreServices.AttachView(nil)
+		embeddedGoUIApp = nil
+		return
+	}
+	woxui.SetProtocolURLHandler(func(deeplink string) {
+		ui.GetUIManager().ProcessDeeplink(util.NewTraceContext(), deeplink)
+	})
+	for _, deeplink := range startupDeepLinks {
+		// The launcher is already shown on startup, so toggling here would
+		// immediately hide it when a URL starts the first Wox instance.
+		if deeplink == "wox://toggle" || deeplink == "wox://toggle/" {
+			ui.GetUIManager().GetUI(ctx).ShowApp(ctx, common.ShowContext{SelectAll: true})
+			continue
+		}
+		ui.GetUIManager().ProcessDeeplink(ctx, deeplink)
+	}
+	automationInfo, automationErr := automation.Start(ctx, embeddedGoUIApp)
+	if automationErr != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("failed to start test automation: %s", automationErr.Error()))
+	} else if automationInfo.Address != "" {
+		util.GetLogger().Info(ctx, fmt.Sprintf("test automation listening on %s", automationInfo.Address))
+	}
+	util.Go(ctx, "start primary instance control server", func() {
+		err := appcontrol.ServeAndWait(ctx, serverPort, appcontrol.Handlers{
+			PreviewFileMedia: appcontrol.NewFileMediaHandler(),
+			Show: func(requestCtx context.Context) error {
+				ui.GetUIManager().GetUI(requestCtx).ShowApp(requestCtx, common.ShowContext{SelectAll: true})
+				return nil
+			},
+			DeepLink: func(requestCtx context.Context, deepLink string) error {
+				ui.GetUIManager().ProcessDeeplink(requestCtx, deepLink)
+				return nil
+			},
+		})
+		if err != nil {
+			util.GetLogger().Error(ctx, fmt.Sprintf("primary instance control server stopped: %s", err.Error()))
+		}
+	})
+}
+
+func resolveServerPort(ctx context.Context) (int, error) {
+	if util.IsProd() {
+		return util.GetAvailableTcpPort(ctx)
+	}
+
+	testPort, testErr := util.GetTestServerPortOverride()
+	if testErr == nil {
+		return testPort, nil
+	}
+
+	return util.DefaultDevServerPort, nil
+}
+
+// retrieves the instance port from the existing instance lock file.
+// It returns 0 if the lock file doesn't exist or fails to read the file.
+func getExistingInstancePort(ctx context.Context) int {
+	filePath := util.GetLocation().GetAppLockPath()
+	if !util.IsFileExists(filePath) {
+		return 0
+	}
+
+	file, err := os.ReadFile(filePath)
+	if err != nil {
+		return 0
+	}
+
+	port, err := strconv.Atoi(string(file))
+	if err != nil {
+		return 0
+	}
+
+	//check if the port is valid
+	response, err := util.HttpGet(ctx, fmt.Sprintf("http://127.0.0.1:%d/ping", port))
+	if err != nil {
+		return 0
+	}
+
+	if !strings.Contains(string(response), "pong") {
+		return 0
+	}
+
+	return port
+}

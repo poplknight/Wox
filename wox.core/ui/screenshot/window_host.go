@@ -1,0 +1,161 @@
+package screenshot
+
+import (
+	"errors"
+	"sync"
+)
+
+type screenshotEditorWindowHost struct {
+	mu    sync.RWMutex
+	state *screenshotEditorOverlayState
+}
+
+func (host *screenshotEditorWindowHost) begin(state *screenshotEditorOverlayState) error {
+	host.mu.Lock()
+	defer host.mu.Unlock()
+	if host.state != nil {
+		return errors.New("a screenshot window is already active")
+	}
+	host.state = state
+	return nil
+}
+
+func (host *screenshotEditorWindowHost) end(state *screenshotEditorOverlayState) {
+	host.mu.Lock()
+	if host.state == state {
+		host.state = nil
+	}
+	host.mu.Unlock()
+}
+
+func (host *screenshotEditorWindowHost) current() *screenshotEditorOverlayState {
+	host.mu.RLock()
+	state := host.state
+	host.mu.RUnlock()
+	return state
+}
+
+func (host *screenshotEditorWindowHost) draw(displayList *DisplayList, frame FrameInfo) {
+	if state := host.current(); state != nil {
+		if recording := state.activeRecordingUI(); recording != nil && recording.usesToolbarSurface(frame) {
+			recording.drawToolbar(displayList, frame)
+			return
+		}
+		if state.document != nil {
+			state.mu.Lock()
+			scale, offset := screenshotDocumentViewport(state.document.Frame, frame.Size)
+			state.viewportScale, state.viewportOffset = scale, offset
+			state.mu.Unlock()
+			frame.Size = state.document.Frame
+			frame.Damage = Rect{}
+			displayList.SetDamage(Rect{})
+			displayList.SetNativeDamage(Rect{})
+			state.draw(displayList, frame)
+			displayList.TransformScene(scale, offset)
+			return
+		}
+		state.draw(displayList, frame)
+	} else {
+		displayList.Clear(Color{})
+	}
+}
+
+func (host *screenshotEditorWindowHost) pointer(event PointerEvent) {
+	if state := host.current(); state != nil {
+		if recording := state.activeRecordingUI(); recording != nil {
+			recording.toolbarPointer(event)
+			return
+		}
+		if state.document != nil {
+			state.mu.Lock()
+			scale, offset := state.viewportScale, state.viewportOffset
+			state.mu.Unlock()
+			if scale <= 0 {
+				return
+			}
+			event.Position = Point{X: (event.Position.X - offset.X) / scale, Y: (event.Position.Y - offset.Y) / scale}
+			if event.Kind == PointerDown && !screenshotEditorRectContains(Rect{Width: state.document.Frame.Width, Height: state.document.Frame.Height}, event.Position) {
+				return
+			}
+		}
+		state.pointer(event)
+	}
+}
+
+func (host *screenshotEditorWindowHost) key(event KeyEvent) bool {
+	if state := host.current(); state != nil {
+		if recording := state.activeRecordingUI(); recording != nil {
+			recording.mu.Lock()
+			dialog := recording.runtimeDialog
+			recording.mu.Unlock()
+			if dialog != nil && dialog.host != nil {
+				return dialog.host.Key(event)
+			}
+
+			if event.Down && event.Key == KeyEscape {
+				recording.cancel()
+				return true
+			}
+			return false
+		}
+		return state.key(event)
+	}
+	return false
+}
+
+func (host *screenshotEditorWindowHost) textInput(event TextInputEvent) {
+	if state := host.current(); state != nil {
+		state.textInput(event)
+	}
+}
+
+func (host *screenshotEditorWindowHost) closed() {
+	if state := host.current(); state != nil {
+		state.closeSizeDialog(false)
+		if recording := state.activeRecordingUI(); recording != nil {
+			recording.closed()
+		} else {
+			state.complete(true)
+		}
+	}
+	host.mu.Lock()
+	host.state = nil
+	host.mu.Unlock()
+}
+
+// prepareScreenshotEditorWindow creates one session-owned hidden native surface on the UI thread.
+func prepareScreenshotEditorWindow(manager *WindowManager, host *screenshotEditorWindowHost) (*ManagedWindow, error) {
+	managed, created, err := manager.Open(ScreenshotWindowID, WindowOptions{
+		Title:       "Wox Screenshot",
+		Size:        Size{Width: 100, Height: 100},
+		Role:        WindowRoleScreenshot,
+		HideOnBlur:  false,
+		OnFrame:     host.draw,
+		OnPointer:   host.pointer,
+		OnKey:       host.key,
+		OnTextInput: host.textInput,
+		OnClosed:    host.closed,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !created {
+		return nil, errors.New("a screenshot window is already active")
+	}
+	return managed, nil
+}
+
+// prepareScreenshotEditorWindowOnUIThread overlaps cold renderer creation with desktop capture.
+func prepareScreenshotEditorWindowOnUIThread(manager *WindowManager, host *screenshotEditorWindowHost) (*ManagedWindow, error) {
+	if manager == nil {
+		return nil, nil
+	}
+	var managed *ManagedWindow
+	var prepareErr error
+	if err := Call(func() {
+		managed, prepareErr = prepareScreenshotEditorWindow(manager, host)
+	}); err != nil {
+		return nil, err
+	}
+	return managed, prepareErr
+}

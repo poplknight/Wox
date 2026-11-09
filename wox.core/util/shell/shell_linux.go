@@ -1,0 +1,79 @@
+package shell
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"wox/util"
+)
+
+func Open(path string) error {
+	cmd := exec.Command("xdg-open", path)
+	cmd.Dir = getWorkingDirectory(path)
+	return cmd.Start()
+}
+
+func Run(name string, arg ...string) (*exec.Cmd, error) {
+	cmd := BuildCommand(name, nil, arg...)
+	cmd.Stdout = util.GetLogger().GetWriter()
+	cmd.Stderr = util.GetLogger().GetWriter()
+	cmd.Dir = getWorkingDirectory(name)
+	cmdErr := cmd.Start()
+	if cmdErr != nil {
+		return nil, cmdErr
+	}
+
+	return cmd, nil
+}
+
+func RunWithEnv(name string, envs []string, arg ...string) (*exec.Cmd, error) {
+	if len(envs) == 0 {
+		return Run(name, arg...)
+	}
+
+	cmd := BuildCommand(name, envs, arg...)
+	cmd.Stdout = util.GetLogger().GetWriter()
+	cmd.Stderr = util.GetLogger().GetWriter()
+	// Set working directory: use file's directory if name is a file path, otherwise use user home directory
+	cmd.Dir = getWorkingDirectory(name)
+	cmdErr := cmd.Start()
+	if cmdErr != nil {
+		return nil, cmdErr
+	}
+
+	return cmd, nil
+}
+
+func RunOutput(name string, arg ...string) ([]byte, error) {
+	cmd := BuildCommand(name, nil, arg...)
+	return cmd.Output()
+}
+
+// RunElevated is only implemented on Windows, where UAC can elevate a process.
+func RunElevated(file string, parameters string, directory string) (WaitFunc, error) {
+	return nil, fmt.Errorf("elevated execution is only supported on Windows")
+}
+
+func OpenFileInFolder(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+
+	targetPath := path
+	// Bug fix: xdg-open opens files with their default application, so the old
+	// implementation launched the file itself instead of revealing its folder.
+	// Linux has no portable select-in-folder flag here, so file inputs must be
+	// normalized to their parent directory while directory inputs stay unchanged.
+	if !info.IsDir() {
+		targetPath = filepath.Dir(path)
+	}
+
+	return exec.Command("xdg-open", targetPath).Start()
+}
+
+// HideWindowCmd is a no-op on Linux as there's no console window to hide
+func HideWindowCmd(cmd *exec.Cmd) {
+	// No-op on Linux
+}

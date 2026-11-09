@@ -1,0 +1,26 @@
+[project]
+name = "wox-plugin"
+version = "0.0.92"
+description = "Python plugin SDK for Wox launcher"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0" }
+authors = [{ name = "Wox Team" }]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Wox-launcher/Wox"
+Repository = "https://github.com/Wox-launcher/Wox"
+
+[project.optional-dependencies]
+dev = ["hatchling", "twine", "ruff", "mypy"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.setuptools]
+package-data = { "wox_plugin" = ["py.typed"] }
+
+[tool.ruff]
+line-length = 140

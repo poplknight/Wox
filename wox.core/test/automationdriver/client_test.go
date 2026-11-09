@@ -1,0 +1,830 @@
+package automationdriver
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"wox/ui/automation"
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+)
+
+func TestNewClientReadsSmokeStepDelay(t *testing.T) {
+	t.Setenv(SmokeStepDelayEnvironment, "250ms")
+	client, err := NewClient(automation.Info{Address: "http://wox-automation.test", Token: "test-token"})
+	if err != nil {
+		t.Fatalf("create slow client: %v", err)
+	}
+	if client.stepDelay != 250*time.Millisecond {
+		t.Fatalf("step delay = %s, want 250ms", client.stepDelay)
+	}
+}
+
+func TestClientAuthenticatesAndDecodesSnapshot(t *testing.T) {
+	t.Parallel()
+
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Header.Get("Authorization") != "Bearer test-token" {
+			t.Fatalf("missing authentication header")
+		}
+		var requestPayload struct {
+			ID     uint64 `json:"id"`
+			Method string `json:"method"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&requestPayload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if requestPayload.Method != "semantics.snapshot" {
+			t.Fatalf("unexpected method %q", requestPayload.Method)
+		}
+		body, err := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      requestPayload.ID,
+			"result": map[string]any{
+				"Tree": map[string]any{
+					"Generation": 7,
+					"RootIDs":    []int{1},
+					"Nodes": []map[string]any{{
+						"ID":           1,
+						"AutomationID": "launcher.query",
+						"Role":         "text_field",
+					}},
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       io.NopCloser(strings.NewReader(string(body))),
+			Header:     make(http.Header),
+		}, nil
+	})
+
+	client, err := NewClient(automation.Info{Address: "http://wox-automation.test", Token: "test-token"})
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	client.http.Transport = transport
+	snapshot, err := client.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("get snapshot: %v", err)
+	}
+	if snapshot.Tree.Generation != 7 {
+		t.Fatalf("expected generation 7, got %d", snapshot.Tree.Generation)
+	}
+	node, found := Find(snapshot, "launcher.query")
+	if !found || node.Role != woxui.AccessibilityRoleTextField {
+		t.Fatalf("unexpected query node: found=%v node=%+v", found, node)
+	}
+}
+
+func TestWaitForReturnsLastSnapshotWhenWaitingFails(t *testing.T) {
+	t.Parallel()
+
+	requestCount := 0
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requestCount++
+		if requestCount > 1 {
+			return nil, errors.New("wait transport failed")
+		}
+		body, err := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      1,
+			"result": map[string]any{"Tree": map[string]any{
+				"Generation": 9,
+				"Nodes":      []map[string]any{{"ID": 1, "AutomationID": "launcher.query.input", "Value": "last value"}},
+			}},
+		})
+		if err != nil {
+			t.Fatalf("encode snapshot response: %v", err)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(string(body))), Header: make(http.Header)}, nil
+	})
+
+	client, err := NewClient(automation.Info{Address: "http://wox-automation.test", Token: "test-token"})
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	client.http.Transport = transport
+	snapshot, err := client.WaitFor(context.Background(), func(woxwidget.AutomationSnapshot) bool { return false })
+	if err == nil || !strings.Contains(err.Error(), "after generation 9") {
+		t.Fatalf("wait error = %v, want generation context", err)
+	}
+	node, found := Find(snapshot, "launcher.query.input")
+	if !found || node.Value != "last value" {
+		t.Fatalf("last snapshot was not preserved: found=%v node=%+v", found, node)
+	}
+}
+
+func TestWaitForPollsSnapshotWithoutGenerationChange(t *testing.T) {
+	t.Parallel()
+
+	requestCount := 0
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requestCount++
+		value := "pending"
+		if requestCount > 1 {
+			value = "ready"
+		}
+		body, err := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      requestCount,
+			"result": map[string]any{"Tree": map[string]any{
+				"Generation": 9,
+				"Nodes":      []map[string]any{{"ID": 1, "AutomationID": "status", "Value": value}},
+			}},
+		})
+		if err != nil {
+			t.Fatalf("encode snapshot response: %v", err)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(string(body))), Header: make(http.Header)}, nil
+	})
+
+	client, err := NewClient(automation.Info{Address: "http://wox-automation.test", Token: "test-token"})
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	client.http.Transport = transport
+	snapshot, err := client.WaitFor(context.Background(), func(snapshot woxwidget.AutomationSnapshot) bool {
+		node, found := Find(snapshot, "status")
+		return found && node.Value == "ready"
+	})
+	if err != nil {
+		t.Fatalf("wait for unchanged generation: %v", err)
+	}
+	if snapshot.Tree.Generation != 9 || requestCount != 2 {
+		t.Fatalf("snapshot generation = %d requests = %d, want generation 9 after two snapshots", snapshot.Tree.Generation, requestCount)
+	}
+}
+
+func TestWithActionTimeoutCapsLongDeadline(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	limited, stop := withActionTimeout(ctx)
+	defer stop()
+	deadline, ok := limited.Deadline()
+	if !ok {
+		t.Fatal("action timeout must set a deadline")
+	}
+	remaining := time.Until(deadline)
+	if remaining > ActionTimeout || remaining < ActionTimeout-time.Second {
+		t.Fatalf("action timeout remaining = %s, want about %s", remaining, ActionTimeout)
+	}
+}
+
+func TestWithActionTimeoutKeepsShorterDeadline(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	limited, stop := withActionTimeout(ctx)
+	defer stop()
+	want, ok := ctx.Deadline()
+	got, limitedOK := limited.Deadline()
+	if !ok || !limitedOK || !got.Equal(want) {
+		t.Fatalf("shorter deadline was replaced: parent %v limited %v", want, got)
+	}
+}
+
+func TestWaitForChangeCapsTimeoutAtActionTimeout(t *testing.T) {
+	t.Parallel()
+
+	var timeoutMS int
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var requestPayload struct {
+			ID     uint64 `json:"id"`
+			Method string `json:"method"`
+			Params struct {
+				TimeoutMS int `json:"timeoutMs"`
+			} `json:"params"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&requestPayload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if requestPayload.Method != "semantics.wait" {
+			t.Fatalf("unexpected method %q", requestPayload.Method)
+		}
+		timeoutMS = requestPayload.Params.TimeoutMS
+		body, err := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      requestPayload.ID,
+			"result":  map[string]any{"Tree": map[string]any{"Generation": 2}},
+		})
+		if err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(string(body))), Header: make(http.Header)}, nil
+	})
+
+	client, err := NewClient(automation.Info{Address: "http://wox-automation.test", Token: "test-token"})
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	client.http.Transport = transport
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if _, err := client.WaitForChange(ctx, 1); err != nil {
+		t.Fatalf("wait for change: %v", err)
+	}
+	if timeoutMS != int(ActionTimeout.Milliseconds()) {
+		t.Fatalf("timeoutMs = %d, want %d", timeoutMS, ActionTimeout.Milliseconds())
+	}
+}
+
+func TestProcessExitStateDistinguishesRunningFromCrashed(t *testing.T) {
+	t.Parallel()
+
+	running := &Process{done: make(chan struct{})}
+	if _, exited := running.ExitState(); exited {
+		t.Fatal("a running process must not report an exit state")
+	}
+
+	crashed := &Process{done: make(chan struct{}), waitErr: errors.New("exit status 3221225477")}
+	close(crashed.done)
+	if state, exited := crashed.ExitState(); !exited || state != "exit status 3221225477" {
+		t.Fatalf("crashed state = %q exited %v, want the native exit status", state, exited)
+	}
+
+	clean := &Process{done: make(chan struct{})}
+	close(clean.done)
+	if state, exited := clean.ExitState(); !exited || state != "exited with status 0" {
+		t.Fatalf("clean state = %q exited %v", state, exited)
+	}
+}
+
+func TestWaitForReasonTimeoutReportsRejectedStateAndDiagnostics(t *testing.T) {
+	t.Parallel()
+
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var requestPayload struct {
+			ID uint64 `json:"id"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&requestPayload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		body, err := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      requestPayload.ID,
+			"result": map[string]any{
+				"Tree": map[string]any{
+					"Generation": 17,
+					"RootIDs":    []int{1},
+					"Nodes": []map[string]any{{
+						"ID":           1,
+						"AutomationID": "settings-nav-general",
+						"Role":         "button",
+						"Label":        "General",
+					}},
+				},
+				"Diagnostics": []string{"duplicate automation id \"settings-nav-general\" on nodes 1 and 2"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(string(body))), Header: make(http.Header)}, nil
+	})
+
+	client, err := NewClient(automation.Info{Address: "http://wox-automation.test", Token: "test-token"})
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	client.http.Transport = transport
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, waitErr := client.WaitForReason(ctx, func(snapshot woxwidget.AutomationSnapshot) (bool, string) {
+		return false, "want nav \"通用\"; got " + DescribeNodes(snapshot, "settings-nav-general")
+	})
+	if waitErr == nil {
+		t.Fatal("stuck wait must fail")
+	}
+	if !errors.Is(waitErr, context.DeadlineExceeded) {
+		t.Fatalf("wait error = %v, want a deadline cause", waitErr)
+	}
+	message := waitErr.Error()
+	for _, want := range []string{"generation 17", "want nav \"通用\"", "label=\"General\"", "duplicate automation id"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("wait error %q must explain %q", message, want)
+		}
+	}
+}
+
+func TestWaitForTimeoutReportsObservedSurfaceWithoutPredicateReason(t *testing.T) {
+	t.Parallel()
+
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var requestPayload struct {
+			ID uint64 `json:"id"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&requestPayload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		body, err := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      requestPayload.ID,
+			"result": map[string]any{
+				"Tree": map[string]any{
+					"Generation": 549,
+					"RootIDs":    []int{1},
+					"Nodes": []map[string]any{
+						{"ID": 1, "AutomationID": "launcher-query-input-key", "Focused": true},
+						{"ID": 2, "AutomationID": "launcher.result.0"},
+					},
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(string(body))), Header: make(http.Header)}, nil
+	})
+
+	client, err := NewClient(automation.Info{Address: "http://wox-automation.test", Token: "test-token"})
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	client.http.Transport = transport
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, waitErr := client.WaitFor(ctx, func(snapshot woxwidget.AutomationSnapshot) bool {
+		_, found := Find(snapshot, "action-search")
+		return found
+	})
+	if waitErr == nil {
+		t.Fatal("stuck wait must fail")
+	}
+	message := waitErr.Error()
+	for _, want := range []string{"generation 549", "focus=\"launcher-query-input-key\"", "nodes=2", "launcher.result.0"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("wait error %q must explain %q", message, want)
+		}
+	}
+}
+
+func TestDescribeSnapshotTruncatesLongIDListsAndReportsMissingFocus(t *testing.T) {
+	t.Parallel()
+
+	nodes := make([]woxui.AccessibilityNode, 0, waitSnapshotIDBudget+5)
+	for index := range waitSnapshotIDBudget + 5 {
+		nodes = append(nodes, woxui.AccessibilityNode{AutomationID: fmt.Sprintf("row-%d", index)})
+	}
+	description := DescribeSnapshot(woxwidget.AutomationSnapshot{Tree: woxui.AccessibilityTree{Nodes: nodes}})
+	if !strings.Contains(description, "focus=none") {
+		t.Fatalf("description %q must report an unfocused surface", description)
+	}
+	if !strings.Contains(description, "(+5 more)") {
+		t.Fatalf("description %q must report the truncated ID count", description)
+	}
+	if strings.Contains(description, fmt.Sprintf("row-%d ", waitSnapshotIDBudget)) {
+		t.Fatalf("description %q must not exceed the ID budget", description)
+	}
+}
+
+func TestDescribeNodesReportsLabelsValuesAndMissingNodes(t *testing.T) {
+	t.Parallel()
+
+	snapshot := woxwidget.AutomationSnapshot{Tree: woxui.AccessibilityTree{Nodes: []woxui.AccessibilityNode{
+		{ID: 1, AutomationID: "setting-choice-LangCode", Label: "Language", Value: "English"},
+	}}}
+	described := DescribeNodes(snapshot, "setting-choice-LangCode", "settings-nav-general")
+	want := `setting-choice-LangCode label="Language" value="English", settings-nav-general missing`
+	if described != want {
+		t.Fatalf("described = %q, want %q", described, want)
+	}
+}
+
+func TestPressKeyHandledReturnsServerResult(t *testing.T) {
+	t.Parallel()
+
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var requestPayload struct {
+			ID     uint64 `json:"id"`
+			Method string `json:"method"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&requestPayload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if requestPayload.Method != "input.key" {
+			t.Fatalf("unexpected method %q", requestPayload.Method)
+		}
+		body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": requestPayload.ID, "result": true})
+		if err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(string(body))), Header: make(http.Header)}, nil
+	})
+
+	client, err := NewClient(automation.Info{Address: "http://wox-automation.test", Token: "test-token"})
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	client.http.Transport = transport
+	handled, err := client.PressKeyHandled(context.Background(), woxui.Key("v"), woxui.KeyModifierMeta)
+	if err != nil || !handled {
+		t.Fatalf("press handled = %v err %v, want true", handled, err)
+	}
+}
+
+func TestSendKeyHandledDispatchesKeyEvent(t *testing.T) {
+	t.Parallel()
+
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var requestPayload struct {
+			ID     uint64 `json:"id"`
+			Method string `json:"method"`
+			Params struct {
+				Key       woxui.Key          `json:"key"`
+				Modifiers woxui.KeyModifiers `json:"modifiers"`
+				Down      bool               `json:"down"`
+			} `json:"params"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&requestPayload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if requestPayload.Method != "input.key_event" || requestPayload.Params.Key != woxui.KeyAlt || requestPayload.Params.Modifiers != woxui.KeyModifierAlt || !requestPayload.Params.Down {
+			t.Fatalf("unexpected key event %#v", requestPayload)
+		}
+		body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": requestPayload.ID, "result": true})
+		if err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(string(body))), Header: make(http.Header)}, nil
+	})
+
+	client, err := NewClient(automation.Info{Address: "http://wox-automation.test", Token: "test-token"})
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	client.http.Transport = transport
+	handled, err := client.SendKeyHandled(context.Background(), woxui.KeyAlt, woxui.KeyModifierAlt, true)
+	if err != nil || !handled {
+		t.Fatalf("send handled = %v err %v, want true", handled, err)
+	}
+}
+
+func TestClientReadsAndResetsFrameMetrics(t *testing.T) {
+	t.Parallel()
+
+	var methods []string
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var requestPayload struct {
+			ID     uint64 `json:"id"`
+			Method string `json:"method"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&requestPayload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		methods = append(methods, requestPayload.Method)
+		result := any(true)
+		if requestPayload.Method == "render.metrics" {
+			result = map[string]any{"frameCount": 12, "presentedFrameCount": 11}
+		}
+		body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": requestPayload.ID, "result": result})
+		if err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(string(body))), Header: make(http.Header)}, nil
+	})
+
+	client, err := NewClient(automation.Info{Address: "http://wox-automation.test", Token: "test-token"})
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	client.http.Transport = transport
+	metrics, err := client.FrameMetrics(context.Background())
+	if err != nil {
+		t.Fatalf("read frame metrics: %v", err)
+	}
+	if metrics.FrameCount != 12 || metrics.PresentedFrameCount != 11 {
+		t.Fatalf("unexpected frame metrics: %+v", metrics)
+	}
+	if err := client.ResetFrameMetrics(context.Background()); err != nil {
+		t.Fatalf("reset frame metrics: %v", err)
+	}
+	if err := client.RequestFrame(context.Background()); err != nil {
+		t.Fatalf("request frame: %v", err)
+	}
+	if err := client.SetRepaintDebugMode(context.Background(), woxwidget.RepaintDebugVerify); err != nil {
+		t.Fatalf("set repaint debug mode: %v", err)
+	}
+	if err := client.SimulateRendererDeviceRemoved(context.Background()); err != nil {
+		t.Fatalf("simulate renderer device removal: %v", err)
+	}
+	if len(methods) != 5 || methods[0] != "render.metrics" || methods[1] != "render.metrics.reset" || methods[2] != "render.invalidate" || methods[3] != "render.repaint_debug" || methods[4] != "render.simulate_device_removed" {
+		t.Fatalf("unexpected methods: %v", methods)
+	}
+}
+
+func TestClientOpensSettingsRoute(t *testing.T) {
+	t.Parallel()
+
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var requestPayload struct {
+			ID     uint64 `json:"id"`
+			Method string `json:"method"`
+			Params struct {
+				Path string `json:"path"`
+			} `json:"params"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&requestPayload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if requestPayload.Method != "window.open_settings" {
+			t.Fatalf("unexpected method %q", requestPayload.Method)
+		}
+		if requestPayload.Params.Path != "/appearance" {
+			t.Fatalf("unexpected settings path %q", requestPayload.Params.Path)
+		}
+		body, err := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      requestPayload.ID,
+			"result":  true,
+		})
+		if err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       io.NopCloser(strings.NewReader(string(body))),
+			Header:     make(http.Header),
+		}, nil
+	})
+
+	client, err := NewClient(automation.Info{Address: "http://wox-automation.test", Token: "test-token"})
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	client.http.Transport = transport
+	if err := client.OpenSettings(context.Background(), "/appearance"); err != nil {
+		t.Fatalf("open settings route: %v", err)
+	}
+}
+
+func TestClientOpensSelectionQueryAndReadsWindowState(t *testing.T) {
+	t.Parallel()
+
+	var methods []string
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var requestPayload struct {
+			ID     uint64 `json:"id"`
+			Method string `json:"method"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&requestPayload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		methods = append(methods, requestPayload.Method)
+		result := any(true)
+		if requestPayload.Method == "window.state" {
+			result = automation.WindowState{Exists: true, Visible: true, BlurReady: true, Lifecycle: "visible"}
+		}
+		body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": requestPayload.ID, "result": result})
+		if err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(string(body))), Header: make(http.Header)}, nil
+	})
+
+	client, err := NewClient(automation.Info{Address: "http://wox-automation.test", Token: "test-token"})
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	client.http.Transport = transport
+	if err := client.OpenSelectionQuery(context.Background(), "selected text"); err != nil {
+		t.Fatalf("open selection query: %v", err)
+	}
+	state, err := client.WindowState(context.Background(), "selection")
+	if err != nil {
+		t.Fatalf("read selection window state: %v", err)
+	}
+	if !state.Exists || !state.Visible || !state.BlurReady || state.Lifecycle != "visible" {
+		t.Fatalf("unexpected selection window state: %+v", state)
+	}
+	if len(methods) != 2 || methods[0] != "window.open_selection_query" || methods[1] != "window.state" {
+		t.Fatalf("unexpected methods: %v", methods)
+	}
+}
+
+func TestClientMovesPointerToSemanticsNodeCenter(t *testing.T) {
+	t.Parallel()
+
+	var methods []string
+	var pointer woxui.PointerEvent
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var requestPayload struct {
+			ID     uint64          `json:"id"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&requestPayload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		methods = append(methods, requestPayload.Method)
+		result := any(true)
+		if requestPayload.Method == "semantics.snapshot" {
+			result = map[string]any{"Tree": map[string]any{
+				"Generation": 1,
+				"Nodes": []map[string]any{{
+					"ID": 1, "AutomationID": "plan-info", "Role": "image",
+					"Bounds": map[string]any{"X": 100, "Y": 40, "Width": 14, "Height": 14},
+				}},
+			}}
+		} else if requestPayload.Method == "input.pointer" {
+			if err := json.Unmarshal(requestPayload.Params, &pointer); err != nil {
+				t.Fatalf("decode pointer: %v", err)
+			}
+		}
+		body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": requestPayload.ID, "result": result})
+		if err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       io.NopCloser(strings.NewReader(string(body))),
+			Header:     make(http.Header),
+		}, nil
+	})
+
+	client, err := NewClient(automation.Info{Address: "http://wox-automation.test", Token: "test-token"})
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	client.http.Transport = transport
+	node, err := client.MovePointerTo(context.Background(), "plan-info")
+	if err != nil {
+		t.Fatalf("move pointer: %v", err)
+	}
+	if node.AutomationID != "plan-info" {
+		t.Fatalf("unexpected node: %+v", node)
+	}
+	if len(methods) != 2 || methods[0] != "semantics.snapshot" || methods[1] != "input.pointer" {
+		t.Fatalf("unexpected methods: %v", methods)
+	}
+	if pointer.Kind != woxui.PointerMove || pointer.Position != (woxui.Point{X: 107, Y: 47}) {
+		t.Fatalf("unexpected pointer event: %+v", pointer)
+	}
+}
+
+func TestPerformRetriesUntilElementAppears(t *testing.T) {
+	t.Parallel()
+
+	attempts := 0
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var requestPayload struct {
+			ID     uint64 `json:"id"`
+			Method string `json:"method"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&requestPayload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		attempts++
+		result := map[string]any{"jsonrpc": "2.0", "id": requestPayload.ID, "result": true}
+		if attempts < 3 {
+			result = map[string]any{
+				"jsonrpc": "2.0",
+				"id":      requestPayload.ID,
+				"error":   map[string]any{"code": -32000, "message": `automation element "notes.menu.delete" was not found`},
+			}
+		}
+		body, err := json.Marshal(result)
+		if err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(string(body))), Header: make(http.Header)}, nil
+	})
+
+	client, err := NewClient(automation.Info{Address: "http://wox-automation.test", Token: "test-token"})
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	client.http.Transport = transport
+	if err := client.Perform(context.Background(), "notes.menu.delete", woxui.AccessibilityActionActivate, ""); err != nil {
+		t.Fatalf("perform after the element appears: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("perform attempts = %d, want 3", attempts)
+	}
+}
+
+func TestPerformDoesNotRetryActionErrors(t *testing.T) {
+	t.Parallel()
+
+	attempts := 0
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var requestPayload struct {
+			ID uint64 `json:"id"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&requestPayload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		attempts++
+		body, err := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      requestPayload.ID,
+			"error":   map[string]any{"code": -32000, "message": "automation element is disabled"},
+		})
+		if err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(string(body))), Header: make(http.Header)}, nil
+	})
+
+	client, err := NewClient(automation.Info{Address: "http://wox-automation.test", Token: "test-token"})
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	client.http.Transport = transport
+	err = client.Perform(context.Background(), "notes.menu.delete", woxui.AccessibilityActionActivate, "")
+	if err == nil || attempts != 1 {
+		t.Fatalf("perform err = %v, attempts = %d, want one immediate action error", err, attempts)
+	}
+}
+
+func TestFindByAutomationIDPrefix(t *testing.T) {
+	snapshot := woxwidget.AutomationSnapshot{Tree: woxui.AccessibilityTree{Nodes: []woxui.AccessibilityNode{
+		{AutomationID: "terminal-search-input-first"},
+		{AutomationID: "terminal-search-next-first"},
+	}}}
+	node, found := FindByAutomationIDPrefix(snapshot, "terminal-search-next-")
+	if !found || node.AutomationID != "terminal-search-next-first" {
+		t.Fatalf("dynamic node = found %v, id %q", found, node.AutomationID)
+	}
+}
+
+// TestPressKeyWithTimeoutIsScopedToRequest covers native startup without weakening ordinary actions or caller deadlines.
+func TestPressKeyWithTimeoutIsScopedToRequest(t *testing.T) {
+	t.Setenv(SmokeStepDelayEnvironment, "0")
+	client, err := NewClient(automation.Info{Address: "http://wox-automation.test", Token: "test-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wantBudget time.Duration
+	client.http.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		deadline, ok := r.Context().Deadline()
+		remaining := time.Until(deadline)
+		if !ok || remaining > wantBudget || remaining < wantBudget-time.Second {
+			t.Fatalf("effective request budget = %s, want about %s", remaining, wantBudget)
+		}
+		var payload struct {
+			Method string
+			Params struct {
+				Key       woxui.Key
+				Modifiers woxui.KeyModifiers
+			}
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Method != "input.key" || payload.Params.Key != woxui.KeyEnter || payload.Params.Modifiers != woxui.KeyModifierControl {
+			t.Fatalf("unexpected key request: %+v", payload)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"result":true}`)), Header: make(http.Header)}, nil
+	})
+	for _, tc := range []struct {
+		name      string
+		explicit  time.Duration
+		parent    time.Duration
+		effective time.Duration
+	}{
+		{name: "cold startup", explicit: 30 * time.Second, parent: time.Minute, effective: 30 * time.Second},
+		{name: "next ordinary action", parent: time.Minute, effective: ActionTimeout},
+		{name: "earlier caller deadline", explicit: 30 * time.Second, parent: 3 * time.Second, effective: 3 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wantBudget = tc.effective
+			ctx, cancel := context.WithTimeout(context.Background(), tc.parent)
+			defer cancel()
+			var err error
+			if tc.explicit == 0 {
+				err = client.PressKey(ctx, woxui.KeyEnter, woxui.KeyModifierControl)
+			} else {
+				err = client.PressKeyWithTimeout(ctx, woxui.KeyEnter, woxui.KeyModifierControl, tc.explicit)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if client.http.Timeout != ActionTimeout+time.Second {
+				t.Fatalf("shared HTTP timeout changed to %s", client.http.Timeout)
+			}
+		})
+	}
+}
+
+type roundTripFunc func(request *http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}

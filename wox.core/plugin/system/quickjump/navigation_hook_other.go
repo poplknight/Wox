@@ -1,0 +1,15 @@
+//go:build !windows
+
+package quickjump
+
+import "context"
+
+func setExplorerDialogHookEnabled(enabled bool) {}
+
+func navigateFileDialogWithHook(ctx context.Context, windowID string, pid int, targetPath string) bool {
+	return false
+}
+
+func selectFileDialogItemWithHook(ctx context.Context, windowID string, pid int, targetPath string, waitForView bool) bool {
+	return false
+}

@@ -1,0 +1,194 @@
+package clipboard
+
+/*
+#cgo CFLAGS: -x objective-c
+#cgo LDFLAGS: -framework Foundation -framework Cocoa
+#include <stdlib.h>
+
+const char* GetClipboardText();
+char* GetAllClipboardFilePaths();
+unsigned char *GetClipboardImage(size_t *length);
+unsigned char *GetClipboardImageSnapshot(size_t *length);
+void WriteClipboardText(const char *text);
+void WriteClipboardFiles(const char **filePaths, int count);
+void WriteClipboardImage(const char *imageData, int length);
+void WriteClipboardAnimatedGIF(const char *filePath, const unsigned char *gifData, int gifLen);
+_Bool hasClipboardChanged();
+long long GetClipboardChangeCount();
+int GetClipboardContentType();
+*/
+import "C"
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"image"
+	"image/png"
+	"os"
+	"strings"
+	"unsafe"
+
+	"github.com/samber/lo"
+)
+
+// readClipboardContentType detects the current clipboard content type.
+func readClipboardContentType() Type {
+	t := C.GetClipboardContentType()
+	switch int(t) {
+	case 1:
+		return ClipboardTypeText
+	case 2:
+		return ClipboardTypeImage
+	case 3:
+		return ClipboardTypeFile
+	default:
+		return ""
+	}
+}
+
+func readText() (string, error) {
+	text := C.GetClipboardText()
+	if text != nil {
+		return C.GoString(text), nil
+	}
+
+	return "", noDataErr
+}
+
+func readFilePaths() ([]string, error) {
+	cstr := C.GetAllClipboardFilePaths()
+	if cstr != nil {
+		defer C.free(unsafe.Pointer(cstr))
+		filePaths := strings.Split(C.GoString(cstr), "\n")
+		filePaths = lo.Filter(filePaths, func(s string, _ int) bool {
+			return s != ""
+		})
+		return filePaths, nil
+	}
+
+	return nil, noDataErr
+}
+
+func readImage() (image.Image, error) {
+	var length C.size_t
+	imageData := C.GetClipboardImage(&length)
+	if imageData != nil {
+		defer C.free(unsafe.Pointer(imageData))
+		pngBytes := C.GoBytes(unsafe.Pointer(imageData), C.int(length))
+		imgReader := bytes.NewReader(pngBytes)
+		img, _, err := image.Decode(imgReader)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode image: %v", err)
+		}
+		return img, nil
+	}
+
+	return nil, noDataErr
+}
+
+// readImageSnapshot captures native encoded data without NSImage rasterization.
+func readImageSnapshot() (*ImageSnapshot, error) {
+	var length C.size_t
+	imageData := C.GetClipboardImageSnapshot(&length)
+	if imageData != nil {
+		defer C.free(unsafe.Pointer(imageData))
+		data := C.GoBytes(unsafe.Pointer(imageData), C.int(length))
+		return encodedImageSnapshot(data)
+	}
+
+	return nil, noDataErr
+}
+
+func writeTextData(text string) error {
+	cText := C.CString(text)
+	defer C.free(unsafe.Pointer(cText))
+	C.WriteClipboardText(cText)
+
+	return nil
+}
+
+func writeFilePaths(filePaths []string) error {
+	cFilePaths := make([]*C.char, 0, len(filePaths))
+	for _, filePath := range filePaths {
+		trimmedPath := strings.TrimSpace(filePath)
+		if trimmedPath == "" {
+			continue
+		}
+		cFilePaths = append(cFilePaths, C.CString(trimmedPath))
+	}
+
+	for _, cFilePath := range cFilePaths {
+		defer C.free(unsafe.Pointer(cFilePath))
+	}
+
+	if len(cFilePaths) == 0 {
+		return errors.New("file paths are empty")
+	}
+
+	C.WriteClipboardFiles((**C.char)(unsafe.Pointer(&cFilePaths[0])), C.int(len(cFilePaths)))
+	return nil
+}
+
+func writeAnimatedGIFFile(filePath string) error {
+	filePath = strings.TrimSpace(filePath)
+	if filePath == "" {
+		return errors.New("clipboard: gif file path is empty")
+	}
+
+	gifData, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("clipboard: read gif file: %w", err)
+	}
+	if !isGIFBytes(gifData) {
+		return errors.New("clipboard: file is not a GIF")
+	}
+
+	var cGIF *C.uchar
+	cGIFLen := C.int(0)
+	if len(gifData) > 0 {
+		cGIF = (*C.uchar)(unsafe.Pointer(&gifData[0]))
+		cGIFLen = C.int(len(gifData))
+	}
+
+	cPath := C.CString(filePath)
+	defer C.free(unsafe.Pointer(cPath))
+	C.WriteClipboardAnimatedGIF(cPath, cGIF, cGIFLen)
+	return nil
+}
+
+func writeImageData(img image.Image) error {
+	buf := new(bytes.Buffer)
+	err := png.Encode(buf, img)
+	if err != nil {
+		return err
+	}
+
+	data := buf.Bytes()
+	C.WriteClipboardImage((*C.char)(unsafe.Pointer(&data[0])), C.int(len(data)))
+	return nil
+}
+
+func writeImageBytes(pngData []byte, dibData []byte) error {
+	if len(pngData) == 0 {
+		return errors.New("png data is empty")
+	}
+
+	C.WriteClipboardImage((*C.char)(unsafe.Pointer(&pngData[0])), C.int(len(pngData)))
+	return nil
+}
+
+func isClipboardChanged() bool {
+	return bool(C.hasClipboardChanged())
+}
+
+func readClipboardSequenceNumber() uint64 {
+	count := C.GetClipboardChangeCount()
+	if count < 0 {
+		return 0
+	}
+	return uint64(count)
+}
+
+func buildWatchSnapshot() string {
+	return ""
+}

@@ -1,0 +1,379 @@
+package chat
+
+import (
+	"context"
+	"encoding/json"
+	"image"
+	"image/png"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"wox/ai"
+	"wox/common"
+	"wox/plugin"
+	"wox/setting/definition"
+	"wox/util/selection"
+)
+
+type chatTestAPI struct {
+	emptyChatAPI
+	translations map[string]string
+	changed      common.PlainQuery
+	shown        bool
+}
+
+type chatTitleTestAPI struct {
+	emptyChatAPI
+	request  []common.Conversation
+	callback common.ChatStreamFunc
+}
+
+func (a *chatTitleTestAPI) AIChatStream(_ context.Context, _ common.Model, conversations []common.Conversation, _ common.ChatOptions, callback common.ChatStreamFunc) error {
+	a.request, a.callback = conversations, callback
+	return nil
+}
+
+// TestChatTitleFromFirstQuestion needs no assistant response and ignores partial or empty titles.
+func TestChatTitleFromFirstQuestion(t *testing.T) {
+	api := &chatTitleTestAPI{}
+	chat := &AIChatPlugin{api: api}
+	var title string
+	chat.summarizeChat(context.Background(), common.AIChatData{Conversations: []common.Conversation{{Role: common.ConversationRoleUser, Text: "如何编写 Wox 插件？"}}}, func(value string) { title = value })
+	if len(api.request) != 2 || api.request[0].Text != "如何编写 Wox 插件？" {
+		t.Fatalf("unexpected title request: %+v", api.request)
+	}
+	api.callback(common.ChatStreamData{Status: common.ChatStreamStatusStreaming, Data: "partial"})
+	api.callback(common.ChatStreamData{Status: common.ChatStreamStatusFinished, Data: " \n "})
+	api.callback(common.ChatStreamData{Status: common.ChatStreamStatusFinished, Data: "I'll discover the Wox wrapper tools first, then produce only the title.伦敦今日天气如何？"})
+	if title != "" {
+		t.Fatalf("incomplete title applied: %q", title)
+	}
+	api.callback(common.ChatStreamData{Status: common.ChatStreamStatusFinished, Data: " Wox 插件开发\n"})
+	if title != "Wox 插件开发" {
+		t.Fatalf("title = %q", title)
+	}
+}
+
+func (a *chatTestAPI) GetTranslation(ctx context.Context, key string) string {
+	if value := a.translations[key]; value != "" {
+		return value
+	}
+	return key
+}
+
+func (a *chatTestAPI) ChangeQuery(ctx context.Context, query common.PlainQuery) {
+	a.changed = query
+}
+
+func (a *chatTestAPI) ShowApp(context.Context) {
+	a.shown = true
+}
+
+type emptyChatAPI struct{}
+
+func (emptyChatAPI) ChangeQuery(context.Context, common.PlainQuery) {}
+func (emptyChatAPI) HideApp(context.Context)                        {}
+func (emptyChatAPI) ShowApp(context.Context)                        {}
+func (emptyChatAPI) Notify(context.Context, string)                 {}
+func (emptyChatAPI) PushAttention(context.Context, plugin.PushAttentionRequest) {
+}
+func (emptyChatAPI) Log(context.Context, plugin.LogLevel, string)  {}
+func (emptyChatAPI) GetTranslation(context.Context, string) string { return "" }
+func (emptyChatAPI) GetSetting(context.Context, string) string     { return "" }
+func (emptyChatAPI) SaveSetting(context.Context, string, string, bool) {
+}
+func (emptyChatAPI) SetSetting(context.Context, plugin.SetSettingOption) plugin.SetSettingResult {
+	return plugin.SetSettingResult{Success: true}
+}
+func (emptyChatAPI) OnSettingChanged(context.Context, func(context.Context, string, string)) {
+}
+func (emptyChatAPI) OnGetDynamicSetting(context.Context, func(context.Context, string) definition.PluginSettingDefinitionItem) {
+}
+func (emptyChatAPI) OnDeepLink(context.Context, func(context.Context, map[string]string)) {
+}
+func (emptyChatAPI) OnUnload(context.Context, func(context.Context)) {}
+func (emptyChatAPI) OnMRURestore(context.Context, func(context.Context, plugin.MRUData) (*plugin.QueryResult, error)) {
+}
+func (emptyChatAPI) RegisterPluginTool(context.Context, plugin.RegisterPluginToolOption) plugin.RegisterPluginToolResult {
+	return plugin.RegisterPluginToolResult{}
+}
+func (emptyChatAPI) UnregisterPluginTool(context.Context, plugin.UnregisterPluginToolOption) plugin.UnregisterPluginToolResult {
+	return plugin.UnregisterPluginToolResult{}
+}
+func (emptyChatAPI) ListPluginTools(context.Context, plugin.ListPluginToolsOption) plugin.ListPluginToolsResult {
+	return plugin.ListPluginToolsResult{}
+}
+func (emptyChatAPI) InvokePluginTool(context.Context, plugin.InvokePluginToolOption) plugin.InvokePluginToolResult {
+	return plugin.InvokePluginToolResult{}
+}
+func (emptyChatAPI) ShowToolbarMsg(context.Context, plugin.ToolbarMsg) {}
+func (emptyChatAPI) ClearToolbarMsg(context.Context, string)           {}
+func (emptyChatAPI) OnEnterPluginQuery(context.Context, func(context.Context)) {
+}
+func (emptyChatAPI) OnLeavePluginQuery(context.Context, func(context.Context)) {
+}
+func (emptyChatAPI) OnDragOut(context.Context, plugin.DragOutListenOption) plugin.DragOutListenResult {
+	return plugin.DragOutListenResult{}
+}
+func (emptyChatAPI) RegisterQueryCommands(context.Context, []plugin.MetadataCommand) {
+}
+func (emptyChatAPI) AIChatStream(context.Context, common.Model, []common.Conversation, common.ChatOptions, common.ChatStreamFunc) error {
+	return nil
+}
+func (emptyChatAPI) GetUpdatableResult(context.Context, string) *plugin.UpdatableResult {
+	return nil
+}
+func (emptyChatAPI) UpdateResult(context.Context, plugin.UpdatableResult) bool { return false }
+func (emptyChatAPI) PushResults(context.Context, plugin.Query, []plugin.QueryResult) bool {
+	return false
+}
+func (emptyChatAPI) IsVisible(context.Context) bool { return false }
+func (emptyChatAPI) RefreshQuery(context.Context, plugin.RefreshQueryParam) {
+}
+func (emptyChatAPI) RefreshGlance(context.Context, []string) {}
+func (emptyChatAPI) Copy(context.Context, plugin.CopyParams) {}
+func (emptyChatAPI) Screenshot(context.Context, plugin.ScreenshotOption) plugin.ScreenshotResult {
+	return plugin.ScreenshotResult{}
+}
+func (emptyChatAPI) GetCacheFolder(context.Context) string { return "" }
+func (emptyChatAPI) GetThemeColors(context.Context, plugin.GetThemeColorsOption) plugin.GetThemeColorsResult {
+	return plugin.GetThemeColorsResult{}
+}
+
+func TestAIChatPluginDeclaresSelectionQuery(t *testing.T) {
+	metadata := (&AIChatPlugin{}).GetMetadata()
+	if !metadata.IsSupportFeature(plugin.MetadataFeatureQuerySelection) {
+		t.Fatal("AI Chat should declare querySelection so the selection hotkey can reach it")
+	}
+}
+
+func TestAIChatQuerySelectionQuotesText(t *testing.T) {
+	api := &chatTestAPI{translations: map[string]string{
+		"plugin_ai_chat_selection_quote":            "Ask in AI Chat",
+		"plugin_ai_chat_selection_characters_value": "%d chars",
+	}}
+	chatPlugin := &AIChatPlugin{api: api}
+
+	response := chatPlugin.Query(context.Background(), plugin.Query{
+		Type: plugin.QueryTypeSelection,
+		Selection: selection.Selection{
+			Type: selection.SelectionTypeText,
+			Text: "  selected line  ",
+		},
+	})
+	if response.Layout.ChatMode {
+		t.Fatal("selection results must stay in the mixed selection list")
+	}
+	if len(response.Results) != 1 {
+		t.Fatalf("results = %d, want 1", len(response.Results))
+	}
+	result := response.Results[0]
+	if result.Title != "Ask in AI Chat" || result.SubTitle != "" || result.Preview.PreviewType != plugin.WoxPreviewTypeText {
+		t.Fatalf("selection result = %+v", result)
+	}
+	if len(result.Actions) != 1 || result.Actions[0].Action == nil {
+		t.Fatal("selection result is missing the quote action")
+	}
+
+	result.Actions[0].Action(context.Background(), plugin.ActionContext{})
+	// This isolated plugin has no registered instance, so the builder uses the stable plugin scope.
+	if api.changed.QueryType != plugin.QueryTypeInput || api.changed.QueryText != "" || api.changed.QueryScope.Identity() != common.AIChatPluginID {
+		t.Fatalf("change query = %+v", api.changed)
+	}
+	if !strings.Contains(api.changed.ContextData[aiChatAttachmentsContextKey], "  selected line  ") {
+		t.Fatalf("quote context = %#v", api.changed.ContextData)
+	}
+	chatResponse := chatPlugin.Query(context.Background(), plugin.Query{Type: api.changed.QueryType, ContextData: api.changed.ContextData, Scope: api.changed.QueryScope})
+	if !chatResponse.Layout.ChatMode || len(chatResponse.Results) != 1 {
+		t.Fatalf("chat response = %+v", chatResponse)
+	}
+	var preview common.AIChatPreviewData
+	if err := json.Unmarshal([]byte(chatResponse.Results[0].Preview.PreviewData), &preview); err != nil {
+		t.Fatal(err)
+	}
+	if len(preview.InitialAttachments) != 1 || preview.InitialAttachments[0].Kind != common.AIChatAttachmentQuote || preview.InitialAttachments[0].Text != "  selected line  " {
+		t.Fatalf("initial attachments = %+v", preview.InitialAttachments)
+	}
+}
+
+func TestAIChatQuerySelectionSkipsEmpty(t *testing.T) {
+	chatPlugin := &AIChatPlugin{api: &chatTestAPI{}}
+	empty := chatPlugin.Query(context.Background(), plugin.Query{
+		Type:      plugin.QueryTypeSelection,
+		Selection: selection.Selection{Type: selection.SelectionTypeText, Text: "   "},
+	})
+	if len(empty.Results) != 0 {
+		t.Fatalf("empty text results = %d", len(empty.Results))
+	}
+
+	files := chatPlugin.Query(context.Background(), plugin.Query{
+		Type:      plugin.QueryTypeSelection,
+		Selection: selection.Selection{Type: selection.SelectionTypeFile, FilePaths: nil},
+	})
+	if len(files.Results) != 0 {
+		t.Fatalf("file selection results = %d", len(files.Results))
+	}
+}
+
+func TestAIChatQueryInputEmbedsInitialAttachments(t *testing.T) {
+	chatPlugin := &AIChatPlugin{api: &chatTestAPI{}}
+	response := chatPlugin.Query(context.Background(), plugin.Query{
+		Type: plugin.QueryTypeInput,
+		ContextData: common.ContextData{
+			aiChatAttachmentsContextKey: `[{"ID":"quote","Kind":"quote","Text":"selected text"}]`,
+		},
+	})
+	if !response.Layout.ChatMode || len(response.Results) != 1 {
+		t.Fatalf("input response = %+v", response)
+	}
+
+	var preview common.AIChatPreviewData
+	if err := json.Unmarshal([]byte(response.Results[0].Preview.PreviewData), &preview); err != nil {
+		t.Fatalf("decode preview: %v", err)
+	}
+	if len(preview.InitialAttachments) != 1 || preview.InitialAttachments[0].Text != "selected text" {
+		t.Fatalf("initial attachments = %+v", preview.InitialAttachments)
+	}
+}
+
+func TestChatAttachmentsPreserveQuotedSkillTags(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "SKILL.md")
+	if err := os.WriteFile(path, []byte("Review the user's text carefully."), 0600); err != nil {
+		t.Fatal(err)
+	}
+	skill := common.Skill{Id: "attachment-test-skill", Name: "Review", ManifestPath: path, Enabled: true}
+	ai.GetSkillRegistry().Register(skill)
+	t.Cleanup(func() { ai.GetSkillRegistry().Unregister(skill.Id) })
+	source := common.Conversation{Id: "message", Role: common.ConversationRoleUser, Text: "{skill:Review} Explain this",
+		SkillRefs:   []common.AISkillRef{ai.SkillRefFromSkill(skill)},
+		Attachments: []common.AIChatAttachment{{ID: "quote", Kind: common.AIChatAttachmentQuote, Text: "  literal {skill:Example}\nsecond line"}},
+	}
+	plugin := &AIChatPlugin{api: &chatTestAPI{}}
+	runtime := withMessageAttachments(plugin.withMessageSkillReferences(context.Background(), source))
+	if !strings.Contains(runtime.Text, ">   literal {skill:Example}\n> second line") || strings.Contains(runtime.Text, "{skill:Review}") || !strings.Contains(runtime.Text, "Review the user's text carefully.") {
+		t.Fatalf("runtime text = %s", runtime.Text)
+	}
+	if len(runtime.Attachments) != 0 || source.Text != "{skill:Review} Explain this" || len(source.Attachments) != 1 {
+		t.Fatal("runtime materialization mutated stored message")
+	}
+	summary := formatConversationsForCompactionSummary([]common.Conversation{source})
+	if !strings.Contains(summary, "literal {skill:Example}") {
+		t.Fatalf("summary lost reference: %s", summary)
+	}
+	plain := source
+	plain.Attachments = nil
+	if estimateConversationTokens([]common.Conversation{source}) <= estimateConversationTokens([]common.Conversation{plain}) {
+		t.Fatal("attachment tokens were not counted")
+	}
+	clone := cloneAIConversation(source)
+	clone.Attachments[0].Text = "changed"
+	if source.Attachments[0].Text == "changed" {
+		t.Fatal("snapshot shares attachment storage")
+	}
+}
+
+func TestAIChatSelectionForMultipleFilesUsesPathsOnly(t *testing.T) {
+	directory := t.TempDir()
+	paths := []string{filepath.Join(directory, "one.pdf"), filepath.Join(directory, "two.bin")}
+	for _, path := range paths {
+		if err := os.WriteFile(path, []byte("secret file contents"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	api := &chatTestAPI{}
+	chatPlugin := &AIChatPlugin{api: api}
+	response := chatPlugin.Query(context.Background(), plugin.Query{Type: plugin.QueryTypeSelection, Selection: selection.Selection{Type: selection.SelectionTypeFile, FilePaths: paths}})
+	if len(response.Results) != 1 || response.Layout.ChatMode {
+		t.Fatalf("selection response = %+v", response)
+	}
+	response.Results[0].Actions[0].Action(context.Background(), plugin.ActionContext{})
+	var attachments []common.AIChatAttachment
+	if err := json.Unmarshal([]byte(api.changed.ContextData[aiChatAttachmentsContextKey]), &attachments); err != nil {
+		t.Fatal(err)
+	}
+	if len(attachments) != 2 {
+		t.Fatalf("attachments = %+v", attachments)
+	}
+	for i, attachment := range attachments {
+		if attachment.Kind != common.AIChatAttachmentFile || attachment.URL != paths[i] || attachment.Text != "" {
+			t.Fatalf("file reference = %+v", attachment)
+		}
+	}
+	message := withMessageAttachments(common.Conversation{Role: common.ConversationRoleUser, Text: "Compare", Attachments: attachments})
+	if !strings.Contains(message.Text, paths[0]) || !strings.Contains(message.Text, paths[1]) || strings.Contains(message.Text, "secret file contents") {
+		t.Fatalf("runtime message = %+v", message)
+	}
+}
+
+func TestAIChatAttachFilesCommandSeedsComposer(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shot.png")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := png.Encode(file, image.NewRGBA(image.Rect(0, 0, 8, 8))); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	api := &chatTestAPI{}
+	result := (&AIChatPlugin{api: api}).openChatWithAttachmentsTool(context.Background(), plugin.InvokePluginToolHandlerOption{
+		Arguments: map[string]any{"paths": []any{path}},
+	})
+	if result.Error != nil {
+		t.Fatalf("open chat with attachments = %#v", result)
+	}
+	if !api.shown || api.changed.QueryType != plugin.QueryTypeInput || api.changed.QueryText != "" || api.changed.QueryScope.Identity() != common.AIChatPluginID {
+		t.Fatalf("opened chat = shown:%t query:%+v", api.shown, api.changed)
+	}
+	var attachments []common.AIChatAttachment
+	t.Cleanup(func() { common.RemoveImportedChatAttachments(attachments) })
+	if err := json.Unmarshal([]byte(api.changed.ContextData[aiChatAttachmentsContextKey]), &attachments); err != nil {
+		t.Fatal(err)
+	}
+	if len(attachments) != 1 || attachments[0].Kind != common.AIChatAttachmentImage {
+		t.Fatalf("attachments = %+v", attachments)
+	}
+}
+
+func TestAIChatAttachFilesCommandRequiresPath(t *testing.T) {
+	result := (&AIChatPlugin{api: &chatTestAPI{}}).openChatWithAttachmentsTool(context.Background(), plugin.InvokePluginToolHandlerOption{})
+	if result.Error == nil || result.Error.Message != "path is required" {
+		t.Fatalf("empty attach files tool = %#v", result)
+	}
+}
+
+// TestAIChatMRURestoreTargetsSavedChat keeps the selected conversation attached
+// to the query built by the shared chat entry point.
+func TestAIChatMRURestoreTargetsSavedChat(t *testing.T) {
+	api := &chatTestAPI{}
+	chatPlugin := &AIChatPlugin{api: api}
+	chatPlugin.replaceChatSummaries([]common.AIChatData{{Id: "saved-chat", Title: "Saved chat"}})
+	result, err := chatPlugin.handleMRURestore(context.Background(), plugin.MRUData{ContextData: common.ContextData{"ai_chat_active_id": "saved-chat"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || len(result.Actions) != 1 {
+		t.Fatalf("restored result = %+v", result)
+	}
+	result.Actions[0].Action(context.Background(), plugin.ActionContext{})
+	if api.changed.QueryType != plugin.QueryTypeInput || api.changed.QueryText != "" || api.changed.QueryScope.Identity() != common.AIChatPluginID || api.changed.ContextData["ai_chat_active_id"] != "saved-chat" {
+		t.Fatalf("restored chat query = %+v", api.changed)
+	}
+}
+
+func (emptyChatAPI) RegisterTriggerKeyword(context.Context, plugin.RegisterTriggerKeywordOption) plugin.RegisterTriggerKeywordResult {
+	return plugin.RegisterTriggerKeywordResult{Success: true}
+}
+func (emptyChatAPI) UnregisterTriggerKeyword(context.Context, plugin.UnregisterTriggerKeywordOption) plugin.UnregisterTriggerKeywordResult {
+	return plugin.UnregisterTriggerKeywordResult{Success: true}
+}
+
+func (api emptyChatAPI) ShowToastMsg(ctx context.Context, option plugin.ShowToastMsgOption) plugin.ShowToastMsgResult {
+	api.Notify(ctx, option.Message)
+	return plugin.ShowToastMsgResult{Success: true}
+}

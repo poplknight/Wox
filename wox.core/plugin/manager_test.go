@@ -1,0 +1,878 @@
+package plugin
+
+import (
+	"bytes"
+	"context"
+	"image"
+	"image/color"
+	"image/gif"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"wox/common"
+	"wox/common/icons"
+	"wox/database"
+	"wox/setting"
+	"wox/util"
+	"wox/util/selection"
+)
+
+func TestAppendPluginInstanceRejectsDuplicateID(t *testing.T) {
+	manager := &Manager{}
+	first := &Instance{Metadata: Metadata{Id: "9d7b4e96-a81d-44a3-a75a-bc828cf5668e", Name: "Linkding"}}
+	second := &Instance{Metadata: Metadata{Id: "9d7b4e96-a81d-44a3-a75a-bc828cf5668e", Name: "Linkding"}}
+
+	require.True(t, manager.lifecycle.appendPluginInstance(first))
+	require.False(t, manager.lifecycle.appendPluginInstance(second))
+	require.True(t, manager.lifecycle.appendPluginInstance(&Instance{Metadata: Metadata{Id: "other-plugin", Name: "Other"}}))
+	require.True(t, manager.lifecycle.appendPluginInstance(&Instance{Host: &fakeHost{}, RuntimeLoaded: true}))
+	require.True(t, manager.lifecycle.appendPluginInstance(&Instance{Host: &fakeHost{}, RuntimeLoaded: true}))
+
+	instances := manager.GetPluginInstances()
+	require.Len(t, instances, 4)
+	assert.Equal(t, first.Metadata.Id, instances[0].Metadata.Id)
+	assert.Equal(t, "other-plugin", instances[1].Metadata.Id)
+}
+
+func TestTroubleshootingModeBlocksThirdPartyLoading(t *testing.T) {
+	initPluginManagerLoadTest(t)
+	previousArgs := os.Args
+	previousSystemPlugins, previousHosts := AllSystemPlugin, AllHosts
+	os.Args = []string{"wox.exe", util.ArgNoThirdPartyPlugins}
+	t.Cleanup(func() {
+		os.Args = previousArgs
+		AllSystemPlugin, AllHosts = previousSystemPlugins, previousHosts
+	})
+	builtin := &troubleshootingSystemPlugin{}
+	host := &countingLoadHost{}
+	AllSystemPlugin, AllHosts = []SystemPlugin{builtin}, []Host{host}
+	manager := &Manager{lifecycle: pluginLifecycle{systemPluginsReady: make(chan struct{})}}
+	require.NoError(t, manager.Start(context.Background(), nil))
+	instances := manager.GetPluginInstances()
+	require.Len(t, instances, 1)
+	assert.True(t, instances[0].IsSystemPlugin)
+	assert.Equal(t, int32(1), builtin.initCalls.Load())
+	assert.Zero(t, host.startCount)
+	assert.Nil(t, manager.lifecycle.scriptPluginWatch)
+	assert.Nil(t, manager.lifecycle.singleFilePluginWatch)
+	assert.False(t, manager.lifecycle.hostWatchdogStarted)
+	metadata := Metadata{Id: "third-party-plugin", Runtime: string(PLUGIN_RUNTIME_PYTHON)}
+	require.Error(t, manager.lifecycle.loadHostPlugin(context.Background(), host, metadata))
+	require.Error(t, manager.LoadPlugin(context.Background(), "missing-plugin-directory"))
+	require.Error(t, manager.ReloadPlugin(context.Background(), metadata))
+	assert.Zero(t, host.loadCalls.Load())
+	assert.Len(t, manager.GetPluginInstances(), 1)
+	store := &Store{}
+	blocked := ensureThirdPartyPluginsEnabled(context.Background()).Error()
+	require.EqualError(t, store.Install(context.Background(), StorePluginManifest{}), blocked)
+	require.EqualError(t, store.InstallLocal(context.Background(), StorePluginManifest{}), blocked)
+	require.EqualError(t, store.InstallFromLocal(context.Background(), "missing-plugin-package"), blocked)
+}
+
+type troubleshootingSystemPlugin struct{ fakeLifecyclePlugin }
+
+func (*troubleshootingSystemPlugin) GetMetadata() Metadata {
+	return Metadata{Id: "troubleshooting-builtin", Name: "Built-in test plugin", Runtime: string(PLUGIN_RUNTIME_GO)}
+}
+
+func TestConcurrentLoadHostPluginKeepsOneInstance(t *testing.T) {
+	initPluginManagerLoadTest(t)
+	host := &countingLoadHost{}
+	manager := &Manager{}
+	metadata := Metadata{
+		Id:      "9d7b4e96-a81d-44a3-a75a-bc828cf5668e",
+		Name:    "Linkding",
+		Runtime: string(PLUGIN_RUNTIME_PYTHON),
+	}
+
+	var workers sync.WaitGroup
+	workers.Add(2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			defer workers.Done()
+			require.NoError(t, manager.lifecycle.loadHostPlugin(context.Background(), host, metadata))
+		}()
+	}
+	workers.Wait()
+
+	assert.Equal(t, int32(1), host.loadCalls.Load())
+	require.Len(t, manager.GetPluginInstances(), 1)
+	assert.Equal(t, metadata.Id, manager.GetPluginInstances()[0].Metadata.Id)
+	// Loading publishes the instance before asynchronous Init finishes. Join it
+	// before another test replaces the package logger or closes the test database.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	require.NoError(t, manager.GetPluginInstances()[0].WaitInit(ctx))
+}
+
+type countingLoadHost struct {
+	fakeHost
+	loadCalls atomic.Int32
+}
+
+func (h *countingLoadHost) LoadPlugin(ctx context.Context, metadata Metadata, pluginDirectory string) (Plugin, error) {
+	h.loadCalls.Add(1)
+	return &fakeLifecyclePlugin{}, nil
+}
+
+func initPluginManagerLoadTest(t *testing.T) {
+	t.Helper()
+	logger = util.GetLogger()
+	dataDir := t.TempDir()
+	t.Setenv(util.TestWoxDataDirEnv, dataDir)
+	t.Setenv(util.TestUserDataDirEnv, filepath.Join(dataDir, "user"))
+	if err := util.GetLocation().Init(); err != nil {
+		t.Fatalf("init test location: %v", err)
+	}
+	if err := database.Init(context.Background()); err != nil {
+		t.Fatalf("init test database: %v", err)
+	}
+	t.Cleanup(func() {
+		db := database.GetDB()
+		if db == nil {
+			return
+		}
+		sqlDB, err := db.DB()
+		if err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+}
+
+func TestLargeMediaPreviewBypassesRemoteWrapping(t *testing.T) {
+	previewData := strings.Repeat("x", previewDataMaxSize+1)
+	preview := WoxPreview{PreviewType: WoxPreviewTypeMedia, PreviewData: previewData}
+	assert.False(t, shouldWrapRemotePreview(preview))
+	assert.True(t, shouldWrapRemotePreview(WoxPreview{PreviewType: WoxPreviewTypeText, PreviewData: previewData}))
+
+	result := (&Manager{}).buildResultUI(&QueryResultCache{
+		Result: QueryResult{Id: "media-result", Preview: preview},
+		Query:  Query{SessionId: "session"},
+	}, "query")
+
+	assert.Equal(t, WoxPreviewTypeMedia, result.Preview.PreviewType)
+	assert.Equal(t, previewData, result.Preview.PreviewData)
+}
+
+// TestRemotePreviewKeepsDefaultHidden prevents deferred payloads from opening before user input.
+func TestRemotePreviewKeepsDefaultHidden(t *testing.T) {
+	result := (&Manager{}).buildResultUI(&QueryResultCache{
+		Result: QueryResult{Id: "hidden", Preview: WoxPreview{
+			PreviewType: WoxPreviewTypeText, PreviewData: strings.Repeat("x", previewDataMaxSize+1), DefaultHidden: true,
+		}},
+		Query: Query{SessionId: "session"},
+	}, "query")
+	assert.Equal(t, WoxPreviewTypeRemote, result.Preview.PreviewType)
+	assert.True(t, result.Preview.DefaultHidden)
+}
+
+func TestLargeChatAndTerminalPreviewsBypassRemoteWrapping(t *testing.T) {
+	previewData := strings.Repeat("x", previewDataMaxSize+1)
+	for _, previewType := range []string{WoxPreviewTypeChat, WoxPreviewTypeTerminal} {
+		preview := WoxPreview{PreviewType: previewType, PreviewData: previewData}
+		assert.False(t, shouldWrapRemotePreview(preview), previewType)
+
+		result := (&Manager{}).buildResultUI(&QueryResultCache{
+			Result: QueryResult{Id: previewType + "-result", Preview: preview},
+			Query:  Query{SessionId: "session"},
+		}, "query")
+
+		assert.Equal(t, previewType, result.Preview.PreviewType)
+		assert.Equal(t, previewData, result.Preview.PreviewData)
+	}
+}
+
+func Test_QueryAlias(t *testing.T) {
+	aliases := []setting.QueryAlias{
+		{
+			Alias: "wi",
+			Query: "wpm install",
+		},
+		{
+			Alias: "wix",
+			Query: "wpm install {0} x {1}",
+		},
+	}
+
+	query := GetPluginManager().expandQueryAlias(util.NewTraceContext(), "wi 1 2", aliases)
+	assert.Equal(t, "wpm install 1 2", query)
+
+	query = GetPluginManager().expandQueryAlias(util.NewTraceContext(), "wi wi 1 2", aliases)
+	assert.Equal(t, "wpm install wi 1 2", query)
+
+	query = GetPluginManager().expandQueryAlias(util.NewTraceContext(), "wix 1 2", aliases)
+	assert.Equal(t, "wpm install 1 x 2", query)
+
+	query = GetPluginManager().expandQueryAlias(util.NewTraceContext(), "wix 1 2 3 4", aliases)
+	assert.Equal(t, "wpm install 1 x 2 3 4", query)
+
+	query = GetPluginManager().expandQueryAlias(util.NewTraceContext(), "wix 1", aliases)
+	assert.Equal(t, "wpm install 1 x {1}", query)
+}
+
+func TestNewQueryAliasText(t *testing.T) {
+	existing := []setting.QueryAlias{{Alias: "tr", Query: "chatgpt translate"}}
+
+	queryText, ok := newQueryAliasText(Query{Type: QueryTypeInput, RawQuery: "  google wox  "}, existing)
+	assert.True(t, ok)
+	assert.Equal(t, "google wox", queryText)
+
+	// A query that an alias already expands to would only duplicate that entry.
+	_, ok = newQueryAliasText(Query{Type: QueryTypeInput, RawQuery: "chatgpt translate"}, existing)
+	assert.False(t, ok)
+
+	_, ok = newQueryAliasText(Query{Type: QueryTypeInput, RawQuery: "   "}, existing)
+	assert.False(t, ok)
+
+	_, ok = newQueryAliasText(Query{Type: QueryTypeSelection, RawQuery: "google wox"}, existing)
+	assert.False(t, ok)
+}
+
+func TestAddQueryAliasActionUsesInlineForm(t *testing.T) {
+	action := (&Manager{}).newAddQueryAliasAction(&Instance{Metadata: Metadata{Id: "wox"}}, "google wox")
+
+	assert.Equal(t, QueryResultActionTypeForm, action.Type)
+	assert.True(t, action.IsSystemAction)
+	assert.True(t, action.PreventHideAfterAction)
+	assert.NotNil(t, action.OnSubmit)
+	require.Len(t, action.Form, 2)
+	assert.Equal(t, queryAliasFormAliasKey, action.Form[0].Value.GetKey())
+	assert.Empty(t, action.Form[0].Value.GetDefaultValue())
+	assert.Equal(t, queryAliasFormQueryKey, action.Form[1].Value.GetKey())
+	assert.Equal(t, "google wox", action.Form[1].Value.GetDefaultValue())
+}
+
+func TestPolishUpdatableResultClearsPreviewForGlobalQuery(t *testing.T) {
+	manager, pluginInstance := newTestManagerWithCachedResult(Query{
+		Id:        "query-global",
+		SessionId: "session",
+		Type:      QueryTypeInput,
+		RawQuery:  "pause",
+		Search:    "pause",
+	}, QueryResult{
+		Id:    "result-global",
+		Title: "Song",
+	})
+	preview := WoxPreview{
+		PreviewType: WoxPreviewTypeImage,
+		PreviewData: "base64:cover",
+	}
+
+	result := manager.PolishUpdatableResult(context.Background(), pluginInstance, UpdatableResult{
+		Id:      "result-global",
+		Preview: &preview,
+	})
+
+	assert.NotNil(t, result.Preview)
+	assert.True(t, result.Preview.IsEmpty())
+
+	cachedResult, found := manager.resultStore.findByID("result-global")
+	assert.True(t, found)
+	assert.True(t, cachedResult.Result.Preview.IsEmpty())
+}
+
+func TestPolishUpdatableResultKeepsPreviewForTriggeredQuery(t *testing.T) {
+	manager, pluginInstance := newTestManagerWithCachedResult(Query{
+		Id:             "query-triggered",
+		SessionId:      "session",
+		Type:           QueryTypeInput,
+		RawQuery:       "media",
+		TriggerKeyword: "media",
+	}, QueryResult{
+		Id:    "result-triggered",
+		Title: "Song",
+	})
+	preview := WoxPreview{
+		PreviewType: WoxPreviewTypeImage,
+		PreviewData: "base64:cover",
+	}
+
+	result := manager.PolishUpdatableResult(context.Background(), pluginInstance, UpdatableResult{
+		Id:      "result-triggered",
+		Preview: &preview,
+	})
+
+	assert.NotNil(t, result.Preview)
+	assert.Equal(t, "base64:cover", result.Preview.PreviewData)
+}
+
+// TestMRUResultUpdatesPreserveSystemActions covers both a read-modify-write update
+// and replacing plugin actions while keeping the restore-owned removal callback.
+func TestMRUResultUpdatesPreserveSystemActions(t *testing.T) {
+	ctx := context.Background()
+	removed := 0
+	manager, pluginInstance := newTestManagerWithCachedResult(Query{
+		Id: "query-mru", SessionId: "session", Type: QueryTypeInput, Env: QueryEnv{IsMRU: true},
+	}, QueryResult{
+		Id: "result-mru", Title: "Original",
+		Actions: []QueryResultAction{
+			{Id: "open", Name: "Open", IsDefault: true},
+			{Id: systemActionOpenPluginSettingID, Name: "Settings", IsSystemAction: true},
+			{Id: "remove-mru", Name: "Remove", IsSystemAction: true, Action: func(context.Context, ActionContext) { removed++ }},
+		},
+	})
+	for _, replaceActions := range []bool{false, true, false} {
+		update := manager.GetUpdatableResult(ctx, "result-mru")
+		if update == nil || update.Actions == nil {
+			t.Fatal("cached MRU result missing")
+		}
+		for _, action := range *update.Actions {
+			if action.IsSystemAction {
+				t.Fatal("system action exposed in plugin update")
+			}
+		}
+		title := "Updated"
+		update.Title = &title
+		// Tail updates require the settings database; this test only updates title and actions.
+		update.Tails = nil
+		if replaceActions {
+			actions := []QueryResultAction{{Id: "copy", Name: "Copy"}}
+			update.Actions = &actions
+		}
+		result := manager.PolishUpdatableResult(ctx, pluginInstance, *update)
+		if result.Actions == nil || len(*result.Actions) != 3 {
+			t.Fatalf("updated actions = %+v, want one plugin action and two MRU system actions", result.Actions)
+		}
+		actions := *result.Actions
+		if actions[1].Id != systemActionOpenPluginSettingID || actions[2].Id != "remove-mru" || !actions[2].IsSystemAction || actions[2].Action == nil {
+			t.Fatalf("MRU system actions changed: %+v", actions)
+		}
+		actions[2].Action(ctx, ActionContext{})
+		cached, found := manager.resultStore.findByID("result-mru")
+		if !found || cached.Result.Title != title || len(cached.Result.Actions) != 3 {
+			t.Fatal("updated MRU result was not retained in cache")
+		}
+	}
+	if removed != 3 {
+		t.Fatalf("removal callback calls = %d, want 3", removed)
+	}
+}
+
+func TestNormalizeToolbarMsgUsesPluginIconWhenMsgIconMissing(t *testing.T) {
+	manager := &Manager{}
+	pluginIcon := common.NewWoxImageSvg(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"><path d="M0 0h1v1H0z"/></svg>`)
+	pluginInstance := &Instance{
+		Metadata: Metadata{
+			Icon: pluginIcon.String(),
+		},
+	}
+
+	normalized := manager.presentation.normalizeToolbarMsg(context.Background(), pluginInstance, ToolbarMsg{Id: "status", Title: "working"})
+
+	assert.Equal(t, pluginIcon, normalized.Icon)
+}
+
+// TestNormalizeToolbarMsgHideIcon preserves text-only messages through the UI payload.
+func TestNormalizeToolbarMsgHideIcon(t *testing.T) {
+	pluginIcon := common.NewWoxImageSvg(`<svg xmlns="http://www.w3.org/2000/svg"/>`)
+	instance := &Instance{Metadata: Metadata{Icon: pluginIcon.String()}}
+	for _, icon := range []common.WoxImage{{}, pluginIcon} {
+		normalized := (&Manager{}).presentation.normalizeToolbarMsg(context.Background(), instance, ToolbarMsg{
+			Id: "count", Title: "20,646 files", Icon: icon, HideIcon: true,
+		})
+		assert.True(t, normalized.Icon.IsEmpty())
+		assert.True(t, normalized.toToolbarMsgUI().Icon.IsEmpty())
+	}
+}
+
+func TestAppendActionEnglishAliasPreservesCustomAliases(t *testing.T) {
+	pluginInstance := &Instance{Metadata: Metadata{I18n: map[string]map[string]string{
+		"en_US": {"copy_path": "Copy Path"},
+	}}}
+	aliases := appendActionEnglishAlias(context.Background(), pluginInstance, "i18n:copy_path", []string{"文件地址"})
+	assert.Equal(t, []string{"文件地址", "Copy Path"}, aliases)
+	assert.Equal(t, aliases, appendActionEnglishAlias(context.Background(), pluginInstance, "i18n:copy_path", aliases))
+}
+
+func TestOpenPluginSettingActionIncludesEnglishAlias(t *testing.T) {
+	pluginInstance := &Instance{Metadata: Metadata{Name: "System Command"}}
+	action := (&Manager{}).newOpenPluginSettingAction(context.Background(), pluginInstance)
+	assert.Equal(t, []string{"Open System Command settings"}, action.SearchAliases)
+}
+
+func TestActionedScoreUsesRelatedQueries(t *testing.T) {
+	now := util.GetSystemTimestamp()
+	unrelated := []setting.ActionedResult{{Timestamp: now, Query: "dictation"}, {Timestamp: now, Query: ""}}
+	assert.Zero(t, calculateActionedResultScore(unrelated, "shot", true))
+	assert.Positive(t, calculateActionedResultScore([]setting.ActionedResult{{Timestamp: now, Query: "Screenshot"}}, "shot", true))
+	assert.Greater(t, calculateActionedResultScore([]setting.ActionedResult{{Timestamp: now, Query: "SHOT"}}, "shot", true), calculateActionedResultScore([]setting.ActionedResult{{Timestamp: now, Query: "screenshot"}}, "shot", true))
+	assert.Positive(t, calculateActionedResultScore(unrelated, "", true))
+	assert.Positive(t, calculateActionedResultScore(unrelated, "shot", false))
+}
+
+func TestActionedRankingScoreTailFormatsBoost(t *testing.T) {
+	if got := actionedRankingScoreTail(55); got != "+55" {
+		t.Fatalf("actionedRankingScoreTail(55) = %q, want +55", got)
+	}
+	if got := actionedRankingScoreTail(0); got != "" {
+		t.Fatalf("actionedRankingScoreTail(0) = %q, want empty", got)
+	}
+	if got := actionedRankingScoreTail(-1); got != "" {
+		t.Fatalf("actionedRankingScoreTail(-1) = %q, want empty", got)
+	}
+}
+
+func TestOpenPluginSettingActionUsesVerbIconAndPluginTail(t *testing.T) {
+	pluginIcon := icons.Get(icons.PluginApp)
+	pluginInstance := &Instance{Metadata: Metadata{Name: "App", Icon: pluginIcon.String()}}
+	action := (&Manager{}).newOpenPluginSettingAction(context.Background(), pluginInstance)
+	assert.Equal(t, icons.Get(icons.ActionSettings), action.Icon)
+	assert.Equal(t, pluginIcon, action.TailIcon)
+}
+
+func TestConvertActionIconsReusesConvertedSource(t *testing.T) {
+	icon := common.NewWoxImageSvg(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"><path d="M0 0h1v1H0z"/></svg>`)
+	cache := make(map[common.WoxImage]common.WoxImage)
+	first := []QueryResultAction{{Icon: icon}, {Icon: icon}}
+	second := []QueryResultAction{{Icon: icon}}
+
+	if converted := convertActionIcons(context.Background(), first, nil, cache); converted != 1 {
+		t.Fatalf("first conversion count = %d, want 1", converted)
+	}
+	if converted := convertActionIcons(context.Background(), second, nil, cache); converted != 0 {
+		t.Fatalf("reused conversion count = %d, want 0", converted)
+	}
+	if first[0].Icon != icon || first[1].Icon != icon || second[0].Icon != icon {
+		t.Fatal("reused action icon changed converted value")
+	}
+}
+
+func TestConvertResultIconDefersRemoteURLWithoutRequest(t *testing.T) {
+	initPluginImageTestLocation(t)
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requestCount++
+	}))
+	defer server.Close()
+	manager := &Manager{resultStore: newQueryResultStore()}
+	query := Query{Id: "query-remote-icon", SessionId: "session-remote-icon"}
+
+	converted := manager.convertResultIcon(context.Background(), nil, query, QueryLayout{}, "result-remote-icon", "Remote", common.NewWoxImageUrl(server.URL+"/icon.png"))
+
+	if requestCount != 0 {
+		t.Fatalf("result polish made %d synchronous remote icon requests", requestCount)
+	}
+	payload, err := common.ParseWoxLazyLoadImagePayload(converted)
+	if err != nil {
+		t.Fatalf("parse registered lazy icon: %v", err)
+	}
+	if payload.Token == "" {
+		t.Fatal("manager did not register a lazy remote icon token")
+	}
+	if _, found := manager.resultStore.lazyResultIcons.Load(payload.Token); !found {
+		t.Fatal("registered lazy remote icon token is missing from manager cache")
+	}
+}
+
+func TestLoadLazyResultIconHydratesRemoteGIF(t *testing.T) {
+	initPluginImageTestLocation(t)
+	served := encodedPluginTestGIF(t)
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		requestCount++
+		response.Header().Set("Content-Type", "image/gif")
+		if _, err := response.Write(served); err != nil {
+			t.Errorf("write remote gif: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	query := Query{Id: "query-remote-gif", SessionId: "session-remote-gif"}
+	result := QueryResult{Id: "result-remote-gif"}
+	manager, _ := newTestManagerWithCachedResult(query, result)
+	manager.resultStore.lazyResultIcons = util.NewHashMap[string, *lazyResultIconEntry]()
+	token := "remote-gif-token"
+	source := common.NewWoxImageUrl(server.URL + "/doge.gif")
+	lazyIcon := common.NewWoxImageLazyLoad(token, source.Hash(), icons.Get(icons.StatusImagePlaceholder), common.ResultListIconSize)
+	cachedResult, found := manager.resultStore.findInSession(query.SessionId, query.Id, result.Id)
+	if !found {
+		t.Fatal("expected cached result")
+	}
+	cachedResult.Result.Icon = lazyIcon
+	manager.resultStore.lazyResultIcons.Store(token, &lazyResultIconEntry{
+		SessionId: query.SessionId, QueryId: query.Id, ResultId: result.Id,
+		OriginalIcon: source, TargetSize: common.ResultListIconSize,
+	})
+
+	loaded, err := manager.LoadLazyResultIcon(context.Background(), token)
+	if err != nil {
+		t.Fatalf("load lazy remote gif: %v", err)
+	}
+	if loaded.ImageType != common.WoxImageTypeAbsolutePath || !loaded.IsAnimatedGif() {
+		t.Fatalf("hydrated remote GIF = %+v, want cached GIF file", loaded)
+	}
+	if loaded == icons.Get(icons.StatusImagePlaceholder) {
+		t.Fatal("remote GIF should not fall back to the placeholder icon")
+	}
+	if requestCount != 1 {
+		t.Fatalf("remote GIF made %d requests, want 1", requestCount)
+	}
+	if _, err := os.Stat(loaded.ImageData); err != nil {
+		t.Fatalf("cached GIF file missing: %v", err)
+	}
+}
+
+func encodedPluginTestGIF(t *testing.T) []byte {
+	t.Helper()
+	frame := image.NewPaletted(image.Rect(0, 0, 8, 8), color.Palette{color.RGBA{R: 255, A: 255}})
+	for y := 0; y < 8; y++ {
+		for x := 0; x < 8; x++ {
+			frame.SetColorIndex(x, y, 0)
+		}
+	}
+	var encoded bytes.Buffer
+	if err := gif.EncodeAll(&encoded, &gif.GIF{
+		Image:     []*image.Paletted{frame, frame},
+		Delay:     []int{10, 10},
+		LoopCount: 0,
+		Config:    image.Config{ColorModel: frame.Palette, Width: 8, Height: 8},
+	}); err != nil {
+		t.Fatalf("encode gif: %v", err)
+	}
+	return encoded.Bytes()
+}
+
+func TestLoadLazyResultIconFallsBackWhenRemoteURLFails(t *testing.T) {
+	initPluginImageTestLocation(t)
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		requestCount++
+		http.Error(response, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	query := Query{Id: "query-remote-icon", SessionId: "session-remote-icon"}
+	result := QueryResult{Id: "result-remote-icon"}
+	manager, _ := newTestManagerWithCachedResult(query, result)
+	manager.resultStore.lazyResultIcons = util.NewHashMap[string, *lazyResultIconEntry]()
+	token := "remote-icon-token"
+	source := common.NewWoxImageUrl(server.URL + "/icon.png")
+	lazyIcon := common.NewWoxImageLazyLoad(token, source.Hash(), icons.Get(icons.StatusImagePlaceholder), common.ResultListIconSize)
+	cachedResult, found := manager.resultStore.findInSession(query.SessionId, query.Id, result.Id)
+	if !found {
+		t.Fatal("expected cached result")
+	}
+	cachedResult.Result.Icon = lazyIcon
+	manager.resultStore.lazyResultIcons.Store(token, &lazyResultIconEntry{
+		SessionId: query.SessionId, QueryId: query.Id, ResultId: result.Id,
+		OriginalIcon: source, TargetSize: common.ResultListIconSize,
+	})
+
+	loaded, err := manager.LoadLazyResultIcon(context.Background(), token)
+	if err != nil {
+		t.Fatalf("load lazy remote icon: %v", err)
+	}
+	if loaded != icons.Get(icons.StatusImagePlaceholder) {
+		t.Fatalf("failed remote URL should resolve to placeholder, got %+v", loaded)
+	}
+	if cachedResult.Result.Icon != icons.Get(icons.StatusImagePlaceholder) {
+		t.Fatalf("cached failed remote URL should be placeholder, got %+v", cachedResult.Result.Icon)
+	}
+	if requestCount != 1 {
+		t.Fatalf("failed remote URL made %d requests, want 1", requestCount)
+	}
+}
+
+func initPluginImageTestLocation(t *testing.T) {
+	t.Helper()
+	dataDir := t.TempDir()
+	t.Setenv(util.TestWoxDataDirEnv, dataDir)
+	t.Setenv(util.TestUserDataDirEnv, filepath.Join(dataDir, "user"))
+	if err := util.GetLocation().Init(); err != nil {
+		t.Fatalf("init test location: %v", err)
+	}
+	common.ClearConvertIconPathExistenceCache()
+}
+
+func TestShouldClearGroupForGlobalQueryKeepsFilePlugin(t *testing.T) {
+	globalQuery := Query{Type: QueryTypeInput, Search: "scottqian"}
+	filePlugin := &Instance{Metadata: Metadata{Id: fileSearchPluginID}}
+	otherPlugin := &Instance{Metadata: Metadata{Id: "other-plugin"}}
+
+	assert.False(t, shouldClearGroupForGlobalQuery(globalQuery, filePlugin))
+	assert.True(t, shouldClearGroupForGlobalQuery(globalQuery, otherPlugin))
+	assert.True(t, shouldClearGroupForGlobalQuery(globalQuery, nil))
+	assert.False(t, shouldClearGroupForGlobalQuery(Query{Type: QueryTypeInput, TriggerKeyword: "f"}, filePlugin))
+
+	groupedPlugin := &Instance{Metadata: Metadata{
+		Id:              "games",
+		TriggerKeywords: []string{"*", "game"},
+	}}
+	assert.True(t, shouldClearGroupForGlobalQuery(globalQuery, groupedPlugin))
+	bareQuery, owner := newQueryInputWithPlugins("game", []*Instance{groupedPlugin})
+	assert.True(t, bareQuery.IsGlobalQuery())
+	assert.Nil(t, owner)
+	assert.True(t, shouldClearGroupForGlobalQuery(bareQuery, groupedPlugin))
+	keywordQuery, owner := newQueryInputWithPlugins("game ", []*Instance{groupedPlugin})
+	assert.False(t, shouldClearGroupForGlobalQuery(keywordQuery, owner))
+}
+
+func TestShouldHidePreviewForGlobalQueryStillHidesFilePreview(t *testing.T) {
+	globalQuery := Query{Type: QueryTypeInput, Search: "scottqian"}
+	preview := WoxPreview{PreviewType: WoxPreviewTypeFile, PreviewData: `C:\tmp\readme.txt`}
+
+	assert.True(t, shouldHidePreviewForGlobalQuery(globalQuery, preview))
+	assert.False(t, shouldHidePreviewForGlobalQuery(Query{Type: QueryTypeInput, TriggerKeyword: "f"}, preview))
+}
+
+func TestApplyDefaultSelectionPreviewFillsEmptySDKPreview(t *testing.T) {
+	ctx := context.Background()
+	manager := &Manager{}
+	fileQuery := Query{
+		Type: QueryTypeSelection,
+		Selection: selection.Selection{
+			Type:      selection.SelectionTypeFile,
+			FilePaths: []string{filepath.Join(t.TempDir(), "2.4.1.exe")},
+		},
+	}
+	textQuery := Query{
+		Type: QueryTypeSelection,
+		Selection: selection.Selection{
+			Type: selection.SelectionTypeText,
+			Text: "selected quote",
+		},
+	}
+
+	emptyTextPreview := WoxPreview{PreviewType: WoxPreviewTypeText, PreviewData: ""}
+	filePreview := manager.applyDefaultSelectionPreview(ctx, fileQuery, emptyTextPreview)
+	if filePreview.PreviewType != WoxPreviewTypeList || !strings.Contains(filePreview.PreviewData, "2.4.1.exe") {
+		t.Fatalf("file selection default preview = %#v", filePreview)
+	}
+
+	textPreview := manager.applyDefaultSelectionPreview(ctx, textQuery, emptyTextPreview)
+	if textPreview.PreviewType != WoxPreviewTypeText || textPreview.PreviewData != "selected quote" {
+		t.Fatalf("text selection default preview = %#v", textPreview)
+	}
+
+	pluginPreview := WoxPreview{PreviewType: WoxPreviewTypeMarkdown, PreviewData: "# custom"}
+	kept := manager.applyDefaultSelectionPreview(ctx, fileQuery, pluginPreview)
+	if kept.PreviewType != pluginPreview.PreviewType || kept.PreviewData != pluginPreview.PreviewData {
+		t.Fatalf("explicit preview was replaced: %#v", kept)
+	}
+
+	inputPreview := manager.applyDefaultSelectionPreview(ctx, Query{Type: QueryTypeInput}, emptyTextPreview)
+	if inputPreview.PreviewType != emptyTextPreview.PreviewType || inputPreview.PreviewData != emptyTextPreview.PreviewData {
+		t.Fatalf("input query gained a selection preview: %#v", inputPreview)
+	}
+}
+
+func TestPolishUpdatableResultFillsEmptySelectionPreview(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "note.txt")
+	manager, pluginInstance := newTestManagerWithCachedResult(Query{
+		Id:        "query-selection",
+		SessionId: "session",
+		Type:      QueryTypeSelection,
+		Selection: selection.Selection{
+			Type:      selection.SelectionTypeFile,
+			FilePaths: []string{filePath},
+		},
+	}, QueryResult{
+		Id:    "result-selection",
+		Title: "Save bookmark",
+	})
+	emptyPreview := WoxPreview{PreviewType: WoxPreviewTypeText}
+
+	result := manager.PolishUpdatableResult(context.Background(), pluginInstance, UpdatableResult{
+		Id:      "result-selection",
+		Preview: &emptyPreview,
+	})
+
+	require.NotNil(t, result.Preview)
+	assert.Equal(t, WoxPreviewTypeList, result.Preview.PreviewType)
+	assert.Contains(t, result.Preview.PreviewData, "note.txt")
+}
+
+func TestBuildQueryResultsSnapshotPlacesPinAheadOfHigherScore(t *testing.T) {
+	query := Query{Id: "query-pin", SessionId: "session-pin", Type: QueryTypeInput, Search: "cb"}
+	manager := &Manager{
+		resultStore: newQueryResultStore(),
+	}
+	resultSet := newQueryResultSet(query)
+	// Ten minutes newer than the pin. Display order uses the pin tier, not this score.
+	const copiedAt int64 = 1_700_000_000_000
+	resultSet.Results.Store("newer", &QueryResultCache{
+		Result: QueryResult{Id: "newer", Title: "400K xof in €", Score: copiedAt + 10*60*1000, Group: "Today", GroupScore: 90},
+	})
+	resultSet.Results.Store("pinned", &QueryResultCache{
+		Result: QueryResult{Id: "pinned", Title: "text", Score: copiedAt, Group: "Today", GroupScore: 90, Tails: []QueryResultTail{queryPinTail()}},
+	})
+	resultSet.Results.Store("older-pin", &QueryResultCache{
+		Result: QueryResult{Id: "older-pin", Title: "old pin", Score: 100, Group: "History", GroupScore: 10, Tails: []QueryResultTail{queryPinTail()}},
+	})
+	sessionQueries := util.NewHashMap[string, *QueryResultSet]()
+	sessionQueries.Store(query.Id, resultSet)
+	manager.resultStore.sessions.Store(query.SessionId, sessionQueries)
+
+	results := manager.BuildQueryResultsSnapshot(query.SessionId, query.Id)
+	if len(results) != 4 {
+		t.Fatalf("snapshot length = %d, want 4", len(results))
+	}
+	if results[0].Id != "pinned" || results[0].IsGroup {
+		t.Fatalf("first result = %#v, want newer pin", results[0])
+	}
+	if results[1].Id != "older-pin" || results[1].IsGroup {
+		t.Fatalf("second result = %#v, want older pin", results[1])
+	}
+	if !results[2].IsGroup || results[2].Title != "Today" {
+		t.Fatalf("third result = %#v, want Today header", results[2])
+	}
+	if results[3].Id != "newer" || results[3].IsGroup {
+		t.Fatalf("fourth result = %#v, want unpinned clipboard row", results[3])
+	}
+}
+
+func queryPinTail() QueryResultTail {
+	return QueryResultTail{ContextData: common.ContextData{favoriteTailContextDataKey: favoriteTailContextDataValue}}
+}
+
+func TestBuildQueryResultsSnapshotKeepsUngroupedResultsAboveFileGroup(t *testing.T) {
+	query := Query{Id: "query-1", SessionId: "session-1", Type: QueryTypeInput, Search: "scottqian"}
+	manager := &Manager{
+		resultStore: newQueryResultStore(),
+	}
+	resultSet := newQueryResultSet(query)
+	resultSet.Results.Store("app", &QueryResultCache{
+		Result: QueryResult{Id: "app", Title: "App", Score: 80},
+	})
+	resultSet.Results.Store("file", &QueryResultCache{
+		Result: QueryResult{Id: "file", Title: "readme.txt", Score: 200, Group: "Files", GroupScore: 0},
+	})
+	sessionQueries := util.NewHashMap[string, *QueryResultSet]()
+	sessionQueries.Store(query.Id, resultSet)
+	manager.resultStore.sessions.Store(query.SessionId, sessionQueries)
+
+	results := manager.BuildQueryResultsSnapshot(query.SessionId, query.Id)
+	if len(results) != 3 {
+		t.Fatalf("snapshot length = %d, want 3", len(results))
+	}
+	if results[0].Id != "app" || results[0].IsGroup {
+		t.Fatalf("first result = %#v, want ungrouped app", results[0])
+	}
+	if !results[1].IsGroup || results[1].Title != "Files" {
+		t.Fatalf("second result = %#v, want Files group header", results[1])
+	}
+	if results[2].Id != "file" || results[2].IsGroup {
+		t.Fatalf("third result = %#v, want file result under group", results[2])
+	}
+}
+
+func TestBuildQueryResultsSnapshotPrefersShorterTitleAndSubtitleOnEqualScore(t *testing.T) {
+	query := Query{Id: "query-tie", SessionId: "session-tie", Type: QueryTypeInput, Search: "qqyy"}
+	manager := &Manager{
+		resultStore: newQueryResultStore(),
+	}
+	resultSet := newQueryResultSet(query)
+	resultSet.Results.Store("lyric", &QueryResultCache{
+		Result: QueryResult{
+			Id:       "lyric",
+			Title:    "陈慧娴 - 千千阕歌 - 301 - 永远是你的朋友_qm.qrc",
+			SubTitle: `C:\Users\qianl\AppData\Roaming\Tencent\QQMusic\QQMusicCache\QQMusicLyricNew\陈慧娴 - 千千阕歌 - 301 - 永远是你的朋友_qm.qrc`,
+			Score:    200,
+			Group:    "Files",
+		},
+	})
+	resultSet.Results.Store("folder", &QueryResultCache{
+		Result: QueryResult{
+			Id:       "folder",
+			Title:    "QQ音乐",
+			SubTitle: `C:\ProgramData\Microsoft\Windows\Start Menu\Programs\腾讯软件\QQ音乐`,
+			Score:    200,
+			Group:    "Files",
+		},
+	})
+	resultSet.Results.Store("png-deep", &QueryResultCache{
+		Result: QueryResult{
+			Id:       "png-deep",
+			Title:    "QQ音乐.png",
+			SubTitle: `C:\ProgramData\Microsoft\Windows\Start Menu\Programs\腾讯软件\QQ音乐.png`,
+			Score:    200,
+			Group:    "Files",
+		},
+	})
+	resultSet.Results.Store("png-short", &QueryResultCache{
+		Result: QueryResult{
+			Id:       "png-short",
+			Title:    "QQ音乐.png",
+			SubTitle: `C:\Users\qianl\.sofast\icons\QQ音乐.png`,
+			Score:    200,
+			Group:    "Files",
+		},
+	})
+	sessionQueries := util.NewHashMap[string, *QueryResultSet]()
+	sessionQueries.Store(query.Id, resultSet)
+	manager.resultStore.sessions.Store(query.SessionId, sessionQueries)
+
+	results := manager.BuildQueryResultsSnapshot(query.SessionId, query.Id)
+	if len(results) != 5 {
+		t.Fatalf("snapshot length = %d, want 5", len(results))
+	}
+	wantIDs := []string{"folder", "png-short", "png-deep", "lyric"}
+	for i, wantID := range wantIDs {
+		if results[i+1].Id != wantID {
+			t.Fatalf("results[%d].Id = %q, want %q (results=%#v)", i+1, results[i+1].Id, wantID, results)
+		}
+	}
+}
+
+func TestRestoreMRUItemSkipsSlowPluginAndKeepsFastOne(t *testing.T) {
+	manager := &Manager{}
+	pluginInstance := &Instance{Metadata: Metadata{Id: "stock", Name: "Stock"}}
+	var block atomic.Bool
+	block.Store(true)
+	pluginInstance.MRURestoreCallbacks = []func(context.Context, MRUData) (*QueryResult, error){
+		func(context.Context, MRUData) (*QueryResult, error) {
+			if block.Load() {
+				time.Sleep(2 * time.Second)
+				return &QueryResult{Title: "late"}, nil
+			}
+			return &QueryResult{Title: "next"}, nil
+		},
+	}
+	item := setting.MRUItem{PluginID: "stock", Title: "Advanced Micro Devices, Inc."}
+
+	start := time.Now()
+	restored := manager.restoreMRUItem(context.Background(), pluginInstance, item, QueryEnv{})
+	elapsed := time.Since(start)
+	if restored != nil {
+		t.Fatalf("slow MRU restore was kept: %+v", restored)
+	}
+	if elapsed < 200*time.Millisecond || elapsed > 800*time.Millisecond {
+		t.Fatalf("slow MRU restore returned in %s, want about %s", elapsed, mruRestoreTimeout)
+	}
+
+	block.Store(false)
+	next := manager.restoreMRUItem(context.Background(), pluginInstance, item, QueryEnv{})
+	if next == nil || next.Title != "next" {
+		t.Fatalf("next MRU item = %+v", next)
+	}
+}
+
+func TestResultIdentityHashIgnoresTranslatedTitleWhenIdentityKeyIsSet(t *testing.T) {
+	raw := resultIdentityHash("sys", QueryResult{Title: "i18n:plugin_sys_open_system_settings", IdentityKey: "open_system_settings"})
+	translated := resultIdentityHash("sys", QueryResult{Title: "Open System Settings", IdentityKey: "open_system_settings"})
+	if raw != translated {
+		t.Fatalf("score key identity changed after translation: %s vs %s", raw, translated)
+	}
+	byTitle := resultIdentityHash("sys", QueryResult{Title: "Open System Settings"})
+	if byTitle == translated {
+		t.Fatal("title identity should differ from score key identity")
+	}
+}
+
+func TestNewResultHashFromPartsPrefersIdentityKey(t *testing.T) {
+	byIdentityKey := setting.NewResultHashFromParts("plugin-id", "title", "subtitle", "score-key")
+	assert.Equal(t, setting.NewResultHash("plugin-id", "score-key", ""), byIdentityKey)
+
+	byTitle := setting.NewResultHashFromParts("plugin-id", "title", "subtitle", "")
+	assert.Equal(t, setting.NewResultHash("plugin-id", "title", "subtitle"), byTitle)
+}

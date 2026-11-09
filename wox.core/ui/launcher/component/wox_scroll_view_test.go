@@ -1,0 +1,483 @@
+package component
+
+import (
+	"math"
+	"testing"
+
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+)
+
+// TestScrollContentGutter keeps content outside every thumb state without moving
+// the scrollbar or changing the default overlay and horizontal contracts.
+func TestScrollContentGutter(t *testing.T) {
+	wide, wider := 20, 26
+	for _, scale := range []float32{0.9, 1, 1.1, 1.5, 2} {
+		for _, width := range []float32{8, 100, 300} {
+			for _, custom := range []bool{false, true} {
+				props := ScrollViewProps{Key: "gutter", Width: width, Height: 100, ContentHeight: 200,
+					ReserveScrollbarSpace: true, AlwaysShowScrollbar: true, Theme: ControlTheme{DensityScale: scale}}
+				hitWidth := float32(12)
+				if custom {
+					props.Theme.ScrollbarWidth, props.Theme.ScrollbarHoverWidth = &wide, &wider
+					hitWidth = 26
+				}
+				want := max(float32(0), width-hitWidth-2-float32(math.Round(float64(4*scale))))
+				for phase := 0; phase < 3; phase++ {
+					state := &scrollViewState{hovered: phase == 1, dragging: phase == 2}
+					stack := buildWoxScrollView(woxwidget.StateContext{}, props, state).(woxwidget.Gesture).Child.(woxwidget.Stack)
+					viewport := stack.Children[0].Child.(woxwidget.ScrollView)
+					if viewport.Width != want || props.ContentViewportWidth() != want || stack.Width != width || stack.Children[1].Right != 2 {
+						t.Fatalf("scale=%v width=%v custom=%v phase=%v: viewport=%v want=%v stack=%#v", scale, width, custom, phase, viewport.Width, want, stack)
+					}
+				}
+				props.ContentHeight = 50
+				if props.ContentViewportWidth() != want {
+					t.Fatal("content width changed when overflow disappeared")
+				}
+				for _, mode := range []string{"overlay", "hidden", "horizontal"} {
+					unreserved := props
+					unreserved.ReserveScrollbarSpace = mode != "overlay"
+					unreserved.HideScrollbar = mode == "hidden"
+					unreserved.Horizontal = mode == "horizontal"
+					if unreserved.ContentViewportWidth() != width {
+						t.Fatalf("%s scroll lost content width", mode)
+					}
+				}
+			}
+		}
+	}
+}
+
+type scrollDamageServices struct {
+	hotkeyRecorderHostServices
+	full, local int
+}
+
+func (s *scrollDamageServices) Invalidate() error               { s.full++; return nil }
+func (s *scrollDamageServices) InvalidateRect(woxui.Rect) error { s.local++; return nil }
+
+// Moving within a result row must not repeatedly invalidate an already-visible scrollbar.
+func TestScrollPointerMoveKeepsDamageLocal(t *testing.T) {
+	host := woxwidget.NewHost(func(woxui.FrameInfo) woxwidget.Widget {
+		return WoxScrollView(ScrollViewProps{
+			Key: "results", Width: 200, Height: 100, ContentHeight: 300,
+			Content: woxwidget.Gesture{ID: "row", OnHover: func(bool) {}, Child: woxwidget.Container{Width: 200, Height: 300}},
+		})
+	})
+	defer host.Dispose()
+	services := &scrollDamageServices{}
+	host.AttachServices(services)
+	frame := woxui.FrameInfo{Size: woxui.Size{Width: 800, Height: 600}, Scale: 1}
+	host.Frame(&woxui.DisplayList{}, frame)
+	services.full, services.local = 0, 0
+	host.Pointer(woxui.PointerEvent{Kind: woxui.PointerMove, Position: woxui.Point{X: 20, Y: 20}})
+	first := services.local
+	for x := float32(21); x < 40; x++ {
+		host.Pointer(woxui.PointerEvent{Kind: woxui.PointerMove, Position: woxui.Point{X: x, Y: 20}})
+	}
+	if services.full != 0 || first == 0 || services.local != first {
+		t.Fatalf("pointer invalidations: full=%d local=%d first=%d", services.full, services.local, first)
+	}
+	services.full, services.local = 0, 0
+	host.Pointer(woxui.PointerEvent{Kind: woxui.PointerScroll, Position: woxui.Point{X: 20, Y: 20}, Scroll: woxui.Point{Y: -30}})
+	if services.full != 0 || services.local == 0 {
+		t.Fatalf("wheel invalidations: full=%d local=%d", services.full, services.local)
+	}
+}
+
+// TestScrollbarThemePreservesAuthoredStyle checks both axes and every pointer state without native rendering.
+func TestScrollbarThemePreservesAuthoredStyle(t *testing.T) {
+	width, hoverWidth, radius := 0, 16, 0
+	normal, hover, active := woxui.Color{R: 1, A: 0}, woxui.Color{G: 2, A: 200}, woxui.Color{B: 3, A: 255}
+	for _, horizontal := range []bool{false, true} {
+		for phase := 0; phase < 3; phase++ {
+			props := ScrollViewProps{Key: "styled-scroll", Width: 100, Height: 100, ContentWidth: 200, ContentHeight: 200, Horizontal: horizontal, AlwaysShowScrollbar: true,
+				Theme: ControlTheme{ScrollbarThumbColor: &normal, ScrollbarThumbHoverColor: &hover, ScrollbarThumbActiveColor: &active, ScrollbarWidth: &width, ScrollbarHoverWidth: &hoverWidth, ScrollbarBorderRadius: &radius}}
+			state := &scrollViewState{hovered: phase > 0, dragging: phase == 2}
+			view := buildWoxScrollView(woxwidget.StateContext{}, props, state).(woxwidget.Gesture)
+			thumb := view.Child.(woxwidget.Stack).Children[1].Child.(woxwidget.Gesture).Child.(woxwidget.AnimatedFloat)
+			thickness := thumb.Builder(1).(woxwidget.AnimatedFloat)
+			align := thickness.Builder(thickness.Target).(woxwidget.Align)
+			fill := align.Child.(woxwidget.Container)
+			wantColor, wantWidth := normal, float32(width)
+			if phase > 0 {
+				wantColor, wantWidth = hover, float32(hoverWidth)
+			}
+			if phase == 2 {
+				wantColor = active
+			}
+			gotWidth, hitWidth := fill.Width, align.Width
+			if horizontal {
+				gotWidth, hitWidth = fill.Height, align.Height
+			}
+			if fill.Color != wantColor || fill.Radius != 0 || gotWidth != wantWidth || hitWidth < max(float32(12), wantWidth) {
+				t.Fatalf("horizontal=%v phase=%d: fill=%#v hit=%v", horizontal, phase, fill, hitWidth)
+			}
+		}
+	}
+}
+
+func TestWoxScrollViewShowsHorizontalThumbAndMapsVerticalWheel(t *testing.T) {
+	props := ScrollViewProps{
+		Key: "horizontal-scroll", Width: 100, Height: 40, ContentWidth: 200, Horizontal: true,
+		ThumbColor: woxui.Color{A: 255},
+	}
+	state := &scrollViewState{}
+	state.InitState(woxwidget.StateContext{}, props)
+	view := state.Build(woxwidget.StateContext{}, props).(woxwidget.Gesture)
+	stack := view.Child.(woxwidget.Stack)
+	scrollbar := stack.Children[1]
+	if !scrollbar.AnchorBottom || scrollbar.Bottom != 2 {
+		t.Fatalf("horizontal scrollbar anchor = %v bottom %.0f, want true/2", scrollbar.AnchorBottom, scrollbar.Bottom)
+	}
+	if !view.OnScrollHandled(woxui.Point{Y: -20}) {
+		t.Fatal("mapped vertical wheel should scroll a standalone horizontal strip")
+	}
+	if state.controller.Offset() != 20 {
+		t.Fatalf("horizontal offset = %.0f, want 20", state.controller.Offset())
+	}
+	state.Dispose()
+}
+
+func TestWoxScrollViewCanFillResolvedParentSize(t *testing.T) {
+	view := WoxScrollView(ScrollViewProps{Key: "fill-size", FillWidth: true, FillHeight: true, Content: woxwidget.Container{Height: 160}})
+	builder, ok := view.(woxwidget.LayoutBuilder)
+	if !ok {
+		t.Fatalf("fill-size scroll = %T, want LayoutBuilder", view)
+	}
+
+	resolved := builder.Build(woxui.Size{Width: 188, Height: 68}).(woxwidget.Stateful)
+	props := resolved.Widget.(ScrollViewProps)
+	if props.Width != 188 || props.Height != 68 || props.FillWidth || props.FillHeight {
+		t.Fatalf("resolved scroll size = %.0fx%.0f fill %v/%v, want 188x68/false/false", props.Width, props.Height, props.FillWidth, props.FillHeight)
+	}
+}
+
+func TestWoxScrollViewRevealsThumbOnPointerMove(t *testing.T) {
+	props := ScrollViewProps{Key: "hover-scroll", Width: 100, Height: 80, ContentHeight: 160, ThumbColor: woxui.Color{A: 255}}
+	state := &scrollViewState{}
+	state.InitState(woxwidget.StateContext{}, props)
+	view := state.Build(woxwidget.StateContext{}, props).(woxwidget.Gesture)
+	if view.OnHover == nil || view.OnPointer == nil || !view.CoverHover {
+		t.Fatal("scroll view does not track pointer motion over child content")
+	}
+	view.OnHover(true)
+	if state.visible || !state.pointerInside || state.hovered {
+		t.Fatalf("still-pointer hover = visible %v inside %v hovered %v, want inside without a thumb", state.visible, state.pointerInside, state.hovered)
+	}
+	if view.OnPointer(woxui.PointerEvent{Kind: woxui.PointerEnter, Position: woxui.Point{X: 10, Y: 10}}) {
+		t.Fatal("pointer enter should not consume the event")
+	}
+	if state.visible {
+		t.Fatal("pointer enter revealed the thumb under a still pointer")
+	}
+	if view.OnPointer(woxui.PointerEvent{Kind: woxui.PointerMove, Position: woxui.Point{X: 12, Y: 12}}) {
+		t.Fatal("pointer move should not consume the event")
+	}
+	if !state.visible || !state.pointerInside || state.hovered {
+		t.Fatalf("moved scroll = visible %v inside %v hovered %v, want a thin overlay thumb", state.visible, state.pointerInside, state.hovered)
+	}
+	stack := state.Build(woxwidget.StateContext{}, props).(woxwidget.Gesture).Child.(woxwidget.Stack)
+	thumb := stack.Children[1].Child.(woxwidget.Gesture)
+	animation := thumb.Child.(woxwidget.AnimatedFloat)
+	widthAnimation := animation.Builder(1).(woxwidget.AnimatedFloat)
+	if animation.Target != 1 || widthAnimation.Target != 3 {
+		t.Fatalf("view hover scrollbar = opacity %.0f width %.0f, want 1/3", animation.Target, widthAnimation.Target)
+	}
+
+	thumb.OnHover(true)
+	stack = state.Build(woxwidget.StateContext{}, props).(woxwidget.Gesture).Child.(woxwidget.Stack)
+	thumb = stack.Children[1].Child.(woxwidget.Gesture)
+	widthAnimation = thumb.Child.(woxwidget.AnimatedFloat).Builder(1).(woxwidget.AnimatedFloat)
+	if !state.hovered || widthAnimation.Target != 7 {
+		t.Fatalf("scrollbar hover = hovered %v width %.0f, want true/7", state.hovered, widthAnimation.Target)
+	}
+
+	thumb.OnHover(false)
+	if state.hovered || state.hideTimer != nil || !state.pointerInside {
+		t.Fatalf("left scrollbar = hovered %v timer %v inside %v, want a thin visible thumb", state.hovered, state.hideTimer, state.pointerInside)
+	}
+
+	view.OnHover(false)
+	if state.pointerInside || state.hideTimer == nil {
+		t.Fatalf("left scroll = inside %v timer %v, want a fade-out after leave", state.pointerInside, state.hideTimer)
+	}
+	state.Dispose()
+}
+
+func TestWoxScrollViewOpacityFollowsScrollActivity(t *testing.T) {
+	props := ScrollViewProps{Key: "test-scroll", Width: 100, Height: 80, ContentHeight: 160, ThumbColor: woxui.Color{A: 255}}
+	state := &scrollViewState{}
+	stack := state.Build(woxwidget.StateContext{}, props).(woxwidget.Gesture).Child.(woxwidget.Stack)
+	scrollbar := stack.Children[1]
+	if !scrollbar.AnchorRight || scrollbar.Right != 2 {
+		t.Fatalf("scrollbar anchor = %v right %.0f, want true/2", scrollbar.AnchorRight, scrollbar.Right)
+	}
+	animation := scrollbar.Child.(woxwidget.AnimatedFloat)
+	if animation.Target != 0 {
+		t.Fatalf("idle scrollbar opacity target = %.0f, want 0", animation.Target)
+	}
+
+	state.visible = true
+	stack = state.Build(woxwidget.StateContext{}, props).(woxwidget.Gesture).Child.(woxwidget.Stack)
+	animation = stack.Children[1].Child.(woxwidget.Gesture).Child.(woxwidget.AnimatedFloat)
+	widthAnimation := animation.Builder(0.5).(woxwidget.AnimatedFloat)
+	if animation.Target != 1 || widthAnimation.Target != 3 {
+		t.Fatalf("visible scrollbar = opacity %.0f width %.0f, want 1/3", animation.Target, widthAnimation.Target)
+	}
+
+	state.hovered = true
+	stack = state.Build(woxwidget.StateContext{}, props).(woxwidget.Gesture).Child.(woxwidget.Stack)
+	animation = stack.Children[1].Child.(woxwidget.Gesture).Child.(woxwidget.AnimatedFloat)
+	widthAnimation = animation.Builder(0.5).(woxwidget.AnimatedFloat)
+	thumb := widthAnimation.Builder(3).(woxwidget.Align).Child.(woxwidget.Container)
+	if animation.Target != 1 || widthAnimation.Target != 7 || thumb.Color.A != 75 {
+		t.Fatalf("active scrollbar = opacity %.0f width %.0f alpha %d, want 1/7/75", animation.Target, widthAnimation.Target, thumb.Color.A)
+	}
+	state.Dispose()
+}
+
+func TestWoxScrollViewScrollActionJumpsToOffset(t *testing.T) {
+	props := ScrollViewProps{Key: "scroll-action", Width: 100, Height: 80, ContentHeight: 200, AutomationID: "scroll-action", Label: "Notes"}
+	state := &scrollViewState{}
+	semantics := state.Build(woxwidget.StateContext{}, props).(woxwidget.Semantics)
+	if err := semantics.OnAction(woxui.AccessibilityActionScroll, "50"); err != nil {
+		t.Fatalf("scroll action: %v", err)
+	}
+	semantics = state.Build(woxwidget.StateContext{}, props).(woxwidget.Semantics)
+	if state.controller.Offset() != 50 || semantics.Value != "50/120" {
+		t.Fatalf("scroll action offset = %.0f value %q, want 50 and 50/120", state.controller.Offset(), semantics.Value)
+	}
+	state.Dispose()
+}
+
+func TestWoxScrollViewScrollActionRequiresLabel(t *testing.T) {
+	props := ScrollViewProps{Key: "scroll-unlabeled", Width: 100, Height: 80, ContentHeight: 200, AutomationID: "settings-page-scroll"}
+	state := &scrollViewState{}
+	semantics := state.Build(woxwidget.StateContext{}, props).(woxwidget.Semantics)
+	if len(semantics.Actions) != 0 || semantics.OnAction != nil {
+		t.Fatal("unlabeled scroll surface must stay non-interactive")
+	}
+	state.Dispose()
+}
+
+func TestWoxScrollViewCanKeepOverflowIndicatorVisible(t *testing.T) {
+	props := ScrollViewProps{Key: "persistent-scroll", Width: 100, Height: 80, ContentHeight: 160, ThumbColor: woxui.Color{A: 255}, AlwaysShowScrollbar: true, AutomationID: "persistent-scroll-state", Label: "Scroll position"}
+	state := &scrollViewState{}
+	semantics := state.Build(woxwidget.StateContext{}, props).(woxwidget.Semantics)
+	view := semantics.Child.(woxwidget.Gesture)
+	stack := view.Child.(woxwidget.Stack)
+	thumb := stack.Children[1].Child.(woxwidget.Gesture)
+	animation := thumb.Child.(woxwidget.AnimatedFloat)
+	if !view.OnScrollHandled(woxui.Point{Y: -20}) {
+		t.Fatal("scroll within the viewport should be handled")
+	}
+	semantics = state.Build(woxwidget.StateContext{}, props).(woxwidget.Semantics)
+	if animation.Target != 1 || state.controller.Offset() != 20 || semantics.AutomationID != "persistent-scroll-state" || semantics.Value != "20/80" {
+		t.Fatalf("persistent scrollbar = opacity %.0f offset %.0f automation %q value %q", animation.Target, state.controller.Offset(), semantics.AutomationID, semantics.Value)
+	}
+	state.Dispose()
+}
+
+func TestWoxScrollViewOwnsActivityHoverAndDrag(t *testing.T) {
+	scrolled := float32(0)
+	props := ScrollViewProps{Key: "test-scroll", Width: 100, Height: 80, ContentHeight: 160, OnScroll: func(delta float32) { scrolled += delta }}
+	state := &scrollViewState{}
+	view := state.Build(woxwidget.StateContext{}, props).(woxwidget.Gesture)
+	if view.OnScrollHandled(woxui.Point{Y: 20}) {
+		t.Fatal("top-boundary scroll should remain unhandled")
+	}
+	if state.visible || scrolled != 0 {
+		t.Fatalf("top-boundary scroll = visible %v delta %.0f, want false/0", state.visible, scrolled)
+	}
+	if !view.OnScrollHandled(woxui.Point{Y: -20}) {
+		t.Fatal("scroll within the viewport should be handled")
+	}
+	if !state.visible || scrolled != 20 || state.hideTimer == nil {
+		t.Fatalf("real scroll = visible %v delta %.0f timer %v, want true/20/non-nil", state.visible, scrolled, state.hideTimer)
+	}
+
+	stack := state.Build(woxwidget.StateContext{}, props).(woxwidget.Gesture).Child.(woxwidget.Stack)
+	thumb := stack.Children[1].Child.(woxwidget.Gesture)
+	thumb.OnHover(true)
+	thumb.OnPanStart(woxui.Point{Y: 10})
+	thumb.OnPanUpdate(woxui.Point{Y: 20})
+	if scrolled != 40 || !state.dragging || state.hideTimer != nil {
+		t.Fatalf("thumb drag = delta %.0f dragging %v timer %v, want 40/true/nil", scrolled, state.dragging, state.hideTimer)
+	}
+	thumb.OnHover(false)
+	thumb.OnPanEnd()
+	if state.dragging || state.hideTimer == nil {
+		t.Fatalf("ended drag = dragging %v timer %v, want false/non-nil", state.dragging, state.hideTimer)
+	}
+	state.Dispose()
+}
+
+func TestWoxScrollViewLeavesBottomBoundaryUnhandled(t *testing.T) {
+	applied := false
+	state := &scrollViewState{}
+	view := state.Build(woxwidget.StateContext{}, ScrollViewProps{
+		Key: "boundary-scroll", Width: 100, Height: 80, ContentHeight: 160, Offset: 80,
+		OnScroll: func(float32) { applied = true },
+	}).(woxwidget.Gesture)
+	handled := view.OnScrollHandled(woxui.Point{Y: -20})
+	if handled || applied {
+		t.Fatalf("bottom-boundary scroll = handled %v applied %v, want false/false", handled, applied)
+	}
+	state.Dispose()
+}
+
+func TestWoxScrollViewOwnsUncontrolledScrollController(t *testing.T) {
+	keepVisible := &woxwidget.ScrollRange{Start: 80, End: 120}
+	props := ScrollViewProps{Key: "catalog", Width: 100, Height: 80, ContentHeight: 160, KeepVisible: keepVisible}
+	state := &scrollViewState{}
+	state.InitState(woxwidget.StateContext{}, props)
+	stack := state.Build(woxwidget.StateContext{}, props).(woxwidget.Gesture).Child.(woxwidget.Stack)
+	scroll := stack.Children[0].Child.(woxwidget.ScrollView)
+
+	if scroll.Controller == nil || scroll.KeepVisible != keepVisible || scroll.OnOffsetChanged == nil || scroll.ID != "catalog-viewport" {
+		t.Fatalf("uncontrolled scroll = controller %p keep visible %p callback %v id %q, want retained shared ownership", scroll.Controller, scroll.KeepVisible, scroll.OnOffsetChanged != nil, scroll.ID)
+	}
+	state.Dispose()
+}
+
+func TestWoxScrollViewAcceptsRetainedScrollController(t *testing.T) {
+	controller := woxwidget.NewScrollController(0)
+	reportedOffset := float32(0)
+	props := ScrollViewProps{
+		Key: "controlled", Width: 100, Height: 80, ContentHeight: 160, Controller: controller,
+		OnOffsetChanged: func(offset float32) { reportedOffset = offset },
+	}
+	state := &scrollViewState{}
+	stack := state.Build(woxwidget.StateContext{}, props).(woxwidget.Gesture).Child.(woxwidget.Stack)
+	scroll := stack.Children[0].Child.(woxwidget.ScrollView)
+
+	if scroll.Controller != controller || scroll.OnOffsetChanged == nil {
+		t.Fatalf("retained controller = %p callback %v, want %p/non-nil", scroll.Controller, scroll.OnOffsetChanged != nil, controller)
+	}
+	scroll.OnOffsetChanged(20)
+	if !state.visible || state.hideTimer == nil || reportedOffset != 20 {
+		t.Fatalf("controller activity = visible %v timer %v offset %.0f, want true/non-nil/20", state.visible, state.hideTimer, reportedOffset)
+	}
+	state.Dispose()
+}
+
+func TestWoxScrollViewShowsForControlledOffsetMovement(t *testing.T) {
+	state := &scrollViewState{}
+	oldProps := ScrollViewProps{Height: 80, ContentHeight: 160}
+	newProps := oldProps
+	newProps.Offset = 20
+	state.DidUpdateWidget(woxwidget.StateContext{}, oldProps, newProps)
+	if !state.visible || state.hideTimer == nil {
+		t.Fatalf("controlled offset movement = visible %v timer %v, want true/non-nil", state.visible, state.hideTimer)
+	}
+	state.Dispose()
+}
+
+func TestWoxScrollViewRemeasuresChangedViewport(t *testing.T) {
+	state := &scrollViewState{hasGeometry: true, viewportExtent: 80, contentExtent: 160}
+	oldProps := ScrollViewProps{Height: 80}
+	newProps := ScrollViewProps{Height: 100}
+
+	state.DidUpdateWidget(woxwidget.StateContext{}, oldProps, newProps)
+
+	if state.hasGeometry {
+		t.Fatal("changed viewport should discard measured scroll geometry")
+	}
+}
+
+func TestWoxScrollViewKeepsExternalOffsetDeclarative(t *testing.T) {
+	props := ScrollViewProps{Key: "launcher-results", Width: 100, Height: 80, ContentHeight: 160, Offset: 20, OnScroll: func(float32) {}}
+	state := &scrollViewState{}
+	scroll := state.Build(woxwidget.StateContext{}, props).(woxwidget.Gesture).Child.(woxwidget.Stack).Children[0].Child.(woxwidget.ScrollView)
+	if scroll.Key != "" || scroll.Controller != nil || scroll.Offset != 20 {
+		t.Fatalf("external viewport = key %q controller %p offset %.0f, want unretained nil/20", scroll.Key, scroll.Controller, scroll.Offset)
+	}
+
+	props.Offset = 60
+	scroll = state.Build(woxwidget.StateContext{}, props).(woxwidget.Gesture).Child.(woxwidget.Stack).Children[0].Child.(woxwidget.ScrollView)
+	if scroll.Offset != 60 {
+		t.Fatalf("updated external viewport offset = %.0f, want 60", scroll.Offset)
+	}
+	state.Dispose()
+}
+
+func TestWoxScrollViewUsesCallerKeyForInteractionIDs(t *testing.T) {
+	props := ScrollViewProps{Key: "settings-search", Width: 100, Height: 80, ContentHeight: 160}
+	state := &scrollViewState{visible: true}
+	view := state.Build(woxwidget.StateContext{}, props).(woxwidget.Gesture)
+	stack := view.Child.(woxwidget.Stack)
+	thumb := stack.Children[1].Child.(woxwidget.Gesture)
+
+	if view.ID != "settings-search" || thumb.ID != "settings-search-scrollbar" {
+		t.Fatalf("scroll interaction ids = %q/%q, want caller-scoped ids", view.ID, thumb.ID)
+	}
+	state.Dispose()
+}
+
+func TestWoxScrollViewCanHideScrollbarWithoutDisablingScroll(t *testing.T) {
+	props := ScrollViewProps{Key: "hidden-scrollbar", Width: 100, Height: 80, ContentHeight: 160, HideScrollbar: true}
+	state := &scrollViewState{}
+	state.InitState(woxwidget.StateContext{}, props)
+	view := state.Build(woxwidget.StateContext{}, props).(woxwidget.Gesture)
+	if !view.OnScrollHandled(woxui.Point{Y: -20}) {
+		t.Fatal("scroll with a hidden scrollbar should still be handled")
+	}
+	stack := view.Child.(woxwidget.Stack)
+
+	if state.controller.Offset() != 20 || len(stack.Children) != 1 || state.visible || state.hideTimer != nil {
+		t.Fatalf("hidden scrollbar = offset %.0f children %d visible %v timer %v, want 20/1/false/nil", state.controller.Offset(), len(stack.Children), state.visible, state.hideTimer)
+	}
+	state.Dispose()
+}
+
+func TestWoxScrollViewUsesMeasuredContentExtent(t *testing.T) {
+	geometryCalls := 0
+	measuredViewport := float32(0)
+	measuredContent := float32(0)
+	props := ScrollViewProps{Key: "measured-scroll", Width: 100, Height: 80, ThumbColor: woxui.Color{A: 255}, OnGeometryChanged: func(viewport, content float32) {
+		geometryCalls++
+		measuredViewport = viewport
+		measuredContent = content
+	}}
+	if _, ok := WoxScrollView(props).(woxwidget.Stateful); !ok {
+		t.Fatal("scroll view without a content-height hint should retain measured geometry")
+	}
+
+	state := &scrollViewState{}
+	state.InitState(woxwidget.StateContext{}, props)
+	initial := state.Build(woxwidget.StateContext{}, props).(woxwidget.Gesture).Child.(woxwidget.Stack)
+	if len(initial.Children) != 1 {
+		t.Fatalf("initial measured scroll children = %d, want viewport only", len(initial.Children))
+	}
+	viewport := initial.Children[0].Child.(woxwidget.ScrollView)
+	viewport.OnGeometryChanged(80, 160)
+	viewport.OnGeometryChanged(80, 160)
+
+	measured := state.Build(woxwidget.StateContext{}, props).(woxwidget.Gesture).Child.(woxwidget.Stack)
+	if len(measured.Children) != 2 || geometryCalls != 1 || measuredViewport != 80 || measuredContent != 160 {
+		t.Fatalf("measured scroll = children %d calls %d geometry %.0f/%.0f, want 2/1/80/160", len(measured.Children), geometryCalls, measuredViewport, measuredContent)
+	}
+	state.Dispose()
+}
+
+func TestWoxScrollUnderlayPreservesUsableViewport(t *testing.T) {
+	props := ScrollViewProps{
+		Key: "footer-underlay", Width: 300, Height: 200, ContentHeight: 600, UnderlayHeight: 40,
+		Offset: 400, OnScroll: func(float32) {},
+	}
+	view := buildWoxScrollView(woxwidget.StateContext{}, props, nil).(woxwidget.Gesture)
+	stack := view.Child.(woxwidget.Stack)
+	scroll := stack.Children[0].Child.(woxwidget.ScrollView)
+	if stack.Height != 240 || scroll.Height != 240 || scroll.ContentHeight != 640 || scroll.Offset != 400 {
+		t.Fatalf("underlay geometry = stack %v scroll %+v", stack.Height, scroll)
+	}
+	if scrollOffset(props, 100) != 400 || scrollAxisViewport(props) != 200 {
+		t.Fatal("footer changed the usable scroll range")
+	}
+	thumb := stack.Children[1]
+	if thumb.Top >= 200 {
+		t.Fatal("scrollbar moved underneath the footer")
+	}
+}

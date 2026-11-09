@@ -1,0 +1,209 @@
+#import <Cocoa/Cocoa.h>
+#import <Foundation/Foundation.h>
+
+static NSInteger lastChangeCount = 0;
+
+long long GetClipboardChangeCount() {
+    return (long long)[[NSPasteboard generalPasteboard] changeCount];
+}
+
+_Bool hasClipboardChanged() {
+    NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
+    NSInteger currentChangeCount = [pasteboard changeCount];
+
+    if (currentChangeCount != lastChangeCount) {
+        lastChangeCount = currentChangeCount;
+        return 1;
+    }
+
+    return 0;
+}
+
+// GetClipboardContentType returns 0=empty, 1=text, 2=image, 3=file
+int GetClipboardContentType() {
+    NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
+
+    // Remote URLs such as Safari address-bar copies are also readable as NSURL.
+    // Restrict this branch to file URLs so their accompanying text stays text.
+    if ([pasteboard availableTypeFromArray:@[NSPasteboardTypeFileURL]] != nil) {
+        return 3;
+    }
+
+    // Check for image types
+    NSArray *imageTypes = [NSArray arrayWithObjects:NSPasteboardTypePNG, NSPasteboardTypeTIFF, nil];
+    if ([pasteboard availableTypeFromArray:imageTypes] != nil) {
+        return 2;
+    }
+
+    // Check for text
+    if ([pasteboard availableTypeFromArray:[NSArray arrayWithObject:NSPasteboardTypeString]] != nil) {
+        return 1;
+    }
+
+    return 0;
+}
+
+const char* GetClipboardText() {
+    @try {
+        NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
+        NSString *string = [pasteboard stringForType:NSPasteboardTypeString];
+
+        if (string != nil) {
+            return [string UTF8String];
+        } else {
+            return NULL;
+        }
+    }
+    @catch (NSException *exception) {
+        NSLog(@"Exception occurred: %@, %@", exception, [exception userInfo]);
+        return NULL;
+    }
+}
+
+char* GetAllClipboardFilePaths() {
+    @try {
+        NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
+        NSArray *classArray = [NSArray arrayWithObject:[NSURL class]];
+        NSDictionary *options = @{NSPasteboardURLReadingFileURLsOnlyKey: @YES};
+
+        if ([pasteboard availableTypeFromArray:@[NSPasteboardTypeFileURL]] == nil) {
+            return NULL; // No file in clipboard
+        }
+
+        NSArray *urls = [pasteboard readObjectsForClasses:classArray options:options];
+        if (urls == nil || [urls count] == 0) {
+            return NULL;
+        }
+
+        NSMutableString *allPaths = [[NSMutableString alloc] init];
+        for (NSURL *url in urls) {
+            [allPaths appendString:[url path]];
+            [allPaths appendString:@"\n"];
+        }
+
+        return strdup([allPaths UTF8String]);
+    }
+    @catch (NSException *exception) {
+        NSLog(@"Exception occurred: %@, %@", exception, [exception userInfo]);
+        return NULL;
+    }
+}
+
+unsigned char *GetClipboardImage(size_t *length) {
+    @try {
+        NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
+        NSImage *image = [[NSImage alloc] initWithPasteboard:pasteboard];
+        if (image == nil) {
+            return NULL;
+        }
+
+        NSData *tiffData = [image TIFFRepresentation];
+        NSBitmapImageRep *imageRep = [NSBitmapImageRep imageRepWithData:tiffData];
+        NSDictionary *imageProps = [NSDictionary dictionaryWithObject:[NSNumber numberWithFloat:1.0] forKey:NSImageCompressionFactor];
+        NSData *pngData = [imageRep representationUsingType:NSBitmapImageFileTypePNG properties:imageProps];
+
+        *length = [pngData length];
+        unsigned char *bytes = (unsigned char *)malloc(*length);
+        memcpy(bytes, [pngData bytes], *length);
+
+        return bytes;
+    }
+    @catch (NSException *exception) {
+        NSLog(@"Exception occurred: %@, %@", exception, [exception userInfo]);
+        return NULL;
+    }
+}
+
+unsigned char *GetClipboardImageSnapshot(size_t *length) {
+    @try {
+        NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
+        // Preserve encoded bytes; Go validates dimensions before decoding off the UI thread.
+        NSData *imageData = [pasteboard dataForType:NSPasteboardTypePNG];
+        if (imageData == nil) {
+            imageData = [pasteboard dataForType:NSPasteboardTypeTIFF];
+        }
+        if (imageData == nil) {
+            imageData = [pasteboard dataForType:@"public.jpeg"];
+        }
+        if (imageData == nil) {
+            imageData = [pasteboard dataForType:@"com.compuserve.gif"];
+        }
+        if (imageData == nil) {
+            return NULL;
+        }
+        *length = [imageData length];
+        unsigned char *bytes = (unsigned char *)malloc(*length);
+        if (bytes == NULL) {
+            return NULL;
+        }
+        memcpy(bytes, [imageData bytes], *length);
+
+        return bytes;
+    }
+    @catch (NSException *exception) {
+        return NULL;
+    }
+}
+
+void WriteClipboardText(const char *text) {
+    NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
+    [pasteboard clearContents];
+    NSString *string = [NSString stringWithUTF8String:text];
+    [pasteboard setString:string forType:NSPasteboardTypeString];
+}
+
+void WriteClipboardFiles(const char **filePaths, int count) {
+    NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
+    [pasteboard clearContents];
+
+    NSMutableArray *urls = [NSMutableArray arrayWithCapacity:count];
+    for (int i = 0; i < count; i++) {
+        if (filePaths[i] == NULL) {
+            continue;
+        }
+
+        NSString *path = [NSString stringWithUTF8String:filePaths[i]];
+        if (path == nil || [path length] == 0) {
+            continue;
+        }
+
+        NSURL *url = [NSURL fileURLWithPath:path];
+        if (url != nil) {
+            [urls addObject:url];
+        }
+    }
+
+    if ([urls count] > 0) {
+        [pasteboard writeObjects:urls];
+    }
+}
+
+void WriteClipboardAnimatedGIF(const char *filePath, const unsigned char *gifData, int gifLen) {
+    if (filePath == NULL) {
+        return;
+    }
+
+    NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
+    [pasteboard clearContents];
+
+    NSString *path = [NSString stringWithUTF8String:filePath];
+    if (path != nil && [path length] > 0) {
+        NSURL *url = [NSURL fileURLWithPath:path];
+        if (url != nil) {
+            [pasteboard writeObjects:@[url]];
+        }
+    }
+
+    if (gifData != NULL && gifLen > 0) {
+        NSData *data = [NSData dataWithBytes:gifData length:gifLen];
+        [pasteboard setData:data forType:@"com.compuserve.gif"];
+    }
+}
+
+void WriteClipboardImage(const char *imageData, int length) {
+    NSData *data = [NSData dataWithBytes:imageData length:length];
+    NSImage *image = [[NSImage alloc] initWithData:data];
+    NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
+    [pasteboard clearContents];
+    [pasteboard writeObjects:@[image]];
+}

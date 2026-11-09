@@ -1,0 +1,489 @@
+package component
+
+import (
+	"testing"
+
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+)
+
+// TestDemoEditorGeometry keeps explicit zero corners and asymmetric spacing visible in the editor.
+func TestDemoEditorGeometry(t *testing.T) {
+	zero := 0
+	geometry := &LauncherDemoGeometry{AppPadding: woxwidget.Insets{Left: 2, Top: 4, Right: 6, Bottom: 8}, ResultPadding: woxwidget.Insets{Left: 3, Top: 5, Right: 7}, ItemPadding: woxwidget.Insets{Left: 9, Top: 2, Right: 11, Bottom: 4}, ActionPadding: woxwidget.Insets{Left: 2, Top: 3, Right: 4, Bottom: 5}, ToolbarPadding: woxwidget.Insets{Left: 7, Right: 9}}
+	props := LauncherDemoProps{Width: 600, Height: 400, Opacity: 1, ShowQuery: true, ShowToolbar: true, Geometry: geometry, Theme: Theme{QuerySeparatorThickness: &zero, ResultItemActiveIndicatorWidth: &zero}, Results: []LauncherDemoResult{{Title: "Result"}}}
+	demo := WoxLauncherDemo(props).(woxwidget.Clip).Child.(woxwidget.Stack)
+	query := demo.Children[2]
+	if query.Left != 2 || query.Top != 4 || query.Right != 6 || query.Child.(woxwidget.Container).Radius != 0 {
+		t.Fatal("query lost zero corners or asymmetric window padding")
+	}
+	rowSlot := demo.Children[3]
+	row := rowSlot.Child.(woxwidget.Container)
+	if rowSlot.Left != 5 || rowSlot.Right != 13 || rowSlot.Top != 64 || row.Padding != geometry.ItemPadding || row.Radius != 0 {
+		t.Fatal("result lost edited spacing or zero corners")
+	}
+	panel := demoActionPanel(props, 300, 220, 255).(woxwidget.Container)
+	if panel.Padding != geometry.ActionPadding {
+		t.Fatal("action padding ignored")
+	}
+	children := panel.Child.(woxwidget.Flex).Children
+	actionQuery := children[len(children)-1].(woxwidget.Container).Child.(woxwidget.Container)
+	if actionQuery.Radius != 0 {
+		t.Fatal("action query zero corners ignored")
+	}
+	toolbar := demoToolbar(props, 40, 12, 255).(woxwidget.Container).Child.(woxwidget.Clip).Child.(woxwidget.Stack)
+	if toolbar.Children[2].Child.(woxwidget.Container).Padding != geometry.ToolbarPadding {
+		t.Fatal("toolbar padding ignored")
+	}
+}
+
+func TestDemoCustomChromePreservesAlpha(t *testing.T) {
+	for _, alpha := range []uint8{0, 128, 255} {
+		background := woxui.Color{R: 23, G: 42, B: 61, A: alpha}
+		demo := WoxLauncherDemo(LauncherDemoProps{Width: 600, Height: 400, Opacity: 1, Background: background, Theme: Theme{AppWindowChrome: true, Background: background}}).(woxwidget.Clip).Child.(woxwidget.Stack)
+		if tint := demo.Children[1].Child.(woxwidget.Container).Color; tint != background {
+			t.Fatalf("custom chrome tint = %+v, want %+v", tint, background)
+		}
+	}
+}
+
+// TestDemoToolbarHotkeyHighlight confines locator overlays to individual keycaps.
+// TestDemoCustomChromeCorners keeps omitted and explicit radii consistent with the native window.
+func TestDemoCustomChromeCorners(t *testing.T) {
+	zero, rounded := 0, 28
+	for _, radius := range []*int{nil, &zero, &rounded} {
+		demo := WoxLauncherDemo(LauncherDemoProps{
+			Width: 400, Height: 240, Opacity: 1, ShowToolbar: true,
+			Theme: Theme{AppWindowChrome: true, AppBorderRadius: radius},
+		}).(woxwidget.Clip)
+		children := demo.Child.(woxwidget.Stack).Children
+		want := woxui.DefaultWindowCornerRadius
+		if radius != nil {
+			want = float32(*radius)
+		}
+		border := children[len(children)-1].Child.(woxwidget.Container)
+		want = min(want, min(border.Width, border.Height)/2)
+		if border.Radius != want {
+			t.Fatalf("preview radius = %g, want %g", border.Radius, want)
+		}
+	}
+}
+
+func TestDemoToolbarHotkeyHighlight(t *testing.T) {
+	flash := woxui.Color{R: 255, A: 255}
+	for _, target := range []LauncherDemoHighlightTarget{LauncherDemoHighlightNone, LauncherDemoHighlightHotkey} {
+		toolbar := demoToolbar(LauncherDemoProps{Width: 600, HighlightTarget: target, HighlightColor: flash}, 40, 12, 255).(woxwidget.Container)
+		content := toolbar.Child.(woxwidget.Clip).Child.(woxwidget.Stack).Children[2].Child.(woxwidget.Container).Child.(woxwidget.Align).Child.(woxwidget.Flex)
+		for index, child := range content.Children {
+			keycap := index == 1 || index == 4 || index == 5
+			overlay, highlighted := child.(woxwidget.Stack)
+			if highlighted != (keycap && target == LauncherDemoHighlightHotkey) {
+				t.Fatalf("target %v: unexpected highlight on child %d", target, index)
+			}
+			if highlighted {
+				cap := overlay.Children[0].Child.(woxwidget.Container)
+				border := overlay.Children[1].Child.(woxwidget.Container)
+				if overlay.Width != cap.Width || overlay.Height != cap.Height || border.BorderColor != flash {
+					t.Fatal("hotkey highlight must follow the keycap bounds")
+				}
+			}
+		}
+	}
+}
+
+// TestDemoActionDividerHighlight makes even a transparent divider discoverable without changing layout.
+func TestDemoActionDividerHighlight(t *testing.T) {
+	transparent := woxui.Color{}
+	flash := woxui.Color{R: 255, G: 100, A: 255}
+	props := LauncherDemoProps{Theme: Theme{ActionContainerDividerColor: &transparent}, HighlightTarget: LauncherDemoHighlightActionDivider, HighlightColor: flash}
+	panel := demoActionPanel(props, 300, 200, 255).(woxwidget.Container)
+	highlight := panel.Child.(woxwidget.Flex).Children[1].(woxwidget.Stack)
+	line := highlight.Children[0].Child.(woxwidget.Align).Child.(woxwidget.Container)
+	overlay := highlight.Children[1].Child.(woxwidget.Container)
+	if highlight.Height != demoActionHeaderGap || line.Color != transparent || overlay.BorderColor != flash || overlay.BorderWidth != 2 {
+		t.Fatal("divider highlight lost geometry, alpha or visible outline")
+	}
+}
+
+// TestDemoActionPanelBorder preserves edge opacity and explicit width in previews.
+func TestDemoActionPanelBorder(t *testing.T) {
+	color := woxui.Color{R: 80, G: 150, B: 100, A: 90}
+	for _, width := range []float32{0, 1, 2} {
+		panel := demoActionPanel(LauncherDemoProps{Theme: Theme{ActionBorder: color, ActionBorderWidth: width, ActionContainerRadius: 12, ActionItemRadius: 6}}, 300, 200, 128).(woxwidget.Container)
+		row := panel.Child.(woxwidget.Flex).Children[2].(woxwidget.Container)
+		if !panel.Floating {
+			t.Fatal("action preview must use the live panel's frosted material")
+		}
+		if panel.Radius != 12 || row.Radius != 6 {
+			t.Fatalf("preview radii = %v/%v", panel.Radius, row.Radius)
+		}
+		if panel.BorderWidth != width || panel.BorderColor != demoColorOpacity(color, float32(128)/255) {
+			t.Fatalf("width %v: unexpected preview border %#v", width, panel)
+		}
+	}
+}
+
+// TestDemoToolbarIndependentDivider checks the same theme geometry and alpha as production.
+func TestDemoToolbarIndependentDivider(t *testing.T) {
+	for _, width := range []float32{0, 2} {
+		color := woxui.Color{R: 40, G: 100, B: 80, A: 80}
+		props := LauncherDemoProps{Width: 600, Opacity: 0.5, Theme: Theme{ToolbarBorder: color, ToolbarBorderWidth: width}}
+		toolbar := demoToolbar(props, 40, 12, 128).(woxwidget.Container)
+		divider := toolbar.Child.(woxwidget.Clip).Child.(woxwidget.Stack).Children[1].Child.(woxwidget.Painter)
+		if divider.Height != width {
+			t.Fatalf("divider height = %v, want %v", divider.Height, width)
+		}
+		actual, expected := &woxui.DisplayList{}, &woxui.DisplayList{}
+		bounds := woxui.Rect{Width: 600, Height: width}
+		divider.Paint(actual, bounds)
+		if width > 0 {
+			expected.FillRect(bounds, demoColorOpacity(color, 0.5))
+		}
+		if err := actual.Compare(expected); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestDemoResultActiveLeftBorder keeps theme previews consistent with launcher selection.
+func TestDemoResultActiveLeftBorder(t *testing.T) {
+	color := woxui.Color{R: 40, G: 160, A: 255}
+	for _, selected := range []bool{false, true} {
+		row := demoResultRow(LauncherDemoProps{Theme: Theme{SelectedBorderLeftWidth: 4, SelectedBorderLeftColor: color, Cursor: woxui.Color{A: 255}}}, LauncherDemoResult{Title: "Title", Selected: selected}, 300, 56, 128).(woxwidget.Container)
+		want := float32(0)
+		if selected {
+			want = 4
+		}
+		if row.LeftBorderWidth != want || (selected && row.LeftBorderColor != demoColorOpacity(color, float32(128)/255)) {
+			t.Fatalf("selected=%t: unexpected preview border %#v", selected, row)
+		}
+	}
+}
+
+func TestWoxLauncherDemoOwnsSharedWindowChrome(t *testing.T) {
+	backdrop := &woxui.Image{}
+	demo := WoxLauncherDemo(LauncherDemoProps{
+		Width: 400, Height: 240, Backdrop: backdrop, Background: woxui.Color{A: 180}, Opacity: 1, ShowQuery: true, ShowToolbar: true,
+		Theme: Theme{QueryText: woxui.Color{A: 255}, PreviewSplit: woxui.Color{A: 90}}, Query: "query",
+		Results: []LauncherDemoResult{{Title: "result"}},
+	}).(woxwidget.Clip)
+	children := demo.Child.(woxwidget.Stack).Children
+
+	if image := children[0].Child.(woxwidget.Image); image.Source != backdrop || image.Fit != woxwidget.ImageFitCover {
+		t.Fatalf("launcher demo backdrop = %#v, want covered wallpaper crop", children[0].Child)
+	}
+	border := children[len(children)-1].Child.(woxwidget.Container)
+	if border.Radius != 12 || border.BorderWidth != 1 {
+		t.Fatalf("launcher demo border = %#v, want shared 12px window chrome", border)
+	}
+	toolbar := children[len(children)-2].Child.(woxwidget.Container).Child.(woxwidget.Clip)
+	fill := toolbar.Child.(woxwidget.Stack).Children[0]
+	if fill.Top != -12 {
+		t.Fatalf("toolbar fill top = %v, want the rounded material extended above the footer clip", fill.Top)
+	}
+	if box := fill.Child.(woxwidget.Container); !box.Floating || box.Radius != 12 || box.Height != toolbar.Height+12 {
+		t.Fatalf("toolbar fill = %#v, want floating material clipped to the 12px window corners", box)
+	}
+}
+
+func TestWoxLauncherDemoKeepsThemedChromeWhileFading(t *testing.T) {
+	backdrop := &woxui.Image{Width: 10, Height: 10}
+	background := woxui.Color{R: 22, G: 22, B: 26, A: 180}
+	fading := WoxLauncherDemo(LauncherDemoProps{
+		Width: 400, Height: 240, Backdrop: backdrop, Background: background, ShowQuery: true, ShowToolbar: true,
+		Theme: Theme{QueryText: woxui.Color{A: 255}, Background: background}, Query: "query", Opacity: .4,
+	}).(woxwidget.Clip)
+	children := fading.Child.(woxwidget.Stack).Children
+	if image := children[0].Child.(woxwidget.Image); image.Source != backdrop {
+		t.Fatal("fading demo dropped the blurred wallpaper underlay")
+	}
+	if mica := children[1].Child.(woxwidget.Container); mica.Color.A != demoMicaColor(background).A {
+		t.Fatalf("fading mica alpha = %d, want rest chrome so the window does not punch through the previous scene", mica.Color.A)
+	}
+}
+
+func TestWoxLauncherDemoKeepsQuietWindowHairline(t *testing.T) {
+	glass := launcherDemoBorderColor(t, woxui.Color{R: 255, G: 255, B: 255, A: 41})
+	if glass != (woxui.Color{R: 255, G: 255, B: 255, A: 41}) {
+		t.Fatalf("glass hairline = %#v, want the theme's 0.16 white split", glass)
+	}
+	opaque := launcherDemoBorderColor(t, woxui.Color{R: 255, G: 255, B: 255, A: 255})
+	if opaque.A != demoWindowBorderMaxAlpha {
+		t.Fatalf("opaque split alpha = %d, want capped window chrome %d", opaque.A, demoWindowBorderMaxAlpha)
+	}
+}
+
+func launcherDemoBorderColor(t *testing.T, split woxui.Color) woxui.Color {
+	t.Helper()
+	demo := WoxLauncherDemo(LauncherDemoProps{
+		Width: 400, Height: 180, Opacity: 1, ShowQuery: true, Theme: Theme{PreviewSplit: split}, Query: "query",
+	}).(woxwidget.Clip)
+	children := demo.Child.(woxwidget.Stack).Children
+	return children[len(children)-1].Child.(woxwidget.Container).BorderColor
+}
+
+func TestWoxLauncherDemoCentersResultContent(t *testing.T) {
+	row := demoResultRow(LauncherDemoProps{Theme: Theme{}}, LauncherDemoResult{Title: "Result", Subtitle: "Subtitle", Tail: "P1"}, 400, 56, 255).(woxwidget.Container)
+	content := row.Child.(woxwidget.Flex)
+	text := content.Children[1].(woxwidget.Clip).Child.(woxwidget.Align)
+	icon := content.Children[0].(woxwidget.Align)
+	tail := content.Children[2].(woxwidget.Align)
+
+	if row.Width != 400 || row.Height != 56 || row.Padding.Top != 3 || icon.Height != 50 || text.Height != 50 || tail.Height != 50 || text.Vertical != .5 {
+		t.Fatalf("result alignment = %#v, want vertically centered shared row", content)
+	}
+}
+
+func TestWoxLauncherDemoResultTailPadsHorizontalText(t *testing.T) {
+	row := demoResultRow(LauncherDemoProps{Theme: Theme{}}, LauncherDemoResult{Title: "Result", Tail: "已就绪"}, 400, 56, 255).(woxwidget.Container)
+	tail := row.Child.(woxwidget.Flex).Children[2].(woxwidget.Align).Child.(woxwidget.Container)
+	inner := tail.Child.(woxwidget.Align)
+	if tail.Padding.Left != 7 || tail.Padding.Right != 7 || tail.Width != 47 || inner.Width != 33 {
+		t.Fatalf("result tail = width %v padding %#v inner %v, want 7px inset around CJK text", tail.Width, tail.Padding, inner.Width)
+	}
+}
+
+func TestWoxLauncherDemoKeepsQueryPartsAdjacent(t *testing.T) {
+	query := demoQuery(LauncherDemoProps{Opacity: 1, QueryParts: []LauncherDemoQueryPart{
+		{Text: "wpm", Color: woxui.Color{A: 255}}, {Text: " install", Color: woxui.Color{A: 255}},
+	}}, 55, 255).(woxwidget.Container)
+	querySlot := query.Child.(woxwidget.Flex).Children[0].(woxwidget.Expanded).Child.(woxwidget.Align)
+	parts := querySlot.Child.(woxwidget.Flex)
+
+	if _, firstIsText := parts.Children[0].(woxwidget.Text); !firstIsText {
+		t.Fatalf("query part = %T, want directly measured text", parts.Children[0])
+	}
+	if _, secondIsText := parts.Children[1].(woxwidget.Text); !secondIsText {
+		t.Fatalf("query part = %T, want adjacent directly measured text", parts.Children[1])
+	}
+	if parts.CrossAxisAlignment != woxwidget.CrossAxisCenter || parts.Children[0].(woxwidget.Text).Style.Size != QueryFontSize {
+		t.Fatalf("query alignment = %#v, want production query typography and centerline", parts)
+	}
+	if querySlot.Height != 55 || querySlot.Vertical != .5 {
+		t.Fatalf("query slot alignment = %#v, want full-height vertical center", querySlot)
+	}
+}
+
+func TestWoxLauncherDemoCollapsesFadedResults(t *testing.T) {
+	results := []LauncherDemoResult{{Title: "One"}, {Title: "Two"}, {Title: "Three"}}
+	hidden := WoxLauncherDemo(LauncherDemoProps{
+		Width: 400, Height: 260, Opacity: 1, ShowQuery: true, ShowToolbar: true,
+		FadeResults: true, ResultsOpacity: 0, Results: results,
+	}).(woxwidget.Clip)
+	shown := WoxLauncherDemo(LauncherDemoProps{
+		Width: 400, Height: 260, Opacity: 1, ShowQuery: true, ShowToolbar: true,
+		FadeResults: true, ResultsOpacity: 1, Results: results,
+	}).(woxwidget.Clip)
+
+	if hidden.Height != 113 {
+		t.Fatalf("collapsed faded demo height = %.0f, want query plus toolbar only", hidden.Height)
+	}
+	if shown.Height <= hidden.Height {
+		t.Fatalf("visible demo height = %.0f, collapsed height = %.0f, want results to grow the window", shown.Height, hidden.Height)
+	}
+}
+
+func TestWoxLauncherDemoUsesProductionLauncherGeometry(t *testing.T) {
+	demo := WoxLauncherDemo(LauncherDemoProps{
+		Width: 600, Height: 320, Opacity: 1, ShowQuery: true, ShowToolbar: true,
+		Results: []LauncherDemoResult{{Title: "Result"}},
+	}).(woxwidget.Clip)
+	children := demo.Child.(woxwidget.Stack).Children
+	query := children[2]
+	result := children[3]
+
+	if query.Left != 10 || query.Top != 10 || result.Left != 10 || result.Top != 73 || result.Child.(woxwidget.Container).Height != 56 {
+		t.Fatalf("launcher geometry = query %.0f/%.0f result %.0f/%.0f/%.0f", query.Left, query.Top, result.Left, result.Top, result.Child.(woxwidget.Container).Height)
+	}
+}
+
+func TestWoxLauncherDemoUsesAuthoredQueryGeometry(t *testing.T) {
+	demo := WoxLauncherDemo(LauncherDemoProps{
+		Width: 600, Height: 320, Opacity: 1, ShowQuery: true, ShowToolbar: true,
+		Theme:   Theme{QueryRadius: 16, AppPadding: woxwidget.Insets{Left: 12, Top: 12, Right: 12, Bottom: 12}},
+		Results: []LauncherDemoResult{{Title: "Result"}},
+	}).(woxwidget.Clip)
+	children := demo.Child.(woxwidget.Stack).Children
+	query := children[2]
+	if query.Left != 12 || query.Top != 12 {
+		t.Fatalf("query inset = %.0f/%.0f, want authored AppPadding 12", query.Left, query.Top)
+	}
+	if box := query.Child.(woxwidget.Container); box.Radius != 16 {
+		t.Fatalf("query radius = %.0f, want authored QueryBoxBorderRadius 16", box.Radius)
+	}
+}
+
+func TestWoxLauncherDemoHonorsCatalogTypeOverrides(t *testing.T) {
+	query := demoQuery(LauncherDemoProps{Opacity: 1, Query: "Preview", QueryFontSize: 14}, 40, 255).(woxwidget.Container)
+	text := query.Child.(woxwidget.Flex).Children[0].(woxwidget.Expanded).Child.(woxwidget.Align).Child.(woxwidget.Text)
+	if query.Height != 40 || text.Style.Size != 14 {
+		t.Fatalf("catalog query = height %.0f size %.0f, want compact 40/14", query.Height, text.Style.Size)
+	}
+}
+
+func TestWoxLauncherDemoResultTailUsesTailColor(t *testing.T) {
+	subtitle := woxui.Color{R: 10, G: 20, B: 30, A: 255}
+	tail := woxui.Color{R: 200, G: 80, B: 40, A: 255}
+	selectedTail := woxui.Color{R: 40, G: 180, B: 90, A: 255}
+	theme := Theme{ResultSubtitle: subtitle, ResultTail: tail, SelectedTail: selectedTail}
+
+	normal := demoResultRow(LauncherDemoProps{Theme: theme}, LauncherDemoResult{Title: "Result", Subtitle: "Subtitle", Tail: "P1"}, 400, 56, 255).(woxwidget.Container)
+	if got := launcherDemoResultTailText(t, normal); got != tail {
+		t.Fatalf("unselected result tail color = %#v, want %#v", got, tail)
+	}
+	if got := launcherDemoResultSubtitleText(t, normal); got != subtitle {
+		t.Fatalf("result subtitle color = %#v, want %#v", got, subtitle)
+	}
+
+	selected := demoResultRow(LauncherDemoProps{Theme: theme}, LauncherDemoResult{Title: "Result", Subtitle: "Subtitle", Tail: "P1", Selected: true}, 400, 56, 255).(woxwidget.Container)
+	if got := launcherDemoResultTailText(t, selected); got != selectedTail {
+		t.Fatalf("selected result tail color = %#v, want %#v", got, selectedTail)
+	}
+}
+
+func launcherDemoResultTailText(t *testing.T, row woxwidget.Container) woxui.Color {
+	t.Helper()
+	tail := row.Child.(woxwidget.Flex).Children[2].(woxwidget.Align).Child.(woxwidget.Container)
+	return tail.Child.(woxwidget.Align).Child.(woxwidget.Text).Color
+}
+
+func launcherDemoResultSubtitleText(t *testing.T, row woxwidget.Container) woxui.Color {
+	t.Helper()
+	labels := row.Child.(woxwidget.Flex).Children[1].(woxwidget.Clip).Child.(woxwidget.Align).Child.(woxwidget.Flex)
+	return labels.Children[1].(woxwidget.Text).Color
+}
+
+func TestWoxLauncherDemoHighlightsSelectedResultTail(t *testing.T) {
+	row := demoResultRow(LauncherDemoProps{
+		Theme: Theme{}, HighlightTarget: LauncherDemoHighlightSelectedTail, HighlightColor: woxui.Color{A: 255},
+	}, LauncherDemoResult{Title: "Result", Tail: "Live", Selected: true}, 400, 56, 255).(woxwidget.Container)
+	tail := row.Child.(woxwidget.Flex).Children[2].(woxwidget.Align).Child.(woxwidget.Stack)
+	if overlay := tail.Children[1].Child.(woxwidget.Container); overlay.BorderWidth != 2 {
+		t.Fatalf("selected result tail highlight = %#v, want a local 2px highlight", overlay)
+	}
+}
+
+func TestWoxLauncherDemoHighlightsOnlyResultSubtitle(t *testing.T) {
+	row := demoResultRow(LauncherDemoProps{
+		Theme: Theme{}, HighlightTarget: LauncherDemoHighlightResultSubtitle, HighlightColor: woxui.Color{A: 255},
+	}, LauncherDemoResult{Title: "Result", Subtitle: "Subtitle"}, 400, 56, 255).(woxwidget.Container)
+	labels := row.Child.(woxwidget.Flex).Children[1].(woxwidget.Clip).Child.(woxwidget.Align).Child.(woxwidget.Flex)
+
+	if _, titleHighlighted := labels.Children[0].(woxwidget.Container); titleHighlighted {
+		t.Fatal("result title was highlighted while locating subtitle")
+	}
+	if subtitle, ok := labels.Children[1].(woxwidget.Container); !ok || subtitle.BorderWidth != 2 {
+		t.Fatalf("result subtitle highlight = %#v, want a local 2px highlight", labels.Children[1])
+	}
+}
+
+func TestWoxLauncherDemoPreservesTransparentThemeColors(t *testing.T) {
+	transparent := woxui.Color{R: 255, G: 255, B: 255}
+	if demoColorOpacity(transparent, 1).A != 0 {
+		t.Fatal("transparent demo color became opaque")
+	}
+	mica := demoMicaColor(woxui.Color{R: 22, G: 22, B: 26, A: 133})
+	if mica.A < 163 || mica.A > 219 {
+		t.Fatalf("demo mica alpha = %d, want 0.64-0.86", mica.A)
+	}
+}
+
+func TestWoxLauncherDemoActionRowsLeadWithIcons(t *testing.T) {
+	demo := WoxLauncherDemo(LauncherDemoProps{
+		Width: 400, Height: 280, Opacity: 1, ShowQuery: true, ShowToolbar: true, ActionProgress: 1,
+		Query: "query", ActionCopy: "Copy", ActionMore: "More",
+		Results: []LauncherDemoResult{{Title: "result"}},
+	}).(woxwidget.Clip)
+	children := demo.Child.(woxwidget.Stack).Children
+	panel := children[len(children)-2].Child.(woxwidget.Container)
+	rows := panel.Child.(woxwidget.Flex).Children
+	if len(rows) < 4 {
+		t.Fatalf("action panel children = %d, want header, divider, and two action rows", len(rows))
+	}
+	for index, row := range []woxwidget.Widget{rows[2], rows[3]} {
+		content := row.(woxwidget.Container).Child.(woxwidget.Stack).Children[0].Child.(woxwidget.Clip).Child.(woxwidget.Flex)
+		if len(content.Children) < 2 {
+			t.Fatalf("action row %d children = %d, want leading icon plus label", index, len(content.Children))
+		}
+		iconSlot := content.Children[0].(woxwidget.Align)
+		if iconSlot.Width != 37 || iconSlot.Height != 38 || iconSlot.Vertical != .5 {
+			t.Fatalf("action row %d icon align = %#v, want a 37x38 vertically centered slot", index, iconSlot)
+		}
+		icon, ok := iconSlot.Child.(woxwidget.Container).Child.(woxwidget.Image)
+		if !ok || icon.Source == nil || icon.Width != 22 || icon.Height != 22 {
+			t.Fatalf("action row %d icon = %#v, want the shared 22px action glyph", index, iconSlot.Child)
+		}
+		label := content.Children[1].(woxwidget.Align)
+		if label.Height != 38 || label.Vertical != .5 {
+			t.Fatalf("action row %d label align = %#v, want vertically centered in the row", index, label)
+		}
+	}
+}
+
+func TestWoxLauncherDemoActionPanelFitsActionRowsBelowQuery(t *testing.T) {
+	demo := WoxLauncherDemo(LauncherDemoProps{
+		Width: 600, Height: 320, Opacity: 1, ShowQuery: true, ShowToolbar: true, ActionProgress: 1,
+		Query: "query", Results: []LauncherDemoResult{{Title: "One"}, {Title: "Two"}, {Title: "Three"}},
+	}).(woxwidget.Clip)
+	children := demo.Child.(woxwidget.Stack).Children
+	slot := children[len(children)-2]
+	panel := slot.Child.(woxwidget.Container)
+	if panel.Height != demoActionPanelHeight() {
+		t.Fatalf("action panel height = %v, want content height %v for two actions", panel.Height, demoActionPanelHeight())
+	}
+	if slot.Top < 65 {
+		t.Fatalf("action panel top = %v, want to stay below the query box", slot.Top)
+	}
+}
+
+func TestWoxLauncherDemoReservesPreviewAboveToolbar(t *testing.T) {
+	demo := WoxLauncherDemo(LauncherDemoProps{
+		Width: 600, Height: 320, Opacity: 1, ShowQuery: true, ShowToolbar: true, ResultWidth: 350,
+		Preview: woxwidget.Container{Width: 234, Height: 201},
+		Results: []LauncherDemoResult{{Title: "One"}, {Title: "Two"}, {Title: "Three"}},
+	}).(woxwidget.Clip)
+	children := demo.Child.(woxwidget.Stack).Children
+	preview := children[len(children)-3]
+	toolbar := children[len(children)-2]
+	previewClip := preview.Child.(woxwidget.Clip)
+
+	if gap := toolbar.Top - (preview.Top + previewClip.Height); gap != 10 {
+		t.Fatalf("preview/toolbar gap = %.0f, want 10px app padding above the toolbar", gap)
+	}
+}
+
+func TestWoxLauncherDemoHidesPreviewUntilTypedQueryResultsFadeIn(t *testing.T) {
+	props := LauncherDemoProps{
+		Width: 600, Height: 320, Opacity: 1, ShowQuery: true, ShowToolbar: true, ResultWidth: 350,
+		Preview: woxwidget.Container{Width: 234, Height: 201}, FadeResults: true,
+		Results: []LauncherDemoResult{{Title: "One"}, {Title: "Two"}, {Title: "Three"}},
+	}
+	typing := WoxLauncherDemo(props).(woxwidget.Clip)
+	if typing.Height != 113 {
+		t.Fatalf("typed-query demo height before results = %.0f, want query plus toolbar", typing.Height)
+	}
+	props.ResultsOpacity = 1
+	done := WoxLauncherDemo(props).(woxwidget.Clip)
+	children := done.Child.(woxwidget.Stack).Children
+	if done.Height != 320 {
+		t.Fatalf("typed-query demo height after results = %.0f, want the preview pane", done.Height)
+	}
+	if _, ok := children[len(children)-3].Child.(woxwidget.Clip); !ok {
+		t.Fatal("typed-query demo dropped the preview after results appeared")
+	}
+}
+
+func TestDemoCornerLocatorKeepsContentAndUsesUnfilledPainter(t *testing.T) {
+	child := woxwidget.Container{Width: 100, Height: 40}
+	for _, radius := range []float32{0, 8, 100} {
+		result := demoHighlight(child, 100, 40, radius, true, woxui.Color{R: 255, A: 255}, true).(woxwidget.Stack)
+		if len(result.Children) != 2 {
+			t.Fatal("locator must preserve content and add one overlay")
+		}
+		painter, ok := result.Children[1].Child.(woxwidget.Painter)
+		if !ok || painter.Width != 100 || painter.Height != 40 {
+			t.Fatal("corner locator must not use a filled rectangle")
+		}
+		painter.Paint(&woxui.DisplayList{}, woxui.Rect{X: 10, Y: 20, Width: 100, Height: 40})
+	}
+}

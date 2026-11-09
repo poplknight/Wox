@@ -1,0 +1,84 @@
+package icons
+
+import "wox/common"
+
+// Action verbs opt into the appearance variable. The Action Panel then tints
+// only these SVGs to the row label color; brand and plugin icons stay authored.
+//
+// Glyphs are drawn on a 24 grid with a 2-unit stroke and keep roughly a 3-unit
+// margin so every verb reads at the same optical size. The panel renders them at
+// 22 logical px; a 2-unit stroke lands closer to whole device pixels there than
+// the previous 1.8, which softened straight edges on 100% displays.
+func newActionIcon(paths string) common.WoxImage {
+	return common.NewWoxImageSvg(`<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="var(--wox-theme-icon-color)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">` + paths + `</svg>`)
+}
+
+// keyboardActionIcon is shared by hotkey and alias verbs. The Action Panel lists
+// them together, so a missing spacebar on one of them reads as three inconsistent
+// keyboards instead of one mark.
+var keyboardActionIcon = newActionIcon(`<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M6 9h.01M9 9h.01M12 9h.01M15 9h.01M18 9h.01M6 13h.01M9 13h.01M12 13h6M8 16h8"/>`)
+
+var defaultActionIcons = map[string]common.WoxImage{
+	ActionNewWindow:            newActionIcon(`<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M12 12v5M9.5 14.5h5"/>`),
+	ActionHotkey:               keyboardActionIcon,
+	ActionFeedback:             newActionIcon(`<path d="M5 4h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-5 3v-3a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/><path d="M7 9h10M7 13h7"/>`),
+	ActionDebug:                newActionIcon(`<path d="m8 3 2 2m6-2-2 2M9 8V7a3 3 0 0 1 6 0v1M6 12H2m16 0h4M6 17H3l-1 3m16-3h3l1 3M7 9H4L2 6m15 3h3l2-3M12 12v9"/><rect x="6" y="8" width="12" height="13" rx="6"/>`),
+	ActionInstall:              newActionIcon(`<path d="M12 4v12M8 12l4 4 4-4M5 20h14"/>`),
+	ActionPin:                  newActionIcon(`<path d="m9 3 6 0-1 6 4 4H6l4-4zM12 13v6"/>`),
+	ActionUnpin:                newActionIcon(`<path d="m9 3 6 0-1 6 4 4H6l4-4zM12 13v6M5 5l14 14"/>`),
+	ActionRevertRanking:        newActionIcon(`<path d="M9 7 5 11l4 4"/><path d="M5 11h8a6 6 0 0 1 6 6v1"/>`),
+	ActionQueryAlias:           keyboardActionIcon,
+	ActionOpenContainingFolder: newActionIcon(`<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>`),
+	ActionContextMenu:          newActionIcon(`<path d="M8 7h12M8 12h12M8 17h12M4 7h.01M4 12h.01M4 17h.01"/>`),
+	ActionPreview:              newActionIcon(`<path d="M3 12s3-6.5 9-6.5 9 6.5 9 6.5-3 6.5-9 6.5S3 12 3 12z"/><circle cx="12" cy="12" r="3"/>`),
+	// Eye-off keeps only the two lid arcs and the slash. The pupil arc made this
+	// the densest verb in the panel without adding meaning next to the slash.
+	ActionHide:                 newActionIcon(`<path d="M3 3l18 18"/><path d="M10.4 5.7A9.6 9.6 0 0 1 12 5.5c6 0 9 6.5 9 6.5a15.7 15.7 0 0 1-2.7 3.5"/><path d="M6.6 6.6A15.5 15.5 0 0 0 3 12s3 6.5 9 6.5a9 9 0 0 0 3.4-.7"/>`),
+	ActionAirdrop:              newActionIcon(`<circle cx="12" cy="12" r="2"/><circle cx="12" cy="12" r="5.5"/><circle cx="12" cy="12" r="9"/>`),
+	ActionCopy:                 newActionIcon(`<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>`),
+	ActionOpen:                 newActionIcon(`<path d="M14 5h5v5M19 5l-9 9"/><path d="M13 7H6a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2v-7"/>`),
+	ActionOpenInSystemTerminal: newActionIcon(`<path d="m6 8 5 4-5 4M12 16h7"/>`),
+	ActionTerminate:            newActionIcon(`<circle cx="12" cy="12" r="9"/><path d="m9 9 6 6M15 9l-6 6"/>`),
+	ActionText:                 newActionIcon(`<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v5h5M9 12h6M9 16h6"/>`),
+	ActionError:                newActionIcon(`<circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/>`),
+	ActionCorrect:              newActionIcon(`<circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/>`),
+	// The gear path is full-bleed in a 24 box. A wider viewBox insets it to the
+	// optical size of other action verbs; stroke is scaled so line weight stays 2.
+	ActionSettings: common.NewWoxImageSvg(`<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="-3 -3 30 30" fill="none" stroke="var(--wox-theme-icon-color)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`),
+	// Star pairs with Unstar for "Favorites", the per-plugin collections a user
+	// curates (clipboard, color, folder, notes). Pin/Unpin above are reserved for
+	// the global "Pin in current query" ranking action, which appears on every
+	// result; keeping the two glyphs distinct is what stops an Action Panel from
+	// showing two identical pins side by side.
+	ActionStar:     newActionIcon(`<path d="m12 3 2.6 5.4 6 .9-4.3 4.2 1 5.9L12 16.8 6.7 19.4l1-5.9L3.4 9.3l6-.9z"/>`),
+	ActionUnstar:   newActionIcon(`<path d="m12 3 2.6 5.4 6 .9-4.3 4.2 1 5.9L12 16.8 6.7 19.4l1-5.9L3.4 9.3l6-.9z"/><path d="M5 5l14 14"/>`),
+	ActionMoveUp:   newActionIcon(`<path d="M12 19V5m-5 5 5-5 5 5"/>`),
+	ActionMoveDown: newActionIcon(`<path d="M12 5v14m-5-5 5 5 5-5"/>`),
+	ActionLock:     newActionIcon(`<rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>`),
+	ActionDelete:   newActionIcon(`<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>`),
+	// Exit is "leave Wox", so it uses the door-and-arrow log-out glyph and pairs
+	// with ActionOpen's frame-and-arrow. Power-off lives in SysShutdown.
+	// Fixed red keeps quitting recognizable on both light and dark launcher surfaces.
+	ActionExit:               common.NewWoxImageSvg(`<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#EF4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5M21 12H9"/></svg>`),
+	ActionCPUProfile:         newActionIcon(`<rect x="7" y="7" width="10" height="10" rx="1"/><path d="M9 3v4M15 3v4M9 17v4M15 17v4M3 9h4M3 15h4M17 9h4M17 15h4"/>`),
+	ActionSearch:             newActionIcon(`<circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/>`),
+	ActionUpdate:             newActionIcon(`<path d="M20 11a8 8 0 1 0-2.34 5.66M20 4v7h-7"/>`),
+	ActionRunAsAdministrator: newActionIcon(`<path d="M12 3 5 6v5c0 4.8 2.9 8.2 7 10 4.1-1.8 7-5.2 7-10V6z"/><path d="m9 12 2 2 4-4"/>`),
+	ActionExecute:            newActionIcon(`<path d="M13 2 4.5 13.5h5.5L9 22l10-13h-6z"/>`),
+	// Play is stroked like Pause and Skip so media rows do not mix a filled
+	// triangle with outlined neighbours.
+	ActionRun:           newActionIcon(`<path d="M8 5v14l11-7z"/>`),
+	ActionEdit:          newActionIcon(`<path d="M13.5 6.5l4 4M4 20h4l10.5-10.5a2.83 2.83 0 1 0-4-4L4 16v4z"/>`),
+	ActionUpgrade:       newActionIcon(`<circle cx="12" cy="12" r="9"/><path d="M12 16V8M8 11l4-4 4 4"/>`),
+	ActionTooltip:       newActionIcon(`<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/>`),
+	ActionMultipleFiles: newActionIcon(`<path d="M8 5h8l4 4v10H8z"/><path d="M16 5v4h4M4 9v12h12"/>`),
+	ActionVolume:        newActionIcon(`<path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16 8.5a5 5 0 0 1 0 7"/>`),
+	ActionVolumeUp:      newActionIcon(`<path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16 8.5a5 5 0 0 1 0 7M19 10v4M17 12h4"/>`),
+	ActionVolumeDown:    newActionIcon(`<path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16 12h5"/>`),
+	ActionMute:          newActionIcon(`<path d="M4 9h4l5-4v14l-5-4H4z"/><path d="m16 9 5 5M21 9l-5 5"/>`),
+	ActionPause:         newActionIcon(`<path d="M8 5v14M16 5v14"/>`),
+	ActionSkipNext:      newActionIcon(`<path d="M5 6v12l9-6zM18 6v12"/>`),
+	ActionSkipPrevious:  newActionIcon(`<path d="M19 6v12l-9-6zM6 6v12"/>`),
+	ActionPaste:         newActionIcon(`<rect x="6" y="7" width="12" height="14" rx="2"/><path d="M9 7V5h6v2M9 13h6M9 17h4"/>`),
+	ActionAdd:           newActionIcon(`<path d="M12 5v14M5 12h14"/>`),
+}

@@ -1,0 +1,223 @@
+//go:build wox_ui_smoke && windows
+
+package smoke
+
+/*
+#include <windows.h>
+
+// woxSmokeSendChord releases a stuck copy of the chord before pressing it.
+// RegisterHotKey uses MOD_NOREPEAT, so a key left down by a recorder or a
+// previous injection is ignored until it is released and pressed again.
+static const char* woxSmokeSendChord(const unsigned short* keys, int count) {
+    if (count <= 0 || count > 8) {
+        return "invalid Windows smoke chord";
+    }
+
+    INPUT inputs[24];
+    int n = 0;
+    WORD releaseFirst[] = {VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU, VK_LSHIFT, VK_RSHIFT};
+    for (int i = 0; i < 6; i++) {
+        if (GetAsyncKeyState(releaseFirst[i]) & 0x8000) {
+            DWORD flags = KEYEVENTF_KEYUP;
+            if (releaseFirst[i] == VK_RCONTROL || releaseFirst[i] == VK_RMENU || releaseFirst[i] == VK_RSHIFT) {
+                flags |= KEYEVENTF_EXTENDEDKEY;
+            }
+            INPUT *ip = &inputs[n++];
+            ZeroMemory(ip, sizeof(*ip));
+            ip->type = INPUT_KEYBOARD;
+            ip->ki.wVk = releaseFirst[i];
+            ip->ki.wScan = (WORD)MapVirtualKeyW(releaseFirst[i], MAPVK_VK_TO_VSC);
+            ip->ki.dwFlags = flags;
+        }
+    }
+    for (int i = 0; i < count; i++) {
+        if (GetAsyncKeyState(keys[i]) & 0x8000) {
+            INPUT *ip = &inputs[n++];
+            ZeroMemory(ip, sizeof(*ip));
+            ip->type = INPUT_KEYBOARD;
+            ip->ki.wVk = keys[i];
+            ip->ki.wScan = (WORD)MapVirtualKeyW(keys[i], MAPVK_VK_TO_VSC);
+            ip->ki.dwFlags = KEYEVENTF_KEYUP;
+        }
+    }
+    if (n > 0) {
+        UINT released = SendInput((UINT)n, inputs, sizeof(INPUT));
+        if (released != (UINT)n) {
+            return "failed to release stuck Windows smoke keys";
+        }
+    }
+
+    n = 0;
+    for (int i = 0; i < count; i++) {
+        INPUT *ip = &inputs[n++];
+        ZeroMemory(ip, sizeof(*ip));
+        ip->type = INPUT_KEYBOARD;
+        ip->ki.wVk = keys[i];
+        ip->ki.wScan = (WORD)MapVirtualKeyW(keys[i], MAPVK_VK_TO_VSC);
+    }
+    for (int i = count - 1; i >= 0; i--) {
+        INPUT *ip = &inputs[n++];
+        ZeroMemory(ip, sizeof(*ip));
+        ip->type = INPUT_KEYBOARD;
+        ip->ki.wVk = keys[i];
+        ip->ki.wScan = (WORD)MapVirtualKeyW(keys[i], MAPVK_VK_TO_VSC);
+        ip->ki.dwFlags = KEYEVENTF_KEYUP;
+    }
+    UINT sent = SendInput((UINT)n, inputs, sizeof(INPUT));
+    if (sent != (UINT)n) {
+        return "failed to send Windows smoke chord";
+    }
+    return NULL;
+}
+
+// woxSmokeSendKeyEvent lets hold gestures cross the real Windows input boundary.
+static const char* woxSmokeSendKeyEvent(unsigned short key, int down) {
+    INPUT input;
+    ZeroMemory(&input, sizeof(input));
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = key;
+    input.ki.wScan = (WORD)MapVirtualKeyW(key, MAPVK_VK_TO_VSC);
+    input.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+    return SendInput(1, &input, sizeof(INPUT)) == 1 ? NULL : "failed to send Windows smoke key event";
+}
+*/
+import "C"
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
+	woxwindow "wox/util/window"
+)
+
+// windowsVisibleWindowSearch carries one title match through EnumWindows.
+type windowsVisibleWindowSearch struct {
+	window uintptr
+	pid    uint32
+	title  [512]uint16
+}
+
+var (
+	windowsEnumWindows        = windows.NewLazySystemDLL("user32.dll").NewProc("EnumWindows")
+	windowsGetWindowProcessID = windows.NewLazySystemDLL("user32.dll").NewProc("GetWindowThreadProcessId")
+	windowsGetWindowText      = windows.NewLazySystemDLL("user32.dll").NewProc("GetWindowTextW")
+	windowsIsWindowVisible    = windows.NewLazySystemDLL("user32.dll").NewProc("IsWindowVisible")
+	windowsEnumWindowCallback = windows.NewCallback(func(window uintptr, lParam uintptr) uintptr {
+		search := (*windowsVisibleWindowSearch)(unsafe.Pointer(lParam))
+		visible, _, _ := windowsIsWindowVisible.Call(window)
+		if visible == 0 {
+			return 1
+		}
+		var windowPID uint32
+		windowsGetWindowProcessID.Call(window, uintptr(unsafe.Pointer(&windowPID)))
+		var windowTitle [512]uint16
+		length, _, _ := windowsGetWindowText.Call(window, uintptr(unsafe.Pointer(&windowTitle[0])), uintptr(len(windowTitle)))
+		actualTitle := strings.ToLower(windows.UTF16ToString(windowTitle[:length]))
+		targetTitle := strings.ToLower(windows.UTF16ToString(search.title[:]))
+		if strings.Contains(actualTitle, targetTitle) {
+			search.window = window
+			search.pid = windowPID
+			return 0
+		}
+		return 1
+	})
+)
+
+// SendNativeKeyChord posts one chord through the real Windows input path.
+func SendNativeKeyChord(keys ...string) error {
+	keyCodes := map[string]C.ushort{"ctrl": 0x11, "alt": 0x12, "space": 0x20, "a": 0x41, "c": 0x43, "f12": 0x7B}
+	resolved := make([]C.ushort, 0, len(keys))
+	for _, key := range keys {
+		code, ok := keyCodes[strings.ToLower(key)]
+		if !ok {
+			return fmt.Errorf("unsupported Windows smoke key %q", key)
+		}
+		resolved = append(resolved, code)
+	}
+	if len(resolved) == 0 {
+		return fmt.Errorf("empty Windows smoke chord")
+	}
+	if message := C.woxSmokeSendChord(&resolved[0], C.int(len(resolved))); message != nil {
+		return fmt.Errorf("%s", C.GoString(message))
+	}
+	return nil
+}
+
+// SendNativeKeyEvent sends a key press or release without releasing held modifiers.
+func SendNativeKeyEvent(key string, down bool) error {
+	keyCodes := map[string]C.ushort{"alt": 0x12, "b": 0x42, "f": 0x46, "j": 0x4A, "n": 0x4E, "p": 0x50, "1": 0x31, "2": 0x32}
+	code, ok := keyCodes[strings.ToLower(key)]
+	if !ok {
+		return fmt.Errorf("unsupported Windows smoke key %q", key)
+	}
+	state := C.int(0)
+	if down {
+		state = 1
+	}
+	if message := C.woxSmokeSendKeyEvent(code, state); message != nil {
+		return fmt.Errorf("%s", C.GoString(message))
+	}
+	return nil
+}
+
+// OpenWindowsNotepad launches, focuses, and registers cleanup for one Notepad document.
+func OpenWindowsNotepad(t *testing.T, ctx context.Context, path string) {
+	t.Helper()
+	systemRoot := os.Getenv("SystemRoot")
+	if systemRoot == "" {
+		systemRoot = `C:\Windows`
+	}
+	title, err := windows.UTF16FromString(filepath.Base(path))
+	if err != nil {
+		t.Fatalf("encode temporary Notepad document title: %v", err)
+	}
+	command := exec.Command(filepath.Join(systemRoot, "System32", "notepad.exe"), path)
+	if err := command.Start(); err != nil {
+		t.Fatalf("start Windows Notepad: %v", err)
+	}
+	var windowPID uint32
+	t.Cleanup(func() {
+		if windowPID != 0 && windowPID != uint32(command.Process.Pid) {
+			if process, findErr := os.FindProcess(int(windowPID)); findErr == nil {
+				_ = process.Kill()
+			}
+		}
+		if command.Process != nil {
+			_ = command.Process.Kill()
+			_, _ = command.Process.Wait()
+		}
+	})
+
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		window, pid := windowsVisibleWindowForTitle(title)
+		if window != 0 {
+			windowPID = pid
+			if woxwindow.ActivateWindow(woxwindow.ManagedWindow{Id: fmt.Sprintf("%d", window), Pid: int(pid)}) {
+				return
+			}
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("wait for temporary Windows Notepad document to become foreground: %v", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+// windowsVisibleWindowForTitle finds a visible top-level window whose title contains the target text.
+func windowsVisibleWindowForTitle(title []uint16) (uintptr, uint32) {
+	search := windowsVisibleWindowSearch{}
+	copy(search.title[:], title)
+	windowsEnumWindows.Call(windowsEnumWindowCallback, uintptr(unsafe.Pointer(&search)))
+	return search.window, search.pid
+}

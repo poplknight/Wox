@@ -1,0 +1,520 @@
+package filesearch
+
+import (
+	"path/filepath"
+	"strings"
+
+	"wox/util"
+	"wox/util/filesearch/column"
+	"wox/util/fuzzymatch"
+)
+
+// queryPlan and its scorer define the common semantics after the column
+// provider's conservative candidate filters: wildcard, path, extension and
+// pinyin queries behave the same for native volumes and configured roots.
+type queryPlan struct {
+	pattern               *fuzzymatch.PreparedPattern
+	pathPattern           *fuzzymatch.PreparedPattern
+	patternASCII          bool
+	andTerms              []SearchQuery
+	raw                   string
+	rawLower              string
+	rawLettersDigits      string
+	pathLike              bool
+	asciiLettersDigits    bool
+	extension             string
+	extensionOnly         bool
+	pathQuery             string
+	pathSegments          []string
+	wildcardLiterals      []string
+	nameTerm              string
+	exactPhrases          []string
+	exactNamePhrases      []string
+	exactPathPhrases      []string
+	usePinyin             bool
+	perClauseLimit        int
+	postIntersectionLimit int
+	preRerankLimit        int
+	shortQueryLength      int
+	namePairs             []int
+}
+
+type docRecord struct {
+	Path           string
+	IsDir          bool
+	PinyinFull     string
+	PinyinInitials string
+	// Column path queries borrow a basename and a shared directory until a
+	// full path is actually needed for a result, wildcard, or quoted phrase.
+	nameText    string
+	directory   *queryDirectory
+	pathKeyText string
+}
+
+const (
+	defaultPerClauseLimit        = 20000
+	defaultPostIntersectionLimit = 10000
+	defaultPreRerankLimit        = 4000
+)
+
+func buildQueryPlan(query SearchQuery) *queryPlan {
+	inputRaw := normalizeQuery(query.Raw)
+	if inputRaw == "" {
+		return nil
+	}
+
+	quoted := parseQuotedSearchQuery(inputRaw)
+	raw := normalizeQuery(quoted.unquoted)
+	exactPhrases := normalizeExactPhrases(quoted.phrases)
+	if raw == "" && len(exactPhrases) == 0 {
+		return nil
+	}
+	recallRaw := raw
+	if recallRaw == "" {
+		recallRaw = longestString(exactPhrases)
+	}
+
+	rawLower := normalizeIndexText(raw)
+	lettersDigits := keepLettersAndDigits(rawLower)
+	pathLike := strings.ContainsAny(inputRaw, `/\`)
+	pathQuery := normalizePathQuery(recallRaw)
+	pathSegments := splitDirectorySegments(pathQuery)
+
+	nameTerm := rawLower
+	if nameTerm == "" {
+		nameTerm = normalizeIndexText(recallRaw)
+	}
+	wildcardLiterals := buildWildcardLiterals(raw)
+	if query.wildcard != nil && len(wildcardLiterals) > 0 {
+		nameTerm = longestString(wildcardLiterals)
+	}
+
+	extension := extractQueryExtension(raw)
+	extensionOnly := extension != "" && !pathLike && strings.TrimSpace(strings.ReplaceAll(rawLower, "*", "")) == "."+extension
+
+	plan := &queryPlan{
+		raw:                raw,
+		pattern:            fuzzymatch.PreparePattern(strings.TrimSpace(raw)),
+		pathPattern:        fuzzymatch.PreparePattern(pathQuery),
+		rawLower:           rawLower,
+		rawLettersDigits:   lettersDigits,
+		pathLike:           pathLike,
+		asciiLettersDigits: isASCIIAlphaNumeric(lettersDigits) && lettersDigits != "",
+		extension:          extension,
+		extensionOnly:      extensionOnly,
+		pathQuery:          pathQuery,
+		pathSegments:       pathSegments,
+		wildcardLiterals:   wildcardLiterals,
+		nameTerm:           nameTerm,
+		exactPhrases:       exactPhrases,
+		exactNamePhrases:   normalizeExactNamePhrases(exactPhrases),
+		exactPathPhrases:   normalizeExactPathPhrases(exactPhrases),
+		// Pinyin recall used to be unconditional inside filesearch, bypassing
+		// Wox's global UsePinYin setting. Keeping the flag in the plan makes every
+		// recall and rerank path use one normalized decision for this query.
+		usePinyin:             !query.DisablePinyin,
+		perClauseLimit:        defaultPerClauseLimit,
+		postIntersectionLimit: defaultPostIntersectionLimit,
+		preRerankLimit:        defaultPreRerankLimit,
+		shortQueryLength:      utf8Len(rawLower),
+	}
+
+	// Unquoted whitespace separates AND conditions. Keep wildcard patterns intact
+	// so existing patterns containing literal spaces retain their meaning.
+	fields := strings.Fields(raw)
+	if query.wildcard == nil && (len(fields) > 1 || len(fields) > 0 && len(exactPhrases) > 0) {
+		for _, field := range fields {
+			plan.andTerms = append(plan.andTerms, normalizeSearchQuery(SearchQuery{Raw: field, DisablePinyin: query.DisablePinyin}))
+		}
+	}
+
+	if plan.shortQueryLength <= 2 {
+		plan.preRerankLimit = min(defaultPreRerankLimit, 2000)
+	}
+
+	if plan.extensionOnly {
+		plan.preRerankLimit = 0
+	}
+
+	plan.patternASCII = true
+	for _, c := range raw {
+		if c >= 128 {
+			plan.patternASCII = false
+			break
+		}
+	}
+	if len(plan.andTerms) > 0 {
+		for _, term := range plan.andTerms {
+			plan.namePairs = append(plan.namePairs, term.plan.namePairs...)
+		}
+	} else if query.wildcard != nil {
+		for _, literal := range wildcardLiterals {
+			plan.namePairs = column.NamePairClasses(literal, plan.namePairs)
+		}
+	} else {
+		plan.namePairs = column.NamePairClasses(raw, plan.namePairs)
+	}
+	for _, phrase := range plan.exactNamePhrases {
+		plan.namePairs = column.NamePairClasses(phrase, plan.namePairs)
+	}
+	return plan
+}
+
+// scoreDocAgainstQuery gives filename-complete matches a separate score band.
+// A large path substring bonus must never outrank a filename satisfying every
+// condition. Explicit path queries keep their existing path-oriented ranking.
+func scoreDocAgainstQuery(query SearchQuery, record docRecord) (bool, int64) {
+	if query.plan == nil || query.plan.pathLike {
+		return scoreDocMatch(query, record, false)
+	}
+	if query.wildcard != nil {
+		return scoreDocMatch(query, record, true)
+	}
+	const namePriorityScore = int64(1000000)
+	if nameMatched, nameScore := scoreDocMatch(query, record, true); nameMatched {
+		return true, namePriorityScore + min(max(nameScore, 0), namePriorityScore-1)
+	}
+	return false, 0
+}
+
+// scoreDocMatch shares matching semantics between full-path eligibility and
+// filename-only ranking, including AND conditions, phrases, and pinyin.
+func scoreDocMatch(query SearchQuery, record docRecord, nameOnly bool) (bool, int64) {
+	if query.Raw == "" {
+		return false, 0
+	}
+
+	plan := query.plan
+	if plan == nil {
+		return false, 0
+	}
+	if nameOnly {
+		record.Path = record.name()
+		record.nameText, record.directory = "", nil
+	}
+	if !recordMatchesExactPhrases(plan, record) {
+		return false, 0
+	}
+	if query.wildcard != nil {
+		return query.wildcard.match(record.name(), record.fullPath())
+	}
+	if len(plan.andTerms) > 0 {
+		var total int64
+		for _, term := range plan.andTerms {
+			if term.plan.extensionOnly {
+				if record.IsDir || normalizeExtension(filepath.Ext(record.name())) != term.plan.extension {
+					return false, 0
+				}
+				total += 500
+				continue
+			}
+			matched, score := scoreDocMatch(term, record, nameOnly)
+			if !matched {
+				return false, 0
+			}
+			total += score
+		}
+		return true, total
+	}
+	if plan.raw == "" && len(plan.exactPhrases) > 0 {
+		return true, scoreExactPhraseMatch(plan, record)
+	}
+
+	var (
+		matched   bool
+		bestScore int64
+	)
+
+	updateBest := func(ok bool, score int64) {
+		if !ok {
+			return
+		}
+		if !matched || score > bestScore {
+			matched = true
+			bestScore = score
+		}
+	}
+
+	// A basename cannot contain a path separator. Avoid preparing/scoring it for
+	// mandatory path clauses; AND terms without separators still score normally.
+	if !strings.Contains(plan.raw, "/") && !(util.IsWindows() && strings.Contains(plan.raw, `\`)) {
+		nameScore := maybeScoreFuzzy(record.name(), plan.raw, plan.usePinyin)
+		updateBest(nameScore.matched, nameScore.score+4000)
+	}
+
+	if !nameOnly {
+		pathMatch := record.pathMatch(plan)
+		updateBest(pathMatch.matched, pathMatch.score+1500)
+	}
+
+	if plan.usePinyin && !plan.pathLike && plan.rawLettersDigits != "" {
+		fullScore := maybeScoreFuzzy(record.PinyinFull, plan.rawLettersDigits, false)
+		updateBest(fullScore.matched, fullScore.score+2500)
+
+		initialsScore := maybeScoreFuzzy(record.PinyinInitials, plan.rawLettersDigits, false)
+		updateBest(initialsScore.matched, initialsScore.score+2500)
+	}
+
+	if !matched && plan.extensionOnly && normalizeExtension(filepath.Ext(record.name())) == plan.extension {
+		return true, 500
+	}
+
+	if matched && plan.extension != "" && normalizeExtension(filepath.Ext(record.name())) == plan.extension {
+		bestScore += 500
+	}
+
+	return matched, bestScore
+}
+
+func recordMatchesExactPhrases(plan *queryPlan, record docRecord) bool {
+	if plan == nil || len(plan.exactPhrases) == 0 {
+		return true
+	}
+	nameTarget := normalizeIndexText(record.name())
+	pathTarget := record.pathKey()
+	for i := range plan.exactPhrases {
+		namePhrase := plan.exactNamePhrases[i]
+		pathPhrase := plan.exactPathPhrases[i]
+		if namePhrase != "" && strings.Contains(nameTarget, namePhrase) {
+			continue
+		}
+		if pathPhrase != "" && strings.Contains(pathTarget, pathPhrase) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func scoreExactPhraseMatch(plan *queryPlan, record docRecord) int64 {
+	nameTarget := normalizeIndexText(record.name())
+	pathTarget := record.pathKey()
+	score := int64(3000)
+	for i := range plan.exactPhrases {
+		namePhrase := plan.exactNamePhrases[i]
+		pathPhrase := plan.exactPathPhrases[i]
+		if namePhrase != "" && strings.Contains(nameTarget, namePhrase) {
+			score += int64(5000 + utf8Len(namePhrase)*100 - utf8Len(nameTarget))
+			continue
+		}
+		if pathPhrase != "" && strings.Contains(pathTarget, pathPhrase) {
+			score += int64(2500 + utf8Len(pathPhrase)*100 - utf8Len(pathTarget))
+		}
+	}
+	return score
+}
+
+type fuzzyScore struct {
+	matched bool
+	score   int64
+}
+
+func maybeScoreFuzzy(term string, query string, usePinyin bool) fuzzyScore {
+	query = strings.TrimSpace(query)
+	term = strings.TrimSpace(term)
+	if query == "" || term == "" {
+		return fuzzyScore{}
+	}
+
+	ok, score := util.IsStringMatchScore(term, query, usePinyin)
+	return fuzzyScore{matched: ok, score: score}
+}
+
+func (record docRecord) directoryPath() string {
+	if record.IsDir {
+		return record.pathKey()
+	}
+	return normalizeIndexText(normalizePath(record.parentPath()))
+}
+
+func (record docRecord) name() string {
+	if record.directory != nil {
+		return record.nameText
+	}
+	return filepath.Base(record.Path)
+}
+
+func (record docRecord) parentPath() string {
+	if record.directory != nil {
+		return record.directory.path
+	}
+	return filepath.Dir(record.Path)
+}
+
+func (record docRecord) pathKey() string {
+	if record.pathKeyText != "" {
+		return record.pathKeyText
+	}
+	return normalizeIndexText(normalizePath(record.fullPath()))
+}
+
+func (record docRecord) fullPath() string {
+	if record.directory != nil {
+		return filepath.Join(record.directory.path, record.nameText)
+	}
+	return record.Path
+}
+
+// pathMatch reuses a directory's score across its children and AND clauses.
+func (record docRecord) pathMatch(plan *queryPlan) fuzzyScore {
+	if record.directory != nil {
+		return record.directory.match(plan)
+	}
+	if record.pathKeyText != "" {
+		return scorePreparedDirectory(record.pathKeyText, plan)
+	}
+	target, query := record.Path, plan.raw
+	if !record.IsDir {
+		target = record.parentPath()
+	}
+	if plan.pathLike {
+		target, query = record.directoryPath(), plan.pathQuery
+	}
+	if plan.pathLike {
+		return scorePreparedDirectory(normalizePathQuery(target), plan)
+	}
+	matched, score := scorePathMatch(target, query)
+	return fuzzyScore{matched: matched, score: score}
+}
+
+func normalizeIndexText(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	return strings.ToLower(filepath.ToSlash(value))
+}
+
+func normalizeExactPhrases(phrases []string) []string {
+	normalized := make([]string, 0, len(phrases))
+	for _, phrase := range phrases {
+		phrase = strings.TrimSpace(phrase)
+		if phrase == "" {
+			continue
+		}
+		normalized = append(normalized, phrase)
+	}
+	return normalized
+}
+
+func normalizeExactNamePhrases(phrases []string) []string {
+	normalized := make([]string, 0, len(phrases))
+	for _, phrase := range phrases {
+		normalized = append(normalized, normalizeIndexText(phrase))
+	}
+	return normalized
+}
+
+func normalizeExactPathPhrases(phrases []string) []string {
+	normalized := make([]string, 0, len(phrases))
+	for _, phrase := range phrases {
+		normalized = append(normalized, normalizePathQuery(phrase))
+	}
+	return normalized
+}
+
+func normalizeExtension(ext string) string {
+	ext = strings.TrimSpace(strings.ToLower(ext))
+	ext = strings.TrimPrefix(ext, ".")
+	return ext
+}
+
+func splitDirectorySegments(path string) []string {
+	path = normalizePathQuery(path)
+	if path == "" {
+		return nil
+	}
+
+	rawSegments := strings.Split(path, "/")
+	segments := make([]string, 0, len(rawSegments))
+	for _, segment := range rawSegments {
+		segment = strings.TrimSpace(segment)
+		if segment == "" || strings.HasSuffix(segment, ":") {
+			continue
+		}
+		segments = append(segments, segment)
+	}
+	return segments
+}
+
+func normalizePathQuery(value string) string {
+	value = normalizeIndexText(value)
+	value = strings.ReplaceAll(value, `\`, "/")
+	return strings.Trim(value, "/")
+}
+
+func keepLettersAndDigits(value string) string {
+	var builder strings.Builder
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			builder.WriteRune(r)
+		}
+	}
+	return builder.String()
+}
+
+func buildWildcardLiterals(raw string) []string {
+	if !strings.Contains(raw, "*") {
+		return nil
+	}
+
+	parts := strings.Split(raw, "*")
+	literals := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = keepLettersAndDigits(normalizeIndexText(part))
+		if part == "" {
+			continue
+		}
+		literals = append(literals, part)
+	}
+	return literals
+}
+
+func extractQueryExtension(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+
+	if strings.HasPrefix(raw, ".") && !strings.ContainsAny(raw[1:], `/\*`) {
+		return normalizeExtension(raw)
+	}
+
+	if strings.Contains(raw, "*") {
+		index := strings.LastIndex(raw, ".")
+		if index >= 0 && index < len(raw)-1 && !strings.ContainsAny(raw[index+1:], `/*\`) {
+			return normalizeExtension(raw[index:])
+		}
+	}
+
+	return ""
+}
+
+func longestString(values []string) string {
+	longest := ""
+	for _, value := range values {
+		if len(value) > len(longest) {
+			longest = value
+		}
+	}
+	return longest
+}
+
+func isASCIIAlphaNumeric(value string) bool {
+	if value == "" {
+		return false
+	}
+
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func utf8Len(value string) int {
+	return len([]rune(value))
+}

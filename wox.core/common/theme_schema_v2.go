@@ -1,0 +1,706 @@
+package common
+
+import (
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"image/color"
+	"math"
+	"reflect"
+	"strconv"
+	"strings"
+)
+
+// ThemeSchemaV2 is the complete v2 document. Nil styles inherit; zero and transparent are explicit overrides.
+// Platform and variant JSON null clears an inherited style instead of skipping it.
+type ThemeSchemaV2 struct {
+	I18n             map[string]map[string]string `json:",omitempty"`
+	Surfaces         ThemeSurfaces                `json:",omitempty"`
+	SchemaVersion    int
+	MinWoxVersion    string `json:",omitempty"`
+	ThemeId          string
+	ThemeName        string
+	ThemeAuthor      string `json:",omitempty"`
+	ThemeUrl         string `json:",omitempty"`
+	Version          string `json:",omitempty"`
+	Description      string `json:",omitempty"`
+	IsSystem         bool   `json:",omitempty"`
+	IsInstalled      bool   `json:",omitempty"`
+	IsAutoAppearance bool   `json:",omitempty"`
+	DarkThemeId      string `json:",omitempty"`
+	LightThemeId     string `json:",omitempty"`
+
+	BaseBackgroundColor string
+	BaseTextColor       string
+	BaseAccentColor     string
+
+	// Any authored AppBorder* field disables system window material on every
+	// platform (Acrylic, Liquid Glass, compositor blur) so Go UI can paint the outline.
+	// A later platform or variant may set these to JSON null to restore system material.
+	AppBorderColor  *string `json:",omitempty"`
+	AppBorderWidth  *int    `json:",omitempty"`
+	AppBorderRadius *int    `json:",omitempty"`
+
+	AppBackgroundColor *string `json:",omitempty"`
+	// Content styling leaves native window material and outer chrome unchanged.
+	AppContentInset           *int    `json:",omitempty"`
+	AppContentBackgroundColor *string `json:",omitempty"`
+	AppContentBorderRadius    *int    `json:",omitempty"`
+	// Floating overlays sit on the desktop, not inside the launcher frame.
+	// Omitted values follow the effective app background and action-item text.
+	OverlayBackgroundColor *string `json:",omitempty"`
+	OverlayFontColor       *string `json:",omitempty"`
+	AppPaddingLeft         *int    `json:",omitempty"`
+	AppPaddingTop          *int    `json:",omitempty"`
+	AppPaddingRight        *int    `json:",omitempty"`
+	AppPaddingBottom       *int    `json:",omitempty"`
+
+	QueryBoxFontColor       *string `json:",omitempty"`
+	QueryBoxBackgroundColor *string `json:",omitempty"`
+	QueryBoxBorderRadius    *int    `json:",omitempty"`
+	QueryBoxCursorColor     *string `json:",omitempty"`
+	// QueryBoxPaddingLeft replaces the built-in text inset when a theme places the query further in.
+	QueryBoxPaddingLeft *int `json:",omitempty"`
+	// QuerySeparator is the line under the query. Thickness is its stroke size.
+	// Left and right padding inset it from the window edges; omitted padding runs
+	// the line across the window, and omitted thickness draws nothing.
+	QuerySeparatorColor                  *string `json:",omitempty"`
+	QuerySeparatorThickness              *int    `json:",omitempty"`
+	QuerySeparatorPaddingLeft            *int    `json:",omitempty"`
+	QuerySeparatorPaddingRight           *int    `json:",omitempty"`
+	QueryBoxTextSelectionBackgroundColor *string `json:",omitempty"`
+	QueryBoxTextSelectionColor           *string `json:",omitempty"`
+
+	ScrollbarThumbColor       *string `json:",omitempty"`
+	ScrollbarThumbHoverColor  *string `json:",omitempty"`
+	ScrollbarThumbActiveColor *string `json:",omitempty"`
+	ScrollbarWidth            *int    `json:",omitempty"`
+	ScrollbarHoverWidth       *int    `json:",omitempty"`
+	ScrollbarBorderRadius     *int    `json:",omitempty"`
+
+	RefinementButtonFontColor                  *string `json:",omitempty"`
+	RefinementButtonIconColor                  *string `json:",omitempty"`
+	RefinementButtonBackgroundColor            *string `json:",omitempty"`
+	RefinementButtonBorderColor                *string `json:",omitempty"`
+	RefinementButtonHoverBackgroundColor       *string `json:",omitempty"`
+	RefinementButtonActiveFontColor            *string `json:",omitempty"`
+	RefinementButtonActiveIconColor            *string `json:",omitempty"`
+	RefinementButtonActiveBackgroundColor      *string `json:",omitempty"`
+	RefinementButtonActiveBorderColor          *string `json:",omitempty"`
+	RefinementButtonActiveHoverBackgroundColor *string `json:",omitempty"`
+
+	RefinementBackgroundColor                *string `json:",omitempty"`
+	RefinementBorderColor                    *string `json:",omitempty"`
+	RefinementTitleColor                     *string `json:",omitempty"`
+	RefinementDividerColor                   *string `json:",omitempty"`
+	RefinementHotkeyColor                    *string `json:",omitempty"`
+	RefinementItemFontColor                  *string `json:",omitempty"`
+	RefinementItemBackgroundColor            *string `json:",omitempty"`
+	RefinementItemHoverBackgroundColor       *string `json:",omitempty"`
+	RefinementItemActiveFontColor            *string `json:",omitempty"`
+	RefinementItemActiveBackgroundColor      *string `json:",omitempty"`
+	RefinementItemActiveHoverBackgroundColor *string `json:",omitempty"`
+
+	GlanceFontColor            *string `json:",omitempty"`
+	GlanceIconColor            *string `json:",omitempty"`
+	GlanceBackgroundColor      *string `json:",omitempty"`
+	GlanceHoverBackgroundColor *string `json:",omitempty"`
+
+	AttentionFontColor            *string `json:",omitempty"`
+	AttentionIconColor            *string `json:",omitempty"`
+	AttentionBackgroundColor      *string `json:",omitempty"`
+	AttentionBorderColor          *string `json:",omitempty"`
+	AttentionHoverBackgroundColor *string `json:",omitempty"`
+	AttentionHoverBorderColor     *string `json:",omitempty"`
+
+	ResultContainerPaddingLeft   *int `json:",omitempty"`
+	ResultContainerPaddingTop    *int `json:",omitempty"`
+	ResultContainerPaddingRight  *int `json:",omitempty"`
+	ResultContainerPaddingBottom *int `json:",omitempty"`
+
+	ResultItemBorderRadius                *int    `json:",omitempty"`
+	ResultItemPaddingLeft                 *int    `json:",omitempty"`
+	ResultItemPaddingTop                  *int    `json:",omitempty"`
+	ResultItemPaddingRight                *int    `json:",omitempty"`
+	ResultItemPaddingBottom               *int    `json:",omitempty"`
+	ResultItemTitleColor                  *string `json:",omitempty"`
+	ResultItemSubTitleColor               *string `json:",omitempty"`
+	ResultItemTailTextColor               *string `json:",omitempty"`
+	ResultItemBorderLeftWidth             *int    `json:",omitempty"`
+	ResultItemHoverBackgroundColor        *string `json:",omitempty"`
+	ResultItemActiveBackgroundColor       *string `json:",omitempty"`
+	ResultItemActiveTitleColor            *string `json:",omitempty"`
+	ResultItemActiveSubTitleColor         *string `json:",omitempty"`
+	ResultItemActiveIndicatorWidth        *int    `json:",omitempty"`
+	ResultItemActiveIndicatorInsetLeft    *int    `json:",omitempty"`
+	ResultItemActiveIndicatorInsetTop     *int    `json:",omitempty"`
+	ResultItemActiveIndicatorInsetBottom  *int    `json:",omitempty"`
+	ResultItemActiveIndicatorBorderRadius *int    `json:",omitempty"`
+	ResultItemActiveIndicatorColor        *string `json:",omitempty"`
+	ResultItemActiveTailTextColor         *string `json:",omitempty"`
+
+	ActionContainerDividerColor    *string `json:",omitempty"`
+	ActionContainerBackgroundColor *string `json:",omitempty"`
+	ActionContainerBorderColor     *string `json:",omitempty"`
+	ActionContainerBorderWidth     *int    `json:",omitempty"`
+	ActionContainerHeaderFontColor *string `json:",omitempty"`
+	ActionContainerBorderRadius    *int    `json:",omitempty"`
+	ActionContainerPaddingLeft     *int    `json:",omitempty"`
+	ActionContainerPaddingTop      *int    `json:",omitempty"`
+	ActionContainerPaddingRight    *int    `json:",omitempty"`
+	ActionContainerPaddingBottom   *int    `json:",omitempty"`
+
+	ActionItemBorderRadius          *int    `json:",omitempty"`
+	ActionItemActiveBackgroundColor *string `json:",omitempty"`
+	ActionItemActiveFontColor       *string `json:",omitempty"`
+	ActionItemFontColor             *string `json:",omitempty"`
+
+	ActionQueryBoxFontColor       *string `json:",omitempty"`
+	ActionQueryBoxBackgroundColor *string `json:",omitempty"`
+	ActionQueryBoxBorderRadius    *int    `json:",omitempty"`
+
+	PreviewBackgroundColor      *string `json:",omitempty"`
+	PreviewBorderColor          *string `json:",omitempty"`
+	PreviewBorderRadius         *int    `json:",omitempty"`
+	PreviewTagBorderRadius      *int    `json:",omitempty"`
+	PreviewTagFontColor         *string `json:",omitempty"`
+	PreviewTagBackgroundColor   *string `json:",omitempty"`
+	PreviewTagBorderColor       *string `json:",omitempty"`
+	PreviewFontColor            *string `json:",omitempty"`
+	PreviewSplitLineColor       *string `json:",omitempty"`
+	PreviewPropertyTitleColor   *string `json:",omitempty"`
+	PreviewPropertyContentColor *string `json:",omitempty"`
+	PreviewTextSelectionColor   *string `json:",omitempty"`
+
+	ToolbarPrimaryFontColor             *string `json:",omitempty"`
+	ToolbarPrimaryHotkeyFontColor       *string `json:",omitempty"`
+	ToolbarPrimaryHotkeyBackgroundColor *string `json:",omitempty"`
+	ToolbarPrimaryHotkeyBorderColor     *string `json:",omitempty"`
+	ToolbarHotkeyFontColor              *string `json:",omitempty"`
+	ToolbarHotkeyBackgroundColor        *string `json:",omitempty"`
+	ToolbarHotkeyBorderColor            *string `json:",omitempty"`
+
+	ActionItemHotkeyFontColor       *string `json:",omitempty"`
+	ActionItemHotkeyBackgroundColor *string `json:",omitempty"`
+	ActionItemHotkeyBorderColor     *string `json:",omitempty"`
+
+	ActionItemActiveHotkeyFontColor       *string `json:",omitempty"`
+	ActionItemActiveHotkeyBackgroundColor *string `json:",omitempty"`
+	ActionItemActiveHotkeyBorderColor     *string `json:",omitempty"`
+
+	ToolbarFontColor       *string  `json:",omitempty"`
+	ToolbarBackgroundColor *string  `json:",omitempty"`
+	ToolbarBlurSigma       *float64 `json:",omitempty"`
+	ToolbarBlurBrightness  *float64 `json:",omitempty"`
+	ToolbarBlurSaturation  *float64 `json:",omitempty"`
+	ToolbarBorderColor     *string  `json:",omitempty"`
+	ToolbarBorderWidth     *int     `json:",omitempty"`
+	ToolbarPaddingLeft     *int     `json:",omitempty"`
+	ToolbarPaddingRight    *int     `json:",omitempty"`
+
+	Windows *ThemePlatformOverride `json:"windows,omitempty"`
+	MacOS   *ThemePlatformOverride `json:"macos,omitempty"`
+	Linux   *ThemePlatformOverride `json:"linux,omitempty"`
+}
+
+func init() {
+	registerThemeSchema(2, themeSchema{parse: parseThemeV2, marshal: marshalThemeV2, resolve: resolveThemeV2, colors: themeV2Colors})
+}
+
+// parseThemeV2 resolves optional styles while retaining their authored presence.
+func parseThemeV2(data []byte) (Theme, error) {
+	var t Theme
+	err := decodeThemeV2(data, &t)
+	return t, err
+}
+
+func decodeThemeV2(data []byte, t *Theme) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	for _, platform := range []string{"windows", "macos", "linux"} {
+		if err := validateThemePlatformOverride(raw, platform, themeV2StyleFields); err != nil {
+			return err
+		}
+	}
+	// Fields this build does not know are left unread. A theme from another
+	// Wox version can carry them without failing to load.
+	var definition ThemeSchemaV2
+	if err := json.Unmarshal(data, &definition); err != nil {
+		return err
+	}
+	if definition.ThemeId == "" || definition.ThemeName == "" {
+		return fmt.Errorf("v2 theme requires ThemeId and ThemeName")
+	}
+	*t = Theme{
+		SchemaVersion:    definition.SchemaVersion,
+		MinWoxVersion:    definition.MinWoxVersion,
+		ThemeId:          definition.ThemeId,
+		ThemeName:        definition.ThemeName,
+		I18n:             definition.I18n,
+		ThemeAuthor:      definition.ThemeAuthor,
+		ThemeUrl:         definition.ThemeUrl,
+		Version:          definition.Version,
+		Description:      definition.Description,
+		IsSystem:         definition.IsSystem,
+		IsInstalled:      definition.IsInstalled,
+		IsAutoAppearance: definition.IsAutoAppearance,
+		DarkThemeId:      definition.DarkThemeId,
+		LightThemeId:     definition.LightThemeId,
+		Windows:          definition.Windows, MacOS: definition.MacOS, Linux: definition.Linux,
+	}
+	type themeAlias Theme
+	resolved, err := definition.resolve()
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(resolved, (*themeAlias)(t)); err != nil {
+		return err
+	}
+	var resolvedFields map[string]json.RawMessage
+	if err := json.Unmarshal(resolved, &resolvedFields); err != nil {
+		return err
+	}
+	colors := make(map[string]string)
+	for key, value := range resolvedFields {
+		if strings.HasSuffix(key, "Color") {
+			var css string
+			if err := json.Unmarshal(value, &css); err != nil {
+				return err
+			}
+			colors[key] = css
+		}
+	}
+	t.source = &themeV2Source{
+		definition:      definition,
+		colors:          colors,
+		appWindowChrome: authoredAppWindowChrome(definition.AppBorderColor, definition.AppBorderWidth, definition.AppBorderRadius),
+	}
+	if err := validateV2ThemePlatforms(raw); err != nil {
+		return err
+	}
+	return nil
+}
+
+// resolveThemeV2 merges authored platform overrides before deriving any default colors or geometry.
+func resolveThemeV2(t Theme, platform, variant string, capabilities ...string) (Theme, error) {
+	if platform == "darwin" {
+		platform = "macos"
+	}
+	encoded, err := json.Marshal(t)
+	if err != nil {
+		return Theme{}, err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &raw); err != nil {
+		return Theme{}, err
+	}
+	var node map[string]json.RawMessage
+	if data := raw[platform]; len(data) > 0 {
+		if err := json.Unmarshal(data, &node); err != nil {
+			return Theme{}, err
+		}
+	}
+	layers, err := themeVariantLayers(node, variant, capabilities)
+	if err != nil {
+		return Theme{}, err
+	}
+	for _, fields := range layers {
+		mergeThemeV2OverrideFields(raw, fields)
+	}
+	delete(raw, "windows")
+	delete(raw, "macos")
+	delete(raw, "linux")
+	encoded, err = json.Marshal(raw)
+	if err != nil {
+		return Theme{}, err
+	}
+	var resolved Theme
+	if err := json.Unmarshal(encoded, &resolved); err != nil {
+		return Theme{}, err
+	}
+	// Keep the original authored source alongside effective fields for lossless editing and sync.
+	// Window chrome follows the merged document, including outlines authored only in capability variants.
+	resolved.source.(*themeV2Source).definition = t.source.(*themeV2Source).definition
+	resolved.source.(*themeV2Source).appWindowChrome = rawHasAppWindowChrome(raw)
+	resolved.AssetFiles = t.AssetFiles
+	resolved.Windows, resolved.MacOS, resolved.Linux = t.Windows, t.MacOS, t.Linux
+	return resolved, nil
+}
+
+func authoredAppWindowChrome(color *string, width *int, radius *int) bool {
+	return color != nil || width != nil || radius != nil
+}
+
+// mergeThemeV2OverrideFields applies one platform or variant layer. Omitted keys
+// inherit the parent. JSON null clears the inherited value so a child can restore
+// schema defaults, including system window material after a parent AppBorder* outline.
+func mergeThemeV2OverrideFields(raw, fields map[string]json.RawMessage) {
+	for key, value := range fields {
+		if key == "variants" || key == themeBackgroundBlurField {
+			continue
+		}
+		if string(value) == "null" {
+			delete(raw, key)
+			continue
+		}
+		if key == "Surfaces" {
+			var parent, child map[string]json.RawMessage
+			_ = json.Unmarshal(raw[key], &parent)
+			if err := json.Unmarshal(value, &child); err != nil {
+				raw[key] = value
+				continue
+			}
+			if parent == nil {
+				parent = map[string]json.RawMessage{}
+			}
+			for name, surface := range child {
+				if string(surface) == "null" {
+					delete(parent, name)
+				} else {
+					parent[name] = surface
+				}
+			}
+			raw[key], _ = json.Marshal(parent)
+			continue
+		}
+		raw[key] = value
+	}
+}
+
+func rawHasAppWindowChrome(raw map[string]json.RawMessage) bool {
+	for _, key := range []string{"AppBorderColor", "AppBorderWidth", "AppBorderRadius"} {
+		if value, ok := raw[key]; ok && string(value) != "null" {
+			return true
+		}
+	}
+	return false
+}
+
+// marshalThemeV2 preserves authored v2 overrides instead of exporting resolved defaults.
+func marshalThemeV2(t Theme) ([]byte, error) {
+	source, ok := t.source.(*themeV2Source)
+	if !ok || source == nil {
+		return nil, fmt.Errorf("v2 theme has no authored definition")
+	}
+	definition := source.definition
+	// Metadata can change on install or save-as; styles stay exactly as authored.
+	definition.SchemaVersion = t.SchemaVersion
+	definition.MinWoxVersion = t.MinWoxVersion
+	definition.ThemeId = t.ThemeId
+	definition.ThemeName = t.ThemeName
+	definition.I18n = t.I18n
+	definition.ThemeAuthor = t.ThemeAuthor
+	definition.ThemeUrl = t.ThemeUrl
+	definition.Version = t.Version
+	definition.Description = t.Description
+	definition.IsSystem = t.IsSystem
+	definition.IsInstalled = t.IsInstalled
+	definition.IsAutoAppearance = t.IsAutoAppearance
+	definition.DarkThemeId = t.DarkThemeId
+	definition.LightThemeId = t.LightThemeId
+	definition.Windows, definition.MacOS, definition.Linux = t.Windows, t.MacOS, t.Linux
+	if _, err := definition.resolve(); err != nil {
+		return nil, err
+	}
+	return json.Marshal(definition)
+}
+
+// validateV2ThemePlatforms checks every authored variant, including platforms other than the running OS.
+func validateV2ThemePlatforms(raw map[string]json.RawMessage) error {
+	for _, platform := range []string{"windows", "macos", "linux"} {
+		if len(raw[platform]) == 0 || string(raw[platform]) == "null" {
+			continue
+		}
+		var node map[string]json.RawMessage
+		if err := json.Unmarshal(raw[platform], &node); err != nil {
+			return err
+		}
+		if err := validateV2ThemeOverrideTree(raw, node, platform); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateV2ThemeOverrideTree validates inactive nested capability layers with their inherited values.
+func validateV2ThemeOverrideTree(parent, node map[string]json.RawMessage, path string) error {
+	merged := make(map[string]json.RawMessage, len(parent))
+	for key, value := range parent {
+		if key != "windows" && key != "macos" && key != "linux" {
+			merged[key] = value
+		}
+	}
+	mergeThemeV2OverrideFields(merged, node)
+	data, err := json.Marshal(merged)
+	if err != nil {
+		return err
+	}
+	var theme Theme
+	if err := json.Unmarshal(data, &theme); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	var variants map[string]map[string]json.RawMessage
+	if data := node["variants"]; len(data) > 0 {
+		if err := json.Unmarshal(data, &variants); err != nil {
+			return err
+		}
+	}
+	if data := node[themeBackgroundBlurField]; len(data) > 0 {
+		var child map[string]json.RawMessage
+		if err := json.Unmarshal(data, &child); err != nil {
+			return err
+		}
+		if err := validateV2ThemeOverrideTree(merged, child, path+"/"+themeBackgroundBlurField); err != nil {
+			return err
+		}
+	}
+	for name, child := range variants {
+		if err := validateV2ThemeOverrideTree(merged, child, path+"/"+name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// resolve applies the versioned v2 defaults once, before backend geometry or UI adapters consume the theme.
+func (d ThemeSchemaV2) resolve() ([]byte, error) {
+	if err := d.Surfaces.Validate(); err != nil {
+		return nil, err
+	}
+	bases := []struct{ name, value string }{{"BaseBackgroundColor", d.BaseBackgroundColor}, {"BaseTextColor", d.BaseTextColor}, {"BaseAccentColor", d.BaseAccentColor}}
+	for _, base := range bases {
+		if _, ok := ParseThemeColor(base.value); !ok {
+			return nil, fmt.Errorf("%s must be a valid color", base.name)
+		}
+	}
+	text, _ := ParseThemeColor(d.BaseTextColor)
+	accent, _ := ParseThemeColor(d.BaseAccentColor)
+	secondary := themeColorOpacity(text, .72)
+	divider := themeColorOpacity(text, .16)
+	selected := themeColorOpacity(accent, .18)
+	selection := themeColorOpacity(accent, .35)
+	values := map[string]any{
+		"AppBorderColor":      divider,
+		"ScrollbarThumbColor": themeColorOpacity(text, .58), "ScrollbarThumbHoverColor": themeColorOpacity(text, .72), "ScrollbarThumbActiveColor": themeColorOpacity(accent, .85),
+		"RefinementBackgroundColor":                themeColorOpacity(text, .035),
+		"RefinementBorderColor":                    themeColorOpacity(text, .12),
+		"RefinementTitleColor":                     themeColorOpacity(text, .68),
+		"RefinementDividerColor":                   themeColorOpacity(text, .13),
+		"RefinementHotkeyColor":                    themeColorOpacity(text, .58),
+		"RefinementItemFontColor":                  themeColorOpacity(text, .82),
+		"RefinementItemBackgroundColor":            "transparent",
+		"RefinementItemHoverBackgroundColor":       themeColorOpacity(text, .08),
+		"RefinementItemActiveFontColor":            d.BaseTextColor,
+		"RefinementItemActiveBackgroundColor":      selected,
+		"RefinementItemActiveHoverBackgroundColor": themeColorOpacity(accent, .26),
+
+		"RefinementButtonFontColor":                  secondary,
+		"RefinementButtonIconColor":                  themeColorOpacity(text, .92),
+		"RefinementButtonBackgroundColor":            themeColorOpacity(text, .075),
+		"RefinementButtonBorderColor":                themeColorOpacity(text, .13),
+		"RefinementButtonHoverBackgroundColor":       themeColorOpacity(text, .14),
+		"RefinementButtonActiveFontColor":            themeColorOpacity(text, .94),
+		"RefinementButtonActiveIconColor":            themeColorOpacity(accent, .92),
+		"RefinementButtonActiveBackgroundColor":      themeColorOpacity(accent, .15),
+		"RefinementButtonActiveBorderColor":          themeColorOpacity(accent, .32),
+		"RefinementButtonActiveHoverBackgroundColor": themeColorOpacity(accent, .22),
+
+		"PreviewBackgroundColor": d.BaseBackgroundColor, "PreviewBorderColor": divider, "PreviewTagFontColor": secondary, "PreviewTagBackgroundColor": "transparent", "PreviewTagBorderColor": divider, "GlanceFontColor": secondary, "GlanceIconColor": secondary, "GlanceBackgroundColor": "transparent", "GlanceHoverBackgroundColor": themeColorOpacity(text, .1),
+		"AttentionFontColor": secondary, "AttentionIconColor": secondary, "AttentionBackgroundColor": "transparent", "AttentionBorderColor": "transparent", "AttentionHoverBackgroundColor": themeColorOpacity(text, .1), "AttentionHoverBorderColor": "transparent",
+		"ActionContainerDividerColor": divider, "ActionItemHotkeyFontColor": secondary, "ActionItemHotkeyBackgroundColor": "transparent", "ActionItemHotkeyBorderColor": divider, "ActionItemActiveHotkeyFontColor": d.BaseTextColor, "ActionItemActiveHotkeyBackgroundColor": "transparent", "ActionItemActiveHotkeyBorderColor": d.BaseTextColor, "ToolbarHotkeyFontColor": secondary, "ToolbarHotkeyBackgroundColor": "transparent", "ToolbarHotkeyBorderColor": divider, "ResultItemHoverBackgroundColor": themeColorOpacity(accent, 0.045),
+		"AppBackgroundColor": d.BaseBackgroundColor,
+		"AppContentInset":    0, "AppContentBackgroundColor": "transparent", "AppContentBorderRadius": 0,
+		"AppPaddingLeft": 10, "AppPaddingTop": 10, "AppPaddingRight": 10, "AppPaddingBottom": 10,
+		"ResultContainerPaddingLeft": 0, "ResultContainerPaddingTop": 8, "ResultContainerPaddingRight": 0, "ResultContainerPaddingBottom": 0,
+		"ResultItemBorderRadius": 8, "ResultItemPaddingLeft": 8, "ResultItemPaddingTop": 3, "ResultItemPaddingRight": 8, "ResultItemPaddingBottom": 3,
+		"ResultItemTitleColor": d.BaseTextColor, "ResultItemSubTitleColor": secondary, "ResultItemTailTextColor": secondary,
+		"ResultItemBorderLeftWidth": 0, "ResultItemActiveIndicatorWidth": 0, "ResultItemActiveIndicatorColor": d.BaseAccentColor,
+		"ResultItemActiveBackgroundColor": selected, "ResultItemActiveTitleColor": d.BaseTextColor, "ResultItemActiveSubTitleColor": d.BaseTextColor, "ResultItemActiveTailTextColor": d.BaseTextColor,
+		"QueryBoxFontColor": d.BaseTextColor, "QueryBoxBackgroundColor": d.BaseBackgroundColor, "QueryBoxBorderRadius": 8, "QueryBoxCursorColor": d.BaseAccentColor,
+		"QueryBoxTextSelectionBackgroundColor": selection, "QueryBoxTextSelectionColor": d.BaseTextColor,
+		"ActionContainerBackgroundColor": d.BaseBackgroundColor, "ActionContainerBorderColor": divider, "ActionContainerBorderWidth": 1, "ActionContainerBorderRadius": 8,
+		"ActionContainerHeaderFontColor": secondary, "ActionContainerPaddingLeft": 14, "ActionContainerPaddingTop": 10, "ActionContainerPaddingRight": 14, "ActionContainerPaddingBottom": 10,
+		"ActionItemBorderRadius": 8, "ActionItemActiveBackgroundColor": selected, "ActionItemActiveFontColor": d.BaseTextColor, "ActionItemFontColor": d.BaseTextColor,
+		"ActionQueryBoxFontColor": d.BaseTextColor, "ActionQueryBoxBackgroundColor": d.BaseBackgroundColor, "ActionQueryBoxBorderRadius": 8,
+		"PreviewFontColor": d.BaseTextColor, "PreviewSplitLineColor": divider, "PreviewPropertyTitleColor": secondary, "PreviewPropertyContentColor": d.BaseTextColor, "PreviewTextSelectionColor": selection,
+		"ToolbarFontColor": secondary, "ToolbarBackgroundColor": d.BaseBackgroundColor, "ToolbarBorderColor": divider, "ToolbarBorderWidth": 1, "ToolbarPaddingLeft": 10, "ToolbarPaddingRight": 10,
+	}
+	encoded, err := json.Marshal(d)
+	if err != nil {
+		return nil, err
+	}
+	var overrides map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &overrides); err != nil {
+		return nil, err
+	}
+	for key, value := range overrides {
+		if !themeV2StyleFields[key] || strings.HasPrefix(key, "Base") {
+			continue
+		}
+		if key == "Surfaces" {
+			values[key] = d.Surfaces
+			continue
+		}
+		if limit, ok := ThemeMaterialFieldLimit(key); ok {
+			var number float64
+			if err := json.Unmarshal(value, &number); err != nil {
+				return nil, fmt.Errorf("%s: %w", key, err)
+			}
+			if math.IsNaN(number) || math.IsInf(number, 0) || number < 0 || number > limit {
+				return nil, fmt.Errorf("%s must be between 0 and %g", key, limit)
+			}
+			values[key] = number
+			continue
+		}
+		if strings.HasSuffix(key, "Color") {
+			var css string
+			if err := json.Unmarshal(value, &css); err != nil {
+				return nil, fmt.Errorf("%s: %w", key, err)
+			}
+			parsed, ok := ParseThemeColor(css)
+			if !ok {
+				return nil, fmt.Errorf("%s must be a valid color", key)
+			}
+			// Normalize v2 colors so every existing renderer accepts exactly the validated value.
+			values[key] = themeColorOpacity(parsed, 1)
+		} else {
+			var number int
+			if err := json.Unmarshal(value, &number); err != nil {
+				return nil, fmt.Errorf("%s: %w", key, err)
+			}
+			if number < 0 {
+				return nil, fmt.Errorf("%s must be non-negative", key)
+			}
+			values[key] = number
+		}
+	}
+	// Unauthored emphasis follows the effective toolbar palette, including platform overrides.
+	for primary, normal := range map[string]string{
+		"ToolbarPrimaryFontColor":             "ToolbarFontColor",
+		"ToolbarPrimaryHotkeyFontColor":       "ToolbarHotkeyFontColor",
+		"ToolbarPrimaryHotkeyBackgroundColor": "ToolbarHotkeyBackgroundColor",
+		"ToolbarPrimaryHotkeyBorderColor":     "ToolbarHotkeyBorderColor",
+		// Overlay windows are a separate surface. Unauthored colors keep the
+		// previous app-background wash and action-item text.
+		"OverlayBackgroundColor": "AppBackgroundColor",
+		"OverlayFontColor":       "ActionItemFontColor",
+	} {
+		if _, authored := values[primary]; !authored {
+			values[primary] = values[normal]
+		}
+	}
+	// Base values also pass through normalization (notably the CSS transparent keyword).
+	for key, value := range values {
+		if css, ok := value.(string); ok {
+			parsed, _ := ParseThemeColor(css)
+			values[key] = themeColorOpacity(parsed, 1)
+		}
+	}
+	return json.Marshal(values)
+}
+
+func themeColorOpacity(c color.NRGBA, opacity float64) string {
+	return fmt.Sprintf("#%02X%02X%02X%02X", c.R, c.G, c.B, uint8(math.Floor(float64(c.A)*opacity)))
+}
+
+// ParseThemeColor validates v2 CSS colors strictly; legacy UI parsing remains unchanged.
+func ParseThemeColor(value string) (color.NRGBA, bool) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "transparent" {
+		return color.NRGBA{}, true
+	}
+	if strings.HasPrefix(value, "#") && (len(value) == 7 || len(value) == 9) {
+		data, err := hex.DecodeString(value[1:])
+		if err != nil {
+			return color.NRGBA{}, false
+		}
+		c := color.NRGBA{R: data[0], G: data[1], B: data[2], A: 255}
+		if len(data) == 4 {
+			c.A = data[3]
+		}
+		return c, true
+	}
+	count := 3
+	prefix := "rgb("
+	if strings.HasPrefix(value, "rgba(") {
+		count, prefix = 4, "rgba("
+	}
+	if !strings.HasPrefix(value, prefix) || !strings.HasSuffix(value, ")") {
+		return color.NRGBA{}, false
+	}
+	parts := strings.Split(value[len(prefix):len(value)-1], ",")
+	if len(parts) != count {
+		return color.NRGBA{}, false
+	}
+	channels := [4]uint8{0, 0, 0, 255}
+	for i, part := range parts {
+		n, err := strconv.ParseFloat(strings.TrimSpace(part), 64)
+		limit := float64(255)
+		if i == 3 {
+			limit = 1
+		}
+		if err != nil || math.IsNaN(n) || math.IsInf(n, 0) || n < 0 || n > limit {
+			return color.NRGBA{}, false
+		}
+		if i == 3 {
+			n *= 255
+		}
+		channels[i] = uint8(math.Floor(n))
+	}
+	return color.NRGBA{R: channels[0], G: channels[1], B: channels[2], A: channels[3]}, true
+}
+
+// themeV2Source keeps authored styles separate from target-specific resolved colors.
+type themeV2Source struct {
+	definition      ThemeSchemaV2
+	colors          map[string]string
+	appWindowChrome bool
+}
+
+func themeV2Colors(t Theme) map[string]string {
+	if source, ok := t.source.(*themeV2Source); ok {
+		return source.colors
+	}
+	return nil
+}
+
+// The complete v2 declaration is the source of truth for accepted JSON fields.
+var themeV2DocumentFields = func() map[string]bool {
+	fields := make(map[string]bool)
+	typ := reflect.TypeFor[ThemeSchemaV2]()
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		name := strings.Split(field.Tag.Get("json"), ",")[0]
+		if name == "" {
+			name = field.Name
+		}
+		fields[name] = true
+	}
+	return fields
+}()
+
+// Only v2 style fields may occur in platform overrides; identity stays at the root.
+var themeV2StyleFields = func() map[string]bool {
+	fields := make(map[string]bool, len(themeV2DocumentFields))
+	for key := range themeV2DocumentFields {
+		fields[key] = true
+	}
+	for _, key := range []string{"I18n", "SchemaVersion", "MinWoxVersion", "ThemeId", "ThemeName", "ThemeAuthor", "ThemeUrl", "Version", "Description", "IsSystem", "IsInstalled", "IsAutoAppearance", "DarkThemeId", "LightThemeId", "windows", "macos", "linux"} {
+		delete(fields, key)
+	}
+	return fields
+}()
+
+// ThemeMaterialFieldLimit distinguishes continuous material controls from integer geometry.
+func ThemeMaterialFieldLimit(key string) (float64, bool) {
+	switch key {
+	case "ToolbarBlurSigma":
+		return 64, true
+	case "ToolbarBlurBrightness", "ToolbarBlurSaturation":
+		return 2, true
+	default:
+		return 0, false
+	}
+}

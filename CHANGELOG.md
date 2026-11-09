@@ -1,0 +1,978 @@
+# Changelog
+
+## v2.4.9 - 2026-10-31
+
+Import Raycast settings and plugins into Wox, and organize AI Chat conversations into projects. Wox also offers improved Omarchy support, including an Omarchy Auto theme that follows your desktop theme.
+
+
+![Wox v2.4.9: Raycast import and Omarchy support](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/changelog-v2.4.9.png)
+
+- Add
+  - [`Raycast`] Import a Raycast export during setup to bring over supported settings, shortcuts, notes, clipboard history, and other data. You can also import compatible locally installed extensions and use their commands in Wox.
+  - [`Omarchy`] Automatically follow the current desktop theme and search Omarchy menu commands in Wox. For details, see [the Omarchy guide](https://www.woxlauncher.com/blog/wox-launcher-loves-omarchy.html).
+
+- Improve
+  - [`Notes`] Organize and pin notes in the sidebar, search your notes, and find text within an open note.
+  - [`AI Chat`] Search conversation history, test provider connections in Settings, and organize conversations into projects.
+  - [`Linux`] On Hyprland, bring a running app's window forward, including on another workspace, and select windows for screenshots. App results can show CPU and memory usage. On Omarchy, use selected text in searches.
+  - [`Web Search`] Open saved websites and searches directly inside Wox, with the option to keep pages running in the background. **Existing WebView sites move to Web Search.** Query hotkeys can open a preview without the results list. [#4659](https://github.com/Wox-launcher/Wox/issues/4659)
+  - [`Hotkey`] Choose Emacs or Vim-style keys to navigate results and the Action Panel, and customize the filter shortcut. [#4682](https://github.com/Wox-launcher/Wox/issues/4682)
+  - [`Screenshot`] Compress MP4 recordings and show progress while they are saved.
+  - [`Quick Jump`] Use Directory Opus as a source when switching a file dialog to an open folder. [#4670](https://github.com/Wox-launcher/Wox/pull/4670) [@momadacoding](https://github.com/momadacoding)
+  - [`Plugin`] Update installed plugins with `wpm update`.
+
+- Fix
+  - [`Clipboard`] Keep searches responsive with large histories, including histories with many images or long text.
+  - [`Query`] Rank close matches above scattered letters and keep unrelated past searches from pushing results up.
+  - [`Launcher`] Keep the launcher on the intended display when monitors use different scaling, and restore its position more reliably. [#4680](https://github.com/Wox-launcher/Wox/issues/4680)
+  - [`Screenshot`] Keep the editing toolbar on the active display, and exclude the recording border from Linux captures.
+  - [`Windows`] Restore Snap support for resizable Wox windows and fix freezes when hiding Wox with software rendering enabled. [#4637](https://github.com/Wox-launcher/Wox/issues/4637)
+  - [`Browser`] Fix links from Wox opening in the wrong default browser on Windows. [#4674](https://github.com/Wox-launcher/Wox/issues/4674)
+
+- Store
+  - Plugin
+    - [Asyntai AI Chatbot](https://asyntai.com/documentation/integrations/wox/) Read your website chats, leads and tickets, and ask your Asyntai AI chatbot, right from Wox. [#4672](https://github.com/Wox-launcher/Wox/pull/4672) [@asyntai](https://github.com/asyntai)
+    - [TOTP Codes](https://github.com/sqlwwx/Wox.Plugin.Totp) Query and copy TOTP codes, local storage, supports otpauth:// URIs [#4676](https://github.com/Wox-launcher/Wox/pull/4676) [@sqlwwx](https://github.com/sqlwwx)
+    - [Window Pin](https://gist.github.com/qianlifeng/03c57db33077eda40b352dc6aa67c039) Keep Windows applications above other windows [@qianlifeng](https://github.com/qianlifeng)
+  - Theme
+    - [Western Oil Painting](https://github.com/dragonish/Wox.Theme.WesternOilPainting) A Western oil-painting frame in sage, ochre and sky blue, around a warm-paper workspace with a pink query box, gold toolbar and deep burnt-sienna selection. [#4678](https://github.com/Wox-launcher/Wox/pull/4678) [@dragonish](https://github.com/dragonish)
+
+## v2.4.8 - 2026-10-25
+
+File searches are faster and use less memory. You can open a new app window with Ctrl/Cmd+Enter and choose where screenshots are saved.
+![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/filesearch.png)
+
+- Improve
+  - [`File Search`] Speed up filename and path searches and use less memory when preparing the file list. Improve pinyin matching, prefer shorter names when matches are equally good, and put Recycle Bin files last. Choose how many files appear in searches without the `f` keyword.
+  - [`App`] Support requesting a new app window with Ctrl/Cmd+Enter [#4657](https://github.com/Wox-launcher/Wox/issues/4657). On Windows, search and open Control Panel items and tasks. Keep the app list up to date with less scanning.
+  - [`Folder`] Support browsing with `cd` or your chosen Folder keyword, including when using Shift+Enter from File Search. Keep the preview collapsed until you open it.
+  - [`Screenshot`] Support saving captures to a folder of your choice, including a OneDrive folder. Existing screenshots move automatically and remain searchable during the move. On Windows, support recording with FFmpeg installed through Scoop without opening a console window.
+  - [`Preview`] Support live plugin previews that keep your scroll position, selected text, and animations as they update. Refresh their content when Wox reopens.
+  - [`Settings`] Support software rendering to work around graphics driver problems, with a Restart Wox button to apply the change. You can also search for the Restart Wox command [#4637](https://github.com/Wox-launcher/Wox/issues/4637).
+  - [`Feedback`] Support restarting in debug mode to collect more detail about crashes and freezes. A visible label shows when debug mode is on.
+  - [`Linux`] Improve responsiveness when typing and scrolling in Settings.
+
+- Fix
+  - [`File Search`] Fix missing or outdated results after file changes. On macOS, show recently modified files when the system's recent-file list is empty or unavailable.
+  - [`Quick Jump`] Keep files from the current folder above matches elsewhere.
+  - [`Query`] Keep fallback searches below ordinary matches, even when used frequently.
+  - [`App`] Fix missing Windows app icons and shortcuts losing their custom icons [#4665](https://github.com/Wox-launcher/Wox/issues/4665). On Linux, fix newly installed apps taking too long to appear when other launchers cannot be used.
+  - [`Plugin`] Fix Node.js plugins failing to start because of unrelated files in a parent folder. Show the actual startup error promptly instead of a long connection timeout [#4651](https://github.com/Wox-launcher/Wox/issues/4651).
+  - [`Settings`] Fix multi-select plugin settings losing earlier selections, plugin-provided settings not appearing, and live settings updates discarding edits or leaving buttons unresponsive. [#4644](https://github.com/Wox-launcher/Wox/pull/4644) [@stmluyuer](https://github.com/stmluyuer) [#4647](https://github.com/Wox-launcher/Wox/pull/4647) [@dragonish](https://github.com/dragonish)
+  - [`AI Chat`] Fix answers sometimes disappearing from the chat window on Windows while the launcher is hidden [#4646](https://github.com/Wox-launcher/Wox/issues/4646).
+  - [`Windows`] Fix freezes when hiding Wox with software rendering enabled [#4637](https://github.com/Wox-launcher/Wox/issues/4637). Fix blank windows, missing icons, and file pickers failing after prolonged use [#4639](https://github.com/Wox-launcher/Wox/issues/4639).
+
+- Store
+  - Plugin
+    - [PortGenerator](https://github.com/dragonish/Wox.Plugin.PortGenerator) Check port usage / Generate random ports. [#4635](https://github.com/Wox-launcher/Wox/pull/4635) [@dragonish](https://github.com/dragonish)
+    - [ASCII Art Generator](https://github.com/dragonish/Wox.Plugin.ASCIIArtGenerator) Generate ASCII art strings. [#4655](https://github.com/Wox-launcher/Wox/pull/4655) [@dragonish](https://github.com/dragonish)
+    - [Kaomoji](https://github.com/dragonish/Wox.Plugin.Kaomoji) Search and copy kaomoji. [#4662](https://github.com/Wox-launcher/Wox/pull/4662) [@dragonish](https://github.com/dragonish)
+  - Theme
+    - [Dracula](https://gist.github.com/dragonish/c6118868fc93e7519ef1d11b2a5b0248) A dark theme inspired by the Dracula palette: near-black background, soft-white text, purple selection and cyan accents. Unofficial, not affiliated with Dracula Theme. [#4640](https://github.com/Wox-launcher/Wox/pull/4640) [@dragonish](https://github.com/dragonish)
+    - [Five Shades of Ink](https://gist.github.com/dragonish/2cf9d018af5fd48991be9de497128d81) Rice-paper background with five grades of ink — scorched, dense, heavy, pale and clear — and a cinnabar seal accent. [#4641](https://github.com/Wox-launcher/Wox/pull/4641) [@dragonish](https://github.com/dragonish)
+    - [Dai](https://gist.github.com/dragonish/9278791e2a2e09ee4281f97a45545730) Deep blue-black Dai ink, moon-white text, mineral blue-green accents, and a cinnabar seal stroke. [#4642](https://github.com/Wox-launcher/Wox/pull/4642) [@dragonish](https://github.com/dragonish)
+
+## v2.4.7 - 2026-10-15
+
+This release brings offline mode, portable settings, and a way to import shortcuts, themes, and plugins from Flow Launcher on Windows.
+
+![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/import_from_flow_launcher.png)
+
+- Add
+  - [`Privacy`] Use offline mode to pause Wox's network features and all third-party plugins while keeping local search available.
+  - [`Portable Mode`] Create a `wox-user` folder beside the Wox executable. Wox will use it for your settings the next time it starts, so you can copy Wox and its settings to another location and keep your configuration.
+  - [`Flow Launcher`] On Windows, import hotkeys, query aliases, general settings, the current theme, and installed plugins during setup. Keep using familiar shortcuts and plugins.
+
+- Improve
+  - [`Screenshot`] Select a button or other part of a window under the pointer, and scroll to select a larger enclosing area. Drag the editing toolbar out of the way, paste captures sooner, and keep saved captures in your chosen user data folder.
+  - [`App`] Support uninstalling macOS apps by moving them to the Trash. Use less CPU when updating the app list, and show a cleaner app grid with better icons on Windows.
+  - [`File Search`] Include files in searches without requiring the `f` keyword.
+  - [`Converter`] Choose a default display currency, or use your system region, so currency calculations no longer need an explicit target currency. [#4619](https://github.com/Wox-launcher/Wox/pull/4619) [@mtsgsr](https://github.com/mtsgsr)
+  - [`Notes`] Preview a note, including its images, beside the results and see when it was last updated.
+  - [`Hotkey`] Open Settings with Ctrl/Cmd+, and close the current window or embedded web page with Ctrl/Cmd+W. From Notes or AI Chat, the settings shortcut opens that plugin's settings.
+  - [`Query`] Restore the selected result when undoing or redoing a query.
+  - [`Data`] Create a `wox-user` folder beside the executable to keep settings, plugins, themes, and other user data with that copy of Wox.
+  - [`Backup`] When automatic backups are enabled, back up once a day while Wox is running. Delete old backups from Settings, see backup progress, and avoid starting a second backup while one is running.
+  - [`Cloud Sync`] Reduce disk usage by cleaning up old sync history overnight.
+
+- Fix
+  - [`Query`] Keep pinned results above result groups and limit each pin to the query where it was saved. Keep results visible during a refresh, and show fallback searches without waiting for slow plugins.
+  - [`Clipboard`] Fix text and images copied from Wox missing from clipboard history [#4620](https://github.com/Wox-launcher/Wox/issues/4620).
+  - [`Plugin`] Fix Python plugins interfering with each other when they use the same entry file name [#4628](https://github.com/Wox-launcher/Wox/issues/4628).
+  - [`Backup`] Fix restoring backups while files are still in use, and keep restored data from being overwritten by older cloud data. Skip unreadable plugin files so they do not stop the entire backup.
+  - [`Notes`] Fix typing `- [ ] ` not creating a task. [#4618](https://github.com/Wox-launcher/Wox/pull/4618) [@lmgarret](https://github.com/lmgarret)
+  - [`Settings`] Save text fields when focus moves away, apply proxy changes when the proxy is turned off, and restore settings-window dragging on macOS.
+  - [`Theme`] Fix themes failing to load when they contain options from a different Wox version.
+  - [`Windows`] Fix memory staying in use after closing a web preview and hiding Wox.
+
+- Store
+  - Plugin
+    - [Wox.Plugin.Manasikāra](https://github.com/Archetype444/Wox.Plugin.Manasikara) Continuous focus and deep focus, three Pomodoro variants, meditation and countdown timers with configurable singing-bowl chimes and activity prompts. [#4621](https://github.com/Wox-launcher/Wox/pull/4621) [@Archetype444](https://github.com/Archetype444)
+    - [Nbnhhsh](https://github.com/dragonish/Wox.Plugin.Nbnhhsh) Look up the meanings of Chinese pinyin abbreviations. [#4624](https://github.com/Wox-launcher/Wox/pull/4624) [@dragonish](https://github.com/dragonish)
+    - [PowerToys](https://github.com/dragonish/Wox.Plugin.PowerToys) Allows the user to launch some PowerToys from Wox. [#4626](https://github.com/Wox-launcher/Wox/pull/4626) [@dragonish](https://github.com/dragonish)
+    - [QRCode](https://github.com/dragonish/Wox.Plugin.QRCode) Generate a QR Code / Screenshot to scan and recognize the QR Code. [#4630](https://github.com/Wox-launcher/Wox/pull/4630) [@dragonish](https://github.com/dragonish)
+
+## v2.4.6 - 2026-10-06
+
+This version mainly enhances the screenshot plugin, Folder plugin, and other bug fixes. We also fine-tuned the built-in theme styles of Wox. You can now also use `Ctrl/Cmd + P` to temporarily hide/show the preview panel.
+![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/guide/plugin_screenshot_show_background.png)
+
+- Improve
+  - [`Screenshot`] Capture a window or a free region, draw and write on it, and save a PNG or a short GIF, WebP, or MP4. Press Space to put the wallpaper behind the selection, and edit the capture again from history or the clipboard.
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/screenshot_window_capture.png)
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/screenshot_edit.png)
+  - [`Folder`] A folder listing starts with `..`, and Enter goes up. Shift+Enter browses a folder, or the folder that contains a file, inside Wox.
+  - [`Clipboard`] Show a copied link's title and image after you copy it again. On Hyprland, X11, and Plasma, copied text can show which app it came from. Favorites stay out of the normal list unless Show favorite by default is on, and `cb fav` ranks them by use [#4592](https://github.com/Wox-launcher/Wox/issues/4592).
+  - [`Converter`] Support 156 currencies, and tell Mbps apart from MBps.
+  - [`Calculator`] Accept digit separators in numbers, such as `1,000` or `1_000`.
+  - [`Preview`] Open a closed preview with Ctrl/Cmd+P, and show source files as colored code.
+  - [`Launcher`] Apply the interface size to chat, settings, and other windows [#4586](https://github.com/Wox-launcher/Wox/issues/4586). Choose which screen the launcher opens on [#4597](https://github.com/Wox-launcher/Wox/issues/4597). The toolbar keeps the main action.
+  - [`Hotkey`] Use the Windows key by itself as the launcher hotkey, and keep the Start menu closed [#4595](https://github.com/Wox-launcher/Wox/issues/4595).
+  - [`Theme`] Blur the launcher background where the desktop supports it, and adjust how frosted the toolbar looks.
+  - [`Cloud Sync`] Show Free or Pro on the sync status, how many changes are waiting, and the size of past syncs.
+  - [`AI Chat`] Select and copy an answer across paragraphs, lists, and code.
+  - [`Plugin`] Mask password fields, and let you keep a plugin's cache when uninstalling it.
+  - [`Feedback`] Restart with only built-in plugins to troubleshoot. A warning stays up until you start normally and bring the others back.
+
+- Fix
+  - [`Query`] Fix a search with no results keeping the spinner when a disabled plugin was still included [#4615](https://github.com/Wox-launcher/Wox/issues/4615). Trim blank lines from the start and end of a pasted query.
+  - [`AI Chat`] Fix a custom chat keyword being ignored when opening chat from a selection, a file, or history [#4611](https://github.com/Wox-launcher/Wox/issues/4611).
+  - [`App`] Fix the same Windows program appearing more than once as a shortcut and an executable [#4599](https://github.com/Wox-launcher/Wox/issues/4599).
+  - [`Screenshot`] Fix a pinned capture dropping behind other windows.
+  - [`Launcher`] Fix the start page closing after you remove an item, and recent results not returning after you clear a query opened from a hotkey or a link.
+  - [`Notes`] Fix a heading changing type when lines are inserted in preview, and a note image changing height after it scrolls away.
+  - [`Color`] Fix a searched color not being saved to history.
+  - [`Hotkey`] Fix Windows key shortcuts that Wox could not take over, while Win+L still locks the PC [#4604](https://github.com/Wox-launcher/Wox/issues/4604). On GNOME, leftover shortcuts no longer swallow keys after Wox registers them.
+  - [`Onboarding`] Fix first-run setup on macOS skipping the permission steps [#4603](https://github.com/Wox-launcher/Wox/issues/4603).
+  - [`Plugin`] Fix plugin actions that did nothing after a plugin reconnected [#4588](https://github.com/Wox-launcher/Wox/issues/4588). Fix plugin files extracting into the wrong folders on Windows, and the start page opening a plugin with `*` instead of its keyword.
+  - [`Icon`] Fix some app icons, such as Code - OSS, showing as solid black.
+
+- Store
+  - Plugin
+    - [Stock](https://gist.github.com/qianlifeng/a99f529ece21561ff7b73d872e72998c) Look up A-share, Hong Kong, and US quotes. [@qianlifeng](https://github.com/qianlifeng)
+    - [Stopwatch](https://github.com/lmgarret/wox-stopwatch-plugin) Stopwatch with laps, live in the launcher [@lmgarret](https://github.com/lmgarret)
+    - [Weather](https://gist.github.com/qianlifeng/25d66a91de168cb7e210f2cf756960c2) Current weather and the next few days from wttr.in. [@qianlifeng](https://github.com/qianlifeng)
+    - [Word Count](https://gist.github.com/qianlifeng/bf1b14e74b6cbecd6fcc8fc6ede94f7f) Count words and text statistics from a query or selection [@qianlifeng](https://github.com/qianlifeng)
+    - [Games](https://github.com/Wox-launcher/Wox.Plugin.Games) Search installed games from Steam, Epic, GOG, Ubisoft Connect, EA, Battle.net, Xbox, and itch.io. [@Wox-launcher](https://github.com/Wox-launcher)
+    - [IMDB](https://gist.github.com/qianlifeng/dc6511115bdde92b3976369c4b675ebe) Search TMDB movies and TV, with posters and ratings [@qianlifeng](https://github.com/qianlifeng)
+    - [Clash Verge](https://gist.github.com/qianlifeng/db55c71d2bef5359af515f309be4d23d) Show the local Clash Verge core and switch proxy nodes. [@qianlifeng](https://github.com/qianlifeng)
+
+## v2.4.5 - 2026-09-23
+
+This release lets you set a global hotkey or a search alias on any result.
+![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/result_hotkey_alias.png)
+
+
+- Improve
+  - [`Theme`] Add the `.wox-theme` theme format.
+  - [`Web Search`] Open a search result inside the launcher with Ctrl/Cmd+Enter [#4574](https://github.com/Wox-launcher/Wox/issues/4574).
+  - [`Launcher`] Open the About menu from the toolbar or Ctrl/Cmd+Shift+K.
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/about_panel.png)
+  - [`AI Chat`] Mention a plugin in the conversation with @.
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/ai_chat_ask_plugin.png)
+  - [`Shell`] Open the current command in the system terminal with Ctrl/Cmd+T.
+  - [`Hotkey`] Ignore launcher hotkeys in fullscreen [#4573](https://github.com/Wox-launcher/Wox/issues/4573), and register global shortcuts on COSMIC [#4576](https://github.com/Wox-launcher/Wox/issues/4576).
+  - [`Folder`] Preview a folder's contents, and copy its path or name.
+  - [`Screenshot`] Send a capture to AI Chat so you can quickly ask about or summarize the image.
+  - [`Clipboard`] Filter favorites with `cb fav`.
+  - [`Settings`] Give hotkeys their own settings page. Show a plugin's description, settings, and keywords on one page.
+  - [`App`] Copy an app's name. Use less memory after Wox hides.
+  - [`Preview`] Make HTML previews follow the launcher colors.
+  - [`Confetti`] Play confetti from another app with `wox://confetti`.
+
+- Fix
+  - [`Shell`] Fix command output that could not be selected or copied [#4581](https://github.com/Wox-launcher/Wox/issues/4581).
+  - [`App`] Fix an `.exe` ignore rule hiding shortcuts [#4580](https://github.com/Wox-launcher/Wox/issues/4580).
+  - [`Launcher`] Fix a dropped file being replaced by the recent list, and wrong placement with mixed display scaling [#4572](https://github.com/Wox-launcher/Wox/issues/4572).
+  - [`Query`] Fix `wox://` links opening an empty launcher.
+  - [`Clipboard`] Fix favorites missing from the start page.
+  - [`Settings`] Fix misplaced errors, clipped dropdown labels, and blank plugin paths.
+  - [`Hotkey`] Fix held shortcuts, Caps Lock query hotkeys, and accidental keys while recording.
+  - [`Selection`] Fix reading the selection while the shortcut is still held.
+  - [`Screenshot`] Fix Chinese, Japanese, and Korean text in saved screenshots turning into boxes.
+  - [`Cloud Sync`] Fix payment links opening the wrong page.
+  - [`Preview`] Fix icons whose links have no `.svg` ending.
+  - [`Attention`] Fix the unread count missing its icon.
+  - [`Linux`] Fix the first-run theme list stuck loading.
+
+- Store
+  - Plugin
+    - [Stremio Search](https://github.com/NubPlayz/Stremio.Search.Wox.Plugin) Fast local library search & catalog lookup for Stremio [@NubPlayz](https://github.com/NubPlayz)
+    - [JSON Formatter](https://gist.github.com/qianlifeng/0a8440a902dad5308dd3465e634a4428) Format, minify, and validate JSON from the query, selection, or a file [@qianlifeng](https://github.com/qianlifeng)
+    - [Random Data Generator](https://gist.github.com/qianlifeng/8299ba9cd0478ef75a22537b9ffd5353) Generate random numbers, UUIDs, passwords, emails, names, colors, and more. Add a count, e.g. random number 10 [@qianlifeng](https://github.com/qianlifeng)
+    - [YouTube](https://gist.github.com/qianlifeng/04a9609de66eaa582a473f5852450ede) Search YouTube videos and open them in the browser [@qianlifeng](https://github.com/qianlifeng)
+  - Theme
+    - [Knit](https://github.com/qianlifeng/Wox.Theme.Knit) A cozy blue-grey and cream knit frame for a quieter workspace. [@qianlifeng](https://github.com/qianlifeng)
+      ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/theme_knit.png)
+
+## v2.4.4 - 2026-09-16
+
+This release brings a new Jade system theme, and uses Liquid Glass on macOS 26. Settings keep their own look, so themes no longer change the Settings window.
+
+![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/theme_jade.png)
+
+
+- Improve
+  - [`Theme`] Support the Jade theme, use Liquid Glass on macOS 26+, and make theme previews match the live launcher. Themes can also customize window corners, toolbar colors, and frosted panels.
+  - [`Settings`] Keep Settings and first-run setup on their own look so your launcher theme does not change them, and let plugin catalog filters use one dropdown at a time
+  - [`Query`] Suggest command completions you can accept with Tab, undo a query change with Ctrl/Cmd+Z, and hide extra command hints in File Search, Clipboard, and Feedback
+  - [`Clipboard`] Paste history one item at a time with `cb paste`, favorite and rename images, show website icons on copied links, and open the folder that contains a copied file [See video](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/sequential_paste.mp4)
+  - [`Converter`] Understand more everyday calculator phrases, decode pasted Base64 or encode text, answer `now` / `now in` time questions, and handle playback speed, rounding, and lap times more reliably
+  ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/converter_now_in_JP.jpg)
+  - [`AI`] Support SiliconFlow as a chat provider
+  - [`AI Chat`] Paste or drop files and images into a conversation [#4566](https://github.com/Wox-launcher/Wox/issues/4566), open model and skill lists faster, close a popped-out chat window with Escape, and make streaming replies feel smoother
+  - [`File Search`] Match filenames that contain every word you type [#4560](https://github.com/Wox-launcher/Wox/issues/4560), and read text inside PDFs more reliably [#4564](https://github.com/Wox-launcher/Wox/issues/4564)
+  - [`App`] Find Windows Store and Apps Folder apps, and pick up newly installed apps [#4565](https://github.com/Wox-launcher/Wox/issues/4565)
+  - [`Web Search`] Open a search in a private or incognito window
+  - [`Plugin`] Install a plugin by opening a `.wox` file, find Node.js and Python installed by mise without restarting Wox [#4569](https://github.com/Wox-launcher/Wox/issues/4569), keep the launcher open after dragging a file out of a result, and show Attention unread counts again with a shortcut to that plugin's settings
+  - [`Notes`] Keep your place when switching between preview and Markdown, paste images and text more reliably, and show a character count
+  - [`Launcher`] Jump between result groups with Ctrl (Option on macOS) plus Up/Down, keep the toolbar visible over the list, use a star for Favorites and a pin only for ranking, and show the best action-list matches first
+  - [`Hotkey`] Let Windows record Win+Space as a Wox hotkey
+  - [`Browser Bookmark`] Search bookmarks with `b`, and match titles and URLs more loosely in that command
+  - [`Folder`] Open the parent folder from a folder result
+  - [`Selection`] Read selected text and files more reliably, including from Wox's own windows [#4561](https://github.com/Wox-launcher/Wox/issues/4561) [#4558](https://github.com/Wox-launcher/Wox/issues/4558)
+  - [`Font`] Show installed Windows fonts in font pickers [#4554](https://github.com/Wox-launcher/Wox/issues/4554)
+  - [`Updater`] Show Chinese release notes in the update preview, and play confetti after a successful update
+
+- Fix
+  - [`File Search`] Fix newly added folders not showing up in search
+  - [`IME`] Fix English input on Windows when using Chinese IMEs such as WeChat IME
+  - [`UI`] Fix the cursor not blinking on transparent Windows windows, and blurred panels hiding the result list
+  - [`Clipboard`] Fix paste actions showing a long window title instead of the app name
+  - [`AI`] Fix being unable to select AI answers
+  - [`Media Player`] Fix a long wait when opening Media Player on Windows
+  - [`Attention`] Fix the unread badge disappearing while you type
+  - [`Screenshot`] Fix recording shortcuts showing as separate keys instead of one shortcut
+
+- Store
+  - Plugin
+    - [Lock Keybord](https://gist.github.com/qianlifeng/a46c95ef4bd0e5f782e873260ed72491) Lock the keyboard so you can wipe it without triggering shortcuts [@qianlifeng](https://github.com/qianlifeng)
+    - [Droppy](https://gist.github.com/qianlifeng/b27ea5c3cc3f78d2f526c9b481ad9c24) A stash box for files. Drop files in, then drag them out later. [@qianlifeng](https://github.com/qianlifeng)
+  - Theme
+    - [Omarchy](https://github.com/basecamp/omarchy) Omarchy's default Walker menu: charcoal card, cream outline, full-width gray selection, and muted teal active icons. [@qianlifeng](https://github.com/qianlifeng)
+    - Ocean Glass Blue-gray content panel, native-material rim, and warm yellow accents inspired by the supplied launcher screenshot. [@qianlifeng](https://github.com/qianlifeng)
+    - [Wox Saffron](https://github.com/Wox-launcher/Wox) Warm ivory surfaces, teal text, and a saffron query underline. A light theme showcasing the query bottom border. [@qianlifeng](https://github.com/qianlifeng)
+
+## v2.4.3 - 2026-09-09
+
+This release adds query hints so Web Search and other commands can collect multiple named inputs with Tab instead of a single free-text box.
+
+![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/query_hint.jpg)
+
+
+- Add
+  - [`Query`] Add query hints for command templates so users can fill multi-part commands with argument chips, ghost placeholders, and Tab completion. Web Search templates can collect multiple named inputs, including selected text and clipboard text captured before the launcher takes focus.
+  - [`Feedback`] Add a built-in Feedback plugin to export diagnostics, review crash reports, clear logs before a reproduction, and open GitHub issues or feature requests.  
+  ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/feedback.jpg)
+
+- Improve
+  - [`AI`] Group the provider dropdown into API and Installed CLI, use brand icons for local CLI providers, and allow searching the list
+  - [`AI Chat`] Support popping a conversation into a dedicated window that keeps the unsent draft after the launcher hides, attach selected text, files, and images without mixing them into instructions, edit `{wox:...}` placeholders as tokens [#4543](https://github.com/Wox-launcher/Wox/issues/4543), and grow the composer from one to five wrapped lines
+  - [`File Search`] Show OS recent files for an empty File Search query, using Windows Jump Lists, macOS Spotlight last-used dates, and Linux recently-used.xbel
+  - [`Quick Jump`] Rename File Explorer Search to Quick Jump (`jump`), keep saved paths per OS, skip ignored applications, navigate Wox's own Windows pickers, and inject 32-bit window hooks so 32-bit hosts such as Foxmail and Office work [#4511](https://github.com/Wox-launcher/Wox/issues/4511)
+  - [`App`] Support hide-from-search with live wildcard or selected-app ignore rules and a match preview [#4537](https://github.com/Wox-launcher/Wox/issues/4537), and support Japanese (ja_JP)
+  - [`Clipboard`] Support pasting clipboard images and emoji into the active window [#4538](https://github.com/Wox-launcher/Wox/issues/4538)
+  - [`Plugin`] Support query refinements and static HTML previews, runtime trigger-keyword registration, and a WPM action that copies an AI prompt for creating a plugin
+  - [`Launcher`] Support resetting a result's usage-based ranking from the action panel, group system actions, and validate required fields in query-requirement forms
+  - [`Hotkey`] Improve macOS hotkey recording with an Accessibility permission prompt and a local fallback when global recording is unavailable [#4548](https://github.com/Wox-launcher/Wox/issues/4548)
+  - [`Preview`] Defer large text, Office, and PDF previews behind a details-first gate so rapid selection does not start heavy reads
+  - [`Browser`] Improve browser window identification so tab results stay scoped to the active browser [#4542](https://github.com/Wox-launcher/Wox/issues/4542)
+  - [`Converter`] Expand unit, currency, date, and percentage queries into typed expressions so nested conversions, tips, workdays, and timezone sentences compose in one query, with copy actions for formatted, raw, and question-answer results
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/converter_time.jpg)
+  - [`Query`] Support saving the current query as a shortcut from the action panel, and add a Query Test button in settings for query hotkeys, shortcuts, and tray queries
+  - [`Folder`] Support Windows environment variables such as `%LOCALAPPDATA%` in folder paths
+  - [`Notes`] Support reordering checklist tasks by dragging the trailing handle
+
+- Fix
+  - [`App`] Fix Linux apps whose icons sit directly in XDG data icon dirs showing the default icon
+  - [`Quick Jump`] Fix Windows Move Items folder choosers and cut hung window-hook waits that delayed dialog navigation [#4511](https://github.com/Wox-launcher/Wox/issues/4511)
+  - [`UI`] Fix hidden WebView renderers being destroyed on Windows memory trim, and clip native file previews under overlays so they match rounded corners
+  - [`Launcher`] Fix caret placement on long query text
+  - [`AI Chat`] Fix conversations resetting about every 30 seconds when App directory scans refreshed the query [#4551](https://github.com/Wox-launcher/Wox/issues/4551), and keep fullscreen chat after hide/show
+
+- Store
+  - Plugin
+    - [Linkding](https://github.com/Myraxion/Wox.Plugin.Linkding) Search, save, and manage bookmarks from your Linkding instance [@Myraxion](https://github.com/Myraxion)
+    - [GitHub](https://github.com/Wox-launcher/Wox.Plugin.Github) Manage GitHub issues and notifications [@Wox-launcher](https://github.com/Wox-launcher)
+    - [Notion](https://github.com/lmgarret/wox-notion-plugin) Search Notion pages and databases, jump to recent pages, and quick-capture notes from the launcher [@lmgarret](https://github.com/lmgarret)
+
+## v2.4.2 - 2026-09-03
+
+This release speeds up File Search on Windows with optional Fast Indexing through an NTFS service, so large volumes stay current without a full crawl.
+
+![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/fast_file_index.jpg)
+
+- Improve
+  - [`File Search`] Support optional Fast Indexing on Windows by installing a service that indexes NTFS volumes through MFT and USN, let content-search directories be configured independently of filename-search roots, group file results in global queries, and filter results to content matches
+  - [`Confetti`] Show a fullscreen confetti overlay from the Confetti command, try `confetti` query
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/confetti.png)
+  - [`AI Chat`] Support configuring MCP servers from settings with a server table, JSON import for full mcpServers documents, OAuth, and per-server tools [#4529](https://github.com/Wox-launcher/Wox/issues/4529)
+  - [`Wox Memory`] Add built-in memory diagnostics to inspect Wox process composition with Go heap, native, and per-process breakdowns plus a live Glance
+  - [`Clipboard`] Support searching clipboard images by their OCR text [#4525](https://github.com/Wox-launcher/Wox/issues/4525), and improve macOS handling for remote file URLs [#4532](https://github.com/Wox-launcher/Wox/issues/4532)
+  - [`Folder`] Support fuzzy matching for child names and complete parent-directory paths while typing
+  - [`Shell`] Show a running indicator on active commands in history
+  - [`Launcher`] Improve action-panel search with aliases so localized actions stay findable by English names and extra terms
+  - [`Explorer`] Prioritize matches in the current directory during type-to-search [#4527](https://github.com/Wox-launcher/Wox/issues/4527)
+  - [`Indicator`] Support matching plugins by description as well as name
+  - [`Settings`] Support opening links from plugin setting help text
+  - [`Screenshot`] Lower the default screenshot history retention from 30 to 15 days
+  - [`UI`] Support animated GIF images in results and previews without flattening animation
+  - [`App`] Support Korean (ko_KR) language and reconcile Windows app directories when indexed paths are missing
+  - [`Plugin`] Surface plugin initialization failures, add store plugin health checks, and let users refresh Python and Node.js runtimes from settings
+
+- Fix
+  - [`Notes`] Fix new notes not being pinned by default
+  - [`Explorer`] Fix the type-to-search dialog hint closing too early during focus handoff
+  - [`Launcher`] Constrain launcher height to the display work area [#4527](https://github.com/Wox-launcher/Wox/issues/4527)
+  - [`Clipboard`] Fix Wox's own clipboard writes being recorded as new history entries
+  - [`Linux`] Fix X11 clipboard reads hanging by timing out clipboard commands
+  - [`App`] Release GPU and database caches after Wox hides and improve native memory accounting in diagnostics
+  - [`UI`] Fix scrollbar overlay visibility in scroll views and incorrect list updates when result lists shrink
+
+- Store
+  - Plugin
+    - [need](https://github.com/zzedbot/wox-plugin-need) Store and quickly retrieve local key-value notes [@zzedbot](https://github.com/zzedbot)
+    - [Nextcloud Passwords](https://github.com/zzedbot/wox-plugin-nextcloud-password) Search, inspect, copy, and update passwords stored in Nextcloud Passwords [@zzedbot](https://github.com/zzedbot)
+    - [Timestamp](https://gist.github.com/qianlifeng/31363d95905325e9969d93d999e94b07) Convert between Unix timestamps and datetime strings [@qianlifeng](https://github.com/qianlifeng)
+    - [Scoop](https://gist.github.com/qianlifeng/75ee2660ab0bd347623a752b0f2d4cd9) Search and manage Windows apps with Scoop [@qianlifeng](https://github.com/qianlifeng)
+    - [Video Downloader](https://gist.github.com/qianlifeng/c6b0e26b0db6efa9e9e9cd6a9252e08b) Download videos and audio from 1000+ sites with yt-dlp [@qianlifeng](https://github.com/qianlifeng)
+    - [Hacker News](https://gist.github.com/qianlifeng/5505503cf2ab741e2073e8bc120fba77) Browse Hacker News stories and discussions [@qianlifeng](https://github.com/qianlifeng)
+    - [Speedtest](https://gist.github.com/qianlifeng/dd2735f0aedb12b99c0aa0e226771a8f) Test internet speed over HTTP download, upload, and ping [@qianlifeng](https://github.com/qianlifeng)
+    - [Sound Switch](https://gist.github.com/qianlifeng/bb270f4d9d36053d6750244445e5bfc9) Switch audio input and output devices quickly [@qianlifeng](https://github.com/qianlifeng)
+    - [Gif Search](https://gist.github.com/qianlifeng/ab5524eecdf36a9484265cd94b22f359) Search animated GIFs from GIPHY and The Finer Gifs Club [@qianlifeng](https://github.com/qianlifeng)
+
+## v2.4.1 - 2026-08-28
+
+This release adds built-in floating Notes so you can capture text, tables, and images in dedicated windows, search and pin them from the launcher, and save selections from Clipboard, Screenshot, and other plugins.
+
+![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/note.png)
+
+
+- Add
+  - [`Notes`] Add built-in floating notes for quick capture without leaving your workflow: create and search notes from the launcher, edit rich text with tables and image attachments in dedicated windows, pin notes (including across macOS Spaces), restore recent notes, export Markdown, text, or HTML, sync note text with Cloud Sync while keeping images on the device, and save text, files, or images to Notes from Clipboard, Explorer, File Search, Screenshot, Selection, and Shell.
+
+- Improve
+  - [`Launcher`] Support running visible results with Alt (Windows/Linux) or Command (macOS) plus 1–9, keep toolbar shortcuts visible beside long plugin messages, and show tooltips on result tails #4513
+  - [`App`] Support uninstalling Windows apps, including UWP packages, from launcher results
+  - [`Glance`] Enable Glance by default so live information such as the current time appears beside the query box
+  - [`Onboarding`] Move first-run setup into an independent window that stays available when the launcher hides, let users apply a query hotkey, starter plugin, and theme before starting Wox, and complete the macOS permission flow more reliably
+  - [`File Search`] Support absolute folder paths in ignore patterns and show index size, entry counts, and last index duration in settings #4518
+  - [`Screenshot`] Improve the editor with typed pixel width and height (click the size chip or press S), lock-ratio and swap, a more readable color inspector that copies the selected color on macOS, and JPEG export that keeps native pixels
+  - [`Shell`] Support default and per-command working directories (home, last used, or custom) with a directory picker
+  - [`Linux`] Support compositor background blur via `ext-background-effect-v1`, Hyprland-specific dark and light theme variants, overlay HUDs above the launcher, and layer-shell window dragging
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/linux_ext-background-effect-v1.png)
+  - [`Theme`] Unify window material across Windows acrylic, macOS vibrancy, and Linux blur, and keep overlay chrome readable over native backdrop
+  - [`Preview`] Improve preview-tag scrolling, image zoom and pan, and auto-link issue references in update-preview Markdown
+  - [`Hotkey`] Surface main hotkey registration failures in settings and onboarding
+  - [`Updater`] Clean up stale Windows update backup files
+  - [`Plugin`] Time out hung plugin downloads
+
+- Fix
+  - [`Timer`] Fix stale timer overlays remaining after a timer is deleted
+  - [`Preview`] Fix deferred image, WebView, and file previews showing placeholder text instead of a loading indicator
+  - [`Settings`] Fix Switch input method defaulting to on for new installs
+  - [`Linux`] Fix a GTK crash when hiding the launcher
+
+## v2.4.0 - 2026-08-23
+
+This stable release replaces the Flutter UI with an embedded native UI, cutting typical memory use roughly in half, and adds offline Dictation, file-content search, countdown timers, and Private Mode while rolling up the stability and cross-platform improvements from the v2.4.0 betas.
+
+![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/timer.png)
+
+- Add
+  - [`UI`] Replace the Flutter UI with an embedded native UI that owns windows, focus, widgets, and GPU rendering in-process, removing the separate Flutter process, cutting typical memory use roughly in half to about 150 MB in daily use, and keeping launcher and settings workflows aligned across Windows, macOS, and Linux.
+  - [`Dictation`] Add local voice-to-text dictation with downloadable offline models, configurable microphones and model loading, press, double-press, and hold hotkeys, live status overlays, audio ducking, searchable history with audio playback that preserves original and AI-refined transcripts, and custom actions that can refine speech with AI, type into the active window, show an overlay, or start AI Chat.
+  - [`File Search`] Add optional file-content indexing and search so users can find supported text, PDF, and Office files by words inside them, choose indexed extensions, track indexing progress, use quoted phrases, benefit from faster parallel indexing and more reliable index reconciliation, and open theme-aware previews with clear large-file limits.
+  - [`Timer`] Add built-in countdown timers with pause/resume, optional notes, accessible desktop overlays, and persistence across restarts so users can start timers like `timer 5m` or `timer 1h meeting` from the launcher. #4495
+  - [`Privacy`] Add Private Mode for temporary use on shared computers: when enabled, Wox clears local data after exit while preserving non-sensitive settings such as language and hotkeys.
+
+- Improve
+  - [`AI Chat`] Improve AI Chat with reusable local and remote skills, built-in tools, inline model and skill selection, configurable tool usage, cancellable streaming, summarized conversation history, and a fallback search action.
+  - [`OCR`] Support downloadable offline PaddleOCR models alongside system OCR, with per-feature model selection for Screenshot and Clipboard.
+  - [`Screenshot`] Improve capture, annotation, and recording with cursor inclusion, numbered markers, shadowed pinned overlays, display-scaled editor chrome, clearer scrolling-capture borders, and more consistent recording controls across platforms.
+  - [`Preview`] Improve native file and WebView previews with draggable title-bar controls, user-agent presets, URL validation, corner radius, mouse-button navigation, Markdown, scrollable metadata, and clearer window chrome.
+  - [`Launcher`] Improve query editing with multiline input, clipboard actions, context menus, secondary-tap actions, stable result layouts while typing, and a loading indicator for slow queries.
+  - [`Query`] Add scoped queries that pin results to specific plugins and show scope icons, and automatically record successful display-only queries such as Calculator and Converter results in query history.
+  - [`Hotkey`] Improve hotkey recording and registration with left/right-specific modifiers, multi-key hold shortcuts, F-keys, more reliable press, double-press, hold, and Caps Lock combo handling, clearer registration fallback messaging, and additional recorder tip positions #4496
+  - [`Media Player`] Improve now-playing results with artwork, a dedicated preview, live progress, playback controls, an action to open the full Media Player view, and Linux MPRIS support.
+  - [`Explorer`] Improve type-to-search with indexed results beyond the current folder, faster in-place navigation and item selection in Windows open/save dialogs, Cmd+G hints on macOS, and Quick Switch between Explorer or Finder and open/save dialogs #4511
+  - [`Overlay`] Improve movable overlays with draggable title bars, sticky host-window tracking, and clearer close-button and focus behavior.
+  - [`Onboarding`] Expand first-run onboarding with main hotkey, selection hotkey, platform-specific tray setup, interactive demos, and a guided macOS permission flow.
+  - [`Window Manager`] Improve workspace restoration with more reliable display matching across resolution changes and faster placement of newly launched apps.
+  - [`Cloud Sync`] Improve setup guidance after sign-in and make per-item synchronization progress clearer.
+  - [`Converter`] Improve time and duration results with localized weekdays and units, 24-hour formatting, more reliable date and timezone calculations, and confirmation before fetching crypto prices #4480
+  - [`AI`] Support Ollama Cloud with its default endpoint and improve compatibility with OpenAI-compatible relays #4473
+  - [`Indicator`] Let plugin results open the corresponding plugin settings directly.
+  - [`Theme`] Improve AI-generated themes with more reliable JSON extraction and clearer preview guidance.
+  - [`Settings`] Improve settings control sizing, hover feedback, disabled table states, dialog actions, and form layout consistency across settings pages #4503
+  - [`Clipboard`] Let users exclude applications from clipboard history, and improve text and image clipboard handling across Linux Wayland and X11 environments.
+  - [`Shell`] Support running shell commands as administrator with UAC elevation on Windows.
+  - [`App`] Support running Windows apps as administrator from launcher results #4498
+  - [`Diagnostic`] Capture crash incidents for bug reports with more reliable Windows crash artifacts.
+  - [`Plugin`] Improve plugin-host reliability with a watchdog that recovers unhealthy host processes.
+  - [`Linux`] Improve Hyprland and GTK rendering, pointer and scroll capture, per-pixel alpha and pointer passthrough, in-window tooltips, settings chrome alignment, and package distribution with `.deb` and `.rpm` builds.
+  - [`Windows`] Improve CJK text rendering, Task Manager Apps grouping, backdrop and dark-appearance sync, and DPI transition stability.
+  - [`macOS`] Improve hidden-window memory release and keep management windows available across Spaces.
+
+- Fix
+  - [`Calculator`] Fix floating-point display artifacts by preserving exact arithmetic in expressions #4497
+  - [`Input`] Fix IME mode being reset when opening the launcher #4493
+  - [`Updater`] Fix Windows updates when the downloaded executable and Wox installation are on different drives #4471
+  - [`Launcher`] Fix preview panel sizing and query state when switching launch modes #4474
+  - [`Settings`] Fix memory accumulation after closing the settings window on macOS, plugin-list navigation scrolling to the wrong position, and settings rendering on Hyprland.
+  - [`Linux`] Fix startup crashes by initializing Xlib thread support before GTK, Hyprland hotkey and clipboard handling, X11 window visibility #4505, and query cursor movement during accessibility updates.
+  - [`Windows`] Fix GPU renderer recovery after display device removal and release renderer resources after Wox remains hidden for an extended period #4502
+  - [`Explorer`] Fix type-to-search function-key handling and file-dialog window detection on Windows #4504
+  - [`Bookmark`] Fix Chromium bookmark loading #4501
+  - [`Cloud Sync`] Fix update checks blocking restore flows.
+  - [`Plugin`] Fix disabled system plugins appearing in results, toolbar messages without an explicit icon, plugin-host recovery, and trash deletion reliability.
+  - [`Overlay`] Fix text overlay sizing.
+  - [`Emoji`] Fix AI-assisted emoji matching with models that enable thinking by default.
+  - [`URL`] Fix URL history entries with missing favicons.
+
+## v2.4.0-beta.3 - 2026-08-16
+
+This beta stabilizes the native UI introduced in beta.2, fixing settings rendering, control interaction, overlays, previews, and display recovery issues that surfaced after the Flutter UI replacement.
+
+- Improve
+  - [`Settings`] Improve settings control sizing, hover feedback, disabled table states, dialog actions, and form layout consistency across settings pages. #4503
+  - [`Preview`] Improve AI Chat preview with draggable title-bar controls and clearer window chrome.
+  - [`Launcher`] Improve query editing so plugin result layout stays stable while the query text changes.
+  - [`Overlay`] Improve movable overlays with draggable title bars and sticky host-window tracking so overlays stay aligned during window moves.
+  - [`Screenshot`] Improve screenshot editor UI scaling, scrolling-capture borders, and screen-recording controls.
+  - [`Hotkey`] Improve main hotkey registration with clearer fallback messaging when a shortcut cannot be registered.
+  - [`Onboarding`] Expand first-run onboarding with main hotkey, selection hotkey, and platform-specific tray setup steps.
+  - [`Query`] Improve launcher query routing with scoped queries that pin results to specific plugins and show scope icons in the query UI.
+  - [`Shell`] Support running shell commands as administrator with UAC elevation on Windows.
+  - [`Linux`] Add `.deb` and `.rpm` package builds with updated installation documentation.
+
+- Fix
+  - [`Settings`] Fix settings page rendering on Hyprland.
+  - [`Windows`] Fix GPU renderer recovery after display device removal #4502
+  - [`Linux`] Fix Hyprland hotkey registration and clipboard handling.
+  - [`Explorer`] Fix type-to-search function-key handling and file-dialog window detection on Windows #4504
+  - [`Bookmark`] Fix Chromium bookmark loading #4501
+  - [`Plugin`] Fix plugin-host recovery and trash deletion reliability.
+
+## v2.4.0-beta.2 - 2026-08-11
+
+This beta replaces the Flutter UI with an embedded native UI for a single-process launcher and settings experience, cutting typical memory use roughly in half to about 150 MB in daily use, and adds countdown timers plus Private Mode for temporary sessions.  
+
+![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/timer.png)
+
+- Add
+  - [`UI`] Replace the Flutter UI with an embedded native UI that owns windows, focus, widgets, and GPU rendering in-process, removing the separate Flutter process, cutting typical memory use roughly in half to about 150 MB in daily use, and keeping launcher and settings workflows aligned across Windows, macOS, and Linux.
+  - [`Timer`] Add built-in countdown timers with pause/resume, optional notes, desktop overlays, and persistence across restarts so users can start timers like `timer 5m` or `timer 1h meeting` from the launcher. #4495
+  - [`Privacy`] Add Private Mode for temporary use on shared computers: when enabled, Wox clears local data after exit while preserving non-sensitive settings such as language and hotkeys.
+
+- Improve
+  - [`OCR`] Support downloadable offline PaddleOCR models alongside system OCR, with per-feature model selection for Screenshot and Clipboard.
+  - [`Screenshot`] Improve capture and annotation with cursor inclusion, numbered markers, and shadowed pinned overlays across platforms.
+  - [`Preview`] Improve native file previews, WebView previews with title-bar controls, user-agent presets, URL validation, corner radius, and mouse-button navigation, plus Markdown and scrollable metadata.
+  - [`Dictation`] Improve history previews with audio playback controls.
+  - [`Launcher`] Improve query editing with multiline input, clipboard actions, context menus, secondary-tap actions, and a loading indicator for slow queries.
+  - [`Query`] Automatically record successful display-only queries, such as Calculator and Converter results, into query history.
+  - [`Hotkey`] Support F-keys when registering hotkeys and add middle-left/right recorder tip positions #4496
+  - [`App`] Support running Windows apps as administrator from launcher results #4498
+  - [`Converter`] Prompt before fetching crypto prices so users can confirm the network request #4480
+  - [`Diagnostic`] Capture crash incidents for bug reports with more reliable Windows crash artifacts.
+  - [`Plugin`] Improve plugin-host reliability with a watchdog that recovers unhealthy host processes.
+  - [`Linux`] Improve Hyprland layer-shell launcher rendering, pointer and scroll capture, in-window tooltips, and Cloud Sync/settings chrome alignment.
+  - [`Windows`] Improve CJK text rendering, Task Manager Apps grouping, backdrop and dark-appearance sync, and DPI transition stability.
+  - [`macOS`] Improve hidden-window memory release and keep management windows available across Spaces.
+
+- Fix
+  - [`Calculator`] Fix floating-point display artifacts by preserving exact arithmetic in expressions #4497
+  - [`Input`] Fix IME mode being reset when opening the launcher #4493
+  - [`Linux`] Fix startup crashes by initializing Xlib thread support before GTK #4481
+  - [`Launcher`] Fix preview panel sizing and query state when switching launch modes #4474
+  - [`Settings`] Fix memory accumulation after closing the settings window on macOS
+  - [`Cloud Sync`] Fix update checks blocking restore flows
+  - [`Plugin`] Fix disabled system plugins still appearing in results
+
+## v2.4.0-beta.1 - 2026-07-14
+
+This beta introduces local, offline Dictation for fast voice-to-text workflows, alongside file content search and a more capable AI Chat experience.
+![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/dictation_setting.png)
+
+
+- Add
+  - [`Dictation`] Add local voice-to-text dictation with downloadable offline models, configurable microphones and model loading, press, double-press, and hold hotkeys, live status overlays, audio ducking, searchable history that preserves original and AI-refined transcripts, and custom actions that can refine speech with AI, type into the active window, show an overlay, or start AI Chat.  
+
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/dictation.png)
+  - [`File Search`] Add optional file-content indexing and search so users can find supported text, PDF, and Office files by words inside them, choose indexed extensions, track indexing progress, use quoted phrases, benefit from faster parallel indexing and more reliable index reconciliation, and open theme-aware previews with clear large-file limits.  
+
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/file_content_search.png)
+
+- Improve
+  - [`AI Chat`] Improve AI Chat with reusable local and remote skills, built-in tools, inline model and skill selection, configurable tool usage, cancellable streaming, summarized conversation history, and a fallback search action.
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/ai_chat.mp4)
+  - [`Hotkey`] Improve hotkey recording and registration with left/right-specific modifier keys, multi-key hold shortcuts, and more reliable press, double-press, hold, and Caps Lock combo handling.
+  - [`Media Player`] Improve now-playing results with artwork, a dedicated preview, live progress, playback controls, and an action to open the full Media Player view, while expanding Linux support through MPRIS.
+  - [`Explorer`] Improve type-to-search with indexed results beyond the current folder, faster in-place navigation and item selection in Windows open/save dialogs, and Cmd+G search hints on macOS.
+  - [`Window Manager`] Improve workspace restoration with more reliable display matching across resolution changes and faster placement of newly launched apps.
+  - [`Cloud Sync`] Improve setup guidance after sign-in and make per-item synchronization progress clearer.
+  - [`Converter`] Improve time and duration results with localized weekdays and units, 24-hour formatting, and more reliable date and timezone calculations.
+  - [`AI`] Support Ollama Cloud with its default endpoint and improve compatibility with OpenAI-compatible relays #4473
+  - [`Indicator`] Let plugin results open the corresponding plugin settings directly.
+  - [`Theme`] Improve AI-generated themes with more reliable JSON extraction and clearer preview guidance.
+
+- Fix
+  - [`Updater`] Fix Windows updates when the downloaded executable and Wox installation are on different drives #4471
+  - [`Plugin`] Fix toolbar messages without an explicit icon by falling back to the plugin icon.
+  - [`Overlay`] Fix text overlay sizing and improve close-button and focus behavior.
+  - [`Settings`] Fix plugin-list navigation scrolling to the wrong position when navigating directly to a plugin.
+  - [`Emoji`] Fix AI-assisted emoji matching with models that enable thinking by default.
+
+## v2.3.0 - 2026-07-04
+
+This stable release brings Cloud Sync to Wox and adds workspace layouts, while rolling up the Linux, preview, file search, hotkey, settings, and stability improvements from the v2.3.0 betas.
+
+![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/cloud_sync.png)
+
+![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/windows_workspace.png)
+
+- Add
+  - [`Cloud Sync`] Add encrypted cloud sync for settings, installed plugins, and themes, with recovery-code setup, local snapshots, sync history, account plan and device management, device join and revoke flows, legal agreement checks, auto-sync, partial-success history, and clearer server error feedback.
+  - [`Window Manager`] Add workspace layouts so users can save apps across displays, restore them from launcher commands or query hotkeys, launch missing apps, place windows into saved layouts, and open browser URLs with duplicate-tab handling.
+
+- Improve
+  - [`Linux`] Improve Wayland and Hyprland support with wlroots layer-shell detection, Hyprland hotkeys, KDE image clipboard handling, desktop launch environment fixes, draggable window state handling, screenshot monitor capture, uinput doctor checks for Caps Lock combo hotkeys, localized Wayland hotkey help, and FAQ guidance for disabling window animation #4458
+  - [`Hotkey`] Expand Linux hotkey support with Double Ctrl, Caps Lock combo keys, Backspace injection, better input permission checks, and clearer doctor diagnostics. Also support backquote and tilde hotkeys across platforms.
+  - [`Preview`] Improve file previews with on-demand loading, macOS Quick Look support, PDF and large-file handling, and a File Search setting to control whether previews are shown #4463
+  - [`File Search`] Improve indexing performance, fresh full-index bulk sync, direct-entry insertion, and user-home path normalization for faster and more reliable searches.
+  - [`Shell`] Improve selected-folder workflows by letting shell commands run at the selected location and normalizing user-home paths.
+  - [`Window`] Improve Windows monitor detection, DPI-scaled window positioning, launcher focus diagnostics, and settings/onboarding transitions #4436
+  - [`App`] Improve Windows app search with richer UWP metadata retrieval and icon handling.
+  - [`MRU`] Improve query ranking with per-command and context-aware scoring so repeated actions and saved layouts surface more predictably.
+  - [`Settings`] Improve responsive settings layouts, label handling, runtime language updates, platform-specific setting sync behavior, and Cloud Sync configuration notes so settings pages stay readable and clearer after resizing, switching languages, or syncing.
+  - [`Doctor`] Improve doctor check severity handling so update and environment checks can distinguish warnings from blocking issues #4459
+  - [`Theme`] Improve macOS wallpaper retrieval and cache handling for wallpaper-aware theme previews.
+
+- Fix
+  - [`Linux`] Fix startup on systems without `gtk-layer-shell` by loading it dynamically instead of requiring the library at launch.
+  - [`Clipboard`] Fix image paste support on KDE Wayland desktop sessions and improve Windows clipboard history key compatibility #4467
+  - [`Hotkey`] Fix duplicate modifier presses from triggering false-positive hotkey events #4465
+  - [`Calculator`] Fix expression ranking so calculator results prioritize the intended expression matches #4469
+  - [`Launcher`] Fix focus and action handling during launcher lifecycle transitions.
+
+## v2.3.0-beta.2 - 2026.07-01
+
+This beta improves Linux and Wayland reliability while expanding file previews, File Search controls, and selected-folder Shell workflows.
+
+- Improve
+  - [`Linux`] Improve Wayland and Hyprland support with wlroots layer-shell detection, Hyprland hotkeys, KDE image clipboard handling, desktop launch environment fixes, draggable window state handling, screenshot monitor capture, and FAQ guidance for disabling window animation #4458
+  - [`Hotkey`] Expand Linux hotkey support with Double Ctrl, Caps Lock combo keys, Backspace injection, better input permission checks, and clearer doctor diagnostics. Also support backquote and tilde hotkeys across platforms.
+  - [`Preview`] Improve file previews with on-demand loading, macOS Quick Look support, PDF and large-file handling, and a File Search setting to control whether previews are shown #4463
+  - [`File Search`] Improve indexing performance, fresh full-index bulk sync, direct-entry insertion, and user-home path normalization for faster and more reliable searches.
+  - [`Window`] Improve Windows monitor detection, DPI-scaled window positioning, and launcher focus diagnostics #4436
+  - [`Cloud Sync`] Improve account token recovery and expired-session feedback so sync actions handle refresh failures more clearly.
+  - [`Settings`] Improve responsive settings layouts, label handling, and runtime language updates so settings pages stay readable after resizing or switching languages.
+  - [`Doctor`] Improve doctor check severity handling so update and environment checks can distinguish warnings from blocking issues #4459
+  - [`Theme`] Improve macOS wallpaper retrieval and cache handling for wallpaper-aware theme previews.
+
+- Fix
+  - [`Clipboard`] Fix image paste support on KDE Wayland desktop sessions.
+
+## v2.3.0-beta.1 - 2026-06-20
+
+This beta release introduces Cloud Sync, giving users encrypted backup and restore for settings, installed plugins, and themes across devices.  
+
+![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/cloud_sync.png)
+
+- Add
+  - [`Cloud Sync`] Add encrypted cloud sync for settings, installed plugins, and themes, with recovery-code setup, local snapshots, sync history, account plan and device management, device join and revoke flows, and plan-aware auto-sync.
+    
+
+## v2.2.0 - 2026-06-18
+
+This stable release rolls up the v2.1.2 beta work with additional Theme Editor, Linux Wayland, Caps Lock hotkey, update, and stability improvements.
+
+![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/theme-editor.png)
+
+- Add
+  - [`Theme Editor`] Add a theme editor with live launcher preview, color controls, save-as and overwrite flows, platform-specific variants, and wallpaper-aware previews for customizing Wox themes #4421 #4415
+  - [`Window Manager Plugin`] Add a Window Manager plugin to move, resize, minimize, maximize, restore, and send the active window between displays from launcher commands.
+  - [`Selection`] Add Space Quick Look on Windows so users can preview a selected file from File Explorer or open/save dialogs by pressing Space.
+  - [`Result Drag`] Add native file drag export for launcher results, allowing file-backed results from Clipboard and plugins to be dragged directly to folders or other apps.
+  - [`Update`] Add release channels and channel switching so users can stay on stable releases or opt into beta prereleases.
+  - [`Hotkey`] Add Caps Lock combo hotkeys and a Hotkey Overview preview so users can assign Caps Lock-based shortcuts and inspect registered Wox shortcuts. This feature is not available on Linux due to platform limitations.
+  - [`Folder`] Add favorite folders with add, edit, delete, and direct global-search workflows.
+  - [`System`] Add Task View and platform-specific volume control commands.
+
+- Improve
+  - [`Linux`] Improve native Wayland support with portal-backed global hotkeys, portal clipboard support, GTK backend selection, window positioning and resize handling, desktop-entry startup guidance, and Wayland-specific settings availability #4451
+  - [`Preview`] Expand file preview support to code, executable, image, markdown, PDF, shortcuts, video, zip, Office, audio, font, calendar/contact, delimited data, RDP, folder, and media files, with tag-style preview metadata and a wider default preview panel.
+  - [`Media Player`] Improve Windows media session integration so users can view the current track, see artwork, and control playback with play, pause, next, and previous actions from Wox.
+  - [`Explorer`] Improve open/save dialog workflows with type-to-search hints, faster dialog path detection, quick folder jumps, and selection highlighting inside the active dialog.
+  - [`Query Hotkey`] Improve query hotkey setup with a dedicated dialog, names, tooltips, presets documentation, variable editing, and cleaner hotkey availability checks.
+  - [`Hotkey`] Improve hotkey recording, display, and Caps Lock handling across platforms, including better shortcut chip layout and stale modifier cleanup.
+  - [`Search`] Improve fuzzy matching for short text and Pinyin input with better alignment and incomplete-syllable handling.
+  - [`Clipboard`] Improve file clipboard records with support for multiple file paths, draggable file payloads, and favorites-aware query behavior.
+  - [`Shell`] Improve shell commands with background execution, richer command history metadata, elapsed-time notifications, and safer Windows open behavior.
+  - [`Update`] Improve manual update checks and update previews so release-channel actions refresh after checking.
+  - [`Settings`] Improve settings search focus when opening settings.
+  - [`WebView`] Improve embedded preview navigation with custom mouse button handling and more reliable URL and HTML session handling.
+  - [`Logging`] Improve log file naming, rollover, retention, and bug report guidance so users can find and upload `wox.log` more easily #4438 #4446
+
+- Fix
+  - [`UI`] Fix Windows GPU recovery handling so Wox can restart the UI instead of leaving a blank window after GPU recovery #4437
+  - [`Linux`] Fix tray icon menus not responding on Linux.
+  - [`Shell`] Fix Windows open and reveal actions to use native Shell APIs, avoiding blocking launches and preventing crafted file paths from being interpreted as commands.
+  - [`Hotkey`] Fix arrow-key hotkey recognition and stale Windows modifier state during hotkey recording.
+  - [`Screenshot`] Fix permission-denied capture feedback with localized notifications #4433
+  - [`Launcher`] Fix resize and focus edge cases during view transitions and Windows deactivation.
+
+## v2.1.2-beta.2 - 2026-06-10
+
+- Improve
+  - [`Media Player`] Improve Windows media session integration so users can view the current track, see artwork, and control playback with play, pause, next, and previous actions from Wox.
+  - [`Explorer`] Improve open/save dialog workflows with type-to-search hints, faster dialog path detection, quick folder jumps, and selection highlighting inside the active dialog.
+  - [`Preview`] Improve preview metadata by using tag-style pills across AI Command, Clipboard, Selection, Shell, Update, Media Player, and Node.js plugin SDK previews.
+  - [`PDF`] Improve PDF file preview by rendering PDFs through the shared WebView preview path.
+  - [`System`] Improve system commands with a copy-version action for quickly sharing the current Wox version.
+  - [`Update`] Improve manual update checks so the visible update preview and release-channel actions refresh after checking.
+  - [`Logging`] Improve log file naming and bug report guidance so users can find and upload `wox.log` more easily #4446
+
+- Fix
+  - [`Shell`] Fix Windows open actions to use ShellExecute directly and avoid blocking when launching files, URLs, or folders.
+  - [`Hotkey`] Fix hotkey recording so stale Windows modifier state does not leak into the next recorded shortcut.
+
+## v2.1.2-beta.1 - 2026-06-05
+
+- Add
+  - [`Theme`] Add a theme editor with live launcher preview, color controls, save-as and overwrite flows, and wallpaper-aware previews for customizing Wox themes #4421
+  - [`Window Manager`] Add a Window Manager plugin to move, resize, minimize, maximize, restore, and send the active window between displays from launcher commands.
+  - [`Selection`] Add Space Quick Look on Windows so users can preview a selected file from File Explorer or open/save dialogs by pressing Space.
+  - [`Attention`] Add persistent Attention items so plugins can surface follow-up tasks with an unread badge and an inbox that keeps items until users open or mark them read.
+  - [`Result Drag`] Add native file drag export for launcher results, allowing file-backed results from Clipboard and plugins to be dragged directly to folders or other apps.
+  - [`Update`] Add update channels so users can stay on stable releases or opt into beta prereleases.
+
+- Improve
+  - [`Preview`] Expand file preview support to code, executable, image, markdown, PDF, shortcuts, video, zip, Office, audio, font, calendar/contact, delimited data, and RDP files, with a wider default preview panel.
+  - [`Query Hotkey`] Improve query hotkey setup with a dedicated dialog, names, tooltips, presets documentation, and cleaner variable editing.
+  - [`Converter`] Improve storage and time conversion with decimal and binary byte aliases, unit-symbol tails, and broader timezone aliases.
+  - [`Search`] Improve fuzzy matching for short text with optimal alignment scoring.
+  - [`Query Box`] Improve text input and layout consistency across interface sizes #4423
+  - [`Clipboard`] Improve file clipboard records with support for multiple file paths and draggable file payloads.
+  - [`Image`] Improve emoji and URL image loading with caching and download support.
+  - [`Update`] Improve update-available notification wording across languages.
+
+- Fix
+  - [`Screenshot`] Fix permission-denied capture feedback with localized notifications #4433
+  - [`Hotkey`] Fix arrow-key hotkey recognition when alternate key names are reported by the platform.
+  - [`Security`] Fix Windows file reveal behavior to use the Windows Shell API instead of interpolated PowerShell command text, preventing crafted file paths from being interpreted as commands when opening a file's containing folder.
+
+## v2.1.1 - 2026-05-24
+
+- Add
+  - [`Settings`] Add settings search so users can find built-in and plugin settings by localized text without browsing each settings page.
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/setting_search.png)
+  - [`AI Command`] Add an AI command template dialog and default-action selector, with built-in translation and summarization command templates for faster setup.
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/ai_command_templates.png)
+  - [`Bug Report`] Add built-in diagnostics collection and a toolbar indicator so users can prepare bug reports with relevant runtime context #4416
+
+- Improve
+  - [`AI`] Improve AI model selector loading with cached provider resources so settings forms can reuse model data more reliably.
+  - [`Screenshot`] Improve capture on Windows with a native selection overlay, hover-aware region selection, deferred image loading, direction-aware scrolling stitching, and more reliable image cache cleanup.
+  - [`WebView`] Improve embedded preview sessions with focus support, suspend and resume handling, and a toolbar action to hide Wox.
+  - [`Overlay`] Improve overlay behavior with preserve-position, max-height, and follow-scroll options for workflows such as AI command result windows.
+  - [`Runtime`] Improve Windows startup diagnostics by detecting missing Microsoft Visual C++ Redistributable dependencies and showing localized recovery guidance.
+  - [`Runtime`] Improve Node.js and Python executable validation by enforcing supported minimum versions in runtime settings and host discovery, with clearer upgrade guidance for unsupported runtimes #4414
+  - [`Hotkey`] Improve hotkey display with platform-aware modifier labels and more consistent rendering across grids, toolbar actions, refinement controls, and the recorder #4413
+  - [`Query Hotkey`] Improve query hotkey editing with placeholder-variable insertion while preserving the caret position.
+  - [`App`] Improve app search and icons with better global match selection, localized macOS app names, Windows Settings entries, and icon cache invalidation.
+  - [`Theme`] Improve theme behavior with platform-specific overrides for Windows, macOS, and Linux.
+  - [`Plugin`] Improve result polishing with layout-aware sizing so plugin results keep more consistent spacing in list and grid views.
+  - [`Preview`] Improve preview content with metadata tags and selectable text support, making OCR, screenshot, clipboard, and rich previews easier to inspect and copy.
+  - [`File Search`] Improve traversal performance, symlink handling, scan-rate status messages, and indexing diagnostics so skipped roots and scan progress are easier to understand when troubleshooting file search #4417
+  - [`Clipboard`] Improve clipboard URL handling with a link refinement type and more robust URL parsing.
+  - [`WPM`] Improve plugin store interactions with global query support.
+  - [`Usage`] Improve usage statistics with daily breakdowns in the Usage settings page.
+  - [`Navigation`] Improve keyboard navigation with Ctrl+N and Ctrl+P shortcuts in lists and launcher results. #4420
+  - [`Memory`] Improve memory usage reporting with platform-specific retrieval on Windows and Linux.
+  - [`Image`] Improve large icon and PNG handling with lazy raster loading, metadata-aware decoding, and transparent padding support for cleaner previews and lower memory pressure.
+
+- Fix
+  - [`Clipboard`] Fix clipboard type refinement hotkey behavior so filtered clipboard queries keep the expected hotkey logic.
+  - [`OCR`] Fix OCR language handling on Windows and macOS so requested languages are normalized and recognized more reliably.
+  - [`Settings`] Fix settings search and Escape-key handling so navigation and search state behave consistently.
+  - [`Image`] Fix SVG loading error handling so broken vector images fail more gracefully.
+  - [`Logging`] Fix crash diagnostics and Flutter logging behavior so startup and runtime errors are captured more consistently.
+  - [`Launcher`] Fix Flutter frame timing issues and improve settings window responsiveness.
+  - [`Updater`] Fix Linux executable replacement logic during updates.
+
+## v2.1.0 - 2026-05-18
+
+This version adds many new features and improvements. we hope you’ll like it, and wish you all a pleasant week!
+
+- Add
+  - [`Glance`] Add Glance to the query box so users can see lightweight real-time information, such as time, date, and battery status, cpu usage, and memory usage without typing a query. Plugins can provide glance metadata, and users can choose the glance item or hide the glance icon for a cleaner query box.
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/glance.png)
+  - [`Screenshot`] Expand Screenshot with scrolling capture, pinned screenshot overlays, a plugin screenshot API, and configurable history retention. Users can capture long pages or windows, pin captures above other windows as visual references, let old screenshot files clean up automatically, and let plugins start direct capture workflows with hidden toolbar and auto-confirm options #4394
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/screenshot_pin.png)
+  - [`Preview`] Redesign the preview UI and add list previews and image overlay previews so result previews have a cleaner, more consistent surface, while image-heavy results, including clipboard and screenshot results, can open in a lightweight overlay instead of only inside the launcher preview panel.
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/preview_image_click.png)
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/new_preview.png)
+  - [`Query Refinement`] Add refinement controls so plugins can expose filters and sort options directly in the launcher. File Search can filter files or folders and sort by relevance, name, modified time, or size; Clipboard and WPM can expose their own type and install-status filters.
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/query_refinement.png)
+  - [`AI Command`] Add default actions and Run And Paste support for silent query hotkey workflows. Users can select text in any app, press a hotkey, let an AI command optimize or translate the selected text, and replace the original selection in place when the final answer is ready. You can refer [https://www.woxlauncher.com/blog/did-you-know-ai-command-silent-translation-query-hotkey](https://www.woxlauncher.com/blog/did-you-know-ai-command-silent-translation-query-hotkey) for more details.
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/ai_command_run_paste_query_hotkey.mp4)
+  - [`WebView`] Add actions to open preview pages in the system browser and clear saved WebView state, making embedded website previews easier to inspect, reset, and recover when a site keeps stale session data.
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/webview_open_in_browser.png)
+  - [`Usage`] Add X sharing for usage statistics so users can post their Wox usage summary directly from the usage page.
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/usage_share_x.png)
+  - [`Onboarding`] Add the first-run flow with clearer setup steps for permissions, hotkeys, appearance, plugins, themes, tray queries, and Glance.
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/onboarding.png)
+  - [`Glass dark theme`] Add new default Glass dark theme with acrylic blur, transparent panels, and light-colored text and icons for better visibility in dark mode. The new default theme also has improved color contrast and accessibility while still preserving the customizable accent color.
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/theme_glass_dark.png)
+  - [`Color Plugin`] Add Color plugin to search and preview colors by name and hex code, with actions to copy color values in various formats.
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/20260518_new_color_plugin.png)
+
+- Improve
+  - [`File Search`] Improve indexing performance, dynamic root management, hidden/system path handling, and incremental updates so large roots refresh faster and avoid duplicate or unsafe indexed paths.
+  - [`Launcher`] Improve query run state, result caching, and concurrency handling so fast query changes keep the correct result session and preview state #4411
+  - [`Query Box`] Improve multi-line query wrapping, pasted text handling, word-boundary deletion, and Linux Enter handling #4397 #4410
+  - [`Settings`] Redesign the settings pages with clearer section structure, more consistent form controls, and cleaner spacing across General, Data, UI, Plugin, AI, Network, Privacy, Runtime, Usage, and About pages. Plugin-provided pixel styling is deprecated so settings can stay visually consistent while still preserving each setting's behavior and validation.
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/settings_redesign.png)
+  - [`Plugin Store`] Improve install progress, plugin detail state, install-status filtering, and minimum Wox version checks so incompatible plugins are blocked earlier #4401
+  - [`Linux`] Improve Wayland hotkeys, window movement, `.desktop` app indexing and launching, context menus, and file icon resolution #4400 #4404 #4405
+  - [`App`] Improve macOS app icon handling, default icon detection, app directory tracking, and precise app index updates #4402
+  - [`Converter`] Improve currency conversion with broader fiat currency support, exchange-rate refresh fallback, locale-aware default currencies, and clearer rate freshness display.
+  - [`AI`] Improve OpenAI-compatible streaming so tagged reasoning content is separated from answer text.
+  - [`Memory`] Reduce startup and core-process memory usage by lazy-loading Emoji data and releasing native macOS icon images after use.
+  - [`File Explorer Search`] Improve type-to-search routing from launcher queries
+
+- Fix
+  - [`Plugin Store`] Fix plugin installation by starting the required runtime host when possible before install #4395
+  - [`Plugin Setting`] Fix trigger keyword validation so multiple plugins can use the global `*` query
+  - [`Launcher`] Fix Windows focus retry behavior that could select existing query text while the user was typing.
+  - [`Shell`] Fix Windows command output encoding so Shell results preserve the expected text #4409
+
+## v2.0.3 - 2026-04-26
+
+- Add
+  - [`Screenshot`] Add screenshot plugin with annotation, history, export path, clipboard handoff, keyboard confirmation, and multi-display handling. One more app to remove from startup list!  
+     ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/screenshot.png)  
+    **Tips**: Use it with Query Hotkey to capture screenshots with a single shortcut
+  - [`WebView`] Add configurable website previews with navigation actions, preview toolbar, cache controls, and Windows support.  
+     ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/webview_with_hotkey.png)  
+    **Tips**: Use it with Query Hotkey to open frequently used websites with one shortcut, such as Ctrl+Shift+I to quickly check Instagram and hide it again
+  - [`Converter`] Add unit conversion support for length, weight, and temperature #4390
+  - [`File Search`] Add native indexed file search with database-backed scanning, wildcard search, incremental changefeed sync, startup restore, and cross-platform providers. Everything plugin has been moved to [here](https://github.com/qianlifeng/Wox.Plugin.Everything)
+  - [`Toolbar`] Add plugin toolbar messages API so long-running tasks can show progress and actions in the launcher
+  - [`App`] Add customizable ignore rules for app indexing #4375
+  - [`System`] Add shutdown and restart commands with confirmation prompts
+  - [`Query Hotkey`] Add per-hotkey position, query box, toolbar, width, and result count options
+  - [`Tray`] Add context menus and configurable result limits for tray queries
+
+- Improve
+  - [`Launcher`] Improve query result handling, height preservation, and resize timing to reduce flicker and input lag
+  - [`Query`] Improve temporary query restoration, debounced plugin fallback, and result tracking for more stable query transitions
+  - [`Plugin`] Improve uninstall progress reporting and host cleanup
+  - [`File Icon`] Improve Windows file icon retrieval with associated file type fallback
+  - [`Updater`] Improve macOS app replacement and Linux updater logging
+  - [`Settings`] Improve loading of settings and AI model data
+
+- Fix
+  - [`Launcher`] Fix resize regressions, first-result painting flicker, and delayed window hiding on Windows
+  - [`Tray`] Fix preview padding when tray query results only contain a preview
+  - [`App`] Fix application indexing issues and query handling edge cases
+
+## v2.0.2 - 2026-03-23
+
+- Add
+  - [`Plugin`] Add action to open a plugin's settings directly from query results
+  - [`Clipboard`] Add action to open directory paths directly from clipboard results
+  - [`AI`] Add MiniMax provider support
+  - [`Privacy`] Add optional anonymous usage statistics with privacy controls
+  - [`Hotkey`] Add ignored application list for global hotkeys #4372
+  - [`Tray`] Add `Show Query Box` option for tray queries
+
+- Improve
+  - [`App`] Improve app search metadata and indexing on macOS and Windows, including System32 apps, Windows `.url` shortcuts, and cleaner Windows icons #4291 #4367
+  - [`Plugin Setting`] Improve required-value validation in plugin tables and make AI model selection fall back to available provider configs #4365
+  - [`AI`] Improve provider setup with default host configs and clearer provider icons
+  - [`URL`] Improve URL results with dynamic website icons
+  - Improve restoring the previously active window when Wox hides, with better tray interaction and Quick Select behavior on Windows
+  - Improve locale detection when choosing the app language #4371
+  - Improve switching to existing windows by matching window titles more reliably
+
+- Fix
+  - Fix opening URLs and file paths on Windows when the target contains `&` or quotes #4360
+  - [`Clipboard`] Fix cross-platform clipboard handling for text, images, and file paths #4309
+  - Fix Windows DWM refresh and acrylic resize jitter issues
+  - Fix Linux release bundles so bundled shared libraries can resolve their packaged dependencies correctly #4347
+  - [`Python Plugin`] Fix compatibility on modern macOS by requiring a newer Python runtime #4374
+
+## v2.0.1 - 2026-03-07
+
+- Add
+  - Add tray query feature. User can add custom queries to tray menu for quick access
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/tray_query.png)
+  - Add "App font family" setting to choose system font for Wox interface #4335
+  - [`Plugin Setting`] Add image emoji selector for plugin table image fields
+  - [`Plugin Setting`] Add `maxHeight` property support in plugin table setting value #4339
+  - [`Plugin Store`] Add filter functionality and upgrade indicators for plugins #4356
+  - [`Browser Bookmarks`] Add Firefox support #4354
+  - [`Script Plugin`] Add missing runtime notifications with install actions #4357
+  - Add secondary tap support for item actions in grid and list views #4358
+  - [`Web Search`] Allow user to select custom browser #3597
+  - [`Setting`] Add log management features including clearing logs and changing log level
+  - [`File Explorer Search`] Add quick jump paths and enhance file dialog interactions
+
+- Improve
+  - [`Shell`] Enhance Shell plugin terminal preview to support search/full-screen/scroll-to-load functions
+  - Improve query hotkey tooltips and add Wox Chrome extension link in settings #4333
+  - Improve app process exit handling when shutting down Wox #4338
+  - Improve the layout of the plugin settings page
+  - [`Plugin Setting`] Improve focus management and validation
+  - Improve preview functionality and local actions
+  - Improve Windows Start Menu handling by dismissing it when Wox opens #4341
+  - [`Calculator`] Improve history management and limit displayed history to top 100 entries #4340
+  - Improve listview rendering performance
+
+- Fix
+  - [`File Explorer Search`] Fix an issue that file explorer search plugin cannot navigate on open/save dialog
+  - [`Clipboard`] Fix self-triggering in clipboard watch #4309
+  - Fix Windows hotkey recording so the Win key and modifier combinations can be captured correctly
+  - Fix an issue that Wox setting table values can't be saved sometimes
+  - Fix query results not being cleared correctly when app visibility changes
+  - Fix transient focus loss when showing Wox window on Windows #4346
+  - Fix Base64 JPEG decode issue in image preview
+  - [`Plugin Setting`] Fix an issue with handling null and empty JSON responses in plugin table settings
+  - [`File`] Fix Windows Phone Link automatic downloads occurring when fetching file icons #4352
+  - [`Web Search`] Fix query URL formatting for escaped search text #4360
+  - Fix image loading error handling in image view
+
+## v2.0.0 - 2026-02-09
+
+It's time to release the official 2.0 version! There are no major issues in everyday use anymore. Thank you to all users who tested the beta version and provided feedback!
+
+- Add
+  - [`Calculator`] Add comma separator support in Calculator plugin #4325
+  - [`File Explorer Search`] Add type-to-search feature (experimental, default is off, user can enable this in plugin setting). When enabled, user can type to filter in finder/explorer windows.
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/typetosearch.png)
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/typetosearch_setting.png)
+
+- Improve
+  - [`File`] Improve everything sdk integration stability (with 1.5a support) #4317
+
+- Fix
+  - [`File Explorer Search`] Fix a issue that file explorer search plugin's settings do not load #4326
+  - [`Clipboard`] Fix a issue that Clipboard plugin cannot paste to active window #4328
+  - [`Wpm`] Fix a issue where WPM couldn't create script plugins #4330
+
+## v2.0.0-beta.8 — 2026-01-10
+
+- Add
+  - [`Emoji`] Add ai search support for Emoji plugin (you need to enable AI feature in settings first)
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/emoji_ai_search.png)
+  - Add auto theme which changes theme based on system light/dark mode
+    ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/auto_theme.png)
+  - [`Explorer`] Add Explorer plugin to quick switch paths in Open/Save dialog #3259, see [Explorer plugin guide](https://www.woxlauncher.com/guide/plugins/system/explorer) for more details
+  - Add loading animation to query box during plugin metadata fetching to improve user experience
+
+- Improve
+  - Improve markdown preview rendering performance and stability
+  - Critical deletion actions have been implemented to recycle bin, this will prevent accidental data loss #3958
+  - Improve docs website [https://www.woxlauncher.com/guide/introduction](https://www.woxlauncher.com/guide/introduction)
+  - Support multiple-line text in query input box #3797
+    ![](https://github.com/user-attachments/assets/64040d63-5d9b-46b4-93a8-449becf70762)
+  - Improve database recovery mechanism to prevent database corruption on cloud disk sync (icloud, onedrive, dropbox, etc.)
+
+- Fix
+  - Fix clipboard history cause windows copy mal-function #4309
+  - Fix switching to application alway opens a new window instead of focusing existing one #1922
+  - Fixed the parsing issue of lnk files on Windows #4315
+  - Fix the issue where plugin configuration is lost after plugin upgrade
+
+## v2.0.0-beta.7 — 2025-12-19
+
+- Add
+  - Add MCP Server for Wox plugin development (default enabled on port 29867, can be configured in settings)
+  - Add thousands separator for numbers in Calculator plugin `#4299`
+  - Add windows setting searches
+  - Add usage page in settings
+    ![](screenshots/usage.png)
+
+- Improve
+  - Improve fuzzy match based on fzf algorithm
+  - Improve app searches on windows by
+
+- Fix
+  - Fix working directory issues, adding getWorkingDirectory function for command execution context, close `#4161`
+  - Fix command line window display issue when executing Script Plugin
+  - [`AI Chat`] Fix a render issue
+  - [`Emoji`] Fix copy large image not working on windows
+  - [`Clipboard`] Fix clipboard image paste issue on windows
+  - Fix a theme regression released on beta.6 that causes crash on invalid theme colors `#4302`
+
+## v2.0.0-beta.6 — 2025-12-05
+
+- Add
+  - Add Emoji plugin
+  - Add Launch Mode and Start Page setting
+
+- Improve
+  - UI now uses safe color parsing (`safeFromCssColor`) to fall back gracefully when theme colors are invalid, preventing crashes and highlighting misconfigured themes.
+
+## v2.0.0-beta.5 — 2025-09-24
+
+- Fix
+  - Fix a regression issue that some settings can't be changed on beta.4 @yougg
+
+## v2.0.0-beta.4 — 2025-08-24
+
+- Add
+  - Quick Select to choose results via digits/letters
+  - MRU for query mode, use can now display MRU results when opening Wox
+  - Last Query Mode option (retain last query or always start fresh, #4234)
+  - Custom Python and Node.js path configuration (#4220)
+  - Edge bookmarks loading across platforms
+  - Calculator plugin: add power operator (^) support
+
+- Improve
+  - Migrate settings from JSON to a unified, type-safe SQLite store
+  - Reduce clipboard memory usage
+  - Windows UX: app display details, Unicode handling, and UWP icon retrieval
+
+- Fix
+  - Key conflict when holding Ctrl and repeatedly pressing other keys
+  - "Last display position" not restored after restart
+  - Windows app extension checks (case-insensitive, #4251)
+  - Image loading error handling in image view
+
+## v2.0.0-beta.3 — 2025-06-23
+
+- Add
+  - Chat plugin: support multiple tool calls executed simultaneously in a single request
+  - Chat plugin: support custom agents
+  - ScriptPlugin support
+
+- Fix
+  - Windows sometimes cannot gain focus (#4198)
+
+## v2.0.0-beta.2 — 2025-04-18
+
+- Add
+  - Chat plugin (supports MCP)
+  - Double modifiers hotkey (e.g., double-click Ctrl)
+  - [Windows] Everything (file plugin)
+
+- Improve
+  - Settings interface now follows the theme color
+  - [Windows] Optimized transparent display effect
+
+- Fix
+  - [Windows] Focus not returning (#4144, #4166)
+
+## v2.0.0-beta.1 — 2025-02-27
+
+- Add
+  - Cross-platform rewrite (macOS, Windows, Linux) with a single executable
+  - Modern UI/UX with a new preview panel; AI-ready commands
+  - Plugin system (JavaScript and Python); improved plugin store; better action filtering and result scoring
+  - AI integrations (enhanced AI command processing; AI-powered theme creation)
+  - Internationalization for settings
+  - Enhanced deep linking

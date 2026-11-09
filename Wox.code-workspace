@@ -1,0 +1,94 @@
+{
+	"folders": [
+		{
+			"name": "wox",
+			"path": "."
+		},
+		{
+			"name": "wox.core",
+			"path": "wox.core"
+		},
+		{
+			"name": "wox.plugin.python",
+			"path": "wox.plugin.python"
+		},
+		{
+			"name": "wox.plugin.host.python",
+			"path": "wox.plugin.host.python"
+		},
+		{
+			"name": "wox.plugin.nodejs",
+			"path": "wox.plugin.nodejs"
+		},
+		{
+			"name": "wox.plugin.host.nodejs",
+			"path": "wox.plugin.host.nodejs"
+		}
+	],
+	"settings": {
+		"files.exclude": {
+			"wox.plugin.host.nodejs": true,
+			"wox.plugin.host.python": true,
+			"wox.plugin.nodejs": true,
+			"wox.plugin.python": true,
+			"wox.core": true
+		},
+		"[python]": {
+			"editor.formatOnSave": true,
+			"editor.codeActionsOnSave": {
+				"source.fixAll": "explicit",
+				"source.organizeImports": "explicit"
+			},
+		},
+		"editor.formatOnSave": false,
+		"go.lintOnSave": "off"
+	},
+	"extensions": {
+		"recommendations": [
+			"golang.go",
+		]
+	},
+	"tasks": {
+		"version": "2.0.0",
+		"tasks": [
+			{
+				"label": "Configure Wox crash dumps",
+				"type": "process",
+				"command": "powershell.exe",
+				"args": [
+					"-NoProfile",
+					"-Command",
+					"$dumpDir = Join-Path $env:USERPROFILE '.wox\\diagnostics\\dumps'; $key = 'HKCU:\\Software\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps\\__debug_bin_wox.exe'; New-Item -ItemType Directory -Force -Path $dumpDir | Out-Null; New-Item -Path $key -Force | Out-Null; New-ItemProperty -Path $key -Name DumpFolder -PropertyType ExpandString -Value $dumpDir -Force | Out-Null; New-ItemProperty -Path $key -Name DumpType -PropertyType DWord -Value 2 -Force | Out-Null; New-ItemProperty -Path $key -Name DumpCount -PropertyType DWord -Value 5 -Force | Out-Null; Write-Host \"Wox crash dumps: $dumpDir\""
+				],
+				"problemMatcher": [],
+				"presentation": {
+					"reveal": "silent",
+					"panel": "shared"
+				}
+			}
+		]
+	},
+	"launch": {
+		"version": "0.2.0",
+		"configurations": [
+			{
+				"name": "Run Wox",
+				"type": "go",
+				"request": "launch",
+				"mode": "auto",
+				"program": "${workspaceFolder:wox.core}",
+				"cwd": "${workspaceFolder:wox.core}",
+				// Keep the macOS process identity stable so AppKit can reuse tray positions between debug builds.
+				"output": "${workspaceFolder:wox.core}/__debug_bin_wox",
+				"buildFlags": "-tags=sqlite_fts5,wox_automation",
+				"env": {
+					"CGO_ENABLED": "1",
+					"WOX_AUTOMATION_INFO_FILE": "${workspaceFolder:wox.core}/.wox-automation.json"
+				},
+				"windows": {
+					"preLaunchTask": "Configure Wox crash dumps"
+				}
+			}
+		]
+	}
+}

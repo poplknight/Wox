@@ -1,0 +1,1662 @@
+package common
+
+import (
+	"bytes"
+	"context"
+	"crypto/md5"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	"image/png"
+	"io"
+	"mime"
+	"net/url"
+	"os"
+	"path"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+	"wox/network"
+	"wox/util"
+	"wox/util/fileicon"
+	"wox/util/imagecache"
+	woxsvg "wox/util/svg"
+	"wox/util/timetracking"
+
+	"github.com/disintegration/imaging"
+)
+
+type WoxImageType = string
+
+var NOT_PNG_ERR = errors.New("image is not png")
+
+var serverPort int
+
+var pngEncoderBufferPool = sync.Pool{
+	New: func() any {
+		return &png.EncoderBuffer{}
+	},
+}
+
+var fastPngEncoder = &png.Encoder{
+	CompressionLevel: png.BestSpeed,
+	BufferPool:       &pngBufferPool{},
+}
+
+var transparentPaddingBypassCache = util.NewHashMap[string, struct{}]()
+
+const (
+	ResultListIconSize     = util.ResultListIconSize
+	ResultGridIconSize     = util.ResultGridIconSize
+	resizeImageCachePrefix = "resize_v2_"
+	pngCropLargeDimension  = 1024
+	twemojiPNGBaseURL      = "https://cdn.jsdelivr.net/gh/jdecked/twemoji@v17.0.3/assets/72x72"
+)
+
+var (
+	pngFileSignature = [8]byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a}
+	pngChunkIHDR     = [4]byte{'I', 'H', 'D', 'R'}
+	pngChunkIDAT     = [4]byte{'I', 'D', 'A', 'T'}
+	pngChunktRNS     = [4]byte{'t', 'R', 'N', 'S'}
+)
+
+const (
+	pngColorTypeGrayscale      = 0
+	pngColorTypeTruecolor      = 2
+	pngColorTypeIndexed        = 3
+	pngColorTypeGrayscaleAlpha = 4
+	pngColorTypeTruecolorAlpha = 6
+)
+
+type pngBufferPool struct{}
+
+type pngCropMetadata struct {
+	width                  int
+	height                 int
+	mayContainTransparency bool
+}
+
+func (p *pngBufferPool) Get() *png.EncoderBuffer {
+	return pngEncoderBufferPool.Get().(*png.EncoderBuffer)
+}
+
+func (p *pngBufferPool) Put(b *png.EncoderBuffer) {
+	pngEncoderBufferPool.Put(b)
+}
+
+func savePngFast(img image.Image, filename string) error {
+	if err := os.MkdirAll(filepath.Dir(filename), 0755); err != nil {
+		return err
+	}
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return fastPngEncoder.Encode(f, img)
+}
+
+func rememberTransparentPaddingBypass(imageHash string) {
+	transparentPaddingBypassCache.Store(imageHash, struct{}{})
+}
+
+func isKnownTransparentPaddingBypass(imageHash string) bool {
+	return transparentPaddingBypassCache.Exist(imageHash)
+}
+
+// ClearConvertIconPathExistenceCache clears image conversion memory state after image cache removal.
+// Callers should invoke this after removing the image cache directory to avoid stale conversion decisions.
+func ClearConvertIconPathExistenceCache() {
+	imagecache.ClearDerivedPathExistenceCache()
+	transparentPaddingBypassCache.Clear()
+}
+
+const (
+	WoxImageTypeAbsolutePath = "absolute"
+	WoxImageTypeRelativePath = "relative"
+	WoxImageTypeBase64       = "base64"
+	WoxImageTypeSvg          = "svg"
+	WoxImageTypeEmoji        = "emoji"
+	WoxImageTypeUrl          = "url"
+	WoxImageTypeTheme        = "theme"
+	WoxImageTypeFileIcon     = "fileicon" // system associated file icon for given file absolute path
+	WoxImageTypeLazyLoad     = "lazyloadimage"
+)
+
+type WoxImage struct {
+	ImageType WoxImageType
+	ImageData string
+}
+
+// WoxLazyLoadImagePayload is an internal payload created by core after a plugin
+// has already returned a normal WoxImage. Source is used only inside core before
+// manager token registration; UI receives the token form and asks core for
+// the real resized icon only after the result image widget is built.
+type WoxLazyLoadImagePayload struct {
+	Token       string    `json:"token,omitempty"`
+	CacheKey    string    `json:"cacheKey,omitempty"`
+	Placeholder WoxImage  `json:"placeholder"`
+	TargetSize  int       `json:"targetSize"`
+	Source      *WoxImage `json:"source,omitempty"`
+	CacheScope  string    `json:"cacheScope,omitempty"`
+}
+
+func (w WoxImage) String() string {
+	return fmt.Sprintf("%s:%s", w.ImageType, w.ImageData)
+}
+
+func (w WoxImage) IsEmpty() bool {
+	return w.ImageData == ""
+}
+
+func (w *WoxImage) ToPng() (image.Image, error) {
+	if w.ImageType == WoxImageTypeBase64 {
+		if !strings.HasPrefix(w.ImageData, "data:image/png;") {
+			return nil, NOT_PNG_ERR
+		}
+
+		data := strings.Split(w.ImageData, ",")[1]
+		decodedData, base64DecodeErr := base64.StdEncoding.DecodeString(data)
+		if base64DecodeErr != nil {
+			return nil, base64DecodeErr
+		}
+
+		imgReader := bytes.NewReader(decodedData)
+		return png.Decode(imgReader)
+	}
+
+	if w.ImageType == WoxImageTypeAbsolutePath {
+		if isSvgFilePath(w.ImageData) || fileLooksLikeSvg(w.ImageData) {
+			return w.ToImage()
+		}
+
+		if !strings.EqualFold(filepath.Ext(w.ImageData), ".png") {
+			return nil, NOT_PNG_ERR
+		}
+
+		imgReader, openErr := os.Open(w.ImageData)
+		if openErr != nil {
+			return nil, openErr
+		}
+		defer imgReader.Close()
+		return png.Decode(imgReader)
+	}
+
+	if w.ImageType == WoxImageTypeSvg {
+		img, imgErr := w.ToImage()
+		if imgErr != nil {
+			return nil, imgErr
+		}
+		return img, nil
+	}
+
+	return nil, NOT_PNG_ERR
+}
+
+func (w WoxImage) ToImage() (image.Image, error) {
+	return w.ToImageWithContext(util.NewTraceContext())
+}
+
+// ToImageWithContext converts an image while allowing remote fetch callers to apply cancellation or timeout.
+func (w WoxImage) ToImageWithContext(ctx context.Context) (image.Image, error) {
+	return w.toImage(ctx, true)
+}
+
+func (w WoxImage) ToImageWithoutRemoteFetch() (image.Image, error) {
+	// Some user-visible flows, such as screenshot success notifications, only need a best-effort icon.
+	// The previous implementation always routed emoji icons through Twemoji download on cache miss, which
+	// blocked those flows on network latency. Callers that need predictable completion can use this local-only path.
+	return w.toImage(util.NewTraceContext(), false)
+}
+
+func (w *WoxImage) toImage(ctx context.Context, allowRemoteFetch bool) (image.Image, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	if w.ImageType == WoxImageTypeAbsolutePath {
+		if isSvgFilePath(w.ImageData) || fileLooksLikeSvg(w.ImageData) {
+			svgData, err := os.ReadFile(w.ImageData)
+			if err != nil {
+				return nil, err
+			}
+
+			return renderSvgImage(string(svgData))
+		}
+
+		return imaging.Open(w.ImageData)
+	}
+	if w.ImageType == WoxImageTypeBase64 {
+		parts := strings.SplitN(w.ImageData, ",", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid base64 image data")
+		}
+
+		data := parts[1]
+		decodedData, base64DecodeErr := base64.StdEncoding.DecodeString(data)
+		if base64DecodeErr != nil {
+			return nil, base64DecodeErr
+		}
+
+		imgReader := bytes.NewReader(decodedData)
+		return imaging.Decode(imgReader)
+	}
+	if w.ImageType == WoxImageTypeSvg {
+		return renderSvgImage(w.ImageData)
+	}
+	if w.ImageType == WoxImageTypeEmoji {
+		emojiPath, err := w.emojiImageCachePath(w.ImageData)
+		if err != nil {
+			return nil, err
+		}
+
+		if info, err := os.Stat(emojiPath); err == nil {
+			img, openErr := imaging.Open(emojiPath)
+			if openErr != nil {
+				return nil, openErr
+			}
+			imagecache.Touch(util.NewTraceContext(), emojiPath, info)
+			return img, nil
+		}
+
+		if !allowRemoteFetch {
+			return nil, fmt.Errorf("emoji image cache miss: %s", w.ImageData)
+		}
+
+		if err := os.MkdirAll(util.GetLocation().GetImageCacheDirectory(), 0755); err != nil {
+			return nil, err
+		}
+
+		if err := w.downloadEmojiImage(ctx, w.ImageData, emojiPath); err != nil {
+			return nil, err
+		}
+
+		return imaging.Open(emojiPath)
+	}
+	if w.ImageType == WoxImageTypeUrl {
+		cachePath, err := w.urlImageCachePath(ctx, w.ImageData)
+		if err != nil {
+			return nil, err
+		}
+
+		if img, ok, err := w.loadCachedURLImageAny(cachePath); err != nil {
+			return nil, err
+		} else if ok {
+			return img, nil
+		}
+
+		if !allowRemoteFetch {
+			return nil, fmt.Errorf("url image cache miss: %s", w.ImageData)
+		}
+
+		if err := w.warmURLImageCache(ctx, w.ImageData, cachePath); err != nil {
+			return nil, err
+		}
+
+		if img, ok, err := w.loadCachedURLImageAny(cachePath); err != nil {
+			return nil, err
+		} else if ok {
+			return img, nil
+		}
+
+		return nil, fmt.Errorf("url image cache miss after download: %s", w.ImageData)
+	}
+
+	return nil, fmt.Errorf("unsupported image type: %s", w.ImageType)
+}
+
+func (w *WoxImage) emojiImageCachePath(emoji string) (string, error) {
+	codePoints, err := w.emojiImageCodePointCandidates(emoji)
+	if err != nil {
+		return "", err
+	}
+
+	return path.Join(util.GetLocation().GetImageCacheDirectory(), fmt.Sprintf("emoji_%s.png", codePoints[0])), nil
+}
+
+// downloadEmojiImage tries Twemoji filename variants because some assets omit text/presentation variation selectors.
+func (w *WoxImage) downloadEmojiImage(ctx context.Context, emoji string, dest string) error {
+	if network.IsOffline() {
+		return network.ErrOffline
+	}
+	codePoints, err := w.emojiImageCodePointCandidates(emoji)
+	if err != nil {
+		return err
+	}
+
+	var lastErr error
+	for _, codePoint := range codePoints {
+		url := fmt.Sprintf("%s/%s.png", twemojiPNGBaseURL, codePoint)
+		if downloadErr := util.HttpDownload(ctx, url, dest); downloadErr == nil {
+			return nil
+		} else {
+			lastErr = downloadErr
+		}
+	}
+
+	return lastErr
+}
+
+// emojiImageCodePointCandidates returns Twemoji asset names from most specific to fallback-compatible.
+func (w *WoxImage) emojiImageCodePointCandidates(emoji string) ([]string, error) {
+	if emoji == "" {
+		return nil, fmt.Errorf("emoji is empty")
+	}
+	if !utf8.ValidString(emoji) {
+		return nil, fmt.Errorf("emoji is not valid UTF-8")
+	}
+
+	parts := make([]string, 0, utf8.RuneCountInString(emoji))
+	for _, codePoint := range emoji {
+		parts = append(parts, fmt.Sprintf("%x", codePoint))
+	}
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("empty emoji codepoint: %s", emoji)
+	}
+
+	codePoint := strings.Join(parts, "-")
+	candidates := []string{codePoint}
+	withoutVariation := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part != "fe0e" && part != "fe0f" {
+			withoutVariation = append(withoutVariation, part)
+		}
+	}
+	if len(withoutVariation) > 0 {
+		fallbackCodePoint := strings.Join(withoutVariation, "-")
+		if fallbackCodePoint != codePoint {
+			candidates = append(candidates, fallbackCodePoint)
+		}
+	}
+
+	return candidates, nil
+}
+
+func (w *WoxImage) urlImageCachePath(ctx context.Context, rawURL string) (string, error) {
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		return "", err
+	}
+
+	ext := strings.ToLower(filepath.Ext(parsedURL.Path))
+	if ext == "" || len(ext) > 8 {
+		ext = ".img"
+	}
+
+	cacheName := fmt.Sprintf("remote_image_%x%s", md5.Sum([]byte(rawURL)), ext)
+	return path.Join(imageCacheDirectory(ctx), cacheName), nil
+}
+
+// urlImageCacheCandidates also checks an .svg sibling because gist-style URLs
+// have no suffix and are first cached as .img, then rewritten after sniffing.
+func urlImageCacheCandidates(cachePath string) []string {
+	candidates := []string{cachePath}
+	if svgPath := replaceImageCacheExt(cachePath, ".svg"); svgPath != cachePath {
+		candidates = append(candidates, svgPath)
+	}
+	return candidates
+}
+
+func replaceImageCacheExt(cachePath string, ext string) string {
+	current := filepath.Ext(cachePath)
+	if current == "" {
+		return cachePath + ext
+	}
+	return cachePath[:len(cachePath)-len(current)] + ext
+}
+
+// existingURLImageCache returns the first populated cache file for a remote URL.
+func existingURLImageCache(cachePath string) (string, os.FileInfo, bool) {
+	for _, candidate := range urlImageCacheCandidates(cachePath) {
+		info, err := os.Stat(candidate)
+		if err != nil || info.IsDir() || info.Size() == 0 {
+			continue
+		}
+		return candidate, info, true
+	}
+	return "", nil, false
+}
+
+// loadCachedURLImageAny tries the URL-derived cache path and an .svg sibling.
+func (w *WoxImage) loadCachedURLImageAny(cachePath string) (image.Image, bool, error) {
+	var lastErr error
+	for _, candidate := range urlImageCacheCandidates(cachePath) {
+		img, ok, err := w.loadCachedURLImage(candidate)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if ok {
+			return img, true, nil
+		}
+	}
+	return nil, false, lastErr
+}
+
+func (w *WoxImage) loadCachedURLImage(cachePath string) (image.Image, bool, error) {
+	info, err := os.Stat(cachePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if info.IsDir() || info.Size() == 0 {
+		return nil, false, nil
+	}
+
+	data, err := os.ReadFile(cachePath)
+	if err != nil {
+		return nil, false, err
+	}
+
+	if isSvgFilePath(cachePath) || isSvgBytes(data) {
+		img, err := renderSvgImage(string(data))
+		if err != nil {
+			return nil, false, err
+		}
+		imagecache.Touch(util.NewTraceContext(), cachePath, info)
+		return img, true, nil
+	}
+
+	img, err := imaging.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, false, err
+	}
+	imagecache.Touch(util.NewTraceContext(), cachePath, info)
+	return img, true, nil
+}
+
+func (w *WoxImage) warmURLImageCache(ctx context.Context, rawURL string, cachePath string) error {
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0755); err != nil {
+		return err
+	}
+
+	resp, err := util.HttpOpen(ctx, rawURL)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	dest := cachePath
+	if isSvgContentType(resp.Header.Get("Content-Type")) || isSvgBytes(data) {
+		dest = replaceImageCacheExt(cachePath, ".svg")
+	}
+
+	return os.WriteFile(dest, data, 0644)
+}
+
+func isSvgFilePath(filePath string) bool {
+	return strings.EqualFold(filepath.Ext(filePath), ".svg")
+}
+
+// isSvgContentType reports official SVG MIME types, including charset suffixes.
+func isSvgContentType(contentType string) bool {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		mediaType = strings.TrimSpace(strings.Split(contentType, ";")[0])
+	}
+	switch strings.ToLower(mediaType) {
+	case "image/svg+xml", "image/svg":
+		return true
+	default:
+		return false
+	}
+}
+
+// isSvgBytes sniffs an SVG document from the payload so gist user-attachment
+// URLs without a .svg suffix still render after download.
+func isSvgBytes(data []byte) bool {
+	trimmed := bytes.TrimSpace(bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF}))
+	if len(trimmed) == 0 {
+		return false
+	}
+
+	lower := bytes.ToLower(trimmed)
+	if bytes.HasPrefix(lower, []byte("<svg")) || bytes.HasPrefix(lower, []byte("<!doctype svg")) {
+		return true
+	}
+	if !bytes.HasPrefix(lower, []byte("<?xml")) {
+		return false
+	}
+
+	probe := lower
+	if len(probe) > 1024 {
+		probe = probe[:1024]
+	}
+	return bytes.Contains(probe, []byte("<svg")) && !bytes.Contains(probe, []byte("<html"))
+}
+
+// fileLooksLikeSvg peeks the file header so extensionless cached SVGs still render.
+func fileLooksLikeSvg(filePath string) bool {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+
+	header := make([]byte, 1024)
+	n, err := io.ReadFull(file, header)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return false
+	}
+	return isSvgBytes(header[:n])
+}
+
+func renderSvgImage(svg string) (image.Image, error) {
+	return woxsvg.Render(svg, 32, 32)
+}
+
+func (w *WoxImage) IsValid() bool {
+	if w.ImageData == "" {
+		return false
+	}
+
+	// check absolute path exists
+	if w.ImageType == WoxImageTypeAbsolutePath {
+		if _, err := os.Stat(w.ImageData); err != nil {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (w WoxImage) Hash() string {
+	return util.Md5([]byte(w.ImageType + w.ImageData))
+}
+
+func (w *WoxImage) Overlay(overlay WoxImage, sizePercent, xPercent, yPercent float64) WoxImage {
+	backgroundImg, backErr := w.ToImage()
+	if backErr != nil {
+		return *w
+	}
+
+	overlayImage, overlayErr := overlay.ToImage()
+	if overlayErr != nil {
+		return *w
+	}
+
+	bgWidth := backgroundImg.Bounds().Dx()
+	bgHeight := backgroundImg.Bounds().Dy()
+
+	size := int(float64(bgWidth) * sizePercent)
+	x := int(float64(bgWidth) * xPercent)
+	y := int(float64(bgHeight) * yPercent)
+
+	resizedOverlayImg := imaging.Resize(overlayImage, size, size, imaging.Lanczos)
+	finalImg := imaging.Overlay(backgroundImg, resizedOverlayImg, image.Pt(x, y), 1)
+	overlayWoxImg, overlayWoxImgErr := NewWoxImage(finalImg)
+	if overlayWoxImgErr != nil {
+		return *w
+	}
+
+	return overlayWoxImg
+}
+
+func (w *WoxImage) OverlayFullPercentage(overlay WoxImage, percentage float64) WoxImage {
+	backgroundImg, backErr := w.ToImage()
+	if backErr != nil {
+		return *w
+	}
+
+	overlayImage, overlayErr := overlay.ToImage()
+	if overlayErr != nil {
+		return *w
+	}
+
+	width := int(float64(backgroundImg.Bounds().Dx()) * percentage)
+	height := int(float64(backgroundImg.Bounds().Dy()) * percentage)
+	pt := image.Pt((backgroundImg.Bounds().Dx()-width)/2, (backgroundImg.Bounds().Dy()-height)/2)
+
+	resizedOverlayImg := imaging.Resize(overlayImage, width, height, imaging.Lanczos)
+	finalImg := imaging.Overlay(backgroundImg, resizedOverlayImg, pt, 1)
+	overlayWoxImg, overlayWoxImgErr := NewWoxImage(finalImg)
+	if overlayWoxImgErr != nil {
+		return *w
+	}
+
+	return overlayWoxImg
+}
+
+// IsGif reports GIF paths, URLs, and data URIs so conversion keeps the original
+// file and UI can decode every playback frame instead of a resized PNG.
+func (w *WoxImage) IsGif() bool {
+	data := strings.ToLower(strings.TrimSpace(w.ImageData))
+	if data == "" {
+		return false
+	}
+	if strings.HasPrefix(data, "data:image/gif") {
+		return true
+	}
+	if cut := strings.IndexAny(data, "?#"); cut >= 0 {
+		data = data[:cut]
+	}
+	return strings.HasSuffix(data, ".gif")
+}
+
+// IsAnimatedGif reports sources that must stay as the original GIF file, including
+// cached remote downloads whose filename extension is not .gif.
+func (w *WoxImage) IsAnimatedGif() bool {
+	if w.IsGif() {
+		return true
+	}
+	if w.ImageType != WoxImageTypeAbsolutePath || w.ImageData == "" {
+		return false
+	}
+	return isGIFFile(w.ImageData)
+}
+
+// ResolveAnimatedGIFPath returns a local GIF file path for clipboard copy.
+// cleanup removes temporary files created for URL or base64 sources.
+func (w *WoxImage) ResolveAnimatedGIFPath(ctx context.Context) (path string, cleanup func(), err error) {
+	cleanup = func() {}
+	if !w.IsAnimatedGif() {
+		return "", cleanup, fmt.Errorf("woximage: not an animated gif")
+	}
+
+	switch w.ImageType {
+	case WoxImageTypeAbsolutePath:
+		path = strings.TrimSpace(w.ImageData)
+		if path == "" || !isGIFFile(path) {
+			return "", cleanup, fmt.Errorf("woximage: gif file not found")
+		}
+		return path, cleanup, nil
+	case WoxImageTypeUrl:
+		localized, materializeErr := w.materializeURLImage(ctx)
+		if materializeErr != nil {
+			return "", cleanup, materializeErr
+		}
+		return localized.ResolveAnimatedGIFPath(ctx)
+	case WoxImageTypeBase64:
+		gifBytes, decodeErr := w.base64ImageBytes()
+		if decodeErr != nil {
+			return "", cleanup, decodeErr
+		}
+		if !isGIFBytes(gifBytes) {
+			return "", cleanup, fmt.Errorf("woximage: base64 data is not gif")
+		}
+		tmp, createErr := os.CreateTemp("", "wox-clipboard-*.gif")
+		if createErr != nil {
+			return "", cleanup, createErr
+		}
+		tmpPath := tmp.Name()
+		if _, writeErr := tmp.Write(gifBytes); writeErr != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmpPath)
+			return "", cleanup, writeErr
+		}
+		if closeErr := tmp.Close(); closeErr != nil {
+			_ = os.Remove(tmpPath)
+			return "", cleanup, closeErr
+		}
+		cleanup = func() {
+			_ = os.Remove(tmpPath)
+		}
+		return tmpPath, cleanup, nil
+	default:
+		return "", cleanup, fmt.Errorf("woximage: unsupported animated gif type %s", w.ImageType)
+	}
+}
+
+func (w *WoxImage) base64ImageBytes() ([]byte, error) {
+	parts := strings.SplitN(w.ImageData, ",", 2)
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid base64 image data")
+	}
+	return base64.StdEncoding.DecodeString(parts[1])
+}
+
+func isGIFBytes(data []byte) bool {
+	if len(data) < 6 {
+		return false
+	}
+	header := string(data[:6])
+	return header == "GIF87a" || header == "GIF89a"
+}
+
+// materializeURLImage downloads a remote image into the local cache and returns an absolute-path image.
+func (w *WoxImage) materializeURLImage(ctx context.Context) (WoxImage, error) {
+	if w.ImageType != WoxImageTypeUrl {
+		return *w, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	cachePath, err := w.urlImageCachePath(ctx, w.ImageData)
+	if err != nil {
+		return WoxImage{}, err
+	}
+	if resolved, info, ok := existingURLImageCache(cachePath); ok {
+		imagecache.Touch(ctx, resolved, info)
+		return NewWoxImageAbsolutePath(resolved), nil
+	}
+	if err := w.warmURLImageCache(ctx, w.ImageData, cachePath); err != nil {
+		return WoxImage{}, err
+	}
+	resolved, info, ok := existingURLImageCache(cachePath)
+	if !ok {
+		return WoxImage{}, fmt.Errorf("url image cache miss after download: %s", w.ImageData)
+	}
+	imagecache.Touch(ctx, resolved, info)
+	return NewWoxImageAbsolutePath(resolved), nil
+}
+
+func isGIFFile(path string) bool {
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+
+	var header [6]byte
+	if _, err := io.ReadFull(file, header[:]); err != nil {
+		return false
+	}
+	return string(header[:]) == "GIF87a" || string(header[:]) == "GIF89a"
+}
+
+// localizeRemoteIconSource downloads GIF URLs only on the synchronous convert
+// path. Query polish keeps them lazy so a grid of Tenor/Giphy results does not
+// block on network I/O before the first paint. Non-GIF URLs stay typed as url
+// so their resize cache key remains the original remote source.
+func localizeRemoteIconSource(ctx context.Context, image WoxImage, allowLazy bool) WoxImage {
+	if allowLazy || image.ImageType != WoxImageTypeUrl || !image.IsGif() {
+		return image
+	}
+	localized, err := image.materializeURLImage(ctx)
+	if err != nil {
+		return image
+	}
+	return localized
+}
+
+func NewWoxImageSvg(svg string) WoxImage {
+	return WoxImage{
+		ImageType: WoxImageTypeSvg,
+		ImageData: svg,
+	}
+}
+
+func NewWoxImageAbsolutePath(path string) WoxImage {
+	return WoxImage{
+		ImageType: WoxImageTypeAbsolutePath,
+		ImageData: path,
+	}
+}
+
+func NewWoxImageFileIcon(filePath string) WoxImage {
+	return WoxImage{
+		ImageType: WoxImageTypeFileIcon,
+		ImageData: filePath,
+	}
+}
+
+func NewWoxImageBase64(data string) WoxImage {
+	return WoxImage{
+		ImageType: WoxImageTypeBase64,
+		ImageData: data,
+	}
+}
+
+func NewWoxImage(image image.Image) (WoxImage, error) {
+	buf := new(bytes.Buffer)
+	encodeErr := fastPngEncoder.Encode(buf, image)
+	if encodeErr != nil {
+		return WoxImage{}, fmt.Errorf("failed to encode image: %s", encodeErr.Error())
+	}
+
+	return NewWoxImageBase64(fmt.Sprintf("data:image/png;base64,%s", base64.StdEncoding.EncodeToString(buf.Bytes()))), nil
+}
+
+func NewWoxImageUrl(url string) WoxImage {
+	return WoxImage{
+		ImageType: WoxImageTypeUrl,
+		ImageData: url,
+	}
+}
+
+func NewWoxImageEmoji(emoji string) WoxImage {
+	return WoxImage{
+		ImageType: WoxImageTypeEmoji,
+		ImageData: emoji,
+	}
+}
+
+func NewWoxImageLazyLoad(token string, cacheKey string, placeholder WoxImage, targetSize int) WoxImage {
+	// LazyLoad is an internal image type: core serializes the placeholder and
+	// token together so UI can render immediately, then ask core for the
+	// resized raster only when the image widget is built.
+	payload, _ := json.Marshal(WoxLazyLoadImagePayload{
+		Token:       token,
+		CacheKey:    cacheKey,
+		Placeholder: placeholder,
+		TargetSize:  targetSize,
+	})
+	return WoxImage{
+		ImageType: WoxImageTypeLazyLoad,
+		ImageData: string(payload),
+	}
+}
+
+// imageThumbnailPlaceholder is the conversion fallback inside common. This
+// package cannot import wox/common/icons without a cycle; the catalog registers
+// the same SVG as status.image-placeholder.
+var imageThumbnailPlaceholder = NewWoxImageSvg(`<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3" fill="#E6E9F2"/><path fill="#A6B0C3" d="M7.5 9.5a2 2 0 1 0 0-4 2 2 0 0 0 0 4"/><path fill="#7B879C" d="M5 18h14l-4.7-6.2a1.4 1.4 0 0 0-2.2 0l-2.5 3.3-1.1-1.4a1.3 1.3 0 0 0-2.1.1z"/></svg>`)
+
+func NewWoxImageLazyLoadCandidate(source WoxImage, targetSize int) WoxImage {
+	// Candidate lazy images are returned only inside core while polishing results.
+	// The manager replaces this source-bearing marker with a token-bearing
+	// lazyloadimage after it has registered the result in its cache.
+	payload, _ := json.Marshal(WoxLazyLoadImagePayload{
+		Placeholder: imageThumbnailPlaceholder,
+		TargetSize:  targetSize,
+		Source:      &source,
+	})
+	return WoxImage{
+		ImageType: WoxImageTypeLazyLoad,
+		ImageData: string(payload),
+	}
+}
+
+func ParseWoxLazyLoadImagePayload(image WoxImage) (WoxLazyLoadImagePayload, error) {
+	if image.ImageType != WoxImageTypeLazyLoad {
+		return WoxLazyLoadImagePayload{}, fmt.Errorf("image type is not lazyloadimage: %s", image.ImageType)
+	}
+
+	var payload WoxLazyLoadImagePayload
+	if err := json.Unmarshal([]byte(image.ImageData), &payload); err != nil {
+		return WoxLazyLoadImagePayload{}, err
+	}
+	return payload, nil
+}
+
+func ParseWoxImageOrDefault(image string, defaultImage WoxImage) WoxImage {
+	if image == "" {
+		return defaultImage
+	}
+
+	parsedImage, parseErr := ParseWoxImage(image)
+	if parseErr != nil {
+		return defaultImage
+	}
+
+	return parsedImage
+}
+
+func ParseWoxImage(image string) (WoxImage, error) {
+	n := strings.SplitN(image, ":", 2)
+	if len(n) != 2 {
+		return WoxImage{}, fmt.Errorf("invalid image format: %s", image)
+	}
+
+	imageType := n[0]
+	imageData := n[1]
+
+	if imageType == WoxImageTypeAbsolutePath {
+		return NewWoxImageAbsolutePath(imageData), nil
+	}
+	if imageType == WoxImageTypeRelativePath {
+		return WoxImage{
+			ImageType: WoxImageTypeRelativePath,
+			ImageData: imageData,
+		}, nil
+	}
+	if imageType == WoxImageTypeBase64 {
+		return NewWoxImageBase64(imageData), nil
+	}
+	if imageType == WoxImageTypeSvg {
+		return NewWoxImageSvg(imageData), nil
+	}
+	if imageType == WoxImageTypeUrl {
+		return NewWoxImageUrl(imageData), nil
+	}
+	if imageType == WoxImageTypeEmoji {
+		return NewWoxImageEmoji(imageData), nil
+	}
+	if imageType == WoxImageTypeFileIcon {
+		return NewWoxImageFileIcon(imageData), nil
+	}
+	if imageType == WoxImageTypeLazyLoad {
+		return WoxImage{ImageType: WoxImageTypeLazyLoad, ImageData: imageData}, nil
+	}
+
+	return WoxImage{}, fmt.Errorf("unsupported image type: %s", imageType)
+}
+
+func ConvertIcon(ctx context.Context, image WoxImage, pluginDirectory string) (newImage WoxImage) {
+	return ConvertIconWithSize(ctx, image, pluginDirectory, ResultListIconSize)
+}
+
+func ConvertIconWithSize(ctx context.Context, image WoxImage, pluginDirectory string, size int) (newImage WoxImage) {
+	return convertIconWithSize(ctx, image, pluginDirectory, size, false, timetracking.IconConversionDiagnostics{})
+}
+
+// ConvertIconWithSizeWithDiagnostics converts an icon and emits query-scoped timing when diagnostic metadata is provided.
+func ConvertIconWithSizeWithDiagnostics(ctx context.Context, image WoxImage, pluginDirectory string, size int, diagnostics timetracking.IconConversionDiagnostics) (newImage WoxImage) {
+	return convertIconWithSize(ctx, image, pluginDirectory, size, false, diagnostics)
+}
+
+// Converted icons can require remote I/O or expensive raster work, so this variant allows the manager to return a lazy load marker instead of blocking on conversion.
+// The manager replaces the marker with the real resized icon later after it has registered the result in its cache and received the surface size from UI.
+func ConvertIconWithSizeMaybeLazy(ctx context.Context, image WoxImage, pluginDirectory string, size int) (newImage WoxImage) {
+	return convertIconWithSize(ctx, image, pluginDirectory, size, true, timetracking.IconConversionDiagnostics{})
+}
+
+// ConvertIconWithSizeMaybeLazyWithDiagnostics records timing for lazy-capable query result icon conversion.
+func ConvertIconWithSizeMaybeLazyWithDiagnostics(ctx context.Context, image WoxImage, pluginDirectory string, size int, diagnostics timetracking.IconConversionDiagnostics) (newImage WoxImage) {
+	return convertIconWithSize(ctx, image, pluginDirectory, size, true, diagnostics)
+}
+
+func logIconConversionDiagnostics(ctx context.Context, diagnostics timetracking.IconConversionDiagnostics, timing timetracking.IconConversionTiming, size int, allowLazy bool, inputType WoxImageType, inputDataLen int) {
+	if !diagnostics.Enabled() {
+		return
+	}
+	if diagnostics.Recorder != nil {
+		diagnostics.Recorder(diagnostics, timing.Summary())
+		return
+	}
+	if timing.TotalCost == 0 && timing.TotalCostUs < 100 {
+		return
+	}
+
+	tracker := timetracking.New("icon_convert_done")
+	if !tracker.Enabled() {
+		return
+	}
+
+	tracker.SetRawString("queryId", diagnostics.QueryId)
+	tracker.SetRawString("purpose", diagnostics.Purpose)
+	tracker.SetRawString("plugin", diagnostics.Plugin)
+	tracker.SetRawString("resultId", diagnostics.ResultId)
+	tracker.SetString("title", diagnostics.ResultTitle)
+	tracker.SetInt64("totalMs", timing.TotalCost)
+	tracker.SetInt64("totalUs", timing.TotalCostUs)
+	tracker.SetInt("size", size)
+	tracker.SetBool("allowLazy", allowLazy)
+	tracker.SetRawString("inputType", string(inputType))
+	tracker.SetInt("inputDataLen", inputDataLen)
+	tracker.SetRawString("normalizedType", string(timing.NormalizedType))
+	tracker.SetRawString("outputType", string(timing.OutputType))
+	tracker.SetInt("outputDataLen", timing.OutputDataLen)
+	tracker.SetInt64("fileIconMs", timing.FileIconCost)
+	tracker.SetInt64("fileIconUs", timing.FileIconCostUs)
+	tracker.SetInt64("relativeMs", timing.RelativeCost)
+	tracker.SetInt64("relativeUs", timing.RelativeCostUs)
+	tracker.SetInt64("svgCheckMs", timing.SvgCheckCost)
+	tracker.SetInt64("svgCheckUs", timing.SvgCheckCostUs)
+	tracker.SetInt64("cacheMs", timing.CacheCost)
+	tracker.SetInt64("cacheUs", timing.CacheCostUs)
+	tracker.SetBool("cacheHit", timing.CacheHit)
+	tracker.SetRawString("cacheSource", timing.CacheSource)
+	tracker.SetInt64("lazyCheckMs", timing.LazyCheckCost)
+	tracker.SetInt64("lazyCheckUs", timing.LazyCheckCostUs)
+	tracker.SetBool("lazy", timing.Lazy)
+	tracker.SetRawString("lazyReason", timing.LazyReason)
+	tracker.SetInt("lazyWidth", timing.LazyWidth)
+	tracker.SetInt("lazyHeight", timing.LazyHeight)
+	tracker.SetInt64("cropMs", timing.CropCost)
+	tracker.SetInt64("cropUs", timing.CropCostUs)
+	tracker.SetRawString("cropResult", timing.CropTiming.Result)
+	tracker.SetRawString("cropCache", timing.CropTiming.CacheSource)
+	tracker.SetInt64("cropMetadataMs", timing.CropTiming.MetadataMs)
+	tracker.SetInt64("cropDecodeMs", timing.CropTiming.DecodeMs)
+	tracker.SetInt64("cropScanMs", timing.CropTiming.CropMs)
+	tracker.SetInt64("cropSaveMs", timing.CropTiming.SaveMs)
+	tracker.SetInt64("resizeMs", timing.ResizeCost)
+	tracker.SetInt64("resizeUs", timing.ResizeCostUs)
+	tracker.SetRawString("resizeResult", timing.ResizeTiming.Result)
+	tracker.SetRawString("resizeCache", timing.ResizeTiming.CacheSource)
+	tracker.SetInt64("resizeDecodeMs", timing.ResizeTiming.DecodeMs)
+	tracker.SetInt64("resizeOpMs", timing.ResizeTiming.ResizeMs)
+	tracker.SetInt64("resizeSaveMs", timing.ResizeTiming.SaveMs)
+	tracker.SetInt("resizeSourceWidth", timing.ResizeTiming.SourceWidth)
+	tracker.SetInt("resizeSourceHeight", timing.ResizeTiming.SourceHeight)
+	tracker.SetInt("resizeTargetSize", timing.ResizeTiming.TargetSize)
+	tracker.Log(ctx)
+}
+
+func convertIconWithSize(ctx context.Context, image WoxImage, pluginDirectory string, size int, allowLazy bool, diagnostics timetracking.IconConversionDiagnostics) (newImage WoxImage) {
+	if !diagnostics.Enabled() || !util.IsDev() {
+		return convertIconWithSizeFast(ctx, image, pluginDirectory, size, allowLazy)
+	}
+
+	convertStart := util.GetSystemTimestamp()
+	convertTimingStart := time.Now()
+	inputType := image.ImageType
+	inputDataLen := len(image.ImageData)
+	timing := timetracking.IconConversionTiming{
+		CacheSource: "not_checked",
+		LazyReason:  "not_checked",
+		CropTiming: timetracking.IconCropTiming{
+			CacheSource: "not_checked",
+			Result:      "not_checked",
+		},
+		ResizeTiming: timetracking.IconResizeTiming{
+			CacheSource: "not_checked",
+			Result:      "not_checked",
+		},
+	}
+	// Result icon callers can choose the surface size directly. Keep invalid
+	// sizes on the normal list path so every icon cache layer shares one default.
+	if size <= 0 {
+		size = ResultListIconSize
+	}
+
+	// Defer before calling the OS: resolving every app's file icon can block a
+	// whole grid even when the extracted raster is too small for the lazy probe.
+	if allowLazy && size >= ResultGridIconSize && image.ImageType == WoxImageTypeFileIcon {
+		newImage = NewWoxImageLazyLoadCandidate(image, size)
+		timing.Lazy = true
+		timing.LazyReason = "grid_file_icon"
+		timing.TotalCost = util.GetSystemTimestamp() - convertStart
+		timing.TotalCostUs = time.Since(convertTimingStart).Microseconds()
+		timing.OutputType = newImage.ImageType
+		timing.OutputDataLen = len(newImage.ImageData)
+		logIconConversionDiagnostics(ctx, diagnostics, timing, size, allowLazy, inputType, inputDataLen)
+		return newImage
+	}
+
+	fastCacheStart := util.GetSystemTimestamp()
+	fastCacheTimingStart := time.Now()
+	if isFinalResizeCacheImage(ctx, image, size) {
+		imagecache.Touch(ctx, image.ImageData, nil)
+		timing.CacheCost = util.GetSystemTimestamp() - fastCacheStart
+		timing.CacheCostUs = time.Since(fastCacheTimingStart).Microseconds()
+		timing.CacheHit = true
+		timing.CacheSource = "already_resized"
+		timing.NormalizedType = image.ImageType
+		timing.TotalCost = util.GetSystemTimestamp() - convertStart
+		timing.TotalCostUs = time.Since(convertTimingStart).Microseconds()
+		timing.OutputType = image.ImageType
+		timing.OutputDataLen = len(image.ImageData)
+		logIconConversionDiagnostics(ctx, diagnostics, timing, size, allowLazy, inputType, inputDataLen)
+		return image
+	}
+
+	fileIconStart := util.GetSystemTimestamp()
+	fileIconTimingStart := time.Now()
+	newImage = ConvertFileIconToAbsolutePathWithSize(ctx, image, size)
+	timing.FileIconCost = util.GetSystemTimestamp() - fileIconStart
+	timing.FileIconCostUs = time.Since(fileIconTimingStart).Microseconds()
+	relativeStart := util.GetSystemTimestamp()
+	relativeTimingStart := time.Now()
+	newImage = ConvertRelativePathToAbsolutePath(ctx, newImage, pluginDirectory)
+	newImage = localizeRemoteIconSource(ctx, newImage, allowLazy)
+	timing.RelativeCost = util.GetSystemTimestamp() - relativeStart
+	timing.RelativeCostUs = time.Since(relativeTimingStart).Microseconds()
+	timing.NormalizedType = newImage.ImageType
+
+	// Keep SVG data and SVG files as-is so UI can render vectors directly.
+	svgCheckStart := util.GetSystemTimestamp()
+	svgCheckTimingStart := time.Now()
+	if newImage.ImageType == WoxImageTypeSvg || (newImage.ImageType == WoxImageTypeAbsolutePath && isSvgFilePath(newImage.ImageData)) {
+		timing.SvgCheckCost = util.GetSystemTimestamp() - svgCheckStart
+		timing.SvgCheckCostUs = time.Since(svgCheckTimingStart).Microseconds()
+		timing.TotalCost = util.GetSystemTimestamp() - convertStart
+		timing.TotalCostUs = time.Since(convertTimingStart).Microseconds()
+		timing.OutputType = newImage.ImageType
+		timing.OutputDataLen = len(newImage.ImageData)
+		logIconConversionDiagnostics(ctx, diagnostics, timing, size, allowLazy, inputType, inputDataLen)
+		return newImage
+	}
+	timing.SvgCheckCost = util.GetSystemTimestamp() - svgCheckStart
+	timing.SvgCheckCostUs = time.Since(svgCheckTimingStart).Microseconds()
+
+	cacheStart := util.GetSystemTimestamp()
+	cacheTimingStart := time.Now()
+	cached, ok, cacheSource := cachedResizeImageDetailed(ctx, newImage, size)
+	timing.CacheCost = util.GetSystemTimestamp() - cacheStart
+	timing.CacheCostUs = time.Since(cacheTimingStart).Microseconds()
+	timing.CacheHit = ok
+	timing.CacheSource = cacheSource
+	if ok {
+		timing.TotalCost = util.GetSystemTimestamp() - convertStart
+		timing.TotalCostUs = time.Since(convertTimingStart).Microseconds()
+		timing.OutputType = cached.ImageType
+		timing.OutputDataLen = len(cached.ImageData)
+		logIconConversionDiagnostics(ctx, diagnostics, timing, size, allowLazy, inputType, inputDataLen)
+		return cached
+	}
+
+	croppedCacheStart := util.GetSystemTimestamp()
+	croppedCacheTimingStart := time.Now()
+	croppedCached, croppedOk, croppedCacheSource := cachedCroppedResizeImageDetailed(ctx, newImage, size)
+	timing.CacheCost += util.GetSystemTimestamp() - croppedCacheStart
+	timing.CacheCostUs += time.Since(croppedCacheTimingStart).Microseconds()
+	if croppedOk {
+		timing.CacheHit = true
+		timing.CacheSource = croppedCacheSource
+		timing.TotalCost = util.GetSystemTimestamp() - convertStart
+		timing.TotalCostUs = time.Since(convertTimingStart).Microseconds()
+		timing.OutputType = croppedCached.ImageType
+		timing.OutputDataLen = len(croppedCached.ImageData)
+		logIconConversionDiagnostics(ctx, diagnostics, timing, size, allowLazy, inputType, inputDataLen)
+		return croppedCached
+	}
+
+	lazyCheckStart := util.GetSystemTimestamp()
+	lazyCheckTimingStart := time.Now()
+	lazy, lazyReason, lazyWidth, lazyHeight := shouldLazyLoadImageIconDetailed(ctx, newImage, size)
+	timing.LazyCheckCost = util.GetSystemTimestamp() - lazyCheckStart
+	timing.LazyCheckCostUs = time.Since(lazyCheckTimingStart).Microseconds()
+	timing.Lazy = lazy
+	timing.LazyReason = lazyReason
+	timing.LazyWidth = lazyWidth
+	timing.LazyHeight = lazyHeight
+	if allowLazy && lazy {
+		// Optimization: large local raster icons are expensive because the old
+		// polish path decoded, optionally cropped, resized, and wrote every image
+		// before the query response reached UI. Return a source-bearing marker
+		// here and let the manager decide whether to register it as a token, which
+		// keeps cache ownership out of common image conversion.
+		lazyImage := NewWoxImageLazyLoadCandidate(newImage, size)
+		timing.TotalCost = util.GetSystemTimestamp() - convertStart
+		timing.TotalCostUs = time.Since(convertTimingStart).Microseconds()
+		timing.OutputType = lazyImage.ImageType
+		timing.OutputDataLen = len(lazyImage.ImageData)
+		logIconConversionDiagnostics(ctx, diagnostics, timing, size, allowLazy, inputType, inputDataLen)
+		return lazyImage
+	}
+
+	cropStart := util.GetSystemTimestamp()
+	cropTimingStart := time.Now()
+	newImage, timing.CropTiming = cropPngTransparentPaddingsWithTiming(ctx, newImage)
+	timing.CropCost = util.GetSystemTimestamp() - cropStart
+	timing.CropCostUs = time.Since(cropTimingStart).Microseconds()
+	resizeStart := util.GetSystemTimestamp()
+	resizeTimingStart := time.Now()
+	newImage, timing.ResizeTiming = resizeImageWithTiming(ctx, newImage, size)
+	timing.ResizeCost = util.GetSystemTimestamp() - resizeStart
+	timing.ResizeCostUs = time.Since(resizeTimingStart).Microseconds()
+	timing.TotalCost = util.GetSystemTimestamp() - convertStart
+	timing.TotalCostUs = time.Since(convertTimingStart).Microseconds()
+	timing.OutputType = newImage.ImageType
+	timing.OutputDataLen = len(newImage.ImageData)
+	logIconConversionDiagnostics(ctx, diagnostics, timing, size, allowLazy, inputType, inputDataLen)
+	return
+}
+
+// convertIconWithSizeFast keeps the normal icon path free from diagnostic timers.
+func convertIconWithSizeFast(ctx context.Context, image WoxImage, pluginDirectory string, size int, allowLazy bool) (newImage WoxImage) {
+	if size <= 0 {
+		size = ResultListIconSize
+	}
+
+	if allowLazy && size >= ResultGridIconSize && image.ImageType == WoxImageTypeFileIcon {
+		return NewWoxImageLazyLoadCandidate(image, size)
+	}
+
+	if isFinalResizeCacheImage(ctx, image, size) {
+		imagecache.Touch(ctx, image.ImageData, nil)
+		return image
+	}
+
+	newImage = ConvertFileIconToAbsolutePathWithSize(ctx, image, size)
+	newImage = ConvertRelativePathToAbsolutePath(ctx, newImage, pluginDirectory)
+	newImage = localizeRemoteIconSource(ctx, newImage, allowLazy)
+	if newImage.ImageType == WoxImageTypeSvg || (newImage.ImageType == WoxImageTypeAbsolutePath && isSvgFilePath(newImage.ImageData)) {
+		return newImage
+	}
+
+	if cached, ok := cachedResizeImage(ctx, newImage, size); ok {
+		return cached
+	}
+	if cached, ok, _ := cachedCroppedResizeImageDetailed(ctx, newImage, size); ok {
+		return cached
+	}
+	if allowLazy && shouldLazyLoadImageIcon(ctx, newImage, size) {
+		return NewWoxImageLazyLoadCandidate(newImage, size)
+	}
+
+	newImage = cropPngTransparentPaddings(ctx, newImage)
+	newImage = resizeImage(ctx, newImage, size)
+	return
+}
+
+func shouldLazyLoadImageIcon(ctx context.Context, woxImage WoxImage, size int) bool {
+	lazy, _, _, _ := shouldLazyLoadImageIconDetailed(ctx, woxImage, size)
+	return lazy
+}
+
+func shouldLazyLoadImageIconDetailed(ctx context.Context, woxImage WoxImage, size int) (bool, string, int, int) {
+	// A warm final resize cache returned before this probe. Any remaining URL
+	// source may require network I/O and must stay off the query polish path.
+	if woxImage.ImageType == WoxImageTypeUrl {
+		return true, "remote_url", 0, 0
+	}
+	if woxImage.ImageType != WoxImageTypeAbsolutePath || woxImage.IsAnimatedGif() || isSvgFilePath(woxImage.ImageData) {
+		return false, "not_absolute_raster", 0, 0
+	}
+
+	// Grid artwork is loaded only for visible cells. Even small cold rasters add
+	// significant crop/resize work across hundreds of results; warm caches have
+	// already returned above without opening or decoding the source.
+	if size >= ResultGridIconSize {
+		return true, "grid_raster", 0, 0
+	}
+
+	file, err := os.Open(woxImage.ImageData)
+	if err != nil {
+		return false, "open_error", 0, 0
+	}
+	defer file.Close()
+
+	config, _, err := image.DecodeConfig(file)
+	if err != nil {
+		// Keep unknown image shapes on the existing synchronous path. This favors
+		// compatibility for uncommon formats and lets the surrounding slow-query
+		// logs reveal any future formats that need a dedicated lazy rule.
+		util.GetLogger().Debug(ctx, fmt.Sprintf("failed to decode result icon config for lazy decision: %s", err.Error()))
+		return false, "decode_error", 0, 0
+	}
+
+	if max(config.Width, config.Height) > 512 {
+		return true, "large_raster", config.Width, config.Height
+	}
+	return false, "small_raster", config.Width, config.Height
+}
+
+func resizeImageCachePath(ctx context.Context, image WoxImage, size int) string {
+	imgHash := image.Hash()
+	return path.Join(imageCacheDirectory(ctx), fmt.Sprintf("%s%d_%s.png", resizeImageCachePrefix, size, imgHash))
+}
+
+// isFinalResizeCacheImage checks whether the image is already the final resized cache artifact for the requested surface size.
+func isFinalResizeCacheImage(ctx context.Context, image WoxImage, size int) bool {
+	if image.ImageType != WoxImageTypeAbsolutePath || image.ImageData == "" {
+		return false
+	}
+
+	imagePath := filepath.Clean(image.ImageData)
+	cacheDir := filepath.Clean(imageCacheDirectory(ctx))
+	if !strings.EqualFold(filepath.Dir(imagePath), cacheDir) {
+		return false
+	}
+
+	filename := filepath.Base(imagePath)
+	return strings.HasPrefix(filename, fmt.Sprintf("%s%d_", resizeImageCachePrefix, size)) && strings.EqualFold(filepath.Ext(filename), ".png")
+}
+
+func cachedResizeImage(ctx context.Context, image WoxImage, size int) (WoxImage, bool) {
+	woxImage, ok, _ := cachedResizeImageDetailed(ctx, image, size)
+	return woxImage, ok
+}
+
+func cachedResizeImageDetailed(ctx context.Context, image WoxImage, size int) (WoxImage, bool, string) {
+	resizeImgPath := resizeImageCachePath(ctx, image, size)
+	if imagecache.IsKnownExistingDerivedPath(resizeImgPath) {
+		imagecache.Touch(ctx, resizeImgPath, nil)
+		return NewWoxImageAbsolutePath(resizeImgPath), true, "memory"
+	}
+	if info, err := os.Stat(resizeImgPath); err == nil {
+		imagecache.RememberDerivedPathExists(resizeImgPath)
+		imagecache.Touch(ctx, resizeImgPath, info)
+		return NewWoxImageAbsolutePath(resizeImgPath), true, "stat"
+	}
+	return WoxImage{}, false, "miss"
+}
+
+// cachedCroppedResizeImageDetailed returns the final crop+resize cache entry
+// before the lazy-size probe opens the original image. Warm app icons commonly
+// have both derived files already, so this avoids repeated DecodeConfig and stat
+// work on the query polish path.
+func cachedCroppedResizeImageDetailed(ctx context.Context, image WoxImage, size int) (WoxImage, bool, string) {
+	if image.ImageType == WoxImageTypeEmoji || image.IsAnimatedGif() {
+		return WoxImage{}, false, "skipped"
+	}
+
+	cropImgPath := cropPngTransparentPaddingCachePath(ctx, image)
+	cropCacheSource := ""
+	if imagecache.IsKnownExistingDerivedPath(cropImgPath) {
+		imagecache.Touch(ctx, cropImgPath, nil)
+		cropCacheSource = "memory"
+	} else if info, err := os.Stat(cropImgPath); err == nil {
+		imagecache.RememberDerivedPathExists(cropImgPath)
+		imagecache.Touch(ctx, cropImgPath, info)
+		cropCacheSource = "stat"
+	} else {
+		return WoxImage{}, false, "miss"
+	}
+
+	croppedImage := NewWoxImageAbsolutePath(cropImgPath)
+	if resized, ok, resizeCacheSource := cachedResizeImageDetailed(ctx, croppedImage, size); ok {
+		return resized, true, fmt.Sprintf("cropped_%s_%s", cropCacheSource, resizeCacheSource)
+	}
+
+	return WoxImage{}, false, fmt.Sprintf("cropped_%s_resize_miss", cropCacheSource)
+}
+
+func resizeImage(ctx context.Context, image WoxImage, size int) (newImage WoxImage) {
+	newImage, _ = resizeImageWithTiming(ctx, image, size)
+	return newImage
+}
+
+func resizeImageWithTiming(ctx context.Context, image WoxImage, size int) (newImage WoxImage, timing timetracking.IconResizeTiming) {
+	timing.CacheSource = "not_checked"
+	timing.Result = "unknown"
+
+	// skip emoji images
+	if image.ImageType == WoxImageTypeEmoji {
+		timing.Result = "skipped_emoji"
+		return image, timing
+	}
+	if image.IsAnimatedGif() {
+		timing.Result = "skipped_gif"
+		return image, timing
+	}
+
+	newImage = image
+
+	resizeImgPath := resizeImageCachePath(ctx, image, size)
+	cacheStart := util.GetSystemTimestamp()
+	if cached, ok, cacheSource := cachedResizeImageDetailed(ctx, image, size); ok {
+		timing.CacheSource = cacheSource
+		timing.Result = "cache_hit"
+		timing.DecodeMs = util.GetSystemTimestamp() - cacheStart
+		return cached, timing
+	}
+	timing.CacheSource = "miss"
+	timing.DecodeMs = util.GetSystemTimestamp() - cacheStart
+
+	decodeStart := util.GetSystemTimestamp()
+	img, imgErr := image.ToImageWithContext(ctx)
+	timing.DecodeMs = util.GetSystemTimestamp() - decodeStart
+	if imgErr != nil {
+		timing.Result = "decode_error"
+		return image, timing
+	}
+
+	// Respect the original ratio and never enlarge the source. Upscaling a small
+	// native app icon before a grid surface downsampled it made large result icons
+	// visibly soft.
+	sourceWidth := img.Bounds().Dx()
+	sourceHeight := img.Bounds().Dy()
+	targetSize := min(size, max(sourceWidth, sourceHeight))
+	timing.SourceWidth = sourceWidth
+	timing.SourceHeight = sourceHeight
+	timing.TargetSize = targetSize
+	width := targetSize
+	height := targetSize
+	if sourceWidth > sourceHeight {
+		height = 0
+	} else {
+		width = 0
+	}
+
+	resizeFilter := imaging.Lanczos
+	resizeStart := util.GetSystemTimestamp()
+	resizeImg := imaging.Resize(img, width, height, resizeFilter)
+	timing.ResizeMs = util.GetSystemTimestamp() - resizeStart
+	saveStart := util.GetSystemTimestamp()
+	saveErr := savePngFast(resizeImg, resizeImgPath)
+	timing.SaveMs = util.GetSystemTimestamp() - saveStart
+	if saveErr != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("failed to save resize image: %s", saveErr.Error()))
+		timing.Result = "save_error"
+		return image, timing
+	}
+
+	imagecache.RememberDerivedPathExists(resizeImgPath)
+	timing.Result = "saved"
+	return NewWoxImageAbsolutePath(resizeImgPath), timing
+}
+
+func cropPngTransparentPaddings(ctx context.Context, woxImage WoxImage) (newImage WoxImage) {
+	newImage, _ = cropPngTransparentPaddingsWithTiming(ctx, woxImage)
+	return newImage
+}
+
+func cropPngTransparentPaddingsWithTiming(ctx context.Context, woxImage WoxImage) (newImage WoxImage, timing timetracking.IconCropTiming) {
+	timing.CacheSource = "not_checked"
+	timing.Result = "unknown"
+	// skip emoji images
+	if woxImage.ImageType == WoxImageTypeEmoji {
+		timing.Result = "skipped_emoji"
+		return woxImage, timing
+	}
+	if woxImage.IsAnimatedGif() {
+		timing.Result = "skipped_gif"
+		return woxImage, timing
+	}
+
+	imgHash := filepath.Join(imageCacheDirectory(ctx), woxImage.Hash())
+	if isKnownTransparentPaddingBypass(imgHash) {
+		timing.CacheSource = "bypass_memory"
+		timing.Result = "bypassed"
+		return woxImage, timing
+	}
+
+	//try load from cache first
+	cropImgPath := cropPngTransparentPaddingCachePath(ctx, woxImage)
+	if imagecache.IsKnownExistingDerivedPath(cropImgPath) {
+		imagecache.Touch(ctx, cropImgPath, nil)
+		timing.CacheSource = "memory"
+		timing.Result = "cache_hit"
+		return NewWoxImageAbsolutePath(cropImgPath), timing
+	}
+	if info, err := os.Stat(cropImgPath); err == nil {
+		imagecache.RememberDerivedPathExists(cropImgPath)
+		imagecache.Touch(ctx, cropImgPath, info)
+		timing.CacheSource = "stat"
+		timing.Result = "cache_hit"
+		return NewWoxImageAbsolutePath(cropImgPath), timing
+	}
+	timing.CacheSource = "miss"
+	metadataStart := util.GetSystemTimestamp()
+	if metadata, ok := absolutePngCropMetadata(woxImage); ok {
+		timing.MetadataMs = util.GetSystemTimestamp() - metadataStart
+		if metadata.width > pngCropLargeDimension && metadata.height > pngCropLargeDimension {
+			// Very large PNGs are content images instead of icon artwork. Cropping them can force a
+			// full-size decode and transparent scan with no icon benefit, so keep the original image
+			// and let the resize cache own the bounded icon output.
+			rememberTransparentPaddingBypass(imgHash)
+			timing.Result = "metadata_large_bypass"
+			return woxImage, timing
+		}
+		if !metadata.mayContainTransparency {
+			// RGB screenshots cannot have transparent padding, so decoding, scanning every pixel,
+			// and writing an equivalent crop file only adds cold-query latency. The metadata-only
+			// check keeps uncertain or alpha-capable PNGs on the existing full crop path, and the
+			// bypass cache avoids repeating this metadata read on the steady warm path.
+			rememberTransparentPaddingBypass(imgHash)
+			timing.Result = "metadata_no_alpha_bypass"
+			return woxImage, timing
+		}
+	} else {
+		timing.MetadataMs = util.GetSystemTimestamp() - metadataStart
+	}
+
+	decodeStart := util.GetSystemTimestamp()
+	pngImg, pngErr := woxImage.ToPng()
+	timing.DecodeMs = util.GetSystemTimestamp() - decodeStart
+	if pngErr != nil {
+		if !errors.Is(pngErr, NOT_PNG_ERR) {
+			util.GetLogger().Error(ctx, fmt.Sprintf("failed to convert image to png: %s", pngErr.Error()))
+		}
+		timing.Result = "not_png_or_decode_error"
+		return woxImage, timing
+	}
+
+	cropStart := util.GetSystemTimestamp()
+	cropImg := cropTransparentPaddings(pngImg)
+	timing.CropMs = util.GetSystemTimestamp() - cropStart
+	saveStart := util.GetSystemTimestamp()
+	saveErr := savePngFast(cropImg, cropImgPath)
+	timing.SaveMs = util.GetSystemTimestamp() - saveStart
+	if saveErr != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("failed to save crop image: %s", saveErr.Error()))
+		timing.Result = "save_error"
+		return woxImage, timing
+	}
+
+	imagecache.RememberDerivedPathExists(cropImgPath)
+	timing.Result = "saved"
+	return NewWoxImageAbsolutePath(cropImgPath), timing
+}
+
+func cropPngTransparentPaddingCachePath(ctx context.Context, woxImage WoxImage) string {
+	return path.Join(imageCacheDirectory(ctx), fmt.Sprintf("crop_padding_%s.png", woxImage.Hash()))
+}
+
+// absolutePngCropMetadata reads only PNG metadata before IDAT. Any malformed,
+// unsupported, or non-file image returns ok=false so callers keep the full decode path.
+func absolutePngCropMetadata(woxImage WoxImage) (pngCropMetadata, bool) {
+	if woxImage.ImageType != WoxImageTypeAbsolutePath || !strings.EqualFold(filepath.Ext(woxImage.ImageData), ".png") {
+		return pngCropMetadata{}, false
+	}
+
+	file, err := os.Open(woxImage.ImageData)
+	if err != nil {
+		return pngCropMetadata{}, false
+	}
+	defer file.Close()
+
+	var signature [8]byte
+	if _, err = io.ReadFull(file, signature[:]); err != nil || signature != pngFileSignature {
+		return pngCropMetadata{}, false
+	}
+
+	seenHeader := false
+	metadata := pngCropMetadata{}
+	for {
+		var chunkHeader [8]byte
+		if _, err = io.ReadFull(file, chunkHeader[:]); err != nil {
+			return pngCropMetadata{}, false
+		}
+
+		chunkLength := binary.BigEndian.Uint32(chunkHeader[0:4])
+		chunkType := [4]byte{chunkHeader[4], chunkHeader[5], chunkHeader[6], chunkHeader[7]}
+		switch chunkType {
+		case pngChunkIHDR:
+			if seenHeader || chunkLength != 13 {
+				return pngCropMetadata{}, false
+			}
+
+			var headerData [13]byte
+			if _, err = io.ReadFull(file, headerData[:]); err != nil {
+				return pngCropMetadata{}, false
+			}
+			if _, err = file.Seek(4, io.SeekCurrent); err != nil {
+				return pngCropMetadata{}, false
+			}
+
+			colorType := headerData[9]
+			metadata.width = int(binary.BigEndian.Uint32(headerData[0:4]))
+			metadata.height = int(binary.BigEndian.Uint32(headerData[4:8]))
+			seenHeader = true
+			switch colorType {
+			case pngColorTypeGrayscaleAlpha, pngColorTypeTruecolorAlpha:
+				metadata.mayContainTransparency = true
+				return metadata, true
+			case pngColorTypeGrayscale, pngColorTypeTruecolor, pngColorTypeIndexed:
+				metadata.mayContainTransparency = false
+				continue
+			default:
+				return pngCropMetadata{}, false
+			}
+		case pngChunktRNS:
+			if !seenHeader {
+				return pngCropMetadata{}, false
+			}
+			metadata.mayContainTransparency = true
+			return metadata, true
+		case pngChunkIDAT:
+			if !seenHeader {
+				return pngCropMetadata{}, false
+			}
+			return metadata, true
+		default:
+			if !seenHeader {
+				return pngCropMetadata{}, false
+			}
+			if _, err = file.Seek(int64(chunkLength)+4, io.SeekCurrent); err != nil {
+				return pngCropMetadata{}, false
+			}
+		}
+	}
+}
+
+func cropTransparentPaddings(pngImg image.Image) image.Image {
+	bounds := pngImg.Bounds()
+	minX, minY, maxX, maxY := bounds.Max.X, bounds.Max.Y, bounds.Min.X, bounds.Min.Y
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			_, _, _, a := pngImg.At(x, y).RGBA()
+			if a != 0 {
+				// not transparent
+				if x < minX {
+					minX = x
+				}
+				if x+1 > maxX { // add 1 to maxX
+					maxX = x + 1
+				}
+				if y < minY {
+					minY = y
+				}
+				if y+1 > maxY { // add 1 to maxY
+					maxY = y + 1
+				}
+			}
+		}
+	}
+	if maxX > bounds.Max.X {
+		maxX = bounds.Max.X
+	}
+	if maxY > bounds.Max.Y {
+		maxY = bounds.Max.Y
+	}
+
+	return imaging.Crop(pngImg, image.Rect(minX, minY, maxX, maxY))
+}
+
+func ConvertRelativePathToAbsolutePath(ctx context.Context, image WoxImage, pluginDirectory string) (newImage WoxImage) {
+	newImage = image
+
+	if image.ImageType == WoxImageTypeRelativePath {
+		newImage.ImageType = WoxImageTypeAbsolutePath
+		newImage.ImageData = path.Join(pluginDirectory, image.ImageData)
+	}
+
+	return newImage
+}
+
+func ConvertFileIconToAbsolutePath(ctx context.Context, image WoxImage) (newImage WoxImage) {
+	return ConvertFileIconToAbsolutePathWithSize(ctx, image, ResultListIconSize)
+}
+
+func ConvertFileIconToAbsolutePathWithSize(ctx context.Context, image WoxImage, size int) (newImage WoxImage) {
+	newImage = image
+
+	if image.ImageType == WoxImageTypeFileIcon {
+		absPath, err := fileicon.GetFileIconByPathWithSize(ctx, image.ImageData, size)
+		if err == nil {
+			newImage.ImageType = WoxImageTypeAbsolutePath
+			newImage.ImageData = absPath
+		}
+	}
+
+	return newImage
+}
+
+func SetServerPort(port int) {
+	serverPort = port
+}
+
+// GetServerPort returns the loopback port used by Wox's local HTTP services.
+func GetServerPort() int {
+	return serverPort
+}

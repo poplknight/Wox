@@ -1,0 +1,315 @@
+//go:build wox_ui_smoke
+
+package query
+
+import (
+	"context"
+	"fmt"
+	"image"
+	"image/png"
+	"math"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	"wox/test/automationdriver"
+	"wox/test/smoke"
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+)
+
+// Test006LauncherInputRepaintDamage verifies idle caret blinking stays local in both launcher editors.
+// Flow: settle a completed query -> observe query-box caret frames -> open the action panel -> observe its filter caret frames.
+// Evidence: every settled frame reports non-empty logical damage contained by the focused input instead of full-window damage.
+// Windows restores the caret backdrop; macOS and Linux repaint the renderer-blurred panel.
+func Test006LauncherInputRepaintDamage(t *testing.T) {
+	smoke.Case(t, func(ctx context.Context, client *automationdriver.Client) {
+		// The assertion is which pixels move, not the 500ms product phase. A short phase
+		// keeps the same blink path without waiting out four full idle cycles.
+		if err := client.SetCaretBlinkInterval(ctx, 200*time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			restoreCtx, cancel := context.WithTimeout(context.Background(), automationdriver.ActionTimeout)
+			defer cancel()
+			_ = client.SetCaretBlinkInterval(restoreCtx, 0)
+		})
+		if err := client.SetRepaintDebugMode(ctx, woxwidget.RepaintDebugOff); err != nil {
+			t.Fatal(err)
+		}
+		smoke.ShowLauncher(t, ctx, client)
+		snapshot := smoke.ReplaceLauncherQuery(t, ctx, client, "1+1")
+		assertIdleInputDamage(t, ctx, client, snapshot, "launcher.query.input", woxui.Rect{}, false)
+
+		snapshot = smoke.OpenResultActionPanel(t, ctx, client)
+		var surface woxui.Rect
+		if runtime.GOOS == "linux" || runtime.GOOS == "darwin" {
+			// The renderer-blurred floating material samples the back buffer under the panel, so
+			// any repaint inside the panel must cover the whole panel plus the blur's sampling
+			// margin. Derive the panel from its rows and filter; the outset absorbs panel padding,
+			// the header above the rows, the blur margin and the host paint outset.
+			for _, node := range snapshot.Tree.Nodes {
+				if strings.HasPrefix(node.AutomationID, "action-") {
+					surface = unionRect(surface, node.Bounds)
+				}
+			}
+			surface = expandRect(surface, 96)
+		}
+		assertIdleInputDamage(t, ctx, client, snapshot, "action-search", surface, false)
+		if runtime.GOOS == "windows" {
+			if err := client.SimulateRendererDeviceRemoved(ctx); err != nil {
+				t.Fatal(err)
+			}
+			snapshot, err := client.Snapshot(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertIdleInputDamage(t, ctx, client, snapshot, "action-search", surface, false)
+			if err := client.SetRepaintDebugMode(ctx, woxwidget.RepaintDebugRainbow); err != nil {
+				t.Fatal(err)
+			}
+			snapshot, err = client.Snapshot(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertIdleInputDamage(t, ctx, client, snapshot, "action-search", surface, true)
+		}
+		smoke.AssertNoDiagnostics(t, snapshot)
+	})
+}
+
+// assertIdleInputDamage waits through one settling caret frame, then checks two complete blink phases.
+// A non-empty surface widens the allowed damage from the input to that floating surface.
+func assertIdleInputDamage(t *testing.T, ctx context.Context, client *automationdriver.Client, snapshot woxwidget.AutomationSnapshot, inputID string, surface woxui.Rect, highlights bool) {
+	t.Helper()
+	input, found := automationdriver.Find(snapshot, inputID)
+	if !found || !input.Focused {
+		t.Fatalf("idle repaint input %q = found %v focused %v", inputID, found, input.Focused)
+	}
+
+	settled, err := client.WaitForChange(ctx, snapshot.Tree.Generation)
+	if err != nil {
+		t.Fatalf("wait for %q to settle on a caret frame: %v", inputID, err)
+	}
+	if err := client.ResetFrameMetrics(ctx); err != nil {
+		t.Fatalf("reset frame metrics for %q: %v", inputID, err)
+	}
+	// Host damage includes a 4px paint outset; one extra logical pixel absorbs fractional layout bounds.
+	allowed := expandRect(input.Bounds, 5)
+	if surface.Width > 0 && surface.Height > 0 {
+		allowed = unionRect(allowed, surface)
+	}
+	generation := settled.Tree.Generation
+	lastFrameID := uint64(0)
+	consecutiveLocal := 0
+	var pixels *caretPixelProof
+	observed := make([]woxui.FrameMetricsSample, 0, 16)
+	idleCtx, cancelIdle := context.WithTimeout(ctx, 6*time.Second)
+	defer cancelIdle()
+	for idleCtx.Err() == nil {
+		next, waitErr := client.WaitForChange(idleCtx, generation)
+		if waitErr != nil {
+			break
+		}
+		generation = next.Tree.Generation
+		metrics, metricsErr := client.FrameMetrics(ctx)
+		if metricsErr != nil {
+			t.Fatalf("read idle frame metrics for %q: %v", inputID, metricsErr)
+		}
+		for _, sample := range metrics.Recent {
+			if sample.FrameID <= lastFrameID || !sample.HostCompleted || !sample.Presented {
+				continue
+			}
+			lastFrameID = sample.FrameID
+			observed = append(observed, sample)
+			if sample.LogicalDamage.Width <= 0 || sample.LogicalDamage.Height <= 0 {
+				continue
+			}
+			// Query chrome can still paint while the action-panel filter is focused.
+			// Ignore damage that does not touch the input under test.
+			if !rectsIntersect(allowed, sample.LogicalDamage) {
+				continue
+			}
+			local := containsRect(allowed, sample.LogicalDamage)
+			if runtime.GOOS == "windows" {
+				local = local && sample.LogicalDamage.Width <= 2
+				if !highlights {
+					local = local && sample.RendererResources.CacheHits > 0 && sample.RendererResources.TextRasterizations == 0
+				}
+			}
+			if local {
+				consecutiveLocal++
+				// Pixel proof uses these same presented caret frames. A second loop would
+				// wait through another two blinks, and a fixed sleep after each semantics
+				// change captures phases that have not reached the screen yet.
+				if runtime.GOOS == "windows" && !highlights {
+					if pixels == nil {
+						pixels = newCaretPixelProof(t, ctx, client, sample.LogicalDamage)
+					}
+					if pixels.observe(t, ctx, client) {
+						return
+					}
+				} else if consecutiveLocal >= 2 {
+					return
+				}
+			} else {
+				consecutiveLocal = 0
+				pixels = nil
+			}
+		}
+	}
+	if pixels != nil && pixels.changes < 2 {
+		t.Fatalf("caret pixels for %q did not blink through two phases", inputID)
+	}
+	t.Fatalf("idle repaint for %q never settled to two consecutive local frames within %+v; allowed bounds %+v", inputID, observed, allowed)
+}
+
+// caretPixelProof checks composited caret pixels across blink phases while damage is sampled.
+// Two changes are one off transition and the return to the first phase, so the backdrop is restored.
+type caretPixelProof struct {
+	caret     woxui.Rect
+	bounds    woxui.Rect
+	directory string
+	phase     int
+	changes   int
+	previous  image.Image
+	other     image.Image
+}
+
+// newCaretPixelProof records window bounds once so each blink does not repeat that read.
+func newCaretPixelProof(t *testing.T, ctx context.Context, client *automationdriver.Client, caret woxui.Rect) *caretPixelProof {
+	t.Helper()
+	bounds, err := client.Bounds(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := os.MkdirTemp("", "wox-caret-pixels-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("caret captures: %s", directory)
+		} else {
+			os.RemoveAll(directory)
+		}
+	})
+	return &caretPixelProof{caret: caret, bounds: bounds, directory: directory}
+}
+
+// observe captures the presented frame and reports whether both blink phases are proven.
+func (p *caretPixelProof) observe(t *testing.T, ctx context.Context, client *automationdriver.Client) bool {
+	t.Helper()
+	path := filepath.Join(p.directory, fmt.Sprintf("caret-%d.png", p.phase))
+	p.phase++
+	if err := client.Capture(ctx, path); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := png.Decode(file)
+	file.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.previous == nil {
+		p.previous = current
+		return false
+	}
+	if current.Bounds() != p.previous.Bounds() {
+		t.Fatal("window moved or resized during idle blink")
+	}
+	sx := float64(current.Bounds().Dx()) / float64(p.bounds.Width)
+	sy := float64(current.Bounds().Dy()) / float64(p.bounds.Height)
+	// Host caret paints include a 4px outset and stroke antialiasing. A
+	// 1px physical pad is not enough at 150%+ scaling.
+	pad := int(math.Ceil(max(sx, sy)))
+	if pad < 1 {
+		pad = 1
+	}
+	allowed := image.Rect(int(math.Floor(float64(p.caret.X)*sx))-pad, int(math.Floor(float64(p.caret.Y)*sy))-pad,
+		int(math.Ceil(float64(p.caret.X+p.caret.Width)*sx))+pad, int(math.Ceil(float64(p.caret.Y+p.caret.Height)*sy))+pad)
+	changed := false
+	// Desktop capture composites the translucent window over the live wallpaper.
+	// Flat pixels drift by several 8-bit levels between frames; a caret blink is a
+	// large contrast change. Ignore that ambient drift, including in the halo used
+	// to catch compositor rounding around the caret.
+	nearby := allowed.Inset(-3).Intersect(current.Bounds())
+	for y := nearby.Min.Y; y < nearby.Max.Y; y++ {
+		for x := nearby.Min.X; x < nearby.Max.X; x++ {
+			r, g, b, a := current.At(x, y).RGBA()
+			pr, pg, pb, pa := p.previous.At(x, y).RGBA()
+			if !caretPixelChanged(r, g, b, a, pr, pg, pb, pa) {
+				continue
+			}
+			if !image.Pt(x, y).In(allowed) {
+				t.Fatalf("blink changed pixel (%d,%d) outside caret %v at scale %.2fx%.2f", x, y, allowed, sx, sy)
+			}
+			changed = true
+		}
+	}
+	if !changed {
+		return false
+	}
+	if p.other != nil {
+		for y := nearby.Min.Y; y < nearby.Max.Y; y++ {
+			for x := nearby.Min.X; x < nearby.Max.X; x++ {
+				r, g, b, a := current.At(x, y).RGBA()
+				pr, pg, pb, pa := p.other.At(x, y).RGBA()
+				if caretPixelChanged(r, g, b, a, pr, pg, pb, pa) {
+					t.Fatalf("caret phase accumulated a pixel change at (%d,%d)", x, y)
+				}
+			}
+		}
+	}
+	p.other = p.previous
+	p.previous = current
+	p.changes++
+	return p.changes >= 2
+}
+
+// caretCaptureNoise is the per-channel delta ignored in desktop captures.
+// DWM resampling of the translucent launcher moves flat pixels by several
+// 8-bit levels. A painted caret changes contrast by well over this floor.
+const caretCaptureNoise = 16 * 257
+
+// caretPixelChanged reports a capture delta large enough to be a caret blink.
+func caretPixelChanged(r, g, b, a, pr, pg, pb, pa uint32) bool {
+	return absPixelDelta(r, pr) > caretCaptureNoise || absPixelDelta(g, pg) > caretCaptureNoise || absPixelDelta(b, pb) > caretCaptureNoise || absPixelDelta(a, pa) > caretCaptureNoise
+}
+
+func absPixelDelta(a, b uint32) uint32 {
+	if a > b {
+		return a - b
+	}
+	return b - a
+}
+
+func expandRect(rect woxui.Rect, outset float32) woxui.Rect {
+	return woxui.Rect{X: rect.X - outset, Y: rect.Y - outset, Width: rect.Width + 2*outset, Height: rect.Height + 2*outset}
+}
+
+func unionRect(left, right woxui.Rect) woxui.Rect {
+	if left.Width <= 0 || left.Height <= 0 {
+		return right
+	}
+	if right.Width <= 0 || right.Height <= 0 {
+		return left
+	}
+	x := min(left.X, right.X)
+	y := min(left.Y, right.Y)
+	return woxui.Rect{X: x, Y: y, Width: max(left.X+left.Width, right.X+right.Width) - x, Height: max(left.Y+left.Height, right.Y+right.Height) - y}
+}
+
+func containsRect(outer, inner woxui.Rect) bool {
+	return inner.X >= outer.X && inner.Y >= outer.Y && inner.X+inner.Width <= outer.X+outer.Width && inner.Y+inner.Height <= outer.Y+outer.Height
+}
+
+func rectsIntersect(left, right woxui.Rect) bool {
+	return left.X < right.X+right.Width && right.X < left.X+left.Width && left.Y < right.Y+right.Height && right.Y < left.Y+left.Height
+}

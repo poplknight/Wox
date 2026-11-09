@@ -1,0 +1,925 @@
+import asyncio
+import inspect
+import json
+import sys
+import traceback
+from os import path
+from typing import Any, Dict, Optional, Union
+
+from websockets.asyncio.server import ServerConnection
+from wox_plugin import (
+    ActionContext,
+    ChatStreamData,
+    ChatStreamDataType,
+    Context,
+    FormActionContext,
+    InvokePluginToolHandlerOption,
+    InvokePluginToolHandlerResult,
+    MRUData,
+    PluginInitParams,
+    PluginToolError,
+    ToolbarMsgActionContext,
+    Query,
+    QueryResponse,
+    ResultActionType,
+    DragOutEvent,
+    ToastMsgActionContext,
+)
+
+from . import logger
+from .package_module import load_package_module, release_package_module
+from .plugin_api import PluginAPI
+from .plugin_manager import PluginInstance, plugin_instances
+from .single_file import load_single_file_module
+
+legacy_query_return_warnings: set[str] = set()
+
+
+def _parse_context_data(raw: Optional[Union[str, Dict[str, Any]]]) -> Dict[str, str]:
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return {k: v for k, v in raw.items() if isinstance(v, str)}
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return {}
+    if isinstance(data, dict):
+        return {k: v for k, v in data.items() if isinstance(v, str)}
+    return {}
+
+
+async def handle_request_from_wox(ctx: Context, request: Dict[str, Any], ws: ServerConnection) -> Any:
+    """Handle incoming request from Wox, retaining its UI routing context."""
+    for key in ("SessionId", "QueryId"):
+        if isinstance(request.get(key), str) and request[key]:
+            ctx.values[key] = request[key]
+
+    method = request.get("Method")
+    plugin_name = request.get("PluginName")
+
+    # Acquire query buckets before any await so a later release cannot overtake startup.
+    if method == "releaseQueryResults":
+        for instance in plugin_instances.values():
+            instance.result_actions.release(request.get("SessionId", ""), request.get("QueryId", ""))
+        return None
+    if method == "query":
+        return await query(ctx, request)
+    if method == "onMRURestore":
+        return await on_mru_restore(ctx, request)
+    if method == "action":
+        return await action(ctx, request)
+    if method == "formAction":
+        return await form_action(ctx, request)
+    await logger.info(ctx.get_trace_id(), f"invoke <{plugin_name}> method: {method}")
+
+    if method == "loadPlugin":
+        return await load_plugin(ctx, request)
+    elif method == "init":
+        return await init_plugin(ctx, request, ws)
+    elif method == "toolbarMsgAction":
+        return await toolbar_msg_action(ctx, request)
+    elif method == "toastMsgAction":
+        toast_instance = plugin_instances.get(request.get("PluginId", ""))
+        api = toast_instance.api if toast_instance else None
+        params = request.get("Params", {})
+        callback = api.toast_callbacks.pop(params.get("CallbackId", ""), None) if isinstance(api, PluginAPI) else None
+        if callback and params.get("Invoke") == "true":
+            result = callback(ctx, ToastMsgActionContext(context_data=_parse_context_data(params.get("ContextData"))))
+            if inspect.isawaitable(result):
+                await result
+        return None
+    elif method == "unloadPlugin":
+        return await unload_plugin(ctx, request)
+    elif method == "onPluginSettingChange":
+        return await on_plugin_setting_change(ctx, request)
+    elif method == "onGetDynamicSetting":
+        return await on_get_dynamic_setting(ctx, request)
+    elif method == "onUnload":
+        return await on_unload(ctx, request)
+    elif method == "onEnterPluginQuery":
+        return await on_enter_plugin_query(ctx, request)
+    elif method == "onLeavePluginQuery":
+        return await on_leave_plugin_query(ctx, request)
+    elif method == "onDragOut":
+        return await on_drag_out(ctx, request)
+    elif method == "onDeepLink":
+        return await on_deep_link(ctx, request)
+    elif method == "onLLMStream":
+        return await on_llm_stream(ctx, request)
+    elif method == "onInvokePluginTool":
+        return await on_invoke_plugin_tool(ctx, request)
+    else:
+        await logger.info(ctx.get_trace_id(), f"unknown method handler: {method}")
+        raise Exception(f"unknown method handler: {method}")
+
+
+async def load_plugin(ctx: Context, request: Dict[str, Any]) -> None:
+    """Load a plugin"""
+    params: Dict[str, str] = request.get("Params", {})
+    plugin_directory: str = params.get("PluginDirectory", "")
+    entry: str = params.get("Entry", "")
+    entry_mode: str = params.get("EntryMode", "package")
+    plugin_id: str = request.get("PluginId", "")
+    plugin_name: str = request.get("PluginName", "")
+
+    await logger.info(
+        ctx.get_trace_id(),
+        f"<{plugin_name}> load plugin, directory: {plugin_directory}, entry: {entry}, mode: {entry_mode}",
+    )
+
+    try:
+        if not plugin_directory or not entry:
+            raise ValueError("plugin_directory and entry must not be None")
+
+        if entry_mode == "singleFile":
+            module, module_name = load_single_file_module(plugin_id, plugin_directory, entry)
+            plugin_instances[plugin_id] = PluginInstance(
+                plugin=module.plugin,
+                api=None,
+                plugin_dir=plugin_directory,
+                module_name=module_name,
+                toolbar_msg_actions={},
+                sys_paths=[],
+            )
+            await logger.info(ctx.get_trace_id(), f"<{plugin_name}> load plugin successfully")
+            return
+
+        added_paths: list[str] = []
+        # Keep each plugin directory off sys.path. Package plugins share this
+        # interpreter, so those directories would let the first main.py or src
+        # package satisfy every later plugin's imports.
+        deps_dir = path.join(plugin_directory, "dependencies")
+        if path.exists(deps_dir) and deps_dir not in sys.path:
+            await logger.info(ctx.get_trace_id(), f"add: {deps_dir} to sys.path")
+            sys.path.append(deps_dir)
+            added_paths.append(deps_dir)
+
+        try:
+            module, module_name = load_package_module(plugin_id, plugin_directory, entry)
+            await logger.info(ctx.get_trace_id(), f"module_path: {module_name}")
+            plugin_instances[plugin_id] = PluginInstance(
+                plugin=module.plugin,
+                api=None,
+                plugin_dir=plugin_directory,
+                module_name=module_name,
+                toolbar_msg_actions={},
+                sys_paths=added_paths,
+            )
+            await logger.info(ctx.get_trace_id(), f"<{plugin_name}> load plugin successfully")
+        except Exception:
+            for added_path in added_paths:
+                if added_path in sys.path:
+                    sys.path.remove(added_path)
+            raise
+
+    except Exception as e:
+        error_stack = traceback.format_exc()
+        await logger.error(
+            ctx.get_trace_id(),
+            f"<{plugin_name}> load plugin failed: {str(e)}\nStack trace:\n{error_stack}",
+        )
+        raise e
+
+
+async def init_plugin(ctx: Context, request: Dict[str, Any], ws: ServerConnection) -> None:
+    """Initialize a plugin"""
+    plugin_id = request.get("PluginId", "")
+    plugin_name = request.get("PluginName", "")
+    plugin_instance = plugin_instances.get(plugin_id)
+    if not plugin_instance:
+        raise Exception(f"plugin not found: {plugin_name}, forget to load plugin?")
+
+    try:
+        # Create plugin API instance
+        api = PluginAPI(ws, plugin_id, plugin_name, plugin_instance.result_actions)
+        plugin_instance.api = api
+        params: Dict[str, str] = request.get("Params", {})
+        plugin_directory: str = params.get("PluginDirectory", "")
+
+        # Call plugin's init method
+        init_params = PluginInitParams(api=api, plugin_directory=plugin_directory)
+        await plugin_instance.plugin.init(ctx, init_params)
+
+        await logger.info(ctx.get_trace_id(), f"<{plugin_name}> init plugin successfully")
+    except Exception as e:
+        error_stack = traceback.format_exc()
+        await logger.error(
+            ctx.get_trace_id(),
+            f"<{plugin_name}> init plugin failed: {str(e)}\nStack trace:\n{error_stack}",
+        )
+        raise e
+
+
+def _serialize_model(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "to_json"):
+        return json.loads(value.to_json())
+    return {}
+
+
+def _serialize_result(result: Any) -> Dict[str, Any]:
+    if isinstance(result, dict):
+        return result
+    if hasattr(result, "to_json"):
+        return json.loads(result.to_json())
+    return {}
+
+
+async def _normalize_query_response(ctx: Context, plugin_name: str, raw_response: Any) -> Dict[str, Any]:
+    if raw_response is None:
+        return {"Results": [], "Refinements": [], "Layout": {}}
+
+    # Compatibility bridge: old SDK plugins returned List[Result] directly.
+    # The host keeps that deprecated shape working, but Go core only receives
+    # QueryResponse so refinements and layout hints have one transport path.
+    if isinstance(raw_response, list):
+        if plugin_name not in legacy_query_return_warnings:
+            legacy_query_return_warnings.add(plugin_name)
+            # Use the generic log function because the host logger exposes no
+            # dedicated warning helper, while the level still reaches Wox logs.
+            await logger.log(
+                ctx.get_trace_id(),
+                "warning",
+                f"<{plugin_name}> returned deprecated List[Result] from query(); return QueryResponse instead",
+            )
+        return {
+            "Results": [_serialize_result(result) for result in raw_response],
+            "Refinements": [],
+            "Layout": {},
+        }
+
+    # QueryResponse provides typed SDK models, while legacy and duck-typed
+    # plugins may still return dict-like transport shapes. Keep these values as
+    # Any until the shared serializer normalizes them for Go core.
+    results: Any
+    refinements: Any
+    layout: Any
+
+    if isinstance(raw_response, QueryResponse):
+        results = raw_response.results
+        refinements = raw_response.refinements
+        layout = raw_response.layout
+    elif isinstance(raw_response, dict):
+        results = raw_response.get("Results", raw_response.get("results", []))
+        refinements = raw_response.get("Refinements", raw_response.get("refinements", []))
+        layout = raw_response.get("Layout", raw_response.get("layout", {}))
+    else:
+        results = getattr(raw_response, "results", [])
+        refinements = getattr(raw_response, "refinements", [])
+        layout = getattr(raw_response, "layout", {})
+
+    return {
+        "Results": [_serialize_result(result) for result in (results or [])],
+        "Refinements": [_serialize_model(refinement) for refinement in (refinements or [])],
+        "Layout": _serialize_model(layout),
+    }
+
+
+async def query(ctx: Context, request: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle query request"""
+    plugin_id = request.get("PluginId", "")
+    plugin_name = request.get("PluginName", "")
+    plugin_instance = plugin_instances.get(plugin_id)
+    if not plugin_instance:
+        raise Exception(f"plugin not found: {plugin_name}, forget to load plugin?")
+
+    try:
+        params: Dict[str, str] = request.get("Params", {})
+        session_id = request.get("SessionId", params.get("SessionId", ""))
+        query_id = request.get("QueryId", params.get("QueryId", params.get("Id", "")))
+        ctx.values.update(SessionId=session_id, QueryId=query_id)
+        if not query_id:
+            plugin_instance.result_actions.release(session_id, query_id)
+        callbacks = plugin_instance.result_actions.begin(session_id, query_id, request.get("ManagedQuery", False))
+        await logger.info(ctx.get_trace_id(), f"invoke <{plugin_name}> method: query")
+        raw_response = await plugin_instance.plugin.query(ctx, Query.from_json(json.dumps(params)))
+        response = await _normalize_query_response(ctx, plugin_name, raw_response)
+
+        # Ensure each result has an ID and cache actions
+        results_source = []
+        if isinstance(raw_response, QueryResponse):
+            results_source = raw_response.results
+        elif isinstance(raw_response, list):
+            results_source = raw_response
+        elif isinstance(raw_response, dict):
+            results_source = raw_response.get("Results", raw_response.get("results", [])) or []
+        elif raw_response is not None:
+            results_source = getattr(raw_response, "results", []) or []
+
+        if results_source:
+            for result in results_source:
+                callbacks.cache(result)
+
+        # Re-serialize after caching so generated result/action IDs are included
+        # in the object that Go core receives and later sends back for actions.
+        response["Results"] = [_serialize_result(result) for result in results_source]
+        return response
+    except Exception as e:
+        error_stack = traceback.format_exc()
+        await logger.error(
+            ctx.get_trace_id(),
+            f"<{plugin_name}> query failed: {str(e)}\nStack trace:\n{error_stack}",
+        )
+        raise e
+
+
+async def action(ctx: Context, request: Dict[str, Any]) -> None:
+    """Handle action request"""
+    plugin_id = request.get("PluginId", "")
+    plugin_name = request.get("PluginName", "")
+    plugin_instance = plugin_instances.get(plugin_id)
+    if not plugin_instance:
+        raise Exception(f"plugin not found: {plugin_name}, forget to load plugin?")
+
+    try:
+        params: Dict[str, str] = request.get("Params", {})
+        result_id = params.get("ResultId", "")
+        action_id = params.get("ActionId", "")
+        result_action_id = params.get("ResultActionId", "")
+        context_data_raw = params.get("ContextData", "")
+        context_data = _parse_context_data(context_data_raw)
+
+        # Get action from cache
+        bucket = plugin_instance.result_actions.for_context(ctx, result_id)
+        cached = bucket.results.get(result_id, {}).get(action_id) if bucket is not None else None
+        action_func = getattr(cached, "action", None) if getattr(cached, "type", None) != ResultActionType.FORM else None
+        if action_func:
+            # Handle both coroutine and regular functions
+            result = action_func(
+                ctx,
+                ActionContext(result_id=result_id, result_action_id=result_action_id, context_data=context_data),
+            )
+            if asyncio.iscoroutine(result):
+                asyncio.create_task(result)
+        else:
+            await logger.error(
+                ctx.get_trace_id(),
+                f"<{plugin_name}> plugin action not found: {action_id}",
+            )
+
+    except Exception as e:
+        error_stack = traceback.format_exc()
+        await logger.error(
+            ctx.get_trace_id(),
+            f"<{plugin_name}> action failed: {str(e)}\nStack trace:\n{error_stack}",
+        )
+        raise e
+
+
+async def toolbar_msg_action(ctx: Context, request: Dict[str, Any]) -> None:
+    plugin_id = request.get("PluginId", "")
+    plugin_name = request.get("PluginName", "")
+    plugin_instance = plugin_instances.get(plugin_id)
+    if not plugin_instance:
+        raise Exception(f"plugin not found: {plugin_name}, forget to load plugin?")
+
+    try:
+        params: Dict[str, str] = request.get("Params", {})
+        toolbar_msg_id = params.get("ToolbarMsgId", "")
+        action_id = params.get("ActionId", "")
+        toolbar_msg_action_id = params.get("ToolbarMsgActionId", "")
+        context_data = _parse_context_data(params.get("ContextData", ""))
+
+        action_func = plugin_instance.toolbar_msg_actions.get(action_id)
+        if action_func:
+            result = action_func(
+                ctx,
+                ToolbarMsgActionContext(
+                    toolbar_msg_id=toolbar_msg_id,
+                    toolbar_msg_action_id=toolbar_msg_action_id or action_id,
+                    context_data=context_data,
+                ),
+            )
+            if asyncio.iscoroutine(result):
+                asyncio.create_task(result)
+        else:
+            await logger.error(
+                ctx.get_trace_id(),
+                f"<{plugin_name}> toolbar msg action not found: {action_id}",
+            )
+
+    except Exception as e:
+        error_stack = traceback.format_exc()
+        await logger.error(
+            ctx.get_trace_id(),
+            f"<{plugin_name}> toolbar msg action failed: {str(e)}\nStack trace:\n{error_stack}",
+        )
+        raise e
+
+
+async def form_action(ctx: Context, request: Dict[str, Any]) -> None:
+    """Handle form action request"""
+    plugin_id = request.get("PluginId", "")
+    plugin_name = request.get("PluginName", "")
+    plugin_instance = plugin_instances.get(plugin_id)
+    if not plugin_instance:
+        raise Exception(f"plugin not found: {plugin_name}, forget to load plugin?")
+
+    try:
+        params: Dict[str, str] = request.get("Params", {})
+        result_id = params.get("ResultId", "")
+        action_id = params.get("ActionId", "")
+        result_action_id = params.get("ResultActionId", "")
+        context_data_raw = params.get("ContextData", "")
+        context_data = _parse_context_data(context_data_raw)
+        values = json.loads(params.get("Values", "{}"))
+
+        bucket = plugin_instance.result_actions.for_context(ctx, result_id)
+        cached = bucket.results.get(result_id, {}).get(action_id) if bucket is not None else None
+        action_func = getattr(cached, "on_submit", None) if getattr(cached, "type", None) == ResultActionType.FORM else None
+        if action_func:
+            result = action_func(
+                ctx,
+                FormActionContext(
+                    result_id=result_id,
+                    result_action_id=result_action_id or action_id,
+                    context_data=context_data,
+                    values=values,
+                ),
+            )
+            if asyncio.iscoroutine(result):
+                asyncio.create_task(result)
+        else:
+            await logger.error(
+                ctx.get_trace_id(),
+                f"<{plugin_name}> plugin form action not found: {action_id}",
+            )
+
+    except Exception as e:
+        error_stack = traceback.format_exc()
+        await logger.error(
+            ctx.get_trace_id(),
+            f"<{plugin_name}> form action failed: {str(e)}\nStack trace:\n{error_stack}",
+        )
+        raise e
+
+
+def _remove_module(module_name: str) -> None:
+    """Remove a module and its children from sys.modules"""
+    for name in list(sys.modules.keys()):
+        if name == module_name or name.startswith(f"{module_name}."):
+            sys.modules.pop(name, None)
+
+
+async def unload_plugin(ctx: Context, request: Dict[str, Any]) -> None:
+    """Unload a plugin"""
+    plugin_id = request.get("PluginId", "")
+    plugin_name = request.get("PluginName", "")
+    plugin_instance = plugin_instances.get(plugin_id)
+    if not plugin_instance:
+        raise Exception(f"plugin not found: {plugin_name}, forget to load plugin?")
+
+    try:
+        # Remove plugin from instances
+        if isinstance(plugin_instance.api, PluginAPI):
+            plugin_instance.api.toast_callbacks.clear()
+            await plugin_instance.api.stop_plugin_tools()
+        del plugin_instances[plugin_id]
+
+        # Remove imported module cache to allow reloading updated code.
+        # Package plugins own a private namespace; single-file plugins do not.
+        if not release_package_module(plugin_instance.module_name):
+            _remove_module(plugin_instance.module_name)
+            root_package = plugin_instance.module_name.split(".", 1)[0]
+            _remove_module(root_package)
+
+        for added_path in plugin_instance.sys_paths:
+            if added_path in sys.path:
+                sys.path.remove(added_path)
+
+        plugin_instance.result_actions.close()
+        plugin_instance.toolbar_msg_actions.clear()
+        if isinstance(plugin_instance.api, PluginAPI):
+            plugin_instance.api.plugin_tool_callbacks.clear()
+            plugin_instance.api.plugin_tool_callback_ids.clear()
+
+        await logger.info(ctx.get_trace_id(), f"<{plugin_name}> unload plugin successfully")
+    except Exception as e:
+        error_stack = traceback.format_exc()
+        await logger.error(
+            ctx.get_trace_id(),
+            f"<{plugin_name}> unload plugin failed: {str(e)}\nStack trace:\n{error_stack}",
+        )
+        raise e
+
+
+async def on_mru_restore(ctx: Context, request: Dict[str, Any]) -> Any:
+    """Handle MRU restore callback"""
+    plugin_id = request.get("PluginId")
+    if not plugin_id:
+        raise Exception("PluginId is required")
+
+    params = request.get("Params", {})
+    callback_id = params.get("CallbackId")
+    mru_data_dict = json.loads(params.get("MRUData", "{}"))
+
+    plugin_instance = plugin_instances.get(plugin_id)
+    if not plugin_instance:
+        raise Exception(f"plugin instance not found: {plugin_id}")
+
+    if not plugin_instance.api:
+        raise Exception(f"plugin API not found: {plugin_id}")
+
+    # Type cast to access implementation-specific attributes
+    from .plugin_api import PluginAPI
+
+    api = plugin_instance.api
+    if not isinstance(api, PluginAPI):
+        raise Exception(f"Invalid API type for plugin: {plugin_id}")
+
+    callback = api.mru_restore_callbacks.get(callback_id)
+    if not callback:
+        raise Exception(f"MRU restore callback not found: {callback_id}")
+
+    callbacks = plugin_instance.result_actions.begin(
+        request.get("SessionId", ""), request.get("QueryId", ""), request.get("ManagedQuery", False)
+    )
+    try:
+        await logger.info(ctx.get_trace_id(), f"invoke <{plugin_id}> method: onMRURestore")
+        # Convert dict to MRUData object for type safety
+        mru_data = MRUData.from_dict(mru_data_dict)
+
+        # Call the callback (may or may not be async)
+        result = callback(ctx, mru_data)
+        if hasattr(result, "__await__"):
+            result = await result  # type: ignore
+
+        if result is not None:
+            callbacks.cache(result)
+
+        # Convert Result object back to dict for JSON serialization
+        if result is not None:
+            return _serialize_result(result)
+        return None
+    except Exception as e:
+        await logger.error(ctx.get_trace_id(), f"MRU restore callback error: {str(e)}")
+        raise e
+
+
+async def on_deep_link(ctx: Context, request: Dict[str, Any]) -> None:
+    """Handle deep link callback"""
+    plugin_id = request.get("PluginId")
+    if not plugin_id:
+        raise Exception("PluginId is required")
+
+    params = request.get("Params", {})
+    callback_id = params.get("CallbackId")
+    arguments_raw = params.get("Arguments", "{}")
+
+    if not callback_id:
+        raise Exception("CallbackId is required")
+
+    plugin_instance = plugin_instances.get(plugin_id)
+    if not plugin_instance:
+        raise Exception(f"plugin instance not found: {plugin_id}")
+
+    if not plugin_instance.api:
+        raise Exception(f"plugin API not found: {plugin_id}")
+
+    from .plugin_api import PluginAPI
+
+    api = plugin_instance.api
+    if not isinstance(api, PluginAPI):
+        raise Exception(f"Invalid API type for plugin: {plugin_id}")
+
+    callback = api.deep_link_callbacks.get(callback_id)
+    if not callback:
+        raise Exception(f"deep link callback not found: {callback_id}")
+
+    try:
+        arguments = json.loads(arguments_raw) if isinstance(arguments_raw, str) else dict(arguments_raw)
+        result = callback(ctx, arguments)
+        if inspect.isawaitable(result):
+            await result
+    except Exception as e:
+        await logger.error(ctx.get_trace_id(), f"deep link callback error: {str(e)}")
+        raise e
+
+
+async def on_plugin_setting_change(ctx: Context, request: Dict[str, Any]) -> None:
+    """Handle setting change callback"""
+    plugin_id = request.get("PluginId")
+    if not plugin_id:
+        raise Exception("PluginId is required")
+
+    params = request.get("Params", {})
+    callback_id = params.get("CallbackId")
+    key = params.get("Key", "")
+    value = params.get("Value", "")
+
+    if not callback_id:
+        raise Exception("CallbackId is required")
+
+    plugin_instance = plugin_instances.get(plugin_id)
+    if not plugin_instance:
+        raise Exception(f"plugin instance not found: {plugin_id}")
+
+    if not plugin_instance.api:
+        raise Exception(f"plugin API not found: {plugin_id}")
+
+    from .plugin_api import PluginAPI
+
+    api = plugin_instance.api
+    if not isinstance(api, PluginAPI):
+        raise Exception(f"Invalid API type for plugin: {plugin_id}")
+
+    callback = api.setting_change_callbacks.get(callback_id)
+    if not callback:
+        raise Exception(f"setting change callback not found: {callback_id}")
+
+    try:
+        result = callback(ctx, key, value)
+        if inspect.isawaitable(result):
+            await result
+    except Exception as e:
+        await logger.error(ctx.get_trace_id(), f"setting change callback error: {str(e)}")
+        raise e
+
+
+async def on_get_dynamic_setting(ctx: Context, request: Dict[str, Any]) -> str:
+    """Handle dynamic setting callback"""
+    plugin_id = request.get("PluginId")
+    if not plugin_id:
+        raise Exception("PluginId is required")
+
+    params = request.get("Params", {})
+    callback_id = params.get("CallbackId")
+    key = params.get("Key", "")
+
+    if not callback_id:
+        raise Exception("CallbackId is required")
+
+    plugin_instance = plugin_instances.get(plugin_id)
+    if not plugin_instance:
+        raise Exception(f"plugin instance not found: {plugin_id}")
+
+    if not plugin_instance.api:
+        raise Exception(f"plugin API not found: {plugin_id}")
+
+    from .plugin_api import PluginAPI
+
+    api = plugin_instance.api
+    if not isinstance(api, PluginAPI):
+        raise Exception(f"Invalid API type for plugin: {plugin_id}")
+
+    callback = api.get_dynamic_setting_callbacks.get(callback_id)
+    if not callback:
+        raise Exception(f"dynamic setting callback not found: {callback_id}")
+
+    try:
+        result = callback(ctx, key)
+        if inspect.isawaitable(result):
+            result = await result
+
+        if result is None:
+            return ""
+        if isinstance(result, str):
+            return result
+        if hasattr(result, "to_json"):
+            return result.to_json()  # type: ignore[no-any-return]
+        if isinstance(result, dict):
+            return json.dumps(result)
+        return json.dumps(result.__dict__)
+    except Exception as e:
+        await logger.error(ctx.get_trace_id(), f"dynamic setting callback error: {str(e)}")
+        raise e
+
+
+async def on_unload(ctx: Context, request: Dict[str, Any]) -> None:
+    """Handle unload callback"""
+    plugin_id = request.get("PluginId")
+    if not plugin_id:
+        raise Exception("PluginId is required")
+
+    params = request.get("Params", {})
+    callback_id = params.get("CallbackId")
+
+    if not callback_id:
+        raise Exception("CallbackId is required")
+
+    plugin_instance = plugin_instances.get(plugin_id)
+    if not plugin_instance:
+        raise Exception(f"plugin instance not found: {plugin_id}")
+
+    if not plugin_instance.api:
+        raise Exception(f"plugin API not found: {plugin_id}")
+
+    from .plugin_api import PluginAPI
+
+    api = plugin_instance.api
+    if not isinstance(api, PluginAPI):
+        raise Exception(f"Invalid API type for plugin: {plugin_id}")
+
+    callback = api.unload_callbacks.get(callback_id)
+    if not callback:
+        raise Exception(f"unload callback not found: {callback_id}")
+
+    api.toast_callbacks.clear()
+    await api.stop_plugin_tools()
+    try:
+        result = callback(ctx)
+        if inspect.isawaitable(result):
+            await result
+    except Exception as e:
+        await logger.error(ctx.get_trace_id(), f"unload callback error: {str(e)}")
+        raise e
+
+
+async def on_enter_plugin_query(ctx: Context, request: Dict[str, Any]) -> None:
+    plugin_id = request.get("PluginId")
+    if not plugin_id:
+        raise Exception("PluginId is required")
+
+    callback_id = request.get("Params", {}).get("CallbackId")
+    if not callback_id:
+        raise Exception("CallbackId is required")
+
+    plugin_instance = plugin_instances.get(plugin_id)
+    if not plugin_instance or not plugin_instance.api:
+        raise Exception(f"plugin API not found: {plugin_id}")
+
+    from .plugin_api import PluginAPI
+
+    api = plugin_instance.api
+    if not isinstance(api, PluginAPI):
+        raise Exception(f"Invalid API type for plugin: {plugin_id}")
+
+    callback = api.enter_plugin_query_callbacks.get(callback_id)
+    if not callback:
+        raise Exception(f"enter plugin query callback not found: {callback_id}")
+
+    result = callback(ctx)
+    if inspect.isawaitable(result):
+        await result
+
+
+async def on_leave_plugin_query(ctx: Context, request: Dict[str, Any]) -> None:
+    plugin_id = request.get("PluginId")
+    if not plugin_id:
+        raise Exception("PluginId is required")
+
+    callback_id = request.get("Params", {}).get("CallbackId")
+    if not callback_id:
+        raise Exception("CallbackId is required")
+
+    plugin_instance = plugin_instances.get(plugin_id)
+    if not plugin_instance or not plugin_instance.api:
+        raise Exception(f"plugin API not found: {plugin_id}")
+
+    from .plugin_api import PluginAPI
+
+    api = plugin_instance.api
+    if not isinstance(api, PluginAPI):
+        raise Exception(f"Invalid API type for plugin: {plugin_id}")
+
+    callback = api.leave_plugin_query_callbacks.get(callback_id)
+    if not callback:
+        raise Exception(f"leave plugin query callback not found: {callback_id}")
+
+    result = callback(ctx)
+    if inspect.isawaitable(result):
+        await result
+
+
+async def on_drag_out(ctx: Context, request: Dict[str, Any]) -> None:
+    plugin_id = request.get("PluginId")
+    if not plugin_id:
+        raise Exception("PluginId is required")
+
+    params = request.get("Params", {})
+    callback_id = params.get("CallbackId")
+    if not callback_id:
+        raise Exception("CallbackId is required")
+
+    plugin_instance = plugin_instances.get(plugin_id)
+    if not plugin_instance or not plugin_instance.api:
+        raise Exception(f"plugin API not found: {plugin_id}")
+
+    from .plugin_api import PluginAPI
+
+    api = plugin_instance.api
+    if not isinstance(api, PluginAPI):
+        raise Exception(f"Invalid API type for plugin: {plugin_id}")
+
+    callback = api.drag_out_callbacks.get(callback_id)
+    if not callback:
+        raise Exception(f"drag out callback not found: {callback_id}")
+
+    raw_event = params.get("Event")
+    event_payload: Dict[str, Any] = {}
+    if isinstance(raw_event, str) and raw_event:
+        try:
+            parsed = json.loads(raw_event)
+        except Exception:
+            parsed = {}
+        if isinstance(parsed, dict):
+            event_payload = parsed
+    elif isinstance(raw_event, dict):
+        event_payload = raw_event
+
+    result = callback(ctx, DragOutEvent.from_dict(event_payload))
+    if inspect.isawaitable(result):
+        await result
+
+
+async def on_llm_stream(ctx: Context, request: Dict[str, Any]) -> None:
+    """Handle LLM stream callback"""
+    plugin_id = request.get("PluginId")
+    if not plugin_id:
+        raise Exception("PluginId is required")
+
+    params = request.get("Params", {})
+    callback_id = params.get("CallbackId")
+    stream_type = params.get("StreamType", "streaming")
+    data = params.get("Data", "")
+    reasoning = params.get("Reasoning", "")
+
+    plugin_instance = plugin_instances.get(plugin_id)
+    if not plugin_instance:
+        raise Exception(f"plugin instance not found: {plugin_id}")
+
+    if not plugin_instance.api:
+        raise Exception(f"plugin API not found: {plugin_id}")
+
+    api = plugin_instance.api
+    if not isinstance(api, PluginAPI):
+        raise Exception(f"Invalid API type for plugin: {plugin_id}")
+
+    callback = api.llm_stream_callbacks.get(callback_id)
+    if not callback:
+        await logger.error(ctx.get_trace_id(), f"LLM stream callback not found: {callback_id}")
+        raise Exception(f"LLM stream callback not found: {callback_id}")
+
+    # Release before invoking plugin code so a throwing terminal callback cannot leak.
+    if stream_type in ("finished", "error"):
+        api.llm_stream_callbacks.pop(callback_id, None)
+
+    # Create ChatStreamData and call the callback
+    stream_data = ChatStreamData(
+        status=ChatStreamDataType(stream_type),
+        data=data,
+        reasoning=reasoning,
+    )
+    callback(stream_data)
+
+
+async def on_invoke_plugin_tool(ctx: Context, request: Dict[str, Any]) -> Any:
+    """Execute a plugin tool handler registered by this plugin."""
+    plugin_id = request.get("PluginId")
+    if not plugin_id:
+        raise Exception("PluginId is required")
+
+    params = request.get("Params", {})
+    # Core owns the deadline and call chain; only echo its opaque parent token.
+    ctx.values["PluginToolCallId"] = params.get("PluginToolCallId", "")
+    callback_id = params.get("CallbackId")
+    if not callback_id:
+        raise Exception("CallbackId is required")
+
+    plugin_instance = plugin_instances.get(plugin_id)
+    if not plugin_instance:
+        raise Exception(f"plugin instance not found: {plugin_id}")
+    if not plugin_instance.api:
+        raise Exception(f"plugin API not found: {plugin_id}")
+
+    api = plugin_instance.api
+    if not isinstance(api, PluginAPI):
+        raise Exception(f"Invalid API type for plugin: {plugin_id}")
+
+    if api.plugin_tools_stopping:
+        return InvokePluginToolHandlerResult(error=PluginToolError(code="PLUGIN_UNAVAILABLE", message="plugin is unloading")).to_dict()
+
+    callback = api.plugin_tool_callbacks.get(callback_id)
+    if not callback:
+        raise Exception(f"plugin tool callback not found: {callback_id}")
+
+    arguments_raw = params.get("Arguments", "{}")
+    try:
+        arguments = json.loads(arguments_raw) if isinstance(arguments_raw, str) else arguments_raw
+    except Exception:
+        arguments = {}
+    if not isinstance(arguments, dict):
+        arguments = {}
+
+    task = asyncio.current_task()
+    if task is not None:
+        api.plugin_tool_calls.add(task)
+    try:
+        result = callback(ctx, InvokePluginToolHandlerOption(arguments=arguments))
+        if inspect.isawaitable(result):
+            result = await result
+        if not isinstance(result, InvokePluginToolHandlerResult):
+            raise Exception("plugin tool handler must return InvokePluginToolHandlerResult")
+        return result.to_dict()
+    except Exception as e:
+        await logger.error(ctx.get_trace_id(), f"plugin tool callback error: {str(e)}")
+        return InvokePluginToolHandlerResult(error=PluginToolError(code="EXECUTION_FAILED", message=str(e))).to_dict()
+    finally:
+        if task is not None:
+            api.plugin_tool_calls.discard(task)

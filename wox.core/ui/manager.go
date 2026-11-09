@@ -1,0 +1,2523 @@
+package ui
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"image/png"
+	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
+	"runtime/debug"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+	"wox/account"
+	"wox/ai"
+	"wox/analytics"
+	"wox/common"
+	"wox/common/icons"
+	corehotkey "wox/hotkey"
+	"wox/i18n"
+	"wox/plugin"
+	dictationplugin "wox/plugin/system/dictation"
+	"wox/plugin/system/shell/terminal"
+	"wox/privacy"
+	"wox/resource"
+	"wox/setting"
+	"wox/supervisor"
+	"wox/ui/contract"
+	"wox/ui/omarchytheme"
+	woxui "wox/ui/runtime"
+	"wox/updater"
+	"wox/util"
+	"wox/util/appearance"
+	"wox/util/autostart"
+	"wox/util/clipboard"
+	"wox/util/fuzzymatch"
+	utilhotkey "wox/util/hotkey"
+	"wox/util/ime"
+	"wox/util/keyboard"
+	"wox/util/osvariant"
+	"wox/util/overlay/confettioverlay"
+	"wox/util/processmemory"
+	"wox/util/screen"
+	"wox/util/selection"
+	"wox/util/shell"
+	"wox/util/sqlitememory"
+	"wox/util/tray"
+	"wox/util/window"
+
+	"github.com/google/uuid"
+	"github.com/mitchellh/go-homedir"
+	cp "github.com/otiai10/copy"
+	"github.com/samber/lo"
+)
+
+var managerInstance *Manager
+var managerOnce sync.Once
+var logger *util.Log
+
+const mainHotkeyRegistrationToolbarMessageID = "wox-main-hotkey-registration-failed"
+
+type Manager struct {
+	hotkeyService *corehotkey.Service
+	ui            common.UI
+	viewMu        sync.RWMutex
+	primaryView   contract.View
+	views         map[string]contract.View
+	serverPort    int
+	themes        *util.HashMap[string, common.Theme]
+	themeFileIDs  *util.HashMap[string, string]
+	// themePackageDirs maps a user theme id to the directory holding its asset files. Stored
+	// themes keep AssetFiles nil and reload the bytes from here only when a theme is applied,
+	// previewed, or exported, so packaged wallpapers do not stay resident for inactive themes.
+	themePackageDirs  *util.HashMap[string, string]
+	themeReloadTimers *util.HashMap[string, *time.Timer]
+	themeWatchIgnored *util.HashMap[string, int64]
+	// themeWatchMu serializes package replacement with watch changes. The callback releases
+	// a package's subscriptions and returns a function that watches its final directory again.
+	themeWatchMu       sync.Mutex
+	themeWatchSuspend  func(string) func()
+	systemThemeIds     []string
+	isUIReadyHandled   bool
+	isSystemDark       bool
+	exitOnce           sync.Once
+	hyprlandToggleMu   sync.Mutex
+	hyprlandToggleLast time.Time
+	omarchyReloadMu    sync.Mutex
+	omarchyReloadTimer *time.Timer
+
+	activeWindowSnapshot        common.ActiveWindowSnapshot // cached active window snapshot
+	activeWindowSnapshotMu      sync.RWMutex
+	activeWindowSnapshotSeq     uint64
+	pendingStartupNotify        *common.NotifyMsg
+	mainHotkeyWarningMu         sync.RWMutex
+	mainHotkeyWarning           string
+	mainHotkeyRegistrationError string
+	trayEmojiWarmMu             sync.Mutex
+	trayEmojiWarmInFlight       map[string]struct{}
+	trayMu                      sync.Mutex
+	trayVisible                 bool
+}
+
+func GetUIManager() *Manager {
+	managerOnce.Do(func() {
+		managerInstance = &Manager{}
+		managerInstance.hotkeyService = corehotkey.NewService(corehotkey.Callbacks{
+			OnMain: func(combineKey string) {
+				managerInstance.handleMainHotkeyTrigger(combineKey)
+			},
+			OnSelection: func(combineKey string) {
+				managerInstance.handleSelectionHotkeyTrigger(combineKey)
+			},
+			OnQuery: func(combineKey string, queryHotkey setting.QueryHotkey) {
+				managerInstance.handleQueryHotkeyTrigger(combineKey, queryHotkey)
+			},
+			OnResult: func(combineKey string, binding setting.ResultBinding) {
+				managerInstance.handleResultBindingHotkeyTrigger(combineKey, binding)
+			},
+			QueryCanTriggerBeforeRelease: queryCanTriggerBeforeRelease,
+			OnDictationHoldPress: func(ctx context.Context, actionID string) {
+				managerInstance.handleDictationHotkeyPress(ctx, actionID)
+			},
+			OnDictationHoldRelease: func(ctx context.Context, actionID string) {
+				managerInstance.handleDictationHotkeyRelease(ctx, actionID)
+			},
+			OnDictationPressAction: func(ctx context.Context, actionID string) {
+				managerInstance.handleDictationHotkeyPressAction(ctx, actionID)
+			},
+		})
+		managerInstance.ui = &uiImpl{
+			isVisible:       false, // Initially hidden
+			isInSettingView: false,
+		}
+		terminal.GetSessionManager().SetEmitter(terminal.EventEmitter{
+			Chunk: func(ctx context.Context, uiSessionID string, chunk terminal.TerminalChunk) {
+				managerInstance.applyTerminalChunk(ctx, uiSessionID, chunk)
+			},
+			State: func(ctx context.Context, uiSessionID string, state terminal.SessionState) {
+				managerInstance.applyTerminalState(ctx, uiSessionID, state)
+			},
+		})
+		managerInstance.themes = util.NewHashMap[string, common.Theme]()
+		managerInstance.themeFileIDs = util.NewHashMap[string, string]()
+		managerInstance.themePackageDirs = util.NewHashMap[string, string]()
+		managerInstance.themeReloadTimers = util.NewHashMap[string, *time.Timer]()
+		managerInstance.themeWatchIgnored = util.NewHashMap[string, int64]()
+		logger = util.GetLogger()
+		// Inject the UI Manager as the dictation hotkey registrar to break the
+		// import cycle between ui and plugin/system/dictation.
+		dictationplugin.SetHotkeyRegistrar(managerInstance)
+		plugin.GetPluginManager().SetResultBindingApplier(managerInstance.applyResultBindings)
+		selection.SetInternalSelectedTextProvider(woxui.SelectedTextFromFocusedWindow)
+	})
+	return managerInstance
+}
+
+// AttachView replaces the primary process-local UI target used by core push updates.
+func (m *Manager) AttachView(view contract.View) {
+	m.viewMu.Lock()
+	m.primaryView = view
+	m.views = map[string]contract.View{}
+	if view != nil && view.SessionID() != "" {
+		m.views[view.SessionID()] = view
+	}
+	m.viewMu.Unlock()
+	if view != nil {
+		// Plugin init can publish unread counts before the launcher view exists.
+		plugin.PublishAttentionUnreadCount(util.NewTraceContext())
+	}
+}
+
+func (m *Manager) getView() contract.View {
+	m.viewMu.RLock()
+	defer m.viewMu.RUnlock()
+	return m.primaryView
+}
+
+// MemoryDiagnostics sums memory explicitly owned by the active UI views.
+func (m *Manager) MemoryDiagnostics() (decodedImageBytes, rendererBytes uint64) {
+	m.viewMu.RLock()
+	views := make([]contract.View, 0, len(m.views)+1)
+	if len(m.views) > 0 {
+		for _, view := range m.views {
+			views = append(views, view)
+		}
+	} else if m.primaryView != nil {
+		views = append(views, m.primaryView)
+	}
+	m.viewMu.RUnlock()
+
+	for _, view := range views {
+		if reporter, ok := view.(interface{ MemoryDiagnostics() (uint64, uint64) }); ok {
+			images, renderer := reporter.MemoryDiagnostics()
+			decodedImageBytes += images
+			rendererBytes += renderer
+		}
+	}
+	return decodedImageBytes, rendererBytes
+}
+
+// GPUMemoryUsage describes graphics memory the driver attributes to the Wox process. It mirrors
+// the runtime layer's type so plugins can read renderer diagnostics without depending on the
+// native UI runtime package.
+type GPUMemoryUsage struct {
+	SystemBytes          uint64
+	SystemBudgetBytes    uint64
+	DedicatedBytes       uint64
+	DedicatedBudgetBytes uint64
+	UnifiedMemory        bool
+	Available            bool
+}
+
+// GPUMemoryDiagnostics reports what the graphics driver currently attributes to this process.
+// System usage is the driver's VidMm / shared-system total. On Windows those pages are
+// kernel-managed and must not be treated as a subset of the process private working set.
+func (m *Manager) GPUMemoryDiagnostics() GPUMemoryUsage {
+	return GPUMemoryUsage(woxui.ProcessGPUMemoryUsage())
+}
+
+// RegisterView adds one secondary launcher without changing the primary command target.
+func (m *Manager) RegisterView(view contract.View) {
+	if view == nil || view.SessionID() == "" {
+		return
+	}
+	m.viewMu.Lock()
+	if m.views == nil {
+		m.views = map[string]contract.View{}
+	}
+	m.views[view.SessionID()] = view
+	m.viewMu.Unlock()
+}
+
+// UnregisterView removes one secondary launcher from session-routed core pushes.
+func (m *Manager) UnregisterView(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	m.viewMu.Lock()
+	if m.primaryView == nil || m.primaryView.SessionID() != sessionID {
+		delete(m.views, sessionID)
+	}
+	m.viewMu.Unlock()
+}
+
+func (m *Manager) getViewForSession(sessionID string) contract.View {
+	m.viewMu.RLock()
+	defer m.viewMu.RUnlock()
+	if sessionID != "" {
+		if view := m.views[sessionID]; view != nil {
+			return view
+		}
+	}
+	return m.primaryView
+}
+
+func (m *Manager) applyTerminalChunk(ctx context.Context, uiSessionID string, chunk terminal.TerminalChunk) {
+	view := m.getViewForSession(uiSessionID)
+	if view == nil {
+		logger.Warn(ctx, "UI view not ready, skipping terminal chunk")
+		return
+	}
+	if err := view.ApplyTerminalChunk(ctx, uiSessionID, chunk); err != nil {
+		logger.Error(ctx, fmt.Sprintf("apply terminal UI chunk failed: %v", err))
+	}
+}
+
+func (m *Manager) applyTerminalState(ctx context.Context, uiSessionID string, state terminal.SessionState) {
+	view := m.getViewForSession(uiSessionID)
+	if view == nil {
+		logger.Warn(ctx, "UI view not ready, skipping terminal state")
+		return
+	}
+	if err := view.ApplyTerminalState(ctx, uiSessionID, state); err != nil {
+		logger.Error(ctx, fmt.Sprintf("apply terminal UI state failed: %v", err))
+	}
+}
+
+// CollectDictationHotkeys implements the dictation.HotkeyRegistrar interface.
+func (m *Manager) CollectDictationHotkeys(ctx context.Context, bindings []corehotkey.DictationBinding, registerNow bool) {
+	if err := m.hotkeyService.UpdateDictationBindings(ctx, bindings, registerNow); err != nil {
+		logger.Error(ctx, fmt.Sprintf("failed to update dictation hotkeys: %s", err.Error()))
+	}
+}
+
+// CollectWoxSettingHotkeys collects startup Wox-setting hotkeys before plugins load.
+func (m *Manager) CollectWoxSettingHotkeys(ctx context.Context, woxSetting *setting.WoxSetting) {
+	m.hotkeyService.CollectWoxSettings(ctx, woxSetting)
+}
+
+// RegisterAllHotkeys performs a single registration pass of all collected
+// hotkeys. This is the registration-phase entry point called after all sources
+// (Wox settings + dictation plugin) have populated the collector.
+func (m *Manager) RegisterAllHotkeys(ctx context.Context) error {
+	err := m.hotkeyService.RegisterAll(ctx)
+	if bindingErr := m.hotkeyService.ResultBindingRegistrationError(); bindingErr != nil {
+		util.GetLogger().Warn(ctx, bindingErr.Error())
+		m.ui.Notify(ctx, common.NotifyMsg{Text: i18n.GetI18nManager().TranslateWox(ctx, "plugin_manager_result_hotkey_registration_failed"), DisplaySeconds: 5})
+	}
+	mainHotkey := setting.GetSettingManager().GetWoxSetting(ctx).MainHotkey.Get()
+	m.syncMainHotkeyToolbarWarning(ctx, mainHotkey, err)
+	return err
+}
+
+func (m *Manager) Start(ctx context.Context) error {
+	//load embed themes
+	embedThemes := resource.GetEmbedThemes(ctx)
+	for _, themeJson := range embedThemes {
+		theme, themeErr := m.parseTheme(themeJson)
+		if themeErr != nil {
+			logger.Error(ctx, fmt.Sprintf("failed to parse theme: %s", themeErr.Error()))
+			continue
+		}
+		theme.IsInstalled = true
+		theme.IsSystem = true
+		m.themes.Store(theme.ThemeId, theme)
+		m.systemThemeIds = append(m.systemThemeIds, theme.ThemeId)
+	}
+
+	//load user themes
+	userThemesDirectory := util.GetLocation().GetThemeDirectory()
+	dirEntry, readErr := os.ReadDir(userThemesDirectory)
+	if readErr != nil {
+		return readErr
+	}
+	for _, entry := range dirEntry {
+		themePath := filepath.Join(userThemesDirectory, entry.Name())
+		if strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		if entry.IsDir() {
+			themePath = filepath.Join(themePath, "theme.json")
+		}
+		themeData, readThemeErr := os.ReadFile(themePath)
+		if readThemeErr != nil {
+			logger.Error(ctx, fmt.Sprintf("failed to read user theme: %s, %s", entry.Name(), readThemeErr.Error()))
+			continue
+		}
+
+		theme, themeErr := m.parseTheme(string(themeData))
+		if themeErr != nil {
+			logger.Error(ctx, fmt.Sprintf("failed to parse user theme: %s, %s", entry.Name(), themeErr.Error()))
+			continue
+		}
+		if err := theme.LoadThemeAssets(filepath.Dir(themePath)); err != nil {
+			util.GetLogger().Warn(ctx, fmt.Sprintf("load theme assets: %v", err))
+		}
+		m.rememberUserThemeFile(themePath, theme.ThemeId)
+		m.themes.Store(theme.ThemeId, stripThemeAssets(theme))
+	}
+
+	// Omarchy Auto is registered only on Omarchy, before theme file watches start,
+	// so a user file cannot replace this system theme id.
+	m.loadOmarchyAutoTheme(ctx)
+	if omarchytheme.Available() {
+		util.Go(ctx, "watch omarchy theme", func() {
+			m.watchOmarchyTheme(ctx)
+		})
+	}
+
+	// Dropping a JSON into the user theme directory loads it without a restart,
+	// matching single-file plugin discovery. Built-in JSON is watched only in
+	// dev so editing resource/themes hot-reloads the active system theme.
+	util.Go(ctx, "watch user themes", func() {
+		m.startUserThemeMonitoring(ctx, userThemesDirectory)
+	})
+	if util.IsDev() {
+		util.Go(ctx, "watch embed themes", func() {
+			workingDirectory, wdErr := os.Getwd()
+			if wdErr == nil {
+				m.startEmbedThemeMonitoring(ctx, filepath.Join(workingDirectory, "resource", "themes"))
+			}
+		})
+	}
+
+	util.Go(ctx, "start store manager", func() {
+		GetStoreManager().Start(util.NewTraceContext())
+	})
+
+	// Start watching system appearance changes for auto theme switching
+	m.isSystemDark = appearance.IsDark()
+	util.Go(ctx, "watch system appearance", func() {
+		appearance.WatchSystemAppearance(func(isDark bool) {
+			if m.isSystemDark != isDark {
+				m.isSystemDark = isDark
+				logger.Info(ctx, fmt.Sprintf("system appearance changed: isDark=%v", isDark))
+				m.applyAutoAppearanceThemeIfNeed(ctx)
+			}
+		})
+	})
+
+	return nil
+}
+
+// RegisterMainHotkey updates the main hotkey in the hotkey service and re-registers
+// all hotkeys. This is the unified entry point for both startup and setting-change
+// paths: the service holds the current definition, RegisterAll binds it.
+func (m *Manager) RegisterMainHotkey(ctx context.Context, combineKey string) error {
+	woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+	previousConfig := corehotkey.WoxConfigFromSetting(woxSetting)
+	config := previousConfig
+	config.MainHotkey = combineKey
+	if err := m.registerWoxHotkeys(ctx, config, true); err != nil {
+		return err
+	}
+	if strings.TrimSpace(combineKey) == "" || m.hotkeyService.IsRegistered(corehotkey.SourceMain, "main") {
+		return nil
+	}
+
+	registerErr := fmt.Errorf("failed to register main hotkey: %s", combineKey)
+	if restoreErr := m.registerWoxHotkeys(ctx, previousConfig, false); restoreErr != nil {
+		return fmt.Errorf("%w; failed to restore previous hotkeys: %v", registerErr, restoreErr)
+	}
+	return registerErr
+}
+
+// RegisterSelectionHotkey updates the selection hotkey in the hotkey service and
+// re-registers all hotkeys.
+func (m *Manager) RegisterSelectionHotkey(ctx context.Context, combineKey string) error {
+	woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+	config := corehotkey.WoxConfigFromSetting(woxSetting)
+	config.SelectionHotkey = combineKey
+	return m.registerWoxHotkeys(ctx, config, true)
+}
+
+// handleDictationHotkeyPress finds the loaded DictationPlugin and starts
+// the recording session.
+func (m *Manager) handleDictationHotkeyPress(ctx context.Context, actionID string) {
+	sp := plugin.GetPluginManager().GetSystemPlugin(common.DictationPluginID)
+	if sp == nil {
+		logger.Error(ctx, fmt.Sprintf("dictation plugin not found for hotkey press callback: action=%s", actionID))
+		return
+	}
+	type dictationStarter interface {
+		StartDictation(ctx context.Context, actionID string)
+	}
+	if ds, ok := sp.(dictationStarter); ok {
+		ds.StartDictation(ctx, actionID)
+	}
+}
+
+// handleDictationHotkeyRelease finds the loaded DictationPlugin and stops
+// the recording session, producing the recognized text.
+func (m *Manager) handleDictationHotkeyRelease(ctx context.Context, actionID string) {
+	logger.Info(ctx, fmt.Sprintf("dictation: handleDictationHotkeyRelease enter, action=%s", actionID))
+	sp := plugin.GetPluginManager().GetSystemPlugin(common.DictationPluginID)
+	if sp == nil {
+		logger.Error(ctx, fmt.Sprintf("dictation plugin not found for hotkey release callback: action=%s", actionID))
+		return
+	}
+	type dictationStopper interface {
+		StopDictation(ctx context.Context, actionID string)
+	}
+	if ds, ok := sp.(dictationStopper); ok {
+		logger.Info(ctx, fmt.Sprintf("dictation: calling StopDictation, action=%s", actionID))
+		ds.StopDictation(ctx, actionID)
+	} else {
+		logger.Error(ctx, "dictation: plugin does not implement dictationStopper")
+	}
+}
+
+// handleDictationHotkeyPressAction finds the loaded DictationPlugin and runs
+// the press-triggered dictation action.
+func (m *Manager) handleDictationHotkeyPressAction(ctx context.Context, actionID string) {
+	sp := plugin.GetPluginManager().GetSystemPlugin(common.DictationPluginID)
+	if sp == nil {
+		logger.Error(ctx, fmt.Sprintf("dictation plugin not found for hotkey callback: action=%s", actionID))
+		return
+	}
+	type dictationPressHandler interface {
+		PressDictationHotkey(ctx context.Context, actionID string)
+	}
+	if handler, ok := sp.(dictationPressHandler); ok {
+		handler.PressDictationHotkey(ctx, actionID)
+	}
+}
+
+// handleMainHotkeyTrigger runs the main shortcut callback shared by native and
+// portal-backed registrations.
+func (m *Manager) handleMainHotkeyTrigger(combineKey string) {
+	triggerCtx := util.NewTraceContext()
+	logger.Info(triggerCtx, fmt.Sprintf("main hotkey callback received: hotkey=%s recordingActive=%t", combineKey, m.isHotkeyRecordingActive()))
+	if m.recordHotkeyIfRecording(triggerCtx, combineKey) {
+		return
+	}
+	if m.shouldIgnoreHotkeyTrigger(triggerCtx) {
+		return
+	}
+	activationStartedAt := util.GetSystemTimestamp()
+	m.ui.ToggleApp(triggerCtx, common.ShowContext{
+		SelectAll:           true,
+		ShowSource:          common.ShowSourceDefault,
+		ActivationStartedAt: activationStartedAt,
+	})
+}
+
+// handleSelectionHotkeyTrigger runs the selection shortcut callback shared by
+// native and portal-backed registrations.
+func (m *Manager) handleSelectionHotkeyTrigger(combineKey string) {
+	triggerCtx := util.NewTraceContext()
+	logger.Info(triggerCtx, fmt.Sprintf("selection hotkey callback received: hotkey=%s recordingActive=%t", combineKey, m.isHotkeyRecordingActive()))
+	if !selection.SupportsSelectionQuery() {
+		logger.Info(triggerCtx, "selection hotkey ignored: selection capture is unavailable on this desktop")
+		return
+	}
+	if m.recordHotkeyIfRecording(triggerCtx, combineKey) {
+		return
+	}
+	if m.shouldIgnoreHotkeyTrigger(triggerCtx) {
+		return
+	}
+	m.QuerySelection(triggerCtx)
+}
+
+// queryCanTriggerBeforeRelease waits only when query setup needs the current selection.
+// Selection capture may simulate Ctrl+C, which the Caps hook swallows until Caps is released.
+func queryCanTriggerBeforeRelease(queryHotkey setting.QueryHotkey) bool {
+	return !strings.Contains(queryHotkey.Query, plugin.QueryVariableSelectedText) &&
+		!strings.Contains(queryHotkey.Query, plugin.QueryVariableSelectedFile) &&
+		!plugin.GetPluginManager().QueryVariablesRequireSelection()
+}
+
+// handleQueryHotkeyTrigger runs a query shortcut callback shared by native and
+// portal-backed registrations.
+func (m *Manager) handleQueryHotkeyTrigger(combineKey string, queryHotkey setting.QueryHotkey) {
+	queryCtx := util.WithCoreSessionContext(util.NewTraceContext())
+	logger.Info(queryCtx, fmt.Sprintf("query hotkey callback received: hotkey=%s query=%s recordingActive=%t", combineKey, queryHotkey.Query, m.isHotkeyRecordingActive()))
+	if m.recordHotkeyIfRecording(queryCtx, combineKey) {
+		return
+	}
+	if m.shouldIgnoreHotkeyTrigger(queryCtx) {
+		return
+	}
+	if err := m.triggerQueryHotkey(queryCtx, queryHotkey); err != nil {
+		logger.Error(queryCtx, fmt.Sprintf("failed to trigger query hotkey: %s", err.Error()))
+	}
+}
+
+// handleResultBindingHotkeyTrigger restores one bound result and executes it without showing Wox.
+func (m *Manager) handleResultBindingHotkeyTrigger(combineKey string, binding setting.ResultBinding) {
+	queryCtx := util.WithCoreSessionContext(util.NewTraceContext())
+	util.GetLogger().Info(queryCtx, fmt.Sprintf("result binding hotkey callback received: hotkey=%s hash=%s", combineKey, binding.Hash))
+	if m.recordHotkeyIfRecording(queryCtx, combineKey) {
+		return
+	}
+	if m.shouldIgnoreHotkeyTrigger(queryCtx) {
+		return
+	}
+	m.RefreshActiveWindowSnapshotBlocking(queryCtx)
+	if err := plugin.GetPluginManager().ExecuteResultBindingHotkey(queryCtx, binding); err != nil {
+		util.GetLogger().Error(queryCtx, fmt.Sprintf("failed to trigger result binding hotkey: %s", err.Error()))
+	}
+}
+
+// applyResultBindings registers result hotkeys first and persists only after registration succeeds.
+func (m *Manager) applyResultBindings(ctx context.Context, bindings []setting.ResultBinding) error {
+	if err := plugin.GetPluginManager().ValidateResultBindings(ctx, bindings); err != nil {
+		return err
+	}
+	woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+	bindings = setting.CloneResultBindings(bindings)
+	if err := m.hotkeyService.ApplyResultBindings(ctx, bindings, func() error { return woxSetting.ResultBindings.Set(bindings) }); err != nil {
+		return err
+	}
+	m.ui.ReloadSetting(ctx)
+	return nil
+}
+
+// QuerySelection captures the current text selection and opens a Wox query for it.
+func (m *Manager) QuerySelection(ctx context.Context) {
+	newCtx := util.NewTraceContext()
+	if !selection.SupportsSelectionQuery() {
+		logger.Info(newCtx, "skip selection query: selection capture is unavailable on this desktop")
+		return
+	}
+
+	start := util.GetSystemTimestamp()
+	selectionResult, err := selection.GetSelected(newCtx)
+	logger.Debug(newCtx, fmt.Sprintf("took %d ms to get selected", util.GetSystemTimestamp()-start))
+	if err != nil {
+		logger.Error(newCtx, fmt.Sprintf("failed to get selected: %s", err.Error()))
+		return
+	}
+	if selectionResult.IsEmpty() {
+		logger.Info(newCtx, "no selection")
+		return
+	}
+
+	if err := m.triggerSelectionQuery(newCtx, selectionResult); err != nil {
+		logger.Error(newCtx, fmt.Sprintf("failed to trigger selection query: %s", err.Error()))
+	}
+}
+
+func (m *Manager) triggerSelectionQuery(ctx context.Context, selected selection.Selection) error {
+	if selected.IsEmpty() {
+		return errors.New("selection is empty")
+	}
+
+	woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+	m.RefreshActiveWindowSnapshot(ctx)
+	m.openSecondaryInstance(ctx, string(common.ShowSourceSelection), common.PlainQuery{
+		QueryType:      plugin.QueryTypeSelection,
+		QuerySelection: selected,
+	}, selectionShowContext(woxSetting.HideOnLostFocus.Get()))
+	return nil
+}
+
+func selectionShowContext(hideOnLostFocus bool) common.ShowContext {
+	return common.ShowContext{ShowSource: common.ShowSourceSelection, HideOnBlur: hideOnLostFocus}
+}
+
+// showPluginPackageInstaller opens the local .wox installer from a file association.
+func (m *Manager) showPluginPackageInstaller(ctx context.Context, rawPath string) {
+	filePath, ok := util.PluginPackagePathFromArg(rawPath)
+	if !ok {
+		logger.Warn(ctx, "ignored plugin package install deeplink with an invalid path")
+		return
+	}
+
+	// Hide-on-blur would close the installer when Explorer/Finder refocuses
+	// after a double-click, before the user can confirm the install.
+	m.RefreshActiveWindowSnapshot(ctx)
+	// File-open deeplinks belong to the primary launcher, even though their
+	// payload uses a selection query to offer install/reinstall actions.
+	m.ui.OpenWoxInstance(ctx, common.OpenWoxInstanceRequest{
+		Role: common.WoxInstanceRolePrimary,
+		Query: common.PlainQuery{
+			QueryId:   uuid.NewString(),
+			QueryType: plugin.QueryTypeSelection,
+			QuerySelection: selection.Selection{
+				Type:      selection.SelectionTypeFile,
+				FilePaths: []string{filePath},
+			},
+		},
+		ShowApp: pluginPackageInstallShowContext(),
+	})
+}
+
+func pluginPackageInstallShowContext() common.ShowContext {
+	return common.ShowContext{ShowSource: common.ShowSourceSelection, HideOnBlur: false}
+}
+
+// deeplinkQueryShowContext keeps a wox://query payload visible under Fresh launch mode.
+func deeplinkQueryShowContext() common.ShowContext {
+	return common.ShowContext{ShowSource: common.ShowSourceDeeplink}
+}
+
+// openSecondaryInstance preserves the primary launcher while opening a session-owned query window.
+func (m *Manager) openSecondaryInstance(ctx context.Context, instanceName string, query common.PlainQuery, showContext common.ShowContext) {
+	if query.QueryId == "" {
+		query.QueryId = uuid.NewString()
+	}
+	m.ui.OpenWoxInstance(ctx, common.OpenWoxInstanceRequest{
+		Role: common.WoxInstanceRoleSecondary, InstanceName: instanceName, Query: query, ShowApp: showContext,
+	})
+}
+
+// triggerQueryHotkey builds and executes a query hotkey action.
+func (m *Manager) triggerQueryHotkey(ctx context.Context, queryHotkey setting.QueryHotkey) error {
+	queryCtx := util.WithCoreSessionContext(ctx)
+	queryCtx = util.WithShowSourceContext(queryCtx, string(common.ShowSourceQueryHotkey))
+	plainQuery := plugin.GetPluginManager().ReplaceQueryVariable(queryCtx, queryHotkey.Query)
+	plainQuery.QueryId = uuid.NewString()
+
+	m.RefreshActiveWindowSnapshotBlocking(queryCtx)
+	q, _, err := plugin.GetPluginManager().NewQuery(queryCtx, plainQuery)
+	if err != nil {
+		return err
+	}
+
+	if queryHotkey.IsSilentExecution {
+		success := plugin.GetPluginManager().QuerySilent(queryCtx, q)
+		if !success {
+			return fmt.Errorf("failed to execute silent query: %s", plainQuery.String())
+		}
+		logger.Info(queryCtx, fmt.Sprintf("silent query executed: %s", plainQuery.String()))
+		return nil
+	}
+
+	showContext := common.ShowContext{
+		SelectAll:      false,
+		HideQueryBox:   queryHotkey.HideQueryBox,
+		HideToolbar:    queryHotkey.HideToolbar,
+		HideResults:    queryHotkey.HideResults,
+		WindowWidth:    normalizedWindowWidth(queryHotkey.Width),
+		MaxResultCount: normalizedMaxResultCount(queryHotkey.MaxResultCount),
+		ShowSource:     common.ShowSourceQueryHotkey,
+	}
+	if position, ok := m.getQueryHotkeyWindowPosition(queryCtx, queryHotkey); ok {
+		showContext.WindowPosition = &position
+	}
+	// Preview-only hotkeys (e.g. webview panels) reuse the same chrome as selection quick look.
+	if queryHotkey.HideQueryBox && queryHotkey.HideToolbar {
+		showContext.ShowPreviewTitleBar = true
+		m.openSecondaryInstance(queryCtx, "query-hotkey:"+normalizeHotkeyForCompare(queryHotkey.Hotkey), plainQuery, showContext)
+		return nil
+	}
+
+	m.ui.ChangeQuery(queryCtx, plainQuery)
+	m.ui.ShowApp(queryCtx, showContext)
+	return nil
+}
+
+func (m *Manager) registerWoxHotkeys(ctx context.Context, config corehotkey.WoxConfig, restoreCollectorOnFailure bool) error {
+	err := m.hotkeyService.UpdateWoxConfig(ctx, config, restoreCollectorOnFailure)
+	mainHotkey := config.MainHotkey
+	if err != nil {
+		mainHotkey = setting.GetSettingManager().GetWoxSetting(ctx).MainHotkey.Get()
+	}
+	m.syncMainHotkeyToolbarWarning(ctx, mainHotkey, err)
+	return err
+}
+
+// syncMainHotkeyToolbarWarning tracks registration health and updates an attached launcher immediately.
+func (m *Manager) syncMainHotkeyToolbarWarning(ctx context.Context, mainHotkey string, registerErr error) {
+	mainHotkey = strings.TrimSpace(mainHotkey)
+	if mainHotkey != "" && m.hotkeyService.IsRegistered(corehotkey.SourceMain, "main") {
+		mainHotkey = ""
+	}
+
+	m.mainHotkeyWarningMu.Lock()
+	m.mainHotkeyWarning = mainHotkey
+	m.mainHotkeyRegistrationError = ""
+	if mainHotkey != "" {
+		m.mainHotkeyRegistrationError = corehotkey.RegistrationErrorKey(registerErr)
+	}
+	m.mainHotkeyWarningMu.Unlock()
+
+	if m.getView() == nil {
+		return
+	}
+	if mainHotkey == "" {
+		m.ui.ClearToolbarMsg(ctx, mainHotkeyRegistrationToolbarMessageID)
+		return
+	}
+	m.showMainHotkeyToolbarWarning(ctx)
+}
+
+// showMainHotkeyToolbarWarning presents the current non-expiring launcher fallback, if any.
+func (m *Manager) showMainHotkeyToolbarWarning(ctx context.Context) {
+	m.mainHotkeyWarningMu.RLock()
+	mainHotkey := m.mainHotkeyWarning
+	registrationError := m.mainHotkeyRegistrationError
+	m.mainHotkeyWarningMu.RUnlock()
+	if mainHotkey == "" {
+		return
+	}
+
+	title := i18n.GetI18nManager().TranslateWox(ctx, "i18n:ui_main_hotkey_registration_failed")
+	title = strings.ReplaceAll(title, "{hotkey}", mainHotkey)
+	if registrationError == "i18n:ui_hotkey_registration_unsupported" {
+		title = i18n.GetI18nManager().TranslateWox(ctx, registrationError)
+	}
+	m.ui.ShowToolbarMsg(ctx, plugin.ToolbarMsgUI{
+		Id:       mainHotkeyRegistrationToolbarMessageID,
+		Title:    title,
+		Icon:     icons.Get(icons.ActionError),
+		Fallback: true,
+	})
+}
+
+func (m *Manager) hasMainHotkeyToolbarWarning() bool {
+	return m.mainHotkeyToolbarWarning() != ""
+}
+
+func (m *Manager) mainHotkeyToolbarWarning() string {
+	m.mainHotkeyWarningMu.RLock()
+	defer m.mainHotkeyWarningMu.RUnlock()
+	return m.mainHotkeyWarning
+}
+
+func (m *Manager) mainHotkeyRegistrationErrorKey() string {
+	m.mainHotkeyWarningMu.RLock()
+	defer m.mainHotkeyWarningMu.RUnlock()
+	return m.mainHotkeyRegistrationError
+}
+
+type HotkeyAvailability struct {
+	Available     bool
+	ConflictType  string
+	ConflictValue string
+}
+
+const (
+	hotkeyConflictTypeMain      = "main"
+	hotkeyConflictTypeSelection = "selection"
+	hotkeyConflictTypeQuery     = "query"
+	hotkeyConflictTypeDictation = "dictation"
+	hotkeyConflictTypeSystem    = "system"
+)
+
+// CheckHotkeyAvailability checks Wox-owned settings before probing the platform registry.
+func (m *Manager) CheckHotkeyAvailability(ctx context.Context, hotkeyStr string) HotkeyAvailability {
+	if conflict := m.findConfiguredHotkeyConflict(ctx, hotkeyStr); conflict.ConflictType != "" {
+		logger.Info(ctx, fmt.Sprintf("hotkey availability check: hotkey=%s available=false reason=wox_setting conflictType=%s conflictValue=%s", hotkeyStr, conflict.ConflictType, conflict.ConflictValue))
+		return conflict
+	}
+
+	isAvailable, err := utilhotkey.CheckHotkeyAvailability(ctx, hotkeyStr)
+	if err != nil && !errors.Is(err, keyboard.ErrHotkeyConflict) {
+		logger.Warn(ctx, fmt.Sprintf("hotkey availability check failed: hotkey=%s err=%v", hotkeyStr, err))
+		kind := "registration_failed"
+		if errors.Is(err, keyboard.ErrGlobalHotkeysUnavailable) {
+			kind = "unsupported"
+		}
+		return HotkeyAvailability{ConflictType: kind}
+	}
+	logger.Info(ctx, fmt.Sprintf("hotkey availability check: hotkey=%s available=%t reason=platform_probe", hotkeyStr, isAvailable))
+	if !isAvailable {
+		return HotkeyAvailability{Available: false, ConflictType: hotkeyConflictTypeSystem}
+	}
+	return HotkeyAvailability{Available: true}
+}
+
+// IsHotkeyAvailable keeps the existing bool endpoint compatible with callers that only need availability.
+func (m *Manager) IsHotkeyAvailable(ctx context.Context, hotkeyStr string) bool {
+	return m.CheckHotkeyAvailability(ctx, hotkeyStr).Available
+}
+
+// findConfiguredHotkeyConflict keeps availability checks aligned with Wox-owned hotkey settings.
+func (m *Manager) findConfiguredHotkeyConflict(ctx context.Context, hotkeyStr string) HotkeyAvailability {
+	candidateKeys := hotkeyCompareKeys(hotkeyStr)
+	if len(candidateKeys) == 0 {
+		return HotkeyAvailability{Available: true}
+	}
+
+	woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+	if hotkeyCompareKeysIntersect(candidateKeys, hotkeyCompareKeys(woxSetting.MainHotkey.Get())) {
+		return HotkeyAvailability{Available: false, ConflictType: hotkeyConflictTypeMain}
+	}
+	if hotkeyCompareKeysIntersect(candidateKeys, hotkeyCompareKeys(corehotkey.EffectiveSelectionHotkeyForRuntime(woxSetting.SelectionHotkey.Get()))) {
+		return HotkeyAvailability{Available: false, ConflictType: hotkeyConflictTypeSelection}
+	}
+
+	for _, queryHotkey := range woxSetting.QueryHotkeys.Get() {
+		if queryHotkey.Disabled {
+			continue
+		}
+		if hotkeyCompareKeysIntersect(candidateKeys, hotkeyCompareKeys(queryHotkey.Hotkey)) {
+			return HotkeyAvailability{Available: false, ConflictType: hotkeyConflictTypeQuery, ConflictValue: queryHotkey.DisplayName()}
+		}
+	}
+
+	// Dictation hotkeys are collected into the same collector; check all
+	// entries for conflicts by source.
+	for _, entry := range m.hotkeyService.Snapshot() {
+		if entry.Source == corehotkey.SourceDictation {
+			if hotkeyCompareKeysIntersect(candidateKeys, hotkeyCompareKeys(entry.CombineKey)) {
+				return HotkeyAvailability{Available: false, ConflictType: hotkeyConflictTypeDictation, ConflictValue: entry.ID}
+			}
+		}
+	}
+
+	return HotkeyAvailability{Available: true}
+}
+
+func hotkeyCompareKeys(hotkeyStr string) map[string]bool {
+	// Compare the physical chord so Win aliases and dictation's hold prefix
+	// cannot hide a conflict with the launcher's new single-Win shortcut.
+	if key, err := utilhotkey.BindingKey(hotkeyStr); err == nil && key != "" {
+		return map[string]bool{key: true}
+	}
+	// Parse legacy UI aliases without collapsing side-specific chords.
+	tokens := strings.Split(hotkeyStr, "+")
+	for i, token := range tokens {
+		tokens[i] = normalizeHotkeyToken(token)
+		if tokens[i] == "meta" {
+			tokens[i] = "cmd"
+		}
+	}
+	if key, err := utilhotkey.BindingKey(strings.Join(tokens, "+")); err == nil && key != "" {
+		return map[string]bool{key: true}
+	}
+	normalized := normalizeHotkeyForCompare(hotkeyStr)
+	if normalized == "" {
+		return map[string]bool{}
+	}
+
+	keys := map[string]bool{normalized: true}
+	return keys
+}
+
+func hotkeyCompareKeysIntersect(left map[string]bool, right map[string]bool) bool {
+	for key := range left {
+		if right[key] {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeHotkeyForCompare canonicalizes common aliases so stored settings and recorder output compare consistently.
+func normalizeHotkeyForCompare(hotkeyStr string) string {
+	tokens := []string{}
+	for _, token := range strings.Split(hotkeyStr, "+") {
+		normalizedToken := normalizeHotkeyToken(token)
+		if normalizedToken != "" {
+			tokens = append(tokens, normalizedToken)
+		}
+	}
+
+	if len(tokens) == 2 && tokens[0] == tokens[1] && isHotkeyModifierToken(tokens[0]) {
+		return strings.Join(tokens, "+")
+	}
+
+	modifiers := map[string]bool{}
+	key := ""
+	for _, token := range tokens {
+		if token == "capslock" {
+			modifiers[token] = true
+			continue
+		}
+		if isHotkeyModifierToken(token) {
+			modifiers[token] = true
+			continue
+		}
+		if key == "" {
+			key = token
+		}
+	}
+
+	if modifiers["capslock"] && key != "" {
+		return "capslock+" + key
+	}
+
+	parts := []string{}
+	for _, modifier := range []string{"ctrl", "shift", "alt", "meta"} {
+		if modifiers[modifier] {
+			parts = append(parts, modifier)
+		}
+	}
+	if key != "" {
+		parts = append(parts, key)
+	}
+
+	return strings.Join(parts, "+")
+}
+
+// normalizeHotkeyToken maps platform and UI aliases to one comparison token.
+func normalizeHotkeyToken(token string) string {
+	switch strings.ToLower(strings.TrimSpace(token)) {
+	case "", " ":
+		return ""
+	case "control":
+		return "ctrl"
+	case "option":
+		return "alt"
+	case "cmd", "command", "win", "windows", "super":
+		return "meta"
+	case "capslock", "caps_lock", "caps lock":
+		return "capslock"
+	case "return":
+		return "enter"
+	case "arrowleft":
+		return "left"
+	case "arrowright":
+		return "right"
+	case "arrowup":
+		return "up"
+	case "arrowdown":
+		return "down"
+	default:
+		return strings.ToLower(strings.TrimSpace(token))
+	}
+}
+
+func isHotkeyModifierToken(token string) bool {
+	return token == "ctrl" || token == "shift" || token == "alt" || token == "meta"
+}
+
+func (m *Manager) UpdateServerPort(port int) {
+	m.serverPort = port
+}
+
+func (m *Manager) GetCurrentTheme(ctx context.Context) common.Theme {
+	woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+	themeID := woxSetting.ThemeId.Get()
+	if v, ok := m.themes.Load(themeID); ok && omarchyAutoThemeForDisplay(themeID) {
+		// If it's an auto appearance theme, return the actual applied theme (light or dark)
+		if v.IsAutoAppearance {
+			return m.getActualTheme(ctx, v)
+		}
+		return m.resolvePlatformTheme(ctx, m.ThemeWithAssets(ctx, v))
+	}
+	// Cloud sync can restore Omarchy Auto on a machine that does not run Omarchy.
+	// Render the default theme and leave the saved id alone.
+	if fallback, ok := m.defaultThemeWhenOmarchyAutoUnavailable(ctx, themeID); ok {
+		return fallback
+	}
+
+	return common.Theme{}
+}
+
+// ThemeWithAssets reloads packaged asset bytes for a stored theme that needs them. Stored
+// themes drop AssetFiles after validation so only the theme being applied or previewed pays
+// for its wallpapers; themes without asset sources are returned unchanged.
+func (m *Manager) ThemeWithAssets(ctx context.Context, theme common.Theme) common.Theme {
+	if len(theme.AssetFiles) > 0 {
+		return theme
+	}
+	sources, err := theme.ThemeAssetSources()
+	if err != nil || len(sources) == 0 {
+		return theme
+	}
+	directory, ok := m.themePackageDirs.Load(theme.ThemeId)
+	if !ok {
+		return theme
+	}
+	if err := theme.LoadThemeAssets(directory); err != nil {
+		util.GetLogger().Warn(ctx, fmt.Sprintf("load theme assets for %s: %v", theme.ThemeId, err))
+	}
+	return theme
+}
+
+// stripThemeAssets returns the theme without its asset bytes for long-lived storage.
+func stripThemeAssets(theme common.Theme) common.Theme {
+	theme.AssetFiles = nil
+	return theme
+}
+
+// getActualTheme returns the actual theme to apply based on system appearance
+// It copies the auto theme's ID and flags but uses the light/dark theme's properties
+func (m *Manager) getActualTheme(ctx context.Context, autoTheme common.Theme) common.Theme {
+	var targetThemeId string
+	if m.isSystemDark {
+		targetThemeId = autoTheme.DarkThemeId
+	} else {
+		targetThemeId = autoTheme.LightThemeId
+	}
+
+	if targetTheme, ok := m.themes.Load(targetThemeId); ok {
+		// Copy the target theme's properties but keep auto theme's identity
+		result := m.ThemeWithAssets(ctx, targetTheme)
+		result.ThemeId = autoTheme.ThemeId
+		result.IsAutoAppearance = autoTheme.IsAutoAppearance
+		result.DarkThemeId = autoTheme.DarkThemeId
+		result.LightThemeId = autoTheme.LightThemeId
+		return m.resolvePlatformTheme(ctx, result)
+	}
+
+	// Fallback to auto theme if target not found
+	return m.resolvePlatformTheme(ctx, autoTheme)
+}
+
+func (m *Manager) GetAllThemes(ctx context.Context) []common.Theme {
+	var themes []common.Theme
+	m.themes.Range(func(key string, value common.Theme) bool {
+		if !omarchyAutoThemeForDisplay(key) {
+			return true
+		}
+		themes = append(themes, m.resolvePlatformTheme(ctx, value))
+		return true
+	})
+	return themes
+}
+
+func (m *Manager) AddTheme(ctx context.Context, theme common.Theme) {
+	m.StoreTheme(theme)
+	m.ChangeTheme(ctx, theme)
+}
+
+// StoreTheme registers a theme without applying it. Asset bytes are dropped when the theme's
+// package directory is known, because ThemeWithAssets can reload them on demand.
+func (m *Manager) StoreTheme(theme common.Theme) {
+	if _, known := m.themePackageDirs.Load(theme.ThemeId); known {
+		theme = stripThemeAssets(theme)
+	}
+	m.themes.Store(theme.ThemeId, theme)
+}
+
+func (m *Manager) RemoveTheme(ctx context.Context, theme common.Theme) {
+	m.themes.Delete(theme.ThemeId)
+}
+
+func (m *Manager) ChangeToDefaultTheme(ctx context.Context) {
+	if v, ok := m.themes.Load(setting.DefaultThemeId); ok {
+		m.ChangeTheme(ctx, v)
+	}
+}
+
+func (m *Manager) RestoreTheme(ctx context.Context) {
+	var uninstallThemes = m.themes.FilterList(func(key string, theme common.Theme) bool {
+		return !theme.IsSystem
+	})
+
+	for _, theme := range uninstallThemes {
+		GetStoreManager().Uninstall(ctx, theme)
+	}
+
+	m.ChangeToDefaultTheme(ctx)
+}
+
+func (m *Manager) GetThemeById(themeId string) common.Theme {
+	if v, ok := m.themes.Load(themeId); ok {
+		return v
+	}
+	return common.Theme{}
+}
+
+func (m *Manager) parseTheme(themeJson string) (common.Theme, error) {
+	return common.ParseThemeDocument([]byte(themeJson), updater.CURRENT_VERSION)
+}
+
+func (m *Manager) resolvePlatformTheme(ctx context.Context, theme common.Theme) common.Theme {
+	return resolvePlatformThemeForTarget(ctx, theme, util.GetCurrentPlatform(), osvariant.GetCurrentPlatformVariant(), woxui.ThemeCapabilities()...)
+}
+
+func resolvePlatformThemeForTarget(ctx context.Context, theme common.Theme, platformName string, variantName string, capabilities ...string) common.Theme {
+	resolved, err := theme.ResolveForTarget(platformName, variantName, capabilities...)
+	if err != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("resolve theme %s: %s", theme.ThemeId, err))
+		theme.Windows, theme.MacOS, theme.Linux = nil, nil, nil
+		return theme
+	}
+	return resolved
+}
+
+func (m *Manager) ChangeTheme(ctx context.Context, theme common.Theme) {
+	// If it's an auto appearance theme, save the auto theme ID but apply the appropriate light/dark theme
+	if theme.IsAutoAppearance {
+		woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+		woxSetting.ThemeId.Set(theme.ThemeId)
+
+		// Update system dark state and apply the appropriate theme
+		m.isSystemDark = appearance.IsDark()
+		m.applyAutoAppearanceThemeIfNeed(ctx)
+	} else {
+		m.GetUI(ctx).ChangeTheme(ctx, m.resolvePlatformTheme(ctx, m.ThemeWithAssets(ctx, theme)))
+	}
+}
+
+// ApplyCurrentTheme pushes the currently configured theme to UI without writing ThemeId again.
+func (m *Manager) ApplyCurrentTheme(ctx context.Context) {
+	theme := m.GetCurrentTheme(ctx)
+	if theme.ThemeId == "" {
+		logger.Warn(ctx, "skip applying current theme: configured theme not found")
+		return
+	}
+
+	if impl, ok := m.GetUI(ctx).(*uiImpl); ok {
+		impl.ChangeThemeWithoutSave(ctx, theme)
+		return
+	}
+
+	logger.Warn(ctx, "skip applying current theme: UI does not support applying without saving")
+}
+
+func (m *Manager) GetUI(ctx context.Context) common.UI {
+	return m.ui
+}
+
+// ToggleRecordingMode exposes the capture-friendly launcher level only to macOS development builds.
+func (m *Manager) ToggleRecordingMode(ctx context.Context) (bool, error) {
+	if !util.IsDev() || runtime.GOOS != util.PlatformMacOS {
+		return false, errors.New("recording mode is only available in macOS dev builds")
+	}
+
+	impl, ok := m.GetUI(ctx).(*uiImpl)
+	if !ok {
+		return false, errors.New("UI does not support recording mode")
+	}
+	return impl.ToggleRecordingMode(ctx)
+}
+
+// ToggleRepaintDebugMode cycles partial-refresh visualization in development builds.
+func (m *Manager) ToggleRepaintDebugMode(ctx context.Context) (string, error) {
+	if !util.IsDev() {
+		return "", errors.New("repaint debug is only available in dev builds")
+	}
+
+	impl, ok := m.GetUI(ctx).(*uiImpl)
+	if !ok {
+		return "", errors.New("UI does not support repaint debug")
+	}
+	return impl.ToggleRepaintDebugMode(ctx)
+}
+
+// called after UI is ready to show, and will execute only once
+func (m *Manager) PostUIReady(ctx context.Context) {
+	logger.Info(ctx, "app is ready to show")
+	if m.isUIReadyHandled {
+		logger.Warn(ctx, "app is already handled ready to show event")
+		return
+	}
+	m.isUIReadyHandled = true
+	if impl, ok := m.ui.(*uiImpl); ok {
+		sessionID := util.GetContextSessionId(ctx)
+		impl.sessionMu.Lock()
+		impl.primarySessionID = sessionID
+		if impl.sessionVisible == nil {
+			impl.sessionVisible = map[string]bool{}
+		}
+		impl.sessionVisible[sessionID] = false
+		impl.sessionMu.Unlock()
+	}
+
+	// Apply auto appearance theme on startup
+	m.applyAutoAppearanceThemeIfNeed(ctx)
+
+	woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+	if !woxSetting.OnboardingFinished.Get() && !util.ShouldSkipOnboardingForTest() {
+		// The first-run guide must win over HideOnStart so every user data
+		// directory gets one skippable setup pass before normal launcher startup.
+		m.ui.OpenOnboardingWindow(ctx)
+		return
+	}
+
+	if !woxSetting.HideOnStart.Get() {
+		m.ui.ShowApp(ctx, common.ShowContext{})
+	}
+}
+
+func (m *Manager) PostOnShow(ctx context.Context) {
+	// Update cached visibility state
+	if impl, ok := m.ui.(*uiImpl); ok {
+		sessionID := util.GetContextSessionId(ctx)
+		impl.sessionMu.Lock()
+		if impl.sessionVisible == nil {
+			impl.sessionVisible = map[string]bool{}
+		}
+		impl.sessionVisible[sessionID] = true
+		isPrimary := sessionID == "" || sessionID == impl.primarySessionID
+		impl.sessionMu.Unlock()
+		if isPrimary {
+			impl.isVisible = true
+			impl.isInSettingView = false
+			impl.isRecordingHotkey = false
+		}
+	}
+
+	analytics.TrackUIOpened(ctx)
+	m.showMainHotkeyToolbarWarning(ctx)
+
+	if m.pendingStartupNotify != nil {
+		msg := *m.pendingStartupNotify
+		playConfetti := msg.Confetti
+		msg.Confetti = false
+		logger.Info(ctx, "showing pending startup notify")
+		m.ui.Notify(ctx, msg)
+		if playConfetti {
+			if err := confettioverlay.Show(); err != nil {
+				logger.Warn(ctx, "show startup confetti: "+err.Error())
+			}
+		}
+		m.pendingStartupNotify = nil
+	}
+}
+
+func (m *Manager) SetStartupNotify(msg common.NotifyMsg) {
+	logger.Info(util.NewTraceContext(), "setting pending startup notify")
+	m.pendingStartupNotify = &msg
+}
+
+func (m *Manager) PostOnQueryBoxFocus(ctx context.Context) {
+	woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+	if woxSetting.SwitchInputMethodABC.Get() {
+		util.GetLogger().Info(ctx, "switch input method to ABC on query box focus")
+		switchErr := ime.SwitchInputMethodABC()
+		if switchErr != nil {
+			logger.Error(ctx, fmt.Sprintf("failed to switch input method to ABC: %s", switchErr.Error()))
+		}
+	}
+}
+
+func (m *Manager) PostOnHide(ctx context.Context) {
+	sessionID := util.GetContextSessionId(ctx)
+	// Update cached visibility state
+	if impl, ok := m.ui.(*uiImpl); ok {
+		impl.sessionMu.Lock()
+		if impl.sessionVisible == nil {
+			impl.sessionVisible = map[string]bool{}
+		}
+		impl.sessionVisible[sessionID] = false
+		isPrimary := sessionID == "" || sessionID == impl.primarySessionID
+		impl.sessionMu.Unlock()
+		if isPrimary {
+			impl.isVisible = impl.isInOnboardingView
+			impl.isInSettingView = false
+			impl.isRecordingHotkey = false
+		}
+	}
+	plugin.GetPluginManager().TrimHiddenSessionQueryCache(ctx, sessionID)
+	m.releaseHiddenCoreMemory(ctx)
+}
+
+// releaseHiddenCoreMemory lets Go return idle heap pages after hide cleanup settles.
+func (m *Manager) releaseHiddenCoreMemory(ctx context.Context) {
+	util.Go(ctx, "release hidden core memory", func() {
+		time.Sleep(10 * time.Second)
+
+		if impl, ok := m.ui.(*uiImpl); ok && impl.hasAnyVisibleSession() {
+			return
+		}
+
+		// Drop process-wide memoization caches and unused SQLite page cache before
+		// returning heap pages so their backing memory is included in the release.
+		fuzzymatch.ReleaseIdleCaches()
+		woxui.ReleaseIdleTextMetricsCache()
+		sqlitememory.ReleaseIdleMemory(ctx)
+		debug.FreeOSMemory()
+
+		// The character table is several megabytes of map buckets and is only
+		// needed while matching Chinese text. Drop it once the launcher has
+		// stayed hidden as long as the renderer trim, then return those pages.
+		time.Sleep(20 * time.Second)
+		if impl, ok := m.ui.(*uiImpl); ok && impl.hasAnyVisibleSession() {
+			return
+		}
+		// Drop prepared search text before the pinyin table. Those indexes hold the
+		// table's syllable slices, so the table cannot be collected while they remain.
+		plugin.GetPluginManager().ReleasePreparedSearchText()
+		// Queries finishing during the first trim may have repopulated pinyin
+		// segments, which hold dictionary slices even after the dictionary drops.
+		fuzzymatch.ReleaseIdleCaches()
+		fuzzymatch.ReleasePinyinDictionary()
+		debug.FreeOSMemory()
+
+		// Native windows release their renderers on an independent 30-second
+		// timer. Let that cleanup finish before asking Windows to decommit LFH
+		// caches; Go's scavenger cannot return these native heap pages.
+		time.Sleep(5 * time.Second)
+		if impl, ok := m.ui.(*uiImpl); ok && impl.hasAnyVisibleSession() {
+			return
+		}
+		// Background indexing and screenshot persistence can refill SQLite after
+		// the first trim. Return those idle pages before decommitting native heaps.
+		sqlitememory.ReleaseIdleMemory(ctx)
+		if err := processmemory.ReleaseIdleNativeHeap(); err != nil {
+			util.GetLogger().Warn(ctx, fmt.Sprintf("release idle native heap: %v", err))
+		}
+	})
+}
+
+func (m *Manager) PostOnSetting(ctx context.Context, isInSettingView bool) {
+	if impl, ok := m.ui.(*uiImpl); ok {
+		impl.isInSettingView = isInSettingView
+		if !isInSettingView {
+			impl.isRecordingHotkey = false
+		}
+		if isInSettingView {
+			// Settings can be opened while the launcher is hidden. Marking the
+			// application visible here keeps backend notification routing in
+			// sync without waiting for launcher-specific onShow.
+			impl.isVisible = true
+			impl.isInOnboardingView = false
+			impl.sessionMu.Lock()
+			if impl.sessionVisible == nil {
+				impl.sessionVisible = map[string]bool{}
+			}
+			impl.sessionVisible[util.GetContextSessionId(ctx)] = true
+			impl.sessionMu.Unlock()
+		}
+	}
+}
+
+// PostOnInstanceDestroyed forgets visibility and query caches owned by a secondary launcher.
+func (m *Manager) PostOnInstanceDestroyed(ctx context.Context) {
+	sessionID := util.GetContextSessionId(ctx)
+	if sessionID == "" {
+		return
+	}
+	if impl, ok := m.ui.(*uiImpl); ok {
+		impl.sessionMu.Lock()
+		delete(impl.sessionVisible, sessionID)
+		impl.sessionMu.Unlock()
+	}
+	plugin.GetPluginManager().ClearSessionState(ctx, sessionID)
+}
+
+func (m *Manager) PostOnOnboarding(ctx context.Context, isInOnboardingView bool) {
+	if impl, ok := m.ui.(*uiImpl); ok {
+		impl.isInOnboardingView = isInOnboardingView
+		if !isInOnboardingView {
+			impl.isRecordingHotkey = false
+			impl.sessionMu.RLock()
+			impl.isVisible = impl.sessionVisible[impl.primarySessionID] || impl.isInSettingView
+			impl.sessionMu.RUnlock()
+		}
+		if isInOnboardingView {
+			impl.isVisible = true
+			impl.isInSettingView = false
+		}
+	}
+}
+
+// PostOnHotkeyRecording tracks recorder focus and starts the Go-side raw
+// recording session used by settings hotkey controls.
+func (m *Manager) PostOnHotkeyRecording(ctx context.Context, isRecording bool, purpose string, allowedKinds []string) (utilhotkey.RecordingCapability, error) {
+	if impl, ok := m.ui.(*uiImpl); ok {
+		impl.isRecordingHotkey = isRecording
+		if isRecording {
+			capability, err := utilhotkey.StartRecordingSession(allowedKinds, func(result utilhotkey.RecordingResult) {
+				m.ui.RecordHotkey(util.NewTraceContext(), result.Hotkey, result.Kind)
+			})
+			logger.Info(ctx, fmt.Sprintf("hotkey recording state changed: %t purpose=%s raw=%t fallback=%v", isRecording, purpose, capability.RawRecorderAvailable, capability.FallbackAllowedKinds))
+			return capability, err
+		} else {
+			utilhotkey.StopRecordingSession()
+		}
+		logger.Info(ctx, fmt.Sprintf("hotkey recording state changed: %t purpose=%s", isRecording, purpose))
+	}
+	return utilhotkey.RecordingCapability{}, nil
+}
+
+func (m *Manager) PostHotkeyRecordingCandidate(ctx context.Context, hotkeyStr string) error {
+	logger.Info(ctx, fmt.Sprintf("received hotkey recording fallback candidate: %s", hotkeyStr))
+	return utilhotkey.SubmitRecordingFallbackCandidate(hotkeyStr)
+}
+
+func (m *Manager) IsSystemTheme(id string) bool {
+	return lo.Contains(m.systemThemeIds, id)
+}
+
+func (m *Manager) IsThemeUpgradable(id string, version string) bool {
+	theme := m.GetThemeById(id)
+	if theme.ThemeId == "" {
+		return false
+	}
+	return plugin.IsVersionUpgradable(theme.Version, version)
+}
+
+func (m *Manager) ShowTray() {
+	m.trayMu.Lock()
+	defer m.trayMu.Unlock()
+	// CreateTray starts another message loop and adds a second icon. Re-applying
+	// ShowTray, including a migration that leaves the icon visible, must not do that.
+	if m.trayVisible {
+		return
+	}
+	m.trayVisible = true
+
+	ctx := util.NewTraceContext()
+	tray.CreateTray(resource.GetAppIcon(), func() {
+		m.GetUI(ctx).ToggleApp(ctx, common.ShowContext{
+			SelectAll: true,
+		})
+	},
+		tray.MenuItem{
+			Title: i18n.GetI18nManager().TranslateWox(ctx, "ui_tray_toggle_app"),
+			Callback: func() {
+				m.GetUI(ctx).ToggleApp(ctx, common.ShowContext{
+					SelectAll: true,
+				})
+			},
+		}, tray.MenuItem{
+			Title: i18n.GetI18nManager().TranslateWox(ctx, "ui_tray_open_setting_window"),
+			Callback: func() {
+				m.GetUI(ctx).OpenSettingWindow(ctx, common.SettingWindowContext{Source: common.SettingWindowSourceTray})
+			},
+		}, tray.MenuItem{
+			Title:           i18n.GetI18nManager().TranslateWox(ctx, "ui_tray_quit"),
+			SeparatorBefore: true,
+			Callback: func() {
+				m.ExitApp(util.NewTraceContext())
+			},
+		})
+
+	m.refreshTrayQueryIcons(ctx)
+}
+
+func (m *Manager) HideTray() {
+	m.trayMu.Lock()
+	defer m.trayMu.Unlock()
+	m.trayVisible = false
+	tray.RemoveTray()
+}
+
+func (m *Manager) PostSettingUpdate(ctx context.Context, key string, value string) {
+	// If the setting key is platform-specific, only apply it if it matches the current platform.
+	// Cloud sync may send settings for other platforms, which should be ignored here.
+	if baseKey, platform, ok := setting.SplitPlatformSettingKey(key); ok {
+		if platform != util.GetCurrentPlatform() {
+			return
+		}
+		key = baseKey
+	}
+
+	var vb bool
+	var vs = value
+	if vb1, err := strconv.ParseBool(vs); err == nil {
+		vb = vb1
+	}
+
+	switch key {
+	case "ShowTray":
+		if vb {
+			m.ShowTray()
+		} else {
+			m.HideTray()
+		}
+	case "MainHotkey":
+		if err := m.RegisterMainHotkey(ctx, vs); err != nil {
+			logger.Error(ctx, fmt.Sprintf("failed to update main hotkey: %s", err.Error()))
+		}
+	case "SelectionHotkey":
+		if err := m.RegisterSelectionHotkey(ctx, vs); err != nil {
+			logger.Error(ctx, fmt.Sprintf("failed to update selection hotkey: %s", err.Error()))
+		}
+	case "LogLevel":
+		if !supervisor.DebugModeEnabled() {
+			util.GetLogger().SetLevel(vs)
+		}
+	case "HttpProxyEnabled", "HttpProxyUrl":
+		setting.GetSettingManager().GetWoxSetting(ctx).ApplyHTTPProxy(ctx)
+	case "QueryHotkeys":
+		woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+		if err := m.registerWoxHotkeys(ctx, corehotkey.WoxConfigFromSetting(woxSetting), false); err != nil {
+			logger.Error(ctx, fmt.Sprintf("failed to update query hotkeys: %s", err.Error()))
+		}
+	case "ResultBindings":
+		woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+		err := m.registerWoxHotkeys(ctx, corehotkey.WoxConfigFromSetting(woxSetting), false)
+		if err == nil {
+			err = m.hotkeyService.ResultBindingRegistrationError()
+		}
+		if err != nil {
+			util.GetLogger().Error(ctx, fmt.Sprintf("failed to update result bindings: %v", err))
+			m.ui.Notify(ctx, common.NotifyMsg{Text: i18n.GetI18nManager().TranslateWox(ctx, "plugin_manager_result_hotkey_registration_failed"), DisplaySeconds: 5})
+		}
+	case "TrayQueries":
+		woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+		if woxSetting.ShowTray.Get() {
+			m.refreshTrayQueryIcons(ctx)
+		}
+	case "LangCode":
+		langCode := vs
+		langErr := i18n.GetI18nManager().UpdateLang(ctx, i18n.LangCode(langCode))
+		if langErr != nil {
+			logger.Error(ctx, fmt.Sprintf("failed to update lang: %s", langErr.Error()))
+		}
+	case "EnableAutostart":
+		enabled := vb
+		err := autostart.SetAutostart(ctx, enabled)
+		if err != nil {
+			logger.Error(ctx, fmt.Sprintf("failed to set autostart: %s", err.Error()))
+		}
+	case "EnableAutoUpdate":
+		// Update checks are disabled.
+		// util.Go(ctx, "check for updates after setting change", func() {
+		// 	updater.CheckForUpdatesWithCallback(ctx, nil)
+		// })
+	case "AIProviders":
+		plugin.GetPluginManager().GetUI().ReloadChatResources(ctx, "models")
+		if chater := plugin.GetPluginManager().GetAIChatPluginChater(ctx); chater != nil {
+			chater.EnsureDefaultModelValid(ctx)
+		}
+	case "AIMCPServers":
+		// Connecting stdio servers (npx/uvx) can download packages and must not block Save.
+		if chater := plugin.GetPluginManager().GetAIChatPluginChater(ctx); chater != nil {
+			util.Go(ctx, "reload MCP servers after setting change", func() {
+				chater.ReloadMCPServers(util.NewTraceContext(), true)
+			})
+		}
+	case "AIDisabledBuiltinTools":
+		ai.SetDisabledBuiltinTools(setting.GetSettingManager().GetWoxSetting(ctx).AIDisabledBuiltinTools.Get())
+		plugin.GetPluginManager().GetUI().ReloadChatResources(ctx, "tools")
+	case "AISkills":
+		if chater := plugin.GetPluginManager().GetAIChatPluginChater(ctx); chater != nil {
+			if err := chater.ReloadSkills(ctx); err != nil {
+				logger.Error(ctx, fmt.Sprintf("failed to reload AI skills: %s", err.Error()))
+			}
+		}
+	}
+}
+
+func (m *Manager) refreshTrayQueryIcons(ctx context.Context) {
+	if !tray.SupportsQueryIcons() {
+		return
+	}
+
+	woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+	queryItems := make([]tray.QueryIconItem, 0, len(woxSetting.TrayQueries.Get()))
+	logger.Debug(ctx, fmt.Sprintf("refresh tray query icons: entries=%d", len(woxSetting.TrayQueries.Get())))
+	settingMenuTitle := i18n.GetI18nManager().TranslateWox(ctx, "ui_tray_edit_query")
+	for trayQueryIndex, trayQuery := range woxSetting.TrayQueries.Get() {
+		if trayQuery.Disabled {
+			continue
+		}
+
+		query := strings.TrimSpace(trayQuery.Query)
+		if query == "" {
+			continue
+		}
+
+		iconBytes := m.toTrayIconBytes(ctx, trayQuery.Icon)
+		logger.Debug(ctx, fmt.Sprintf("prepared tray query icon: index=%d type=%s iconBytes=%d", trayQueryIndex, trayQuery.Icon.ImageType, len(iconBytes)))
+		tooltip := query
+		if len(tooltip) > 80 {
+			tooltip = tooltip[:80]
+		}
+
+		queryItems = append(queryItems, tray.QueryIconItem{
+			Identifier:       fmt.Sprintf("%d", trayQueryIndex),
+			Icon:             iconBytes,
+			Tooltip:          tooltip,
+			ContextMenuTitle: settingMenuTitle,
+			Callback: func(rect tray.ClickRect) {
+				m.executeTrayQuery(util.NewTraceContext(), trayQuery, rect)
+			},
+			ContextMenuCallback: func() {
+				openSettingCtx := util.NewTraceContext()
+				m.GetUI(openSettingCtx).OpenSettingWindow(openSettingCtx, common.SettingWindowContext{
+					Path:   "/general",
+					Param:  fmt.Sprintf("tray_queries:%d", trayQueryIndex),
+					Source: common.SettingWindowSourceTray,
+				})
+			},
+		})
+	}
+
+	tray.SetQueryIcons(queryItems)
+}
+
+func (m *Manager) executeTrayQuery(ctx context.Context, trayQuery setting.TrayQuery, rect tray.ClickRect) {
+	if !tray.SupportsQueryIcons() {
+		return
+	}
+
+	queryCtx := util.WithCoreSessionContext(ctx)
+	queryCtx = util.WithShowSourceContext(queryCtx, string(common.ShowSourceTrayQuery))
+	// ReplaceQueryVariable returns a PlainQuery whose type may be QueryTypeSelection
+	// when {wox:selected_file} was resolved, so we no longer hard-code QueryTypeInput here.
+	plainQuery := plugin.GetPluginManager().ReplaceQueryVariable(queryCtx, trayQuery.Query)
+	plainQuery.QueryId = uuid.NewString()
+
+	// Tray queries create and execute a plugin query in this call stack, so they
+	// need the fully-populated snapshot instead of the launcher fast path.
+	m.RefreshActiveWindowSnapshotBlocking(queryCtx)
+	_, _, err := plugin.GetPluginManager().NewQuery(queryCtx, plainQuery)
+	if err != nil {
+		logger.Error(queryCtx, fmt.Sprintf("failed to create tray query: %s", err.Error()))
+		return
+	}
+
+	windowWidth := m.getTrayQueryWindowWidth(queryCtx, trayQuery)
+	screenRect, displayID := m.getTrayQueryScreenRect(queryCtx, rect)
+	windowHeight := m.getTrayQueryInitialWindowHeight(queryCtx, trayQuery)
+	windowAnchorBottom := m.getTrayQueryWindowAnchorBottom(rect, screenRect)
+	position := m.getTrayQueryWindowPosition(queryCtx, rect, screenRect, windowWidth, windowHeight, windowAnchorBottom)
+	position.DisplayID = displayID
+	var trayAnchor *common.TrayAnchor
+	if util.IsWindows() {
+		trayAnchor = &common.TrayAnchor{
+			WindowX: position.X,
+			Bottom:  windowAnchorBottom,
+			ScreenRect: common.WindowRect{
+				X:      screenRect.X,
+				Y:      screenRect.Y,
+				Width:  screenRect.Width,
+				Height: screenRect.Height,
+			},
+		}
+		logger.Debug(queryCtx, fmt.Sprintf("tray query anchor resolved: windowX=%d bottom=%d screen=(x=%d y=%d w=%d h=%d)", trayAnchor.WindowX, trayAnchor.Bottom, trayAnchor.ScreenRect.X, trayAnchor.ScreenRect.Y, trayAnchor.ScreenRect.Width, trayAnchor.ScreenRect.Height))
+	}
+	m.openSecondaryInstance(queryCtx, "tray-query:"+strings.TrimSpace(trayQuery.Query), plainQuery, common.ShowContext{
+		SelectAll:            false,
+		HideQueryBox:         trayQuery.HideQueryBox,
+		HideToolbar:          trayQuery.HideToolbar,
+		QueryBoxAtBottom:     runtime.GOOS == "windows",
+		HideOnBlur:           true,
+		ShowSource:           common.ShowSourceTrayQuery,
+		WindowPosition:       &position,
+		WindowPositionHeight: windowHeight,
+		TrayAnchor:           trayAnchor,
+		WindowWidth:          windowWidth,
+		MaxResultCount:       trayQuery.MaxResultCount,
+	})
+}
+
+func (m *Manager) getTrayQueryWindowWidth(ctx context.Context, trayQuery setting.TrayQuery) int {
+	woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+	windowWidth := trayQuery.Width
+	if windowWidth <= 0 {
+		windowWidth = woxSetting.AppWidth.Get() / 2
+	}
+	if windowWidth <= 0 {
+		windowWidth = 400
+	}
+	return windowWidth
+}
+
+func (m *Manager) getTrayQueryWindowPosition(ctx context.Context, rect tray.ClickRect, screenRect common.WindowRect, windowWidth int, windowHeight int, windowAnchorBottom int) common.WindowPosition {
+	margin := 8
+	x := screenRect.X + (screenRect.Width-windowWidth)/2
+	y := screenRect.Y + 10
+
+	if rect.Width > 0 && rect.Height > 0 {
+		x = rect.X + (rect.Width-windowWidth)/2
+		if util.IsWindows() {
+			y = windowAnchorBottom - windowHeight
+		} else if util.IsLinux() && tray.SupportsQueryIcons() && rect.Y <= screenRect.Y+screenRect.Height/2 {
+			// Layer-shell already places the window below the panel exclusive zone.
+			// Extra pointer-based margins leave a gap that can steal focus.
+			y = screenRect.Y
+		} else if util.IsLinux() && rect.Y > screenRect.Y+screenRect.Height/2 {
+			// A bottom panel needs the query window above the pointer.
+			y = rect.Y - windowHeight - margin
+		} else {
+			y = rect.Y + rect.Height + margin
+		}
+	} else if util.IsWindows() {
+		y = windowAnchorBottom - windowHeight
+	}
+
+	minX := screenRect.X + 10
+	maxX := screenRect.X + screenRect.Width - windowWidth - 10
+	x = clampInt(x, minX, maxX)
+
+	minY := screenRect.Y + 10
+	if util.IsLinux() && tray.SupportsQueryIcons() {
+		minY = screenRect.Y
+	}
+	maxY := screenRect.Y + screenRect.Height - windowHeight - 10
+	if maxY < minY {
+		maxY = minY
+	}
+	y = clampInt(y, minY, maxY)
+
+	return common.WindowPosition{X: x, Y: y}
+}
+
+func (m *Manager) getTrayQueryWindowAnchorBottom(rect tray.ClickRect, screenRect common.WindowRect) int {
+	margin := 8
+	if rect.Width > 0 && rect.Height > 0 {
+		if util.IsWindows() {
+			return rect.Y - margin
+		}
+		return rect.Y + rect.Height + margin
+	}
+
+	if util.IsWindows() {
+		return screenRect.Y + screenRect.Height - margin
+	}
+
+	return screenRect.Y + 10
+}
+
+func (m *Manager) getTrayQueryInitialWindowHeight(ctx context.Context, trayQuery setting.TrayQuery) int {
+	theme := m.GetCurrentTheme(ctx)
+	// Tray query popups start before UI has measured content, so backend
+	// positioning must use the same density-scaled base heights as the launcher
+	// render path while leaving theme padding untouched.
+	queryBoxHeight := DensityQueryBoxBaseHeight(ctx) + theme.AppPaddingTop + theme.AppPaddingBottom
+	if queryBoxHeight <= 0 {
+		queryBoxHeight = 80
+	}
+
+	if !trayQuery.HideQueryBox {
+		return queryBoxHeight
+	}
+
+	resultItemHeight := DensityResultItemBaseHeight(ctx) + theme.ResultItemPaddingTop + theme.ResultItemPaddingBottom
+	if resultItemHeight <= 0 {
+		resultItemHeight = 50
+	}
+
+	windowHeight := resultItemHeight + theme.AppPaddingBottom
+	if windowHeight <= 0 {
+		windowHeight = resultItemHeight
+	}
+
+	return windowHeight
+}
+
+func (m *Manager) getQueryHotkeyWindowPosition(ctx context.Context, queryHotkey setting.QueryHotkey) (common.WindowPosition, bool) {
+	positionType := queryHotkey.Position
+	if positionType == "" || positionType == setting.QueryHotkeyPositionSystemDefault {
+		return common.WindowPosition{}, false
+	}
+
+	screenSize := screen.GetMouseScreen()
+	windowWidth := m.getResolvedQueryHotkeyWindowWidth(ctx, queryHotkey)
+	maxResultCount := m.getResolvedQueryHotkeyMaxResultCount(ctx, queryHotkey)
+	windowHeight := CalculateMaxWindowHeight(ctx, maxResultCount, !queryHotkey.HideQueryBox, !queryHotkey.HideToolbar)
+	const margin = 20
+
+	left := screenSize.X + margin
+	centerX := screenSize.X + (screenSize.Width-windowWidth)/2
+	right := screenSize.X + screenSize.Width - windowWidth - margin
+	if right < left {
+		right = left
+	}
+
+	top := screenSize.Y + margin
+	centerY := screenSize.Y + (screenSize.Height-windowHeight)/2
+	bottom := screenSize.Y + screenSize.Height - windowHeight - margin
+	if bottom < top {
+		bottom = top
+	}
+
+	x, y, ok := resolveQueryHotkeyWindowPosition(positionType, left, centerX, right, top, centerY, bottom)
+	if !ok {
+		return common.WindowPosition{}, false
+	}
+
+	if util.IsLinux() {
+		logger.Info(ctx, fmt.Sprintf("linux-window-bounds go stage=query-hotkey screen=%d,%d %dx%d windowWidth=%d windowHeight=%d positionType=%s target=%d,%d screenDebug=%s", screenSize.X, screenSize.Y, screenSize.Width, screenSize.Height, windowWidth, windowHeight, positionType, x, y, screen.LastMouseScreenDebug()))
+	}
+
+	return common.WindowPosition{X: x, Y: y, DisplayID: screenSize.DisplayID}, true
+}
+
+// resolveQueryHotkeyWindowPosition maps the nine-grid setting onto precomputed screen anchors.
+func resolveQueryHotkeyWindowPosition(positionType setting.QueryHotkeyPosition, left, centerX, right, top, centerY, bottom int) (int, int, bool) {
+	switch positionType {
+	case setting.QueryHotkeyPositionTopLeft:
+		return left, top, true
+	case setting.QueryHotkeyPositionTopCenter:
+		return centerX, top, true
+	case setting.QueryHotkeyPositionTopRight:
+		return right, top, true
+	case setting.QueryHotkeyPositionMiddleLeft:
+		return left, centerY, true
+	case setting.QueryHotkeyPositionCenter:
+		return centerX, centerY, true
+	case setting.QueryHotkeyPositionMiddleRight:
+		return right, centerY, true
+	case setting.QueryHotkeyPositionBottomLeft:
+		return left, bottom, true
+	case setting.QueryHotkeyPositionBottomCenter:
+		return centerX, bottom, true
+	case setting.QueryHotkeyPositionBottomRight:
+		return right, bottom, true
+	default:
+		return 0, 0, false
+	}
+}
+
+func (m *Manager) getResolvedQueryHotkeyWindowWidth(ctx context.Context, queryHotkey setting.QueryHotkey) int {
+	windowWidth := normalizedWindowWidth(queryHotkey.Width)
+	if windowWidth > 0 {
+		return windowWidth
+	}
+
+	woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+	if woxSetting.AppWidth.Get() > 0 {
+		return woxSetting.AppWidth.Get()
+	}
+
+	return 800
+}
+
+func (m *Manager) getResolvedQueryHotkeyMaxResultCount(ctx context.Context, queryHotkey setting.QueryHotkey) int {
+	maxResultCount := normalizedMaxResultCount(queryHotkey.MaxResultCount)
+	if maxResultCount > 0 {
+		return maxResultCount
+	}
+
+	woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+	if woxSetting.MaxResultCount.Get() > 0 {
+		return woxSetting.MaxResultCount.Get()
+	}
+
+	return 10
+}
+
+func normalizedWindowWidth(windowWidth int) int {
+	if windowWidth < 0 {
+		return 0
+	}
+	return windowWidth
+}
+
+func normalizedMaxResultCount(maxResultCount int) int {
+	if maxResultCount <= 0 {
+		return 0
+	}
+	return clampInt(maxResultCount, 5, 15)
+}
+
+func (m *Manager) getTrayQueryScreenRect(ctx context.Context, rect tray.ClickRect) (common.WindowRect, string) {
+	displays, err := screen.ListDisplays()
+	if err == nil {
+		if display, ok := trayQueryDisplay(rect, displays); ok {
+			area := display.WorkArea
+			return common.WindowRect{X: area.X, Y: area.Y, Width: area.Width, Height: area.Height}, display.ID
+		}
+	}
+
+	if err != nil {
+		logger.Warn(ctx, fmt.Sprintf("failed to get tray query screen rect from display list, fallback to mouse screen: %s", err.Error()))
+	}
+
+	screenSize := screen.GetMouseScreen()
+	return common.WindowRect{
+		X:      screenSize.X,
+		Y:      screenSize.Y,
+		Width:  screenSize.Width,
+		Height: screenSize.Height,
+	}, screenSize.DisplayID
+}
+
+// trayQueryDisplay uses the native tray monitor before considering ambiguous logical coordinates.
+func trayQueryDisplay(rect tray.ClickRect, displays []screen.Display) (screen.Display, bool) {
+	if rect.DisplayID != "" {
+		for _, display := range displays {
+			if display.ID == rect.DisplayID {
+				return display, true
+			}
+		}
+		return screen.Display{}, false
+	}
+	if rect.Width <= 0 || rect.Height <= 0 {
+		return screen.Display{}, false
+	}
+	pointX, pointY := rect.X+rect.Width/2, rect.Y+rect.Height/2
+	for _, display := range displays {
+		area := display.Bounds
+		if area.IsEmpty() {
+			area = display.WorkArea
+		}
+		if pointX >= area.X && pointX < area.Right() && pointY >= area.Y && pointY < area.Bottom() {
+			return display, true
+		}
+	}
+	return screen.Display{}, false
+}
+
+func (m *Manager) toTrayIconBytes(ctx context.Context, icon common.WoxImage) []byte {
+	if icon.IsEmpty() {
+		return resource.GetAppIcon()
+	}
+
+	img, err := icon.ToImageWithoutRemoteFetch()
+	if err != nil {
+		if icon.ImageType == common.WoxImageTypeEmoji {
+			m.warmTrayEmojiIconCache(ctx, icon)
+		}
+		logger.Warn(ctx, fmt.Sprintf("failed to parse tray query icon, fallback to app icon: %s", err.Error()))
+		return resource.GetAppIcon()
+	}
+
+	buf := bytes.NewBuffer(nil)
+	if err := png.Encode(buf, img); err != nil {
+		logger.Warn(ctx, fmt.Sprintf("failed to encode tray query icon, fallback to app icon: %s", err.Error()))
+		return resource.GetAppIcon()
+	}
+
+	if util.IsWindows() {
+		icoBytes, err := wrapPNGAsICO(buf.Bytes(), img.Bounds().Dx(), img.Bounds().Dy())
+		if err != nil {
+			logger.Warn(ctx, fmt.Sprintf("failed to convert tray query icon to ico, fallback to app icon: %s", err.Error()))
+			return resource.GetAppIcon()
+		}
+		return icoBytes
+	}
+
+	return buf.Bytes()
+}
+
+// warmTrayEmojiIconCache keeps tray refresh local-first while still allowing emoji icons to resolve after the Twemoji PNG cache is ready.
+func (m *Manager) warmTrayEmojiIconCache(ctx context.Context, icon common.WoxImage) {
+	warmParentCtx := context.WithoutCancel(ctx)
+	iconKey := icon.String()
+	m.trayEmojiWarmMu.Lock()
+	if m.trayEmojiWarmInFlight == nil {
+		m.trayEmojiWarmInFlight = map[string]struct{}{}
+	}
+	if _, exists := m.trayEmojiWarmInFlight[iconKey]; exists {
+		m.trayEmojiWarmMu.Unlock()
+		return
+	}
+	m.trayEmojiWarmInFlight[iconKey] = struct{}{}
+	m.trayEmojiWarmMu.Unlock()
+
+	util.Go(warmParentCtx, "warm tray query emoji icon cache", func() {
+		defer func() {
+			m.trayEmojiWarmMu.Lock()
+			delete(m.trayEmojiWarmInFlight, iconKey)
+			m.trayEmojiWarmMu.Unlock()
+		}()
+
+		warmCtx, cancel := context.WithTimeout(warmParentCtx, 15*time.Second)
+		defer cancel()
+
+		if _, err := icon.ToImageWithContext(warmCtx); err != nil {
+			logger.Warn(warmParentCtx, fmt.Sprintf("failed to warm tray query emoji icon cache: %s", err.Error()))
+			return
+		}
+
+		if setting.GetSettingManager().GetWoxSetting(warmParentCtx).ShowTray.Get() {
+			logger.Info(warmParentCtx, fmt.Sprintf("warmed tray query emoji icon cache, refreshing tray query icons: %s", icon.ImageData))
+			m.refreshTrayQueryIcons(warmParentCtx)
+		}
+	})
+}
+
+func wrapPNGAsICO(pngData []byte, width int, height int) ([]byte, error) {
+	if len(pngData) == 0 {
+		return nil, fmt.Errorf("empty png data")
+	}
+
+	if width <= 0 || width > 256 {
+		width = 256
+	}
+	if height <= 0 || height > 256 {
+		height = 256
+	}
+
+	widthByte := byte(width)
+	if width == 256 {
+		widthByte = 0
+	}
+	heightByte := byte(height)
+	if height == 256 {
+		heightByte = 0
+	}
+
+	buf := bytes.NewBuffer(nil)
+	_ = binary.Write(buf, binary.LittleEndian, uint16(0)) // reserved
+	_ = binary.Write(buf, binary.LittleEndian, uint16(1)) // icon type
+	_ = binary.Write(buf, binary.LittleEndian, uint16(1)) // image count
+	_ = buf.WriteByte(widthByte)
+	_ = buf.WriteByte(heightByte)
+	_ = buf.WriteByte(0) // color palette count
+	_ = buf.WriteByte(0) // reserved
+	_ = binary.Write(buf, binary.LittleEndian, uint16(1))
+	_ = binary.Write(buf, binary.LittleEndian, uint16(32))
+	_ = binary.Write(buf, binary.LittleEndian, uint32(len(pngData)))
+	_ = binary.Write(buf, binary.LittleEndian, uint32(22)) // ICONDIR(6) + ICONDIRENTRY(16)
+	_, _ = buf.Write(pngData)
+
+	return buf.Bytes(), nil
+}
+
+func clampInt(v int, min int, max int) int {
+	if min > max {
+		return min
+	}
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+// RestartApp starts a supervisor that waits for this process to exit before relaunching.
+// Preserve troubleshooting mode without replaying startup files or deep links.
+func (m *Manager) RestartApp(ctx context.Context) error {
+	args := []string{supervisor.ArgChild}
+	if supervisor.DebugModeEnabled() {
+		args = append(args, supervisor.ArgDebugMode)
+	}
+	if util.IsThirdPartyPluginsDisabled() {
+		args = append(args, util.ArgNoThirdPartyPlugins)
+	}
+	if err := supervisor.GetManager().StartSupervisorDetached(ctx, true, args...); err != nil {
+		return err
+	}
+	m.ExitApp(ctx)
+	return nil
+}
+
+func (m *Manager) ExitApp(ctx context.Context) {
+	m.exitOnce.Do(func() {
+		util.GetLogger().Info(ctx, "start quitting")
+		plugin.GetPluginManager().Stop(ctx)
+		// Hyprland bindings live in the compositor and can launch Wox again after it exits.
+		m.hotkeyService.UnregisterAll(ctx)
+		ai.ResetMCPClients()
+		shell.CloseLifetimeBoundJob()
+		supervisor.GetManager().MarkCleanExit(ctx)
+		util.GetLogger().Info(ctx, "bye~")
+		if err := privacy.StartExitCleanup(setting.GetSettingManager().GetWoxSetting(ctx)); err != nil {
+			util.GetLogger().Error(ctx, fmt.Sprintf("failed to start private mode cleanup: %s", err.Error()))
+		}
+		if err := clipboard.Flush(woxui.Call); err != nil {
+			util.GetLogger().Warn(ctx, err.Error())
+		}
+		os.Exit(0)
+	})
+}
+
+func (m *Manager) GetActiveWindowSnapshot(ctx context.Context) common.ActiveWindowSnapshot {
+	m.activeWindowSnapshotMu.RLock()
+	defer m.activeWindowSnapshotMu.RUnlock()
+	return m.activeWindowSnapshot
+}
+
+// SeedActiveWindowSnapshotForQuery stores a caller-owned source window for the next plugin query.
+// Incrementing the sequence blocks older async detail refreshes from replacing it.
+func (m *Manager) SeedActiveWindowSnapshotForQuery(snapshot common.ActiveWindowSnapshot) {
+	m.activeWindowSnapshotMu.Lock()
+	m.activeWindowSnapshotSeq++
+	m.activeWindowSnapshot = snapshot
+	m.activeWindowSnapshotMu.Unlock()
+}
+
+// RefreshActiveWindowSnapshot updates the cached active window snapshot without
+// blocking launcher activation on expensive per-process details. The hotkey path
+// captures PID, window id, and name before Wox appears; icon and dialog state
+// are filled later so macOS Accessibility probes cannot delay the first frame.
+func (m *Manager) RefreshActiveWindowSnapshot(ctx context.Context) {
+	m.refreshActiveWindowSnapshot(ctx, false)
+}
+
+// RefreshActiveWindowSnapshotBlocking preserves the old fully-populated snapshot
+// semantics for callers that immediately build or execute a plugin query. Those
+// callers would otherwise read a PID-only snapshot before the background detail
+// refresh has completed.
+func (m *Manager) RefreshActiveWindowSnapshotBlocking(ctx context.Context) {
+	m.refreshActiveWindowSnapshot(ctx, true)
+}
+
+func (m *Manager) refreshActiveWindowSnapshot(ctx context.Context, waitForDetails bool) {
+	activeWindowPid := window.GetActiveWindowPid()
+	activeWindowId := window.GetActiveWindowId()
+
+	if activeWindowPid <= 0 {
+		m.activeWindowSnapshotMu.Lock()
+		m.activeWindowSnapshotSeq++
+		m.activeWindowSnapshot = common.ActiveWindowSnapshot{}
+		m.activeWindowSnapshotMu.Unlock()
+		return
+	}
+
+	if m.isUIWindow(activeWindowPid) {
+		return
+	}
+
+	// Name is cheap on every platform (GetWindowText / NSWorkspace). Capture it
+	// with the PID so plugin actions such as "Paste to %s" do not wait for the
+	// async icon/dialog refresh, which can finish after the first clipboard query.
+	activeWindowName := window.GetActiveWindowName()
+	queryVariables := plugin.GetPluginManager().CaptureQueryVariables(ctx)
+
+	m.activeWindowSnapshotMu.Lock()
+	m.activeWindowSnapshotSeq++
+	snapshotSeq := m.activeWindowSnapshotSeq
+	// Keep icon/dialog empty until the background refresh. Mixing a new PID with
+	// a previous window's details produced stale paste targets, and blocking here
+	// made every launcher activation wait for icon and AX dialog probes.
+	m.activeWindowSnapshot = common.ActiveWindowSnapshot{
+		QueryVariables: queryVariables,
+		Pid:            activeWindowPid,
+		WindowId:       activeWindowId,
+		Name:           activeWindowName,
+	}
+	m.activeWindowSnapshotMu.Unlock()
+
+	if waitForDetails {
+		m.refreshActiveWindowSnapshotDetails(activeWindowPid, snapshotSeq)
+		return
+	}
+
+	util.Go(ctx, "refresh active window snapshot details", func() {
+		m.refreshActiveWindowSnapshotDetails(activeWindowPid, snapshotSeq)
+	})
+}
+
+func (m *Manager) refreshActiveWindowSnapshotDetails(activeWindowPid int, snapshotSeq uint64) {
+	activeWindowName := window.GetWindowNameByPid(activeWindowPid)
+	if activeWindowName != "" {
+		m.activeWindowSnapshotMu.Lock()
+		if m.activeWindowSnapshotSeq == snapshotSeq && m.activeWindowSnapshot.Pid == activeWindowPid {
+			m.activeWindowSnapshot.Name = activeWindowName
+		}
+		m.activeWindowSnapshotMu.Unlock()
+	}
+
+	activeWindowIcon := common.WoxImage{}
+	if icon, err := window.GetWindowIconByPid(activeWindowPid); err == nil {
+		if woxIcon, convErr := common.NewWoxImage(icon); convErr == nil {
+			activeWindowIcon = woxIcon
+		}
+	}
+
+	activeWindowIsOpenSaveDialog := false
+	if isDialog, err := window.IsOpenSaveDialogByPid(activeWindowPid); err == nil {
+		activeWindowIsOpenSaveDialog = isDialog
+	}
+	// Folder-only is a stricter subset of open/save; keep false when uncertain.
+	activeWindowIsOpenSaveDialogSelectFolder := false
+	if activeWindowIsOpenSaveDialog {
+		if isSelectFolder, err := window.IsOpenSaveDialogSelectFolderByPid(activeWindowPid); err == nil {
+			activeWindowIsOpenSaveDialogSelectFolder = isSelectFolder
+		}
+	}
+
+	m.activeWindowSnapshotMu.Lock()
+	if m.activeWindowSnapshotSeq != snapshotSeq || m.activeWindowSnapshot.Pid != activeWindowPid {
+		m.activeWindowSnapshotMu.Unlock()
+		return
+	}
+	// GetWindowNameByPid can return empty after Wox takes focus. Keep the name
+	// captured at activation time instead of wiping "Paste to %s" labels.
+	if activeWindowName != "" {
+		m.activeWindowSnapshot.Name = activeWindowName
+	}
+	m.activeWindowSnapshot.Icon = activeWindowIcon
+	m.activeWindowSnapshot.IsOpenSaveDialog = activeWindowIsOpenSaveDialog
+	m.activeWindowSnapshot.IsOpenSaveDialogSelectFolder = activeWindowIsOpenSaveDialogSelectFolder
+	m.activeWindowSnapshotMu.Unlock()
+}
+
+// shouldIgnoreHotkeyTrigger applies foreground restrictions before launcher activation.
+func (m *Manager) shouldIgnoreHotkeyTrigger(ctx context.Context) bool {
+	woxSetting := setting.GetSettingManager().GetWoxSetting(ctx)
+	// Check fullscreen before the Wayland app-identity fallback: compositor backends
+	// can expose fullscreen state even when process identity is unavailable.
+	if woxSetting.IgnoreHotkeysOnFullscreen.Get() && !m.isUIWindow(window.GetActiveWindowPid()) && window.IsActiveWindowFullscreen() {
+		util.GetLogger().Info(ctx, "ignore hotkey trigger for fullscreen foreground window")
+		return true
+	}
+	if util.IsLinuxWaylandSession() {
+		logger.Info(ctx, "skip ignored hotkey app check: active window identity is unavailable on Wayland")
+		return false
+	}
+
+	ignoredApps := woxSetting.IgnoredHotkeyApps.Get()
+	if len(ignoredApps) == 0 {
+		return false
+	}
+
+	activeWindowName := window.GetActiveWindowName()
+	activeWindowPid := window.GetActiveWindowPid()
+	if m.isUIWindow(activeWindowPid) {
+		return false
+	}
+
+	identity := strings.TrimSpace(window.GetProcessIdentity(activeWindowPid))
+	if identity == "" {
+		return false
+	}
+
+	for _, app := range ignoredApps {
+		if strings.EqualFold(strings.TrimSpace(app.Identity), identity) {
+			logger.Info(ctx, fmt.Sprintf("ignore hotkey trigger for app identity=%s name=%s pid=%d", identity, activeWindowName, activeWindowPid))
+			return true
+		}
+	}
+
+	return false
+}
+
+// debounceHyprlandToggle prevents rapid repeat toggle requests (from Hyprland
+// key-repeat or fast double-press) from causing the main instance to receive
+// multiple toggles in quick succession, which can shut it down.
+func (m *Manager) debounceHyprlandToggle() bool {
+	m.hyprlandToggleMu.Lock()
+	defer m.hyprlandToggleMu.Unlock()
+	if time.Since(m.hyprlandToggleLast) < 300*time.Millisecond {
+		return false
+	}
+	m.hyprlandToggleLast = time.Now()
+	return true
+}
+
+// recordHotkeyIfRecording forwards Wox-owned global hotkey presses to the active recorder instead of executing them.
+func (m *Manager) recordHotkeyIfRecording(ctx context.Context, hotkeyStr string) bool {
+	if !m.isHotkeyRecordingActive() {
+		return false
+	}
+
+	logger.Info(ctx, fmt.Sprintf("record registered hotkey while recording: %s", hotkeyStr))
+	util.Go(ctx, "record global hotkey in UI", func() {
+		m.ui.RecordHotkey(ctx, hotkeyStr, utilhotkey.RecordingKindForHotkeyString(hotkeyStr))
+	})
+	return true
+}
+
+// isHotkeyRecordingActive reports whether the shared UI is currently capturing a hotkey.
+func (m *Manager) isHotkeyRecordingActive() bool {
+	if impl, ok := m.ui.(*uiImpl); ok {
+		return impl.isRecordingHotkey && impl.isVisible
+	}
+	return false
+}
+
+func (m *Manager) isUIWindow(activeWindowPid int) bool {
+	return activeWindowPid == os.Getpid()
+}
+
+func (m *Manager) ProcessDeeplink(ctx context.Context, deeplink string) {
+	ctx = util.WithCoreSessionContext(ctx)
+	logger.Info(ctx, fmt.Sprintf("start processing deeplink: %s", deeplink))
+
+	parts := strings.SplitN(deeplink, "?", 2)
+	command := strings.TrimSuffix(strings.TrimPrefix(parts[0], "wox://"), "/")
+
+	arguments := make(map[string]string)
+	if len(parts) == 2 {
+		queryParams := strings.Split(parts[1], "&")
+		for _, param := range queryParams {
+			keyValue := strings.SplitN(param, "=", 2)
+			if len(keyValue) == 2 {
+				key := keyValue[0]
+				value, err := url.QueryUnescape(keyValue[1])
+				if err != nil {
+					util.GetLogger().Error(ctx, fmt.Sprintf("failed to unescape value: %s", err.Error()))
+					continue
+				}
+				arguments[key] = value
+			}
+		}
+	}
+
+	util.GetLogger().Info(ctx, fmt.Sprintf("parsed deeplink => command: %s, arguments: %v", command, arguments))
+
+	if command == "confetti" {
+		if err := confettioverlay.Show(); err != nil {
+			util.GetLogger().Warn(ctx, "show deeplink confetti: "+err.Error())
+		}
+	}
+
+	if command == "query" {
+		query := arguments["q"]
+		if query != "" {
+			m.ui.ChangeQuery(ctx, common.PlainQuery{
+				QueryType: plugin.QueryTypeInput,
+				QueryText: query,
+			})
+			m.ui.ShowApp(ctx, deeplinkQueryShowContext())
+		}
+	}
+
+	// wox://install?path=<url-encoded-file>
+	// Used when the user double-clicks a .wox package or opens one through the
+	// registered file association. Reuse the selection installer instead of
+	// installing silently so the user can confirm install/upgrade/reinstall.
+	if command == "install" {
+		m.showPluginPackageInstaller(ctx, arguments["path"])
+	}
+
+	if command == "toggle" {
+		// Debounce rapid toggle requests from Hyprland key-repeat to prevent
+		// the main instance from receiving multiple toggles in quick succession
+		// (show then immediately hide), which can cause it to exit.
+		if !m.debounceHyprlandToggle() {
+			return
+		}
+		m.ui.ToggleApp(ctx, common.ShowContext{
+			SelectAll: true,
+		})
+	}
+
+	// wox://gnome-hotkey?binding=<url-encoded-binding>
+	// Invoked when a GNOME custom keybinding fires and the secondary wox
+	// process forwards the deeplink to the already-running instance.
+	// The binding parameter is the GNOME key string (e.g. "<Primary><Shift>k"),
+	// URL-decoded by ProcessDeeplink before it reaches here.
+	if command == "gnome-hotkey" {
+		binding := arguments["binding"]
+		if binding != "" {
+			keyboard.InvokeGnomeHotkeyCallback(binding)
+		}
+	}
+
+	// COSMIC custom shortcuts forward through the same single-instance deeplink route.
+	if command == "cosmic-hotkey" {
+		keyboard.InvokeCosmicHotkeyCallback(arguments["binding"])
+	}
+
+	// wox://hyprland-hotkey?key=<url-encoded-key>
+	// Invoked when a Hyprland hl.bind fires and the secondary wox process
+	// forwards the deeplink to the already-running instance. The key is the
+	// Hyprland Lua key string (e.g. "CTRL+K"), URL-decoded by ProcessDeeplink.
+	if command == "hyprland-hotkey" {
+		key := arguments["key"]
+		if key != "" {
+			keyboard.InvokeHyprlandHotkeyCallback(key)
+		}
+	}
+
+	if strings.HasPrefix(command, "billing/") {
+		ui, isUIImpl := m.ui.(*uiImpl)
+		if isUIImpl {
+			ui.FocusSettingWindow(ctx)
+		}
+		if accountService := account.GetService(); accountService != nil {
+			if err := accountService.RefreshAccount(ctx); err != nil {
+				util.GetLogger().Warn(ctx, fmt.Sprintf("failed to refresh account after billing deeplink: %v", err))
+			}
+		}
+		if isUIImpl {
+			ui.RefreshAccountStatus(ctx)
+		}
+	}
+
+	// wox://plugin/{pluginID}?arg1=val1&arg2=val2
+	if strings.HasPrefix(command, "plugin/") {
+		pluginID := strings.TrimPrefix(command, "plugin/")
+		if pluginID != "" {
+			plugin.GetPluginManager().ExecutePluginDeeplink(ctx, pluginID, arguments)
+		}
+	}
+}
+
+// ChangeUserDataDirectory handles changing the user data directory location
+// This includes creating the new directory structure and copying necessary data
+func (m *Manager) ChangeUserDataDirectory(ctx context.Context, newDirectory string) error {
+	location := util.GetLocation()
+	if location.IsPortableUserData() {
+		return fmt.Errorf("portable mode uses the wox-user directory next to the executable")
+	}
+	oldDirectory := location.GetUserDataDirectory()
+
+	// check if new directory is valid
+	if _, err := os.Stat(newDirectory); os.IsNotExist(err) {
+		return fmt.Errorf("new directory is not a valid directory: %s", newDirectory)
+	}
+
+	// Skip if old and new directories are the same
+	if oldDirectory == newDirectory {
+		logger.Info(ctx, "New directory is the same as current directory, skipping")
+		return nil
+	}
+
+	// Expand tilde if present in the path
+	expandedDir, expandErr := homedir.Expand(newDirectory)
+	if expandErr != nil {
+		return fmt.Errorf("failed to expand directory path: %w", expandErr)
+	}
+	newDirectory = expandedDir
+
+	if privacy.IsEnabled() {
+		if err := privacy.ValidateUserDataDirectory(newDirectory); err != nil {
+			return err
+		}
+	}
+
+	logger.Info(ctx, fmt.Sprintf("Changing user data directory from %s to %s", oldDirectory, newDirectory))
+
+	// Create the new directory if it doesn't exist
+	if err := os.MkdirAll(newDirectory, os.ModePerm); err != nil {
+		return fmt.Errorf("failed to create new directory: %w", err)
+	}
+
+	// Copy only necessary directories instead of the entire user data directory
+	// This prevents recursive copying issues when new directory is inside old directory
+	// #4192
+	if oldDirectory != "" && oldDirectory != newDirectory {
+		// Define the directories we need to copy
+		directoriesToCopy := []struct {
+			srcPath string
+			dstPath string
+		}{
+			{
+				srcPath: filepath.Join(oldDirectory, "plugins"),
+				dstPath: filepath.Join(newDirectory, "plugins"),
+			},
+			{
+				srcPath: filepath.Join(oldDirectory, "settings"),
+				dstPath: filepath.Join(newDirectory, "settings"),
+			},
+			{
+				srcPath: filepath.Join(oldDirectory, "themes"),
+				dstPath: filepath.Join(newDirectory, "themes"),
+			},
+		}
+
+		// Copy each directory if it exists
+		for _, dir := range directoriesToCopy {
+			if _, err := os.Stat(dir.srcPath); os.IsNotExist(err) {
+				logger.Info(ctx, fmt.Sprintf("Source directory %s does not exist, skipping", dir.srcPath))
+				continue
+			}
+
+			logger.Info(ctx, fmt.Sprintf("Copying directory from %s to %s", dir.srcPath, dir.dstPath))
+			if err := cp.Copy(dir.srcPath, dir.dstPath); err != nil {
+				return fmt.Errorf("failed to copy directory %s: %w", dir.srcPath, err)
+			}
+		}
+	}
+
+	// Update the shortcut file
+	shortcutPath := location.GetUserDataDirectoryShortcutPath()
+	file, err := os.OpenFile(shortcutPath, os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open shortcut file for writing: %w", err)
+	}
+	defer file.Close()
+
+	_, writeErr := file.WriteString(newDirectory)
+	if writeErr != nil {
+		return fmt.Errorf("failed to write new directory path to shortcut file: %w", writeErr)
+	}
+
+	// Update the location in memory
+	location.UpdateUserDataDirectory(newDirectory)
+
+	logger.Info(ctx, "User data directory successfully changed")
+	return nil
+}
+
+// applyAutoAppearanceThemeIfNeed applies the appropriate theme based on system appearance
+// when the current theme has IsAutoAppearance enabled
+func (m *Manager) applyAutoAppearanceThemeIfNeed(ctx context.Context) {
+	currentTheme := m.GetCurrentTheme(ctx)
+	if !currentTheme.IsAutoAppearance {
+		return
+	}
+
+	var targetThemeId string
+	if m.isSystemDark {
+		targetThemeId = currentTheme.DarkThemeId
+	} else {
+		targetThemeId = currentTheme.LightThemeId
+	}
+
+	if targetThemeId == "" {
+		logger.Warn(ctx, "auto appearance theme is enabled but target theme id is empty")
+		return
+	}
+
+	if targetTheme, ok := m.themes.Load(targetThemeId); ok {
+		logger.Info(ctx, fmt.Sprintf("auto apply theme: %s (isDark=%v)", targetTheme.ThemeName, m.isSystemDark))
+		// Apply the current-platform effective theme without saving to settings, so
+		// auto appearance keeps storing the auto theme ID while the UI receives the
+		// same flattened payload as normal theme changes.
+		if impl, ok := m.ui.(*uiImpl); ok {
+			impl.ChangeThemeWithoutSave(ctx, m.resolvePlatformTheme(ctx, m.ThemeWithAssets(ctx, targetTheme)))
+		}
+	} else {
+		logger.Warn(ctx, fmt.Sprintf("target theme not found: %s", targetThemeId))
+	}
+}

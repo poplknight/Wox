@@ -1,0 +1,1960 @@
+[
+  {
+    "Id": "47b92e1d-fe3a-455f-a70f-c231a3e4c43e",
+    "Name": "Obsidian",
+    "Author": "qianlifeng",
+    "Version": "0.0.6",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "nodejs",
+    "Description": "Wox plugin to manage obsidian vault notes",
+    "IconUrl": "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.Obsidian/main/images/app.png",
+    "Website": "https://github.com/qianlifeng/Wox.Plugin.Obsidian",
+    "DownloadUrl": "https://github.com/qianlifeng/Wox.Plugin.Obsidian/releases/latest/download/wox.plugin.obsidian.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.Obsidian/main/images/screenshot.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2023-08-29 00:00:00",
+    "DateUpdated": "2026-09-01 15:05:17"
+  },
+  {
+    "Id": "bf145a9f-4976-4486-a671-d44eb64c7cd0",
+    "Name": "Sum Selection Numbers",
+    "Author": "Wox-launcher",
+    "Version": "0.0.2",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "nodejs",
+    "Description": "Sum Selection Numbers",
+    "IconUrl": "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Selection.Sum/main/images/app.png",
+    "Website": "https://github.com/Wox-launcher/Wox.Plugin.Selection.Sum",
+    "DownloadUrl": "https://github.com/Wox-launcher/Wox.Plugin.Selection.Sum/releases/latest/download/Wox.Plugin.Selection.Sum.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Selection.Sum/main/assets/snipaste.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2024-02-03 15:49:00",
+    "DateUpdated": "2024-03-02 09:57:37"
+  },
+  {
+    "Id": "09ea2847-929c-440a-aa2c-9b74bcaae69f",
+    "Name": "DeepL translator",
+    "Author": "Wox-launcher",
+    "Version": "0.1.0",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "nodejs",
+    "Description": "DeepL translation plugin for Wox",
+    "IconUrl": "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.DeepL/main/images/app.png",
+    "Website": "https://github.com/Wox-launcher/Wox.Plugin.DeepL",
+    "DownloadUrl": "https://github.com/Wox-launcher/Wox.Plugin.DeepL/releases/latest/download/Wox.Plugin.DeepL.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.DeepL/main/assets/snapshot.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2024-02-23 19:09:00",
+    "DateUpdated": "2026-03-15 15:06:11"
+  },
+  {
+    "Id": "84cb8c8f-1156-489d-a490-6d04fbc85d52",
+    "Name": "Arc",
+    "Author": "Wox-launcher",
+    "Version": "0.0.3",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "nodejs",
+    "Description": "Search arc tabs",
+    "IconUrl": "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Arc/main/images/app.png",
+    "Website": "https://github.com/Wox-launcher/Wox.Plugin.Arc",
+    "DownloadUrl": "https://github.com/Wox-launcher/Wox.Plugin.Arc/releases/latest/download/wox.plugin.arc.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Arc/main/assets/snapshot.png"
+    ],
+    "SupportedOS": [
+      "Darwin"
+    ],
+    "DateCreated": "2024-05-07 13:02:00",
+    "DateUpdated": "2024-05-21 22:51:11"
+  },
+  {
+    "Id": "09ea2847-929c-440a-aa2c-9b74bcaae88f",
+    "Name": "OSX Volume Control",
+    "Author": "lyl",
+    "Version": "0.0.5",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "nodejs",
+    "Description": "OSX Volume Control",
+    "IconUrl": "https://raw.githubusercontent.com/lylwx/Wox.Plugin.OSXVolumeControl/main/images/app.png",
+    "Website": "https://github.com/lylwx/Wox.Plugin.OSXVolumeControl",
+    "DownloadUrl": "https://github.com/lylwx/Wox.Plugin.OSXVolumeControl/releases/latest/download/Wox.Plugin.OSXVolumeControl.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/lylwx/Wox.Plugin.OSXVolumeControl/main/snapshot.jpg"
+    ],
+    "SupportedOS": [
+      "Darwin"
+    ],
+    "DateCreated": "2024-05-21 15:50:00",
+    "DateUpdated": "2025-11-13 16:25:10"
+  },
+  {
+    "Id": "b5f1cd20-c38f-4c5f-8450-fdd066928e98",
+    "Name": "Moodist",
+    "Author": "qianlifeng",
+    "Version": "0.0.1",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "nodejs",
+    "Description": "Ambient sounds for focus and calm. Inspired by https://github.com/remvze/moodist",
+    "IconUrl": "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.Moodist/main/images/app.png",
+    "Website": "https://github.com/qianlifeng/Wox.Plugin.Moodist",
+    "DownloadUrl": "https://github.com/qianlifeng/Wox.Plugin.Moodist/releases/latest/download/Wox.Plugin.Moodist.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.Moodist/main/snipaste.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2024-06-06 23:51:00",
+    "DateUpdated": "2024-06-06 23:51:00"
+  },
+  {
+    "Id": "aeb94d3d-9c39-4917-9cd0-a4cde95433a2",
+    "Name": "Spotify",
+    "Author": "Wox-launcher",
+    "Version": "0.0.3",
+    "MinWoxVersion": "2.0.3",
+    "Runtime": "nodejs",
+    "Description": "Spotify integration",
+    "IconUrl": "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Spotify/main/images/app.png",
+    "Website": "https://github.com/Wox-launcher/Wox.Plugin.Spotify",
+    "DownloadUrl": "https://github.com/Wox-launcher/Wox.Plugin.Spotify/releases/latest/download/Wox.Plugin.Spotify.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Spotify/main/prev.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2024-07-05 15:00:00",
+    "DateUpdated": "2026-10-15 15:05:45"
+  },
+  {
+    "Id": "9575a1fc-d81b-4947-bcce-bd075f118f3e",
+    "Name": "RSS Reader",
+    "Author": "qianlifeng",
+    "Version": "0.0.4",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "nodejs",
+    "Description": "Read RSS feeds",
+    "IconUrl": "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.RSSReader/main/images/app.png",
+    "Website": "https://github.com/qianlifeng/Wox.Plugin.RSSReader",
+    "DownloadUrl": "https://github.com/qianlifeng/Wox.Plugin.RSSReader/releases/latest/download/wox.plugin.rssreader.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.RSSReader/main/prev.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2024-08-07 14:00:00",
+    "DateUpdated": "2026-08-24 15:13:12"
+  },
+  {
+    "Id": "09785021-7f9e-4482-903a-51c90a585a7d",
+    "Name": "Custom Commands",
+    "Author": "Sacha Duvivier",
+    "Version": "1.0.6",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "nodejs",
+    "Description": "Custom Commands Plugin for Wox 2.0",
+    "IconUrl": "https://raw.githubusercontent.com/sachadvr/Wox.Custom.Commands.Plugin/main/images/shell.png",
+    "Website": "https://github.com/sachadvr/Wox.Custom.Commands.Plugin",
+    "DownloadUrl": "https://github.com/sachadvr/Wox.Custom.Commands.Plugin/releases/latest/download/CustomCommands.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/sachadvr/Wox.Custom.Commands.Plugin/main/images/screenshot.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2025-04-17 11:00:00",
+    "DateUpdated": "2025-04-17 23:02:38"
+  },
+  {
+    "Id": "6f920562-1570-4e63-991b-0b39e7d4a2e9",
+    "Name": "每日60秒新闻",
+    "Author": "qianlifeng",
+    "Version": "1.0.2",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "script",
+    "Description": "基于 https://60s.viki.moe/v2/60s 的每日新闻展示",
+    "IconUrl": "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.60s/refs/heads/main/icon.jpeg",
+    "Website": "https://gist.github.com/qianlifeng/419f2198519caeb8fd0b06b76c6bbc9c",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/419f2198519caeb8fd0b06b76c6bbc9c/raw/Wox.Plugin.Script.60s.py",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/26f4c4de-f8fa-49af-8a3e-75ca99ef9a6d"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2025-08-25 21:15:00",
+    "DateUpdated": "2026-08-27 15:39:10"
+  },
+  {
+    "Id": "25cb95b8-af4c-4ccb-82d6-38843a9999c1",
+    "Name": "UUID Generator",
+    "Author": "qianlifeng",
+    "Version": "1.0.0",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "script",
+    "Description": "Generate various types of UUIDs",
+    "IconEmoji": "🆔",
+    "Website": "https://gist.githubusercontent.com/qianlifeng/82a2f748177ce47a900b4c4da3abfd28",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/82a2f748177ce47a900b4c4da3abfd28/raw/Wox.Plugin.Script.UUID",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/4a93ab0f-9496-4b5d-94a8-d8c2b6fb129a"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2025-11-15 23:15:00",
+    "DateUpdated": "2025-11-15 23:15:00"
+  },
+  {
+    "Id": "36fa2371-144c-4f53-98bb-874f77b21849",
+    "Name": "Mole",
+    "Author": "qianlifeng",
+    "Version": "0.0.2",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "python",
+    "Description": "Dig deep like a mole to optimize you Mac",
+    "IconUrl": "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.Mole/main/image/app.png",
+    "Website": "https://github.com/qianlifeng/Wox.Plugin.Mole",
+    "DownloadUrl": "https://github.com/qianlifeng/Wox.Plugin.Mole/releases/latest/download/Wox.Plugin.Mole.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.Mole/main/image/demo.png"
+    ],
+    "SupportedOS": [
+      "Darwin"
+    ],
+    "DateCreated": "2025-11-26 22:15:00",
+    "DateUpdated": "2026-04-27 06:50:15"
+  },
+  {
+    "Id": "d4cf7d41-5cc2-4c21-8ee6-fbd6ca950c6a",
+    "Name": "Recent Files",
+    "Author": "qianlifeng",
+    "Version": "1.0.0",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "script",
+    "Description": "List recently used files",
+    "IconEmoji": "🕘",
+    "Website": "https://gist.github.com/qianlifeng/43e8f545017fddea69e1198468d76776",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/43e8f545017fddea69e1198468d76776/raw/Wox.Plugin.Script.RecentFile.py",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/da42e6f5-470d-41cf-8796-0684209df0c9"
+    ],
+    "SupportedOS": [
+      "windows"
+    ],
+    "DateCreated": "2025-12-12 21:06:00",
+    "DateUpdated": "2025-12-12 21:06:00"
+  },
+  {
+    "Id": "8b8a1b35-3d9e-4d7d-9f2e-3b1d0b7f9e10",
+    "Name": "IP Geolocation",
+    "Author": "qianlifeng",
+    "Version": "1.0.1",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "script",
+    "Description": "Show local/public IPs and query geolocation via ip-api.com",
+    "IconEmoji": "📍",
+    "Website": "https://gist.github.com/qianlifeng/8caa20ae71e0c2ec2c3c787485890668",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/8caa20ae71e0c2ec2c3c787485890668/raw/Wox.Plugin.Script.IPGeolocation.py",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/06dc6d7e-1cb2-41e5-aa1d-d2d1bc42984b",
+      "https://gist.github.com/user-attachments/assets/07958add-c6dd-42d0-bcbe-7108724dcfc8"
+    ],
+    "SupportedOS": [
+      "windows",
+      "darwin",
+      "linux"
+    ],
+    "DateCreated": "2025-12-13 15:12:00",
+    "DateUpdated": "2026-01-08 20:06:18"
+  },
+  {
+    "Id": "9014abc5-7a57-46c4-8961-abf3d8f1b008",
+    "Name": "i18n:plugin_name",
+    "Author": "Wox-launcher",
+    "Version": "0.0.3",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_desc",
+    "IconUrl": "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.ColorPicker/refs/heads/main/images/app.png",
+    "Website": "https://github.com/Wox-launcher/Wox.Plugin.ColorPicker",
+    "DownloadUrl": "https://github.com/wox-launcher/Wox.Plugin.ColorPicker/releases/latest/download/wox.plugin.colorpicker.wox",
+    "ScreenshotUrls": [
+      "https://github.com/Wox-launcher/Wox.Plugin.ColorPicker/raw/main/images/screenshot1.png"
+    ],
+    "SupportedOS": [
+      "windows",
+      "darwin"
+    ],
+    "DateCreated": "2025-12-15 16:47:00",
+    "DateUpdated": "2026-04-29 04:12:17",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "Color Picker",
+        "plugin_desc": "Wox plugin to pick colors"
+      },
+      "zh_CN": {
+        "plugin_name": "取色器",
+        "plugin_desc": "Wox 取色器插件"
+      }
+    }
+  },
+  {
+    "Id": "c6f8712d-18a5-46f2-92e1-603964f4dd00",
+    "Name": "Strava",
+    "Author": "Wox-launcher",
+    "Version": "0.0.1",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "python",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.Strava/refs/heads/main/image/app.png",
+    "Website": "https://github.com/qianlifeng/Wox.Plugin.Strava",
+    "DownloadUrl": "https://github.com/qianlifeng/Wox.Plugin.Strava/releases/latest/download/wox.plugin.strava.wox",
+    "ScreenshotUrls": [
+      "https://github.com/qianlifeng/Wox.Plugin.Strava/raw/main/image/screenshot.png"
+    ],
+    "SupportedOS": [
+      "windows",
+      "darwin",
+      "linux"
+    ],
+    "DateCreated": "2025-12-26 14:47:00",
+    "DateUpdated": "2025-12-26 14:47:00",
+    "I18n": {
+      "en_US": {
+        "plugin_description": "A plugin to interact with Strava workouts"
+      },
+      "zh_CN": {
+        "plugin_description": "一个与 Strava 运动交互的插件"
+      }
+    }
+  },
+  {
+    "Id": "cb491ba6-e73f-4434-922e-738a55f87558",
+    "Name": "i18n:plugin_name",
+    "Author": "Wox-launcher",
+    "Version": "0.0.4",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "python",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://raw.githubusercontent.com/Wox-Launcher/Wox.Plugin.KillProcess/refs/heads/main/image/app.png",
+    "Website": "https://github.com/Wox-Launcher/Wox.Plugin.KillProcess",
+    "DownloadUrl": "https://github.com/Wox-Launcher/Wox.Plugin.KillProcess/releases/latest/download/wox.plugin.killprocess.wox",
+    "ScreenshotUrls": [
+      "https://github.com/Wox-Launcher/Wox.Plugin.KillProcess/raw/main/image/screenshot.png"
+    ],
+    "SupportedOS": [
+      "windows",
+      "darwin",
+      "linux"
+    ],
+    "DateCreated": "2025-12-27 19:55:00",
+    "DateUpdated": "2026-09-16 06:10:08",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "Kill Process",
+        "plugin_description": "Terminate a running process by its name or ID"
+      },
+      "zh_CN": {
+        "plugin_name": "进程杀手",
+        "plugin_description": "通过进程名称或 ID 终止正在运行的进程"
+      }
+    }
+  },
+  {
+    "Id": "407fdbba-bdab-4bc1-aa09-b46e811155a6",
+    "Name": "LocalSend",
+    "Author": "qianlifeng",
+    "Version": "0.1.0",
+    "MinWoxVersion": "2.5.0",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.LocalSend/refs/heads/main/images/app.png",
+    "Website": "https://github.com/qianlifeng/Wox.Plugin.LocalSend",
+    "DownloadUrl": "https://github.com/qianlifeng/Wox.Plugin.LocalSend/releases/latest/download/wox-plugin-localsend.wox",
+    "ScreenshotUrls": [
+      "https://github.com/qianlifeng/Wox.Plugin.LocalSend/raw/main/images/screenshot.png"
+    ],
+    "SupportedOS": [
+      "windows",
+      "darwin",
+      "linux"
+    ],
+    "DateCreated": "2026-01-02 22:40:00",
+    "DateUpdated": "2026-11-01 15:03:09",
+    "I18n": {
+      "en_US": {
+        "plugin_description": "Share files via LocalSend protocol"
+      },
+      "zh_CN": {
+        "plugin_description": "通过 LocalSend 协议共享文件"
+      }
+    }
+  },
+  {
+    "Id": "66c21ce1-f296-49dd-b75b-f05e76743c93",
+    "Name": "Memos",
+    "Author": "qianlifeng",
+    "Version": "0.0.1",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.Memos/refs/heads/main/images/app.png",
+    "Website": "https://github.com/qianlifeng/Wox.Plugin.Memos",
+    "DownloadUrl": "https://github.com/qianlifeng/Wox.Plugin.Memos/releases/latest/download/wox.plugin.memos.wox",
+    "ScreenshotUrls": [
+      "https://github.com/qianlifeng/Wox.Plugin.Memos/raw/main/images/screenshot.png"
+    ],
+    "SupportedOS": [
+      "windows",
+      "darwin",
+      "linux"
+    ],
+    "DateCreated": "2026-01-05 15:40:00",
+    "DateUpdated": "2026-01-05 15:40:00",
+    "I18n": {
+      "en_US": {
+        "plugin_description": "Memos - View list, search, and create memos"
+      },
+      "zh_CN": {
+        "plugin_description": "Memos - 查看列表，搜索和创建备忘录"
+      }
+    }
+  },
+  {
+    "Id": "e201dc19-34fb-4ad8-8829-bfb2b2eb25d0",
+    "Name": "Crypto Portfolio",
+    "Author": "qianlifeng",
+    "Version": "0.0.8",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.CryptoPortfolio/refs/heads/main/images/app.png",
+    "Website": "https://github.com/qianlifeng/Wox.Plugin.CryptoPortfolio",
+    "DownloadUrl": "https://github.com/qianlifeng/Wox.Plugin.CryptoPortfolio/releases/latest/download/Wox.Plugin.CryptoPortfolio.wox",
+    "ScreenshotUrls": [
+      "https://github.com/qianlifeng/Wox.Plugin.CryptoPortfolio/raw/main/images/screenshot.png"
+    ],
+    "SupportedOS": [
+      "windows",
+      "darwin",
+      "linux"
+    ],
+    "DateCreated": "2026-01-09 16:40:00",
+    "DateUpdated": "2026-08-30 09:05:03",
+    "I18n": {
+      "en_US": {
+        "plugin_description": "Track your crypto portfolio"
+      },
+      "zh_CN": {
+        "plugin_description": "追踪你的加密货币投资组合"
+      }
+    }
+  },
+  {
+    "Id": "4da3959b-cb61-43a7-865c-7fde658340fa",
+    "Name": "Currency Converter",
+    "Author": "sanioooook",
+    "Version": "1.0.2",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "nodejs",
+    "Description": "Convert currencies using exchangerate-api.com",
+    "IconUrl": "https://raw.githubusercontent.com/sanioooook/Wox.Plugin.CurrencyConverter/master/images/app.png",
+    "Website": "https://github.com/sanioooook/Wox.Plugin.CurrencyConverter",
+    "DownloadUrl": "https://github.com/sanioooook/Wox.Plugin.CurrencyConverter/releases/latest/download/Wox.Plugin.CurrencyConverter.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/sanioooook/Wox.Plugin.CurrencyConverter/master/assets/snapshot.png",
+      "https://raw.githubusercontent.com/sanioooook/Wox.Plugin.CurrencyConverter/master/assets/snapshot2.png",
+      "https://raw.githubusercontent.com/sanioooook/Wox.Plugin.CurrencyConverter/master/assets/snapshot3.png",
+      "https://raw.githubusercontent.com/sanioooook/Wox.Plugin.CurrencyConverter/master/assets/snapshot4.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-02-27 00:00:00",
+    "DateUpdated": "2026-02-27 12:07:48"
+  },
+  {
+    "Id": "8f8d2954-4ef6-4b0f-ba53-a816fe095acc",
+    "Name": "Iconify",
+    "Author": "Wox-launcher",
+    "Version": "0.1.1",
+    "MinWoxVersion": "2.4.5",
+    "Runtime": "python",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Iconify/master/image/app.png",
+    "Website": "https://github.com/Wox-launcher/Wox.Plugin.Iconify",
+    "DownloadUrl": "https://github.com/Wox-launcher/Wox.Plugin.Iconify/releases/latest/download/Wox.Plugin.Iconify.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Iconify/master/screenshot.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-03-08 15:56:00",
+    "DateUpdated": "2026-10-15 15:05:52",
+    "I18n": {
+      "en_US": {
+        "plugin_description": "Search Iconify icons - Home of open source icon sets"
+      },
+      "zh_CN": {
+        "plugin_description": "搜索 Iconify 图标资源"
+      }
+    }
+  },
+  {
+    "Id": "2f326a0c-cd9f-4ddf-9b45-f8abf082283f",
+    "Name": "i18n:plugin_name",
+    "Author": "Wox-launcher",
+    "Version": "0.6.1",
+    "MinWoxVersion": "2.4.4",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_desc",
+    "IconUrl": "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.AIQuota/master/images/app.svg",
+    "Website": "https://github.com/Wox-launcher/Wox.Plugin.AIQuota",
+    "DownloadUrl": "https://github.com/Wox-launcher/Wox.Plugin.AIQuota/releases/latest/download/Wox.Plugin.AIQuota.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.AIQuota/master/screenshot.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-03-08 15:56:00",
+    "DateUpdated": "2026-10-15 15:05:52",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "AI Quota",
+        "plugin_desc": "Show AI rate limits inside Wox"
+      },
+      "zh_CN": {
+        "plugin_name": "AI额度",
+        "plugin_desc": "在 Wox 中显示 AI 限额用量"
+      }
+    }
+  },
+  {
+    "Id": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+    "Name": "i18n:plugin_name",
+    "Author": "qianlifeng",
+    "Version": "0.0.5",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Projects/main/images/app.svg",
+    "Website": "https://github.com/Wox-launcher/Wox.Plugin.Projects",
+    "DownloadUrl": "https://github.com/Wox-launcher/Wox.Plugin.Projects/releases/latest/download/Wox.Plugin.Projects.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Projects/main/screenshot.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-03-17 21:20:46",
+    "DateUpdated": "2026-06-18 13:05:12",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "Git Projects",
+        "plugin_description": "Quick search and manage local Git projects"
+      },
+      "zh_CN": {
+        "plugin_name": "Git 项目",
+        "plugin_description": "快速搜索和管理本地 Git 项目"
+      }
+    }
+  },
+  {
+    "Id": "6dd42f91-009d-4d14-909c-97f25454eea7",
+    "Name": "i18n:plugin_name",
+    "Author": "qianlifeng",
+    "Version": "0.1.0",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.Awake/main/images/app.svg",
+    "Website": "https://github.com/qianlifeng/Wox.Plugin.Awake",
+    "DownloadUrl": "https://github.com/qianlifeng/Wox.Plugin.Awake/releases/latest/download/wox.plugin.awake.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.Awake/main/screenshot.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-03-18 11:14:02",
+    "DateUpdated": "2026-10-31 15:03:25",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "Awake",
+        "plugin_description": "Keep your computer awake"
+      },
+      "zh_CN": {
+        "plugin_name": "Awake",
+        "plugin_description": "保持电脑唤醒，阻止休眠"
+      }
+    }
+  },
+  {
+    "Id": "c14b9877-d896-462a-9eac-cc9dc7f0d48b",
+    "Name": "WinFocus",
+    "Author": "bonemind",
+    "Version": "0.0.1",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "nodejs",
+    "Description": "A plugin that allow you to focus a window",
+    "IconUrl": "https://raw.githubusercontent.com/Bonemind/Wox.Plugin.WinFocus/main/images/app.svg",
+    "Website": "https://github.com/Bonemind/Wox.Plugin.WinFocus",
+    "DownloadUrl": "https://github.com/Bonemind/Wox.Plugin.WinFocus/releases/latest/download/Wox.Plugin.WinFocus.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/Bonemind/Wox.Plugin.WinFocus/main/images/screenshot.png"
+    ],
+    "SupportedOS": [
+      "Windows"
+    ],
+    "DateCreated": "2026-03-26 00:00:00",
+    "DateUpdated": "2026-03-26 00:00:00"
+  },
+  {
+    "Id": "7487f0be-1afd-49a8-b257-c41459c5afa9",
+    "Name": "Quick Links",
+    "Author": "bonemind",
+    "Version": "0.0.2",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "nodejs",
+    "Description": "Quickly open named URLs in your browser",
+    "IconUrl": "https://raw.githubusercontent.com/Bonemind/Wox.Plugin.QuickLinks/main/images/app.png",
+    "Website": "https://github.com/Bonemind/Wox.Plugin.QuickLinks",
+    "DownloadUrl": "https://github.com/Bonemind/Wox.Plugin.QuickLinks/releases/latest/download/Wox.Plugin.QuickLinks.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/Bonemind/Wox.Plugin.QuickLinks/main/images/screenshot.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Linux",
+      "Darwin"
+    ],
+    "DateCreated": "2026-03-30 00:00:00",
+    "DateUpdated": "2026-04-01 15:27:18"
+  },
+  {
+    "Id": "6987b7b1-89da-41ef-bab3-d1ba2e3daba0",
+    "Name": "Everything",
+    "Author": "qianlifeng",
+    "Version": "0.1.3",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "nodejs",
+    "Description": "Search files with Everything on Windows",
+    "IconUrl": "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.Everything/main/images/app.png",
+    "Website": "https://github.com/qianlifeng/Wox.Plugin.Everything",
+    "DownloadUrl": "https://github.com/qianlifeng/Wox.Plugin.Everything/releases/latest/download/wox.plugin.everything.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.Everything/main/screenshot.png"
+    ],
+    "SupportedOS": [
+      "Windows"
+    ],
+    "DateCreated": "2026-04-22 20:40:30",
+    "DateUpdated": "2026-10-05 08:30:20"
+  },
+  {
+    "Id": "0057ebd4-1a85-4653-8bfa-d51557c0c7a1",
+    "Name": "i18n:plugin_name",
+    "Author": "qianlifeng",
+    "Version": "0.0.2",
+    "MinWoxVersion": "2.4.5",
+    "Runtime": "python",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.Unsplash/main/images/app.png",
+    "Website": "https://github.com/qianlifeng/Wox.Plugin.Unsplash",
+    "DownloadUrl": "https://github.com/qianlifeng/Wox.Plugin.Unsplash/releases/latest/download/wox.plugin.unsplash.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.Unsplash/main/screenshot.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-04-26 15:15:06",
+    "DateUpdated": "2026-10-15 15:05:55",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "Unsplash",
+        "plugin_description": "Search images on Unsplash and set them as wallpaper"
+      },
+      "zh_CN": {
+        "plugin_name": "Unsplash 壁纸",
+        "plugin_description": "搜索 Unsplash 图片并设置为桌面壁纸"
+      }
+    }
+  },
+  {
+    "Id": "263fa95c-db99-4dc8-be68-784b5ae421f8",
+    "Name": "i18n:plugin_name",
+    "Author": "stmluyuer",
+    "Version": "0.1.4",
+    "MinWoxVersion": "2.0.4",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://raw.githubusercontent.com/stmluyuer/Wox.Plugin.LuxTranslate/main/images/app.svg",
+    "Website": "https://github.com/stmluyuer/Wox.Plugin.LuxTranslate",
+    "DownloadUrl": "https://github.com/stmluyuer/Wox.Plugin.LuxTranslate/releases/latest/download/wox.plugin.luxtranslate.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/stmluyuer/Wox.Plugin.LuxTranslate/main/screenshots/query-result.jpg",
+      "https://raw.githubusercontent.com/stmluyuer/Wox.Plugin.LuxTranslate/main/screenshots/multi-provider-result.jpg",
+      "https://raw.githubusercontent.com/stmluyuer/Wox.Plugin.LuxTranslate/main/screenshots/settings-basic.jpg",
+      "https://raw.githubusercontent.com/stmluyuer/Wox.Plugin.LuxTranslate/main/screenshots/settings-llm-table.jpg",
+      "https://raw.githubusercontent.com/stmluyuer/Wox.Plugin.LuxTranslate/main/screenshots/quick-query-tip.jpg"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-04-28 13:05:57",
+    "DateUpdated": "2026-10-19 03:07:15",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "LuxTranslate",
+        "plugin_description": "Translate text in Wox with no-setup providers and large language models"
+      },
+      "zh_CN": {
+        "plugin_name": "LuxTranslate",
+        "plugin_description": "在 Wox 中使用免配置翻译源和大模型翻译文本"
+      }
+    }
+  },
+  {
+    "Id": "76d3be7c-7f4d-4a9d-9f8a-1e8d4c6b5a2f",
+    "Name": "i18n:plugin_name",
+    "Author": "stmluyuer",
+    "Version": "0.1.0",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://raw.githubusercontent.com/stmluyuer/Wox.Plugin.ScreenshotOCR/main/images/app.svg",
+    "Website": "https://github.com/stmluyuer/Wox.Plugin.ScreenshotOCR",
+    "DownloadUrl": "https://github.com/stmluyuer/Wox.Plugin.ScreenshotOCR/releases/latest/download/wox.plugin.screenshotocr.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/stmluyuer/Wox.Plugin.ScreenshotOCR/main/screenshots/command-help.jpg",
+      "https://raw.githubusercontent.com/stmluyuer/Wox.Plugin.ScreenshotOCR/main/screenshots/settings.jpg",
+      "https://raw.githubusercontent.com/stmluyuer/Wox.Plugin.ScreenshotOCR/main/screenshots/model-config.jpg"
+    ],
+    "SupportedOS": [
+      "Windows"
+    ],
+    "DateCreated": "2026-04-28 20:07:14",
+    "DateUpdated": "2026-04-28 20:07:14",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "Screenshot OCR",
+        "plugin_description": "Capture or read images, recognize text with online OCR, and send text to LuxTranslate"
+      },
+      "zh_CN": {
+        "plugin_name": "截图 OCR",
+        "plugin_description": "截图或读取图片，使用在线 OCR 识别文字，并发送给 LuxTranslate 翻译"
+      }
+    }
+  },
+  {
+    "Id": "ea521bb8-4414-44be-bf42-4b2851ae32ad",
+    "Name": "i18n:plugin_name",
+    "Author": "qianlifeng",
+    "Version": "0.0.1",
+    "MinWoxVersion": "2.0.4",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.Rimage/main/images/app.svg",
+    "Website": "https://github.com/qianlifeng/Wox.Plugin.Rimage",
+    "DownloadUrl": "https://github.com/qianlifeng/Wox.Plugin.Rimage/releases/latest/download/wox.plugin.rimage.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.Rimage/main/screenshot.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-05-06 19:48:30",
+    "DateUpdated": "2026-10-15 15:05:57",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "RImage",
+        "plugin_description": "Compress selected images with rimage"
+      },
+      "zh_CN": {
+        "plugin_name": "RImage",
+        "plugin_description": "使用 rimage 压缩选中的图片"
+      }
+    }
+  },
+  {
+    "Id": "94fbbf13-3bd3-4a26-b710-96e8ecda59ac",
+    "Name": "i18n:plugin_name",
+    "Author": "qianlifeng",
+    "Version": "0.0.1",
+    "MinWoxVersion": "2.1.0",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.HotkeyTrigger/main/images/app.png",
+    "Website": "https://github.com/qianlifeng/Wox.Plugin.HotkeyTrigger",
+    "DownloadUrl": "https://github.com/qianlifeng/Wox.Plugin.HotkeyTrigger/releases/latest/download/wox.plugin.hotkeytrigger.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.HotkeyTrigger/main/screenshot.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin"
+    ],
+    "DateCreated": "2026-05-20 21:29:31",
+    "DateUpdated": "2026-05-20 21:29:31",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "HotkeyTrigger",
+        "plugin_description": "Can't remember all your software shortcuts? Query and trigger configured system hotkeys through Wox"
+      },
+      "zh_CN": {
+        "plugin_name": "HotkeyTrigger",
+        "plugin_description": "一堆软件快捷键记不住？通过 Wox 查询并触发已配置的系统快捷键"
+      }
+    }
+  },
+  {
+    "Id": "2662238b-f605-4f99-a90e-e08e1dec2772",
+    "Name": "i18n:plugin_name",
+    "Author": "Wox-Launcher",
+    "Version": "0.0.1",
+    "MinWoxVersion": "2.1.0",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.WorldCup/main/images/app.svg",
+    "Website": "https://github.com/Wox-launcher/Wox.Plugin.WorldCup",
+    "DownloadUrl": "https://github.com/Wox-launcher/Wox.Plugin.WorldCup/releases/latest/download/wox.plugin.worldcup.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.WorldCup/main/screenshot.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-06-12 20:40:00",
+    "DateUpdated": "2026-06-12 20:40:00",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "World Cup",
+        "plugin_description": "See FIFA World Cup 2026 matches, results, and live scores."
+      },
+      "zh_CN": {
+        "plugin_name": "世界杯",
+        "plugin_description": "查看 FIFA 2026 世界杯赛程、赛果和实时比分。"
+      }
+    }
+  },
+  {
+    "Id": "c1d2e3f4-a5b6-7c8d-9e0f-1a2b3c4d5e6f",
+    "Name": "VSCode Projects",
+    "Author": "hopsiedev",
+    "Version": "1.0.1",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "script",
+    "Description": "Quickly create, open and manage your VSCode projects",
+    "IconEmoji": "💻",
+    "Website": "https://github.com/hopsiedev/Wox.Plugin.VSCodeProjects",
+    "DownloadUrl": "https://raw.githubusercontent.com/hopsiedev/Wox.Plugin.VSCodeProjects/main/Wox.Plugin.Script.VSCodeProjects.py",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/hopsiedev/Wox.Plugin.VSCodeProjects/main/preview.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-06-26 00:00:00",
+    "DateUpdated": "2026-06-26 00:00:00"
+  },
+  {
+    "Id": "44f8e41d-afb9-4a66-8fee-30520957790d",
+    "Name": "Project Explorer",
+    "Author": "Sduby22",
+    "Version": "0.0.7",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "nodejs",
+    "Description": "Search and open recently opened projects from VS Code and Zed",
+    "IconUrl": "https://raw.githubusercontent.com/Sduby22/wox-project-explorer/main/images/app.svg",
+    "Website": "https://github.com/Sduby22/wox-project-explorer",
+    "DownloadUrl": "https://github.com/Sduby22/wox-project-explorer/releases/latest/download/wox.plugin.ProjectExplorer.wox",
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-07-25 02:10:59",
+    "DateUpdated": "2026-07-25 21:17:02"
+  },
+  {
+    "Id": "d30c9661-fa55-4ea6-b6f1-bc61e7aa8586",
+    "Name": "need",
+    "Author": "zed",
+    "Version": "0.2.1",
+    "MinWoxVersion": "2.0.4",
+    "Runtime": "nodejs",
+    "Description": "Store and quickly retrieve local key-value notes",
+    "IconEmoji": "📌",
+    "Website": "https://github.com/zzedbot/wox-plugin-need",
+    "DownloadUrl": "https://github.com/zzedbot/wox-plugin-need/releases/latest/download/wox.plugin.need.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/zzedbot/wox-plugin-need/main/screenshots/createkey.png",
+      "https://raw.githubusercontent.com/zzedbot/wox-plugin-need/main/screenshots/searchkey.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-08-28 21:27:52",
+    "DateUpdated": "2026-09-03 09:06:44"
+  },
+  {
+    "Id": "5e693e9d-4683-4982-8929-d4ea5e364c5b",
+    "Name": "i18n:plugin_name",
+    "Author": "zzedbot",
+    "Version": "0.5.0",
+    "MinWoxVersion": "2.0.4",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://raw.githubusercontent.com/zzedbot/wox-plugin-nextcloud-password/main/icon.svg",
+    "Website": "https://github.com/zzedbot/wox-plugin-nextcloud-password",
+    "DownloadUrl": "https://github.com/zzedbot/wox-plugin-nextcloud-password/releases/latest/download/wox.plugin.NextcloudPasswords.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/zzedbot/wox-plugin-nextcloud-password/main/preview.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-08-29 10:22:22",
+    "DateUpdated": "2026-08-29 10:22:22",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "Nextcloud Passwords",
+        "plugin_description": "Search, inspect, copy, and update passwords stored in Nextcloud Passwords"
+      },
+      "zh_CN": {
+        "plugin_name": "Nextcloud 密码",
+        "plugin_description": "搜索、查看、复制和修改 Nextcloud Passwords 中保存的密码"
+      }
+    }
+  },
+  {
+    "Id": "c3e8a1d4-7b2f-4f19-9e6a-2d5c8b1a4f70",
+    "Name": "Timestamp",
+    "Author": "qianlifeng",
+    "Version": "1.0.0",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "script",
+    "Description": "Convert between Unix timestamps and datetime strings",
+    "IconEmoji": "🕗",
+    "Website": "https://gist.github.com/qianlifeng/31363d95905325e9969d93d999e94b07",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/31363d95905325e9969d93d999e94b07/raw/Wox.Plugin.Script.Timestamp.py",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/9fa4ac8e-271b-4893-b213-79e88a66fe02",
+      "https://gist.github.com/user-attachments/assets/a3a38b13-95d5-474a-8068-b90903c910b6"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-08-31 18:54:00",
+    "DateUpdated": "2026-08-31 18:54:00"
+  },
+  {
+    "Id": "c3e8a7d2-4b1f-4e6a-9d2c-8f5a1b0e7c34",
+    "Name": "i18n:plugin_name",
+    "Author": "qianlifeng",
+    "Version": "1.1.0",
+    "MinWoxVersion": "2.4.9",
+    "Runtime": "script",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://avatars.githubusercontent.com/u/16618068?s=128",
+    "Website": "https://gist.github.com/qianlifeng/75ee2660ab0bd347623a752b0f2d4cd9",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/75ee2660ab0bd347623a752b0f2d4cd9/raw/Wox.Plugin.Script.Scoop.py",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/f210a5f3-e97d-42da-a8bd-da708af62c84"
+    ],
+    "SupportedOS": [
+      "Windows"
+    ],
+    "DateCreated": "2026-09-01 22:55:00",
+    "DateUpdated": "2026-11-01 03:04:58",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "Scoop",
+        "plugin_description": "Search and manage Windows apps with Scoop"
+      },
+      "zh_CN": {
+        "plugin_name": "Scoop",
+        "plugin_description": "用 Scoop 搜索和管理 Windows 应用"
+      }
+    }
+  },
+  {
+    "Id": "b8e3d1a4-6c2f-4a9e-8d71-3f5c0a2e9b16",
+    "Name": "i18n:plugin_name",
+    "Author": "qianlifeng",
+    "Version": "1.1.0",
+    "MinWoxVersion": "2.4.8",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.VideoDownloader/main/images/app.svg",
+    "Website": "https://github.com/qianlifeng/Wox.Plugin.VideoDownloader",
+    "DownloadUrl": "https://github.com/qianlifeng/Wox.Plugin.VideoDownloader/releases/latest/download/wox.plugin.videoDownloader.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/qianlifeng/Wox.Plugin.VideoDownloader/main/screenshot.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-09-01 23:00:00",
+    "DateUpdated": "2026-10-28 20:45:39",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "Video Downloader",
+        "plugin_description": "Download videos and audio from 1000+ sites with yt-dlp"
+      },
+      "zh_CN": {
+        "plugin_name": "视频下载",
+        "plugin_description": "用 yt-dlp 从 1000+ 网站下载视频和音频"
+      }
+    }
+  },
+  {
+    "Id": "a7c3e9f2-4b81-4d6e-9f1a-2c8d5e0b7a13",
+    "Name": "i18n:plugin_name",
+    "Author": "qianlifeng",
+    "Version": "1.0.0",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "script",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://news.ycombinator.com/y18.svg",
+    "Website": "https://gist.github.com/qianlifeng/5505503cf2ab741e2073e8bc120fba77",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/5505503cf2ab741e2073e8bc120fba77/raw/Wox.Plugin.Script.HackerNews.py",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/6c4743e5-de71-42aa-9ff8-2916de349a03"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-09-01 23:37:00",
+    "DateUpdated": "2026-09-01 23:37:00",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "Hacker News",
+        "plugin_description": "Browse Hacker News stories and discussions"
+      },
+      "zh_CN": {
+        "plugin_name": "Hacker News",
+        "plugin_description": "浏览 Hacker News 首页、话题和讨论"
+      }
+    }
+  },
+  {
+    "Id": "e6c4a8b1-2f7d-4c19-9a5e-8d3b1f0e6a24",
+    "Name": "i18n:plugin_name",
+    "Author": "qianlifeng",
+    "Version": "1.2.0",
+    "MinWoxVersion": "2.4.2",
+    "Runtime": "python",
+    "Description": "i18n:plugin_description",
+    "IconEmoji": "🚀",
+    "Website": "https://gist.github.com/qianlifeng/dd2735f0aedb12b99c0aa0e226771a8f",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/dd2735f0aedb12b99c0aa0e226771a8f/raw/Wox.Plugin.Speedtest.py",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/b3fb4389-3d9f-4f3d-b87d-a508434b44e0"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-09-02 22:29:00",
+    "DateUpdated": "2026-09-02 22:29:00",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "Speedtest",
+        "plugin_description": "Test internet speed over HTTP download, upload, and ping"
+      },
+      "zh_CN": {
+        "plugin_name": "Speedtest",
+        "plugin_description": "通过 HTTP 下载、上传和延迟测试网速"
+      }
+    }
+  },
+  {
+    "Id": "a7f3b2c1-9d4e-4f6a-8b2c-1e5d9a3f7b24",
+    "Name": "i18n:plugin_name",
+    "Author": "qianlifeng",
+    "Version": "1.0.4",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "script",
+    "Description": "i18n:plugin_description",
+    "IconEmoji": "🔊",
+    "Website": "https://gist.github.com/qianlifeng/bb270f4d9d36053d6750244445e5bfc9",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/bb270f4d9d36053d6750244445e5bfc9/raw/Wox.Plugin.Script.SoundSwitch.py",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/b6b87d42-d712-4e6d-83e4-5f75362028de",
+      "https://gist.github.com/user-attachments/assets/ddabbaed-2bb1-4153-8b7f-7f7e35123a48"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin"
+    ],
+    "DateCreated": "2026-09-02 22:40:00",
+    "DateUpdated": "2026-09-02 22:40:00",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "Sound Switch",
+        "plugin_description": "Switch audio input and output devices quickly"
+      },
+      "zh_CN": {
+        "plugin_name": "声音切换",
+        "plugin_description": "快速切换音频输入和输出设备"
+      }
+    }
+  },
+  {
+    "Id": "a8c4e2b1-6d3f-4a19-9e7c-2b5f0d8a1c63",
+    "Name": "i18n:plugin_name",
+    "Author": "qianlifeng",
+    "Version": "2.2.0",
+    "MinWoxVersion": "2.4.2",
+    "Runtime": "python",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://gist.github.com/user-attachments/assets/ef2e0790-64cc-4d99-9717-3c9e2caace09",
+    "Website": "https://gist.github.com/qianlifeng/ab5524eecdf36a9484265cd94b22f359",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/ab5524eecdf36a9484265cd94b22f359/raw/Wox.Plugin.GifSearch.py",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/6e87dcdd-2a92-4337-9175-61836741dd8b"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-09-02 23:40:00",
+    "DateUpdated": "2026-09-02 23:40:00",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "Gif Search",
+        "plugin_description": "Search animated GIFs from GIPHY and The Finer Gifs Club"
+      },
+      "zh_CN": {
+        "plugin_name": "GIF 搜索",
+        "plugin_description": "从 GIPHY 和 The Finer Gifs Club 搜索 GIF 动图"
+      }
+    }
+  },
+  {
+    "Id": "9d7b4e96-a81d-44a3-a75a-bc828cf5668e",
+    "Name": "i18n:plugin_name",
+    "Author": "Myraxion",
+    "Version": "1.2.0",
+    "MinWoxVersion": "2.4.2",
+    "Runtime": "python",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://raw.githubusercontent.com/Myraxion/Wox.Plugin.Linkding/main/images/app.svg",
+    "Website": "https://github.com/Myraxion/Wox.Plugin.Linkding",
+    "DownloadUrl": "https://github.com/Myraxion/Wox.Plugin.Linkding/releases/latest/download/Wox.Plugin.Linkding.py",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/Myraxion/Wox.Plugin.Linkding/main/images/screenshot.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-09-05 22:20:00",
+    "DateUpdated": "2026-10-21 09:06:57",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "Linkding",
+        "plugin_description": "Search, save, and manage bookmarks from your Linkding instance"
+      },
+      "zh_CN": {
+        "plugin_name": "Linkding",
+        "plugin_description": "在 Linkding 中搜索、保存和管理书签"
+      }
+    }
+  },
+  {
+    "Id": "35E4296B-89E2-492E-977B-0120ECCB5C95",
+    "Name": "i18n:plugin_name",
+    "Author": "Wox-Launcher",
+    "Version": "0.1.3",
+    "MinWoxVersion": "2.4.2",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Github/main/images/app.svg",
+    "Website": "https://github.com/Wox-launcher/Wox.Plugin.Github",
+    "DownloadUrl": "https://github.com/Wox-launcher/Wox.Plugin.Github/releases/latest/download/wox.plugin.github.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Github/main/screenshot.jpg"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-09-06 18:03:00",
+    "DateUpdated": "2026-09-29 21:05:56",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "GitHub",
+        "plugin_description": "Manage GitHub issues and notifications"
+      },
+      "zh_CN": {
+        "plugin_name": "GitHub",
+        "plugin_description": "管理 GitHub 的 issues 和通知"
+      }
+    }
+  },
+  {
+    "Id": "73c73b8b-ef35-4d50-a2ca-e53484cd9561",
+    "Name": "Notion",
+    "Author": "lmgarret",
+    "Version": "1.0.1",
+    "MinWoxVersion": "2.0.4",
+    "Runtime": "nodejs",
+    "Description": "Search Notion pages and databases, jump to recent pages, and quick-capture notes from the launcher",
+    "IconUrl": "https://raw.githubusercontent.com/lmgarret/wox-notion-plugin/main/images/app.svg",
+    "Website": "https://github.com/lmgarret/wox-notion-plugin",
+    "DownloadUrl": "https://github.com/lmgarret/wox-notion-plugin/releases/latest/download/wox-notion-plugin.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/lmgarret/wox-notion-plugin/main/docs/screenshots/search.png",
+      "https://raw.githubusercontent.com/lmgarret/wox-notion-plugin/main/docs/screenshots/quick-capture.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-09-08 12:57:47",
+    "DateUpdated": "2026-09-08 12:57:47"
+  },
+  {
+    "Id": "b7e2c4a1-8f3d-4e91-9c6a-2d5b1a0e8f47",
+    "Name": "i18n:plugin_name",
+    "Author": "qianlifeng",
+    "Version": "1.0.0",
+    "MinWoxVersion": "2.4.2",
+    "Runtime": "python",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://gist.github.com/user-attachments/assets/1906dd58-4caf-45e2-8874-7da532242cca",
+    "Website": "https://gist.github.com/qianlifeng/a46c95ef4bd0e5f782e873260ed72491",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/a46c95ef4bd0e5f782e873260ed72491/raw/Wox.Plugin.LockKeybord.py",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/12eea724-e736-49cc-96ea-0853bda76a02"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-09-09 12:42:00",
+    "DateUpdated": "2026-09-09 12:42:00",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "Lock Keybord",
+        "plugin_description": "Lock the keyboard so you can wipe it without triggering shortcuts"
+      },
+      "zh_CN": {
+        "plugin_name": "锁定键盘",
+        "plugin_description": "锁定键盘，方便擦拭按键且不会误触快捷键"
+      }
+    }
+  },
+  {
+    "Id": "7c3e9a14-6b2d-4f81-9e5a-1d8c4b0f2a67",
+    "Name": "i18n:plugin_name",
+    "Author": "qianlifeng",
+    "Version": "1.0.0",
+    "MinWoxVersion": "2.4.4",
+    "Runtime": "python",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://gist.github.com/user-attachments/assets/343c6c2d-78b5-4f36-8ca9-61f9cd0f6cd2",
+    "Website": "https://gist.github.com/qianlifeng/b27ea5c3cc3f78d2f526c9b481ad9c24",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/b27ea5c3cc3f78d2f526c9b481ad9c24/raw/Wox.Plugin.Droppy.py",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/a65aaf7b-0f59-4301-8484-1a5af63892fd"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-09-14 22:24:09",
+    "DateUpdated": "2026-09-14 22:24:09",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "Droppy",
+        "plugin_description": "A stash box for files. Drop files in, then drag them out later."
+      },
+      "zh_CN": {
+        "plugin_name": "Droppy",
+        "plugin_description": "随时打开的文件盒子：拖进去暂存，再到别处拖出去。"
+      }
+    }
+  },
+  {
+    "Id": "b81045ca-d93b-4866-9e90-8e10b10f2df1",
+    "Name": "Stremio Search",
+    "Author": "NubPlayz",
+    "Version": "1.0.2",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "python",
+    "Description": "Fast local library search & catalog lookup for Stremio",
+    "IconUrl": "https://raw.githubusercontent.com/NubPlayz/Stremio.Search.Wox.Plugin/main/assets/icon.png",
+    "Website": "https://github.com/NubPlayz/Stremio.Search.Wox.Plugin",
+    "DownloadUrl": "https://github.com/NubPlayz/Stremio.Search.Wox.Plugin/releases/download/v1.0.2/Wox.Plugin.StremioSearch-v1.0.2.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/NubPlayz/Stremio.Search.Wox.Plugin/main/images/Stremio_search1.png",
+      "https://raw.githubusercontent.com/NubPlayz/Stremio.Search.Wox.Plugin/main/images/Stremio_search2.png",
+      "https://raw.githubusercontent.com/NubPlayz/Stremio.Search.Wox.Plugin/main/images/Stremio_Search_Actions.png"
+    ],
+    "SupportedOS": [
+      "Windows"
+    ],
+    "DateCreated": "2026-09-16 18:41:00",
+    "DateUpdated": "2026-09-25 19:30:00"
+  },
+  {
+    "Id": "955c78fd-35f4-470c-975c-474e1dc96d5a",
+    "Name": "i18n:plugin_name",
+    "Author": "qianlifeng",
+    "Version": "1.0.1",
+    "MinWoxVersion": "2.4.2",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://gist.github.com/user-attachments/assets/1bb04831-8c37-4c6b-b956-465fa5dfeda7",
+    "Website": "https://gist.github.com/qianlifeng/0a8440a902dad5308dd3465e634a4428",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/0a8440a902dad5308dd3465e634a4428/raw/Wox.Plugin.JsonFormatter.js",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/9437d6d7-44d4-4229-ae9c-9623419de0b5"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-09-20 18:51:04",
+    "DateUpdated": "2026-09-24 03:06:52",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "JSON Formatter",
+        "plugin_description": "Format, minify, and validate JSON from the query, selection, or a file"
+      },
+      "zh_CN": {
+        "plugin_name": "JSON 格式化",
+        "plugin_description": "从查询、选中内容或文件格式化、压缩并校验 JSON"
+      }
+    }
+  },
+  {
+    "Id": "cd22fbe8-af21-47c9-8ead-9484ad5abc2b",
+    "Name": "i18n:plugin_name",
+    "Author": "qianlifeng",
+    "Version": "1.0.0",
+    "MinWoxVersion": "2.4.2",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://gist.github.com/user-attachments/assets/49bfac6b-183c-41b3-8ecc-9b2fee7fd733",
+    "Website": "https://gist.github.com/qianlifeng/8299ba9cd0478ef75a22537b9ffd5353",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/8299ba9cd0478ef75a22537b9ffd5353/raw/Wox.Plugin.RandomDataGenerator.js",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/aa754948-0830-49ce-bb93-e14912ca70e4"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-09-20 22:27:17",
+    "DateUpdated": "2026-09-20 22:27:17",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "Random Data Generator",
+        "plugin_description": "Generate random numbers, UUIDs, passwords, emails, names, colors, and more. Add a count, e.g. random number 10"
+      },
+      "zh_CN": {
+        "plugin_name": "随机数据生成",
+        "plugin_description": "生成随机数字、UUID、密码、邮箱、姓名、颜色等。可指定数量，例如 random number 10"
+      }
+    }
+  },
+  {
+    "Id": "a0d52aa9-0401-492a-aeda-7a64e16ac2e9",
+    "Name": "i18n:plugin_name",
+    "Author": "qianlifeng",
+    "Version": "1.1.0",
+    "MinWoxVersion": "2.4.2",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://gist.github.com/user-attachments/assets/1cf1ba98-0092-4f20-8b40-2e10296060ab",
+    "Website": "https://gist.github.com/qianlifeng/04a9609de66eaa582a473f5852450ede",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/04a9609de66eaa582a473f5852450ede/raw/Wox.Plugin.YouTube.js",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/7502acdc-1ea5-4ef6-a3fb-31875353dabe"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-09-21 10:44:52",
+    "DateUpdated": "2026-09-21 10:44:52",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "YouTube",
+        "plugin_description": "Search YouTube videos and open them in the browser"
+      },
+      "zh_CN": {
+        "plugin_name": "YouTube",
+        "plugin_description": "搜索 YouTube 视频并在浏览器中打开"
+      }
+    }
+  },
+  {
+    "Id": "074ff6c9-50d1-4c26-9583-c6e48b3c48f2",
+    "Name": "i18n:plugin_name",
+    "Author": "qianlifeng",
+    "Version": "1.0.0",
+    "MinWoxVersion": "2.4.2",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://gist.github.com/user-attachments/assets/084b54d6-a803-4765-b9e4-f691a1d02889",
+    "Website": "https://gist.github.com/qianlifeng/a99f529ece21561ff7b73d872e72998c",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/a99f529ece21561ff7b73d872e72998c/raw/Wox.Plugin.Stock.js",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/56afd410-bd8a-4008-bc7b-ef033bd60e5d"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-09-23 22:07:37",
+    "DateUpdated": "2026-10-15 15:06:05",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "Stock",
+        "plugin_description": "Look up A-share, Hong Kong, and US quotes."
+      },
+      "zh_CN": {
+        "plugin_name": "股票",
+        "plugin_description": "查询 A 股、港股和美股报价。"
+      }
+    }
+  },
+  {
+    "Id": "1a1827d1-63ef-463b-8741-1cb2bf0ad10e",
+    "Name": "Stopwatch",
+    "Author": "lmgarret",
+    "Version": "0.1.1",
+    "MinWoxVersion": "2.0.4",
+    "Runtime": "python",
+    "Description": "Stopwatch with laps, live in the launcher",
+    "IconUrl": "https://raw.githubusercontent.com/lmgarret/wox-stopwatch-plugin/main/images/stopwatch.svg",
+    "Website": "https://github.com/lmgarret/wox-stopwatch-plugin",
+    "DownloadUrl": "https://github.com/lmgarret/wox-stopwatch-plugin/releases/latest/download/wox.plugin.stopwatch.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/lmgarret/wox-stopwatch-plugin/main/screenshots/idle.png",
+      "https://raw.githubusercontent.com/lmgarret/wox-stopwatch-plugin/main/screenshots/running.png",
+      "https://raw.githubusercontent.com/lmgarret/wox-stopwatch-plugin/main/screenshots/laps.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-09-23 16:58:10",
+    "DateUpdated": "2026-09-23 16:58:10"
+  },
+  {
+    "Id": "7c1a0e4e-6b2d-4f5a-9c31-2a8e5d0b7f14",
+    "Name": "i18n:plugin_name",
+    "Author": "qianlifeng",
+    "Version": "1.0.0",
+    "MinWoxVersion": "2.4.2",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://gist.github.com/user-attachments/assets/e60a71a3-cf9b-4683-94fd-e22d52258711",
+    "Website": "https://gist.github.com/qianlifeng/25d66a91de168cb7e210f2cf756960c2",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/25d66a91de168cb7e210f2cf756960c2/raw/Wox.Plugin.Weather.js",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/b6fe32c4-3000-4398-89c2-8b2264445bda"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-09-24 09:59:55",
+    "DateUpdated": "2026-09-24 09:59:55",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "Weather",
+        "plugin_description": "Current weather and the next few days from wttr.in."
+      },
+      "zh_CN": {
+        "plugin_name": "天气",
+        "plugin_description": "用 wttr.in 查看当前天气和未来几天。"
+      }
+    }
+  },
+  {
+    "Id": "32457cd4-8e0d-4826-a9f6-1656d7197202",
+    "Name": "i18n:plugin_name",
+    "Author": "qianlifeng",
+    "Version": "1.0.0",
+    "MinWoxVersion": "2.4.5",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://gist.github.com/user-attachments/assets/25301f4a-e242-42e0-9dc0-67db5ba42844",
+    "Website": "https://gist.github.com/qianlifeng/bf1b14e74b6cbecd6fcc8fc6ede94f7f",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/bf1b14e74b6cbecd6fcc8fc6ede94f7f/raw/Wox.Plugin.WordCount.js",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/ab077fd2-f412-43ec-bbbe-8e85d701750b"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-09-24 11:12:59",
+    "DateUpdated": "2026-09-24 11:12:59",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "Word Count",
+        "plugin_description": "Count words and text statistics from a query or selection"
+      },
+      "zh_CN": {
+        "plugin_name": "词数统计",
+        "plugin_description": "统计查询文本或选中文本中的词数及文本信息"
+      }
+    }
+  },
+  {
+    "Id": "c3a91e47-8d2b-4f65-a1c0-6e9b4d7f2a18",
+    "Name": "i18n:plugin_name",
+    "Author": "Wox-Launcher",
+    "Version": "1.1.2",
+    "MinWoxVersion": "2.4.5",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Games/refs/heads/main/images/app.svg",
+    "Website": "https://github.com/Wox-launcher/Wox.Plugin.Games",
+    "DownloadUrl": "https://github.com/Wox-launcher/Wox.Plugin.Games/releases/latest/download/wox.plugin.games.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Games/refs/heads/main/screenshot.png"
+    ],
+    "SupportedOS": [
+      "Windows"
+    ],
+    "DateCreated": "2026-09-27 18:21:26",
+    "DateUpdated": "2026-10-04 08:01:06",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "Games",
+        "plugin_description": "Search installed games from Steam, Epic, GOG, Ubisoft Connect, EA, Battle.net, Xbox, and itch.io."
+      },
+      "zh_CN": {
+        "plugin_name": "游戏",
+        "plugin_description": "搜索 Steam、Epic、GOG、Ubisoft Connect、EA、Battle.net、Xbox 和 itch.io 里已安装的游戏。"
+      }
+    }
+  },
+  {
+    "Id": "9d778a44-0185-4cd5-81eb-b7b019fd7c3f",
+    "Name": "IMDB",
+    "Author": "qianlifeng",
+    "Version": "1.2.0",
+    "MinWoxVersion": "2.4.5",
+    "Runtime": "nodejs",
+    "Description": "Search TMDB movies and TV, with posters and ratings",
+    "IconUrl": "https://gist.github.com/user-attachments/assets/f8f74160-0bcf-4e73-9615-221bbb0dd861",
+    "Website": "https://gist.github.com/qianlifeng/dc6511115bdde92b3976369c4b675ebe",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/dc6511115bdde92b3976369c4b675ebe/raw/Wox.Plugin.IMDB.js",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/7ff063ae-da80-4c8d-8c45-5e48305fe2d1"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-09-30 20:31:39",
+    "DateUpdated": "2026-09-30 20:31:39"
+  },
+  {
+    "Id": "c4a8e2b7-1d63-4f90-8a55-6e0b9d3c7f21",
+    "Name": "i18n:plugin_name",
+    "Author": "qianlifeng",
+    "Version": "1.0.0",
+    "MinWoxVersion": "2.4.5",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://gist.github.com/user-attachments/assets/8836a961-14d0-4fb8-997c-35a99bd7c64a",
+    "Website": "https://gist.github.com/qianlifeng/db55c71d2bef5359af515f309be4d23d",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/db55c71d2bef5359af515f309be4d23d/raw/Wox.Plugin.ClashVerge.js",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/cb83c7a4-73de-4149-9ab9-23f854b7b4eb"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Darwin",
+      "Linux"
+    ],
+    "DateCreated": "2026-10-05 17:43:15",
+    "DateUpdated": "2026-10-05 17:43:15",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "Clash Verge",
+        "plugin_description": "Show the local Clash Verge core and switch proxy nodes."
+      },
+      "zh_CN": {
+        "plugin_name": "Clash Verge",
+        "plugin_description": "查看本机 Clash Verge 运行状态，并切换代理节点。"
+      }
+    }
+  },
+  {
+    "Id": "ad468a1d-fdb5-4fb0-88a9-d6778bb11d96",
+    "Name": "Wox.Plugin.Manasikāra",
+    "Author": "Archetype444",
+    "Version": "2.0.1",
+    "MinWoxVersion": "2.4.5",
+    "Runtime": "nodejs",
+    "Description": "Continuous focus and deep focus, three Pomodoro variants, meditation and countdown timers with configurable singing-bowl chimes and activity prompts.",
+    "IconUrl": "https://raw.githubusercontent.com/Archetype444/Wox.Plugin.Manasikara/main/assets/icon.svg",
+    "Website": "https://github.com/Archetype444/Wox.Plugin.Manasikara",
+    "DownloadUrl": "https://github.com/Archetype444/Wox.Plugin.Manasikara/releases/download/v2.0.1/Manasikara-v2.0.1.wox",
+    "SupportedOS": [
+      "Windows",
+      "Linux",
+      "Darwin"
+    ],
+    "DateCreated": "2026-10-11 18:38:36",
+    "DateUpdated": "2026-10-11 18:38:36",
+    "ScreenshotUrls": [
+      "https://github.com/user-attachments/assets/f70a5376-fb4e-40b5-bb34-d14d56f211c9",
+      "https://github.com/user-attachments/assets/5deec5d6-1a29-4816-a96e-7e96e67a51e9",
+      "https://github.com/user-attachments/assets/77ac4d4e-692c-44e2-bd92-7e70145fa3e4",
+      "https://github.com/user-attachments/assets/edfa8e00-5d80-44df-a662-e9c4bd6be299",
+      "https://github.com/user-attachments/assets/c2f5aeef-1310-4496-b82c-87e56f7aab03"
+    ]
+  },
+  {
+    "Id": "44ebc063-a997-473b-a70e-885fa28170ee",
+    "Name": "Nbnhhsh",
+    "Author": "dragonish",
+    "Version": "1.2.0",
+    "MinWoxVersion": "2.0.4",
+    "Runtime": "python",
+    "Description": "「能不能好好说话？」拼音首字母缩写翻译工具",
+    "IconUrl": "https://raw.githubusercontent.com/dragonish/Wox.Plugin.Nbnhhsh/main/images/icon.png",
+    "Website": "https://github.com/dragonish/Wox.Plugin.Nbnhhsh",
+    "DownloadUrl": "https://github.com/dragonish/Wox.Plugin.Nbnhhsh/releases/latest/download/wox.plugin.nbnhhsh.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/dragonish/Wox.Plugin.Nbnhhsh/main/assets/preview.jpg"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Linux",
+      "Darwin"
+    ],
+    "DateCreated": "2026-10-13 21:19:11",
+    "DateUpdated": "2026-10-24 00:13:15"
+  },
+  {
+    "Id": "1ed04e7b-5a94-481e-ac27-74c11e34ec63",
+    "Name": "PowerToys",
+    "Author": "dragonish",
+    "Version": "1.1.0",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "python",
+    "Description": "i18n:plugin_desc",
+    "IconUrl": "https://raw.githubusercontent.com/dragonish/Wox.Plugin.PowerToys/make/images/powertoys.png",
+    "Website": "https://github.com/dragonish/Wox.Plugin.PowerToys",
+    "DownloadUrl": "https://github.com/dragonish/Wox.Plugin.PowerToys/releases/latest/download/wox.plugin.powertoys.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/dragonish/Wox.Plugin.PowerToys/make/assets/screenshot.jpg"
+    ],
+    "SupportedOS": [
+      "Windows"
+    ],
+    "DateCreated": "2026-10-13 23:35:27",
+    "DateUpdated": "2026-10-21 15:05:56",
+    "I18n": {
+      "en_US": {
+        "plugin_desc": "Allows the user to launch some PowerToys from Wox."
+      },
+      "zh_CN": {
+        "plugin_desc": "允许用户从 Wox 启动某些 PowerToys 程序。"
+      }
+    }
+  },
+  {
+    "Id": "84a696e0-e250-4cf4-b9cc-e45115bb4119",
+    "Name": "QRCode",
+    "Author": "dragonish",
+    "Version": "1.2.0",
+    "MinWoxVersion": "2.4.5",
+    "Runtime": "python",
+    "Description": "i18n:plugin_desc",
+    "IconUrl": "https://raw.githubusercontent.com/dragonish/Wox.Plugin.QRCode/main/images/app.svg",
+    "Website": "https://github.com/dragonish/Wox.Plugin.QRCode",
+    "DownloadUrl": "https://github.com/dragonish/Wox.Plugin.QRCode/releases/latest/download/wox.plugin.qrcode.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/dragonish/Wox.Plugin.QRCode/main/assets/screenshot.jpg"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Linux",
+      "Darwin"
+    ],
+    "DateCreated": "2026-10-14 20:40:31",
+    "DateUpdated": "2026-10-15 12:08:39",
+    "I18n": {
+      "en_US": {
+        "plugin_desc": "Generate a QR Code / Screenshot to scan and recognize the QR Code."
+      },
+      "zh_CN": {
+        "plugin_desc": "生成二维码 / 截图识别二维码。"
+      }
+    }
+  },
+  {
+    "Id": "24fe7e7c-60c7-4b57-82e7-f30e6a29e040",
+    "Name": "i18n:plugin_name",
+    "Author": "dragonish",
+    "Version": "1.0.0",
+    "MinWoxVersion": "2.0.0",
+    "Runtime": "python",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://raw.githubusercontent.com/dragonish/Wox.Plugin.PortGenerator/main/images/app.svg",
+    "Website": "https://github.com/dragonish/Wox.Plugin.PortGenerator",
+    "DownloadUrl": "https://github.com/dragonish/Wox.Plugin.PortGenerator/releases/latest/download/wox.plugin.portgenerator.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/dragonish/Wox.Plugin.PortGenerator/main/assets/screenshot.jpg"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Linux",
+      "Darwin"
+    ],
+    "DateCreated": "2026-10-15 22:44:32",
+    "DateUpdated": "2026-10-15 22:44:32",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "PortGenerator",
+        "plugin_description": "Check port usage / Generate random ports."
+      },
+      "zh_CN": {
+        "plugin_name": "端口生成器",
+        "plugin_description": "检查端口占用 / 生成随机可用端口。"
+      }
+    }
+  },
+  {
+    "Id": "242ec423-0ac0-47d9-8c93-e72c4d509eb2",
+    "Name": "i18n:plugin_name",
+    "Author": "dragonish",
+    "Version": "1.0.2",
+    "MinWoxVersion": "2.4.8",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_description",
+    "IconUrl": "https://raw.githubusercontent.com/dragonish/Wox.Plugin.ASCIIArtGenerator/main/images/app.svg",
+    "Website": "https://github.com/dragonish/Wox.Plugin.ASCIIArtGenerator",
+    "DownloadUrl": "https://github.com/dragonish/Wox.Plugin.ASCIIArtGenerator/releases/latest/download/wox.plugin.asciiartgenerator.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/dragonish/Wox.Plugin.ASCIIArtGenerator/main/assets/render.jpg",
+      "https://raw.githubusercontent.com/dragonish/Wox.Plugin.ASCIIArtGenerator/main/assets/fonts.jpg",
+      "https://raw.githubusercontent.com/dragonish/Wox.Plugin.ASCIIArtGenerator/main/assets/3d.jpg"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Linux",
+      "Darwin"
+    ],
+    "DateCreated": "2026-10-21 19:59:21",
+    "DateUpdated": "2026-10-25 15:04:49",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "ASCII Art Generator",
+        "plugin_description": "Generate ASCII art strings."
+      },
+      "zh_CN": {
+        "plugin_name": "ASCII 艺术字生成器",
+        "plugin_description": "生成 ASCII 艺术字符串。"
+      }
+    }
+  },
+  {
+    "Id": "9f479da0-2c9f-412c-80f1-02f2bdc10263",
+    "Name": "i18n:plugin_name",
+    "Author": "dragonish",
+    "Version": "1.1.0",
+    "MinWoxVersion": "2.4.8",
+    "Runtime": "nodejs",
+    "Description": "i18n:plugin_desc",
+    "IconUrl": "https://raw.githubusercontent.com/dragonish/Wox.Plugin.Kaomoji/main/images/app.svg",
+    "Website": "https://github.com/dragonish/Wox.Plugin.Kaomoji",
+    "DownloadUrl": "https://github.com/dragonish/Wox.Plugin.Kaomoji/releases/latest/download/wox.plugin.kaomoji.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/dragonish/Wox.Plugin.Kaomoji/main/assets/screenshot.jpg"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Linux",
+      "Darwin"
+    ],
+    "DateCreated": "2026-10-22 21:03:56",
+    "DateUpdated": "2026-10-25 15:04:49",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "Kaomoji",
+        "plugin_desc": "Search and copy kaomoji."
+      },
+      "ja_JP": {
+        "plugin_name": "顔文字",
+        "plugin_desc": "顔文字を検索してコピーします。"
+      },
+      "zh_CN": {
+        "plugin_name": "颜文字",
+        "plugin_desc": "搜索并复制颜文字。"
+      }
+    }
+  },
+  {
+    "Id": "c2d3f97d-ff20-4e27-8813-54f2c2192c6d",
+    "Name": "Asyntai AI Chatbot",
+    "Author": "Asyntai",
+    "Version": "1.0.0",
+    "MinWoxVersion": "2.4.2",
+    "Runtime": "python",
+    "Description": "Read your website chats, leads and tickets, and ask your Asyntai AI chatbot, right from Wox.",
+    "IconUrl": "https://raw.githubusercontent.com/asyntai/Wox.Plugin.AsyntaiAIChatbot/main/images/app.svg",
+    "Website": "https://asyntai.com/documentation/integrations/wox/",
+    "DownloadUrl": "https://github.com/asyntai/Wox.Plugin.AsyntaiAIChatbot/releases/latest/download/Wox.Plugin.AsyntaiAIChatbot.py",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/asyntai/Wox.Plugin.AsyntaiAIChatbot/main/images/screenshot-transcript.png",
+      "https://raw.githubusercontent.com/asyntai/Wox.Plugin.AsyntaiAIChatbot/main/images/screenshot-chats.png",
+      "https://raw.githubusercontent.com/asyntai/Wox.Plugin.AsyntaiAIChatbot/main/images/screenshot-menu.png"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Linux",
+      "Darwin"
+    ],
+    "DateCreated": "2026-10-25 15:43:51",
+    "DateUpdated": "2026-10-25 15:43:51"
+  },
+  {
+    "Id": "ef529aa0-1288-4a8c-b061-b98389491b4e",
+    "Name": "i18n:plugin_name",
+    "Author": "wuweixing",
+    "Version": "0.3.0",
+    "MinWoxVersion": "2.4.2",
+    "Runtime": "nodejs",
+    "Description": "Query and copy TOTP codes, local storage, supports otpauth:// URIs",
+    "I18n": {
+      "en_US": {
+        "plugin_name": "TOTP Codes",
+        "plugin_desc": "Query and copy TOTP codes, local storage, supports otpauth:// URIs"
+      },
+      "zh_CN": {
+        "plugin_name": "TOTP Codes",
+        "plugin_desc": "TOTP 验证码查询/复制，本地存储，支持 otpauth:// 添加"
+      }
+    },
+    "IconUrl": "https://raw.githubusercontent.com/sqlwwx/Wox.Plugin.Totp/master/images/icon.svg",
+    "Website": "https://github.com/sqlwwx/Wox.Plugin.Totp",
+    "DownloadUrl": "https://github.com/sqlwwx/Wox.Plugin.Totp/releases/latest/download/Wox.Plugin.Totp.wox",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/sqlwwx/Wox.Plugin.Totp/master/images/screenshot1.jpg"
+    ],
+    "SupportedOS": [
+      "Windows",
+      "Linux",
+      "Darwin"
+    ],
+    "DateCreated": "2026-10-26 17:12:00",
+    "DateUpdated": "2026-10-26 17:12:00"
+  },
+  {
+    "Id": "c5dfb872-03a5-413a-96e3-438339e4d238",
+    "Name": "Window Pin",
+    "Author": "qianlifeng",
+    "Version": "1.0.2",
+    "MinWoxVersion": "2.4.7",
+    "Runtime": "nodejs",
+    "Description": "Keep Windows applications above other windows",
+    "IconUrl": "https://gist.github.com/user-attachments/assets/4a596b22-ac4d-4caf-9b92-5181bf895e82",
+    "Website": "https://gist.github.com/qianlifeng/03c57db33077eda40b352dc6aa67c039",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/03c57db33077eda40b352dc6aa67c039/raw/Wox.Plugin.WindowPin.js",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/0db10cf1-18f5-46e1-a05f-337df6ec1539"
+    ],
+    "SupportedOS": [
+      "Windows"
+    ],
+    "DateCreated": "2026-10-29 19:02:24",
+    "DateUpdated": "2026-10-29 22:38:13"
+  }
+]

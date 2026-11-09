@@ -1,0 +1,2365 @@
+package screenshot
+
+import (
+	"bytes"
+	"image"
+	"image/color"
+	"image/draw"
+	"image/png"
+	"math"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"testing"
+	"wox/common"
+	"wox/common/icons"
+
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+)
+
+// screenshotTestSurface supplies nonzero font metrics without opening a native window.
+type screenshotTestSurface struct{ *Window }
+
+func (*screenshotTestSurface) MeasureText(text string, style TextStyle) (woxui.TextMetrics, error) {
+	return woxui.TextMetrics{Size: Size{Width: float32(len([]rune(text))) * style.Size / 2, Height: style.Size + 6}}, nil
+}
+
+// TestScreenshotSizeLabelLock keeps the glyph and dimensions centered together at each display scale.
+func TestScreenshotSizeLabelLock(t *testing.T) {
+	surface := &screenshotTestSurface{}
+	for _, scale := range []float32{1, 1.25, 1.5, 2.5} {
+		label := "1725 x 1424"
+		frame := Size{Width: 1600, Height: 1000}
+		selection := Rect{X: 1500, Y: 300, Width: 100, Height: 100}
+		unlocked := screenshotEditorSizeLabelRect(surface, label, selection, Rect{}, frame, scale, false)
+		chip := screenshotEditorSizeLabelRect(surface, label, selection, Rect{}, frame, scale, true)
+		if chip.Width != unlocked.Width+20*scale || chip.X+chip.Width > frame.Width {
+			t.Fatalf("scale %v: locked chip does not fit: %+v", scale, chip)
+		}
+		actual := &DisplayList{}
+		drawScreenshotEditorSizeLabel(actual, surface, label, selection, Rect{}, frame, scale, true)
+		style := TextStyle{Size: 14 * scale, Weight: FontWeightSemibold}
+		metrics, _ := surface.MeasureText(label, style)
+		start := chip.X + (chip.Width-20*scale-metrics.Size.Width)/2
+		expected := &DisplayList{}
+		expected.FillRoundedRect(chip, 10*scale, Color{R: 23, G: 23, B: 23, A: 255})
+		drawScreenshotEditorToolbarIconSized(expected, icons.ControlLink, Rect{X: start, Y: chip.Y + (chip.Height-14*scale)/2, Width: 14 * scale, Height: 14 * scale}, Color{R: 255, G: 255, B: 255, A: 255}, scale, 14)
+		expected.DrawText(label, Rect{X: start + 20*scale, Y: chip.Y + (chip.Height-metrics.Size.Height)/2, Width: metrics.Size.Width, Height: metrics.Size.Height}, style, Color{R: 255, G: 255, B: 255, A: 255})
+		if err := actual.Compare(expected); err != nil {
+			t.Fatalf("scale %v: locked size label: %v", scale, err)
+		}
+	}
+}
+
+// TestScreenshotSizeLabelLockHitArea follows the applied lock and makes the added icon area clickable.
+func TestScreenshotSizeLabelLockHitArea(t *testing.T) {
+	state := &screenshotEditorOverlayState{
+		image: testScreenshotImage(t, 1200, 800), frameSize: Size{Width: 1200, Height: 800},
+		selection: Rect{X: 200, Y: 200, Width: 300, Height: 200}, hasSelection: true,
+	}
+	frame := FrameInfo{Size: state.frameSize}
+	state.draw(&DisplayList{}, frame)
+	unlocked := state.sizeLabelRect
+	state.openSizeDialog()
+	dialog := state.activeSizeDialog()
+	dialog.setRatioLocked(true)
+	dialog.apply()
+	state.draw(&DisplayList{}, frame)
+	locked := state.sizeLabelRect
+	if locked.Width <= unlocked.Width || locked.X != unlocked.X {
+		t.Fatalf("locked hit area = %+v, unlocked = %+v", locked, unlocked)
+	}
+	point := Point{X: locked.X + locked.Width - 1, Y: locked.Y + locked.Height/2}
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: point})
+	if state.activeSizeDialog() == nil {
+		t.Fatal("added chip area did not open the size dialog")
+	}
+}
+
+// screenshotTooltipTestSurface models glyphs wider and taller than the editor's character estimates.
+type screenshotTooltipTestSurface struct{ *Window }
+
+func (*screenshotTooltipTestSurface) MeasureText(text string, style TextStyle) (woxui.TextMetrics, error) {
+	return woxui.TextMetrics{Size: Size{Width: float32(len([]rune(text))) * style.Size * 1.1, Height: style.Size * 1.7}}, nil
+}
+
+// TestScreenshotSizeLabelCentersOpaqueChrome covers the stateless widget path at fractional DPI scales.
+func TestScreenshotSizeLabelCentersOpaqueChrome(t *testing.T) {
+	surface := &screenshotTestSurface{}
+	for _, scale := range []float32{1, 1.25, 1.5, 2.5} {
+		label := "1814 x 1280"
+		selection, frame := Rect{X: 200, Y: 300, Width: 400, Height: 200}, Size{Width: 1600, Height: 1000}
+		chip := screenshotEditorSizeLabelRect(surface, label, selection, Rect{}, frame, scale, false)
+		actual := &DisplayList{}
+		drawScreenshotEditorSizeLabel(actual, surface, label, selection, Rect{}, frame, scale, false)
+		style := TextStyle{Size: 14 * scale, Weight: FontWeightSemibold}
+		metrics, _ := surface.MeasureText(label, style)
+		expected := &DisplayList{}
+		expected.FillRoundedRect(chip, 10*scale, Color{R: 23, G: 23, B: 23, A: 255})
+		expected.DrawText(label, Rect{X: chip.X + (chip.Width-metrics.Size.Width)/2, Y: chip.Y + (chip.Height-metrics.Size.Height)/2, Width: metrics.Size.Width, Height: metrics.Size.Height}, style, Color{R: 255, G: 255, B: 255, A: 255})
+		if err := actual.Compare(expected); err != nil {
+			t.Fatalf("scale %v: size label is not centered and opaque: %v", scale, err)
+		}
+	}
+}
+
+// TestScreenshotSelectionPixelSize covers fractional capture scales independently from desktop origins and chrome DPI.
+func TestScreenshotSelectionPixelSize(t *testing.T) {
+	for _, frame := range []Size{{Width: 1920, Height: 1080}, {Width: 1536, Height: 864}, {Width: 1280, Height: 720}, {Width: 960, Height: 540}, {Width: 1417, Height: 833}} {
+		for _, origin := range []Point{{X: 10, Y: 20}, {X: 100.3, Y: 50.7}, {X: 0.1, Y: 0.2}} {
+			original := Rect{X: origin.X, Y: origin.Y, Width: 200, Height: 100}
+			bounds := image.Rect(-1920, -1080, 0, 0)
+			before, err := screenshotEditorPixelSelection(bounds, original, frame)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, size := range []image.Point{image.Pt(1, 1), image.Pt(101, 73), image.Pt(800, 400), bounds.Max.Sub(before.Min)} {
+				selection := screenshotEditorSelectionWithPixelSize(original, frame, bounds.Size(), size.X, size.Y)
+				got, err := screenshotEditorPixelSelection(bounds, selection, frame)
+				if err != nil || got.Size() != size || got.Min != before.Min || selection.X != original.X || selection.Y != original.Y {
+					t.Fatalf("frame=%+v origin=%+v size=%v: selection=%+v crop=%v err=%v", frame, origin, size, selection, got, err)
+				}
+			}
+		}
+	}
+}
+
+// TestScreenshotSizeDialog exercises the rendered chip, draft validation, modal input, and the applied crop.
+func TestScreenshotSizeDialog(t *testing.T) {
+	state := &screenshotEditorOverlayState{
+		image: testScreenshotImage(t, 1200, 800), frameSize: Size{Width: 1200, Height: 800},
+		selection: Rect{X: 200, Y: 200, Width: 300, Height: 200}, hasSelection: true,
+		chromeScale: func(Rect) float32 { return 1.5 }, desktopPixelOrigin: Point{X: -1200, Y: -800},
+		annotations: []screenshotEditorAnnotation{{tool: screenshotEditorToolRect, rect: Rect{X: 220, Y: 220, Width: 20, Height: 20}}},
+		result:      make(chan screenshotEditorOverlayOutcome, 1),
+	}
+	frame := FrameInfo{Size: state.frameSize}
+	state.annotationDragging = true
+	if state.openSizeDialog() {
+		t.Fatal("size editing must not interrupt an annotation drag")
+	}
+	state.annotationDragging = false
+	state.editMode = screenshotEditorEditMoveSelection
+	if state.openSizeDialog() {
+		t.Fatal("size editing must not interrupt a selection drag")
+	}
+	state.editMode = screenshotEditorEditNone
+	state.draw(&DisplayList{}, frame)
+	chip := state.sizeLabelRect
+	point := Point{X: chip.X + chip.Width/2, Y: chip.Y + chip.Height/2}
+	state.pointer(PointerEvent{Kind: PointerMove, Position: point})
+	if state.pointerCursor != PointerCursorHand {
+		t.Fatal("size chip must show an actionable cursor")
+	}
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: point})
+	dialog := state.activeSizeDialog()
+	if dialog == nil || dialog.width.Text() != "300" || dialog.height.Text() != "200" || state.dragging {
+		t.Fatalf("click did not open the size draft: %+v", dialog)
+	}
+	original := state.selection
+	for _, values := range [][2]string{{"", "200"}, {"0", "200"}, {"-1", "200"}, {"1.5", "200"}, {"abc", "200"}, {"99999999999999999999999", "200"}, {"1001", "200"}, {"300", "601"}} {
+		dialog.width.SetText(values[0], false)
+		dialog.height.SetText(values[1], false)
+		dialog.apply()
+		if !dialog.invalid || state.selection != original || state.activeSizeDialog() != dialog {
+			t.Fatalf("invalid draft %v changed capture or closed dialog", values)
+		}
+	}
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: 10, Y: 10}})
+	state.key(KeyEvent{Key: Key("r"), Down: true})
+	state.textInput(TextInputEvent{Kind: TextInputCommit, Text: "annotation"})
+	if state.selection != original || state.dragging || state.activeTool != screenshotEditorToolSelect || len(state.annotations) != 1 {
+		t.Fatal("dialog input leaked to the capture editor")
+	}
+	state.key(KeyEvent{Key: KeyEscape, Down: true})
+	if state.activeSizeDialog() != nil || state.selection != original || len(state.result) != 0 {
+		t.Fatal("Escape should discard only the size draft")
+	}
+	state.key(KeyEvent{Key: Key("s"), Down: true})
+	dialog = state.activeSizeDialog()
+	if dialog == nil {
+		t.Fatal("S must reopen the size editor")
+	}
+	dialog.width.SetText(" 501 ", false)
+	dialog.height.SetText("303", false)
+	dialog.apply()
+	if state.activeSizeDialog() != nil || state.selection != (Rect{X: 200, Y: 200, Width: 501, Height: 303}) || len(state.annotations) != 1 {
+		t.Fatalf("apply changed the anchor or annotations: %+v", state.selection)
+	}
+	state.chromeScale = func(Rect) float32 { return 2.5 }
+	state.draw(&DisplayList{}, frame)
+	if state.sizeLabelRect.Height <= chip.Height {
+		t.Fatal("size chip did not follow display DPI transition")
+	}
+}
+
+// TestScreenshotSizeDialogKeyboardAndLayout uses the retained controls without opening a native window.
+func TestScreenshotSizeDialogKeyboardAndLayout(t *testing.T) {
+	state := &screenshotEditorOverlayState{
+		image: testScreenshotImage(t, 1200, 800), frameSize: Size{Width: 600, Height: 400},
+		selection: Rect{X: 20, Y: 30, Width: 200, Height: 100}, hasSelection: true,
+		sizeDialogOptions: ScreenshotOptions{SizeLabels: ScreenshotSizeLabels{Title: "修改选区大小", Width: "宽度（像素）", Height: "高度（像素）", Apply: "应用", Cancel: "取消", InvalidSize: "请输入整数：宽度 1–%d，高度 1–%d。", LockAspectRatio: "固定宽高比", Swap: "互换宽度和高度"}},
+	}
+	state.openSizeDialog()
+	dialog := state.activeSizeDialog()
+	dialog.host = woxwidget.NewHost(dialog.build)
+	dialog.host.AttachServices(&screenshotTestSurface{})
+	defer dialog.host.Dispose()
+	frame := FrameInfo{Size: dialog.size(), Scale: 1.5}
+	draw := func() {
+		dialog.host.Frame(&DisplayList{}, frame)
+	}
+	draw()
+	draw()
+	fieldCount := 0
+	var heightBounds Rect
+	for _, node := range dialog.host.Snapshot().Tree.Nodes {
+		if node.AutomationID == "screenshot.size.width" && !node.Focused {
+			t.Fatal("width should receive initial focus")
+		}
+		if node.Role == woxui.AccessibilityRoleTextField || node.Role == woxui.AccessibilityRoleButton {
+			if node.Bounds.Height != 32 || node.Bounds.Y+node.Bounds.Height > frame.Size.Height {
+				t.Fatalf("control outside standard size or dialog: %+v", node)
+			}
+		}
+		if node.Role == woxui.AccessibilityRoleTextField {
+			fieldCount++
+			if node.Bounds.Width < 100 {
+				t.Fatalf("field has no usable input width: %+v", node)
+			}
+			if node.AutomationID == "screenshot.size.height" {
+				heightBounds = node.Bounds
+			}
+		}
+	}
+	if fieldCount != 2 {
+		t.Fatalf("editable fields = %d, want 2", fieldCount)
+	}
+	if runtime.GOOS == "windows" {
+		displayList := &DisplayList{}
+		dialog.draw(displayList, frame)
+		renderer, _ := woxui.NewSoftwareRenderer(int(frame.Size.Width), int(frame.Size.Height))
+		if err := renderer.Render(displayList); err != nil {
+			t.Fatal(err)
+		}
+		if renderer.RGBA().RGBAAt(0, 0).A != 255 {
+			t.Fatal("Windows client corners must be opaque so only DWM draws the outer rounding")
+		}
+	}
+	dialog.host.TextInput(TextInputEvent{Kind: TextInputCommit, Text: "301"})
+	point := Point{X: heightBounds.X + heightBounds.Width/2, Y: heightBounds.Y + heightBounds.Height/2}
+	dialog.host.Pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: point})
+	dialog.host.Pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: point})
+	primaryModifier := KeyModifierControl
+	if !primaryModifier.HasPrimary() {
+		primaryModifier = KeyModifierMeta
+	}
+	dialog.key(KeyEvent{Key: Key("a"), Modifiers: primaryModifier, Down: true})
+	dialog.host.TextInput(TextInputEvent{Kind: TextInputCommit, Text: "151"})
+	dialog.key(KeyEvent{Key: KeyEnter, Down: true})
+	pixels, err := screenshotEditorPixelSelection(image.Rect(0, 0, 1200, 800), state.selection, state.frameSize)
+	if err != nil || state.activeSizeDialog() != nil || pixels.Size() != image.Pt(301, 151) {
+		t.Fatalf("keyboard apply: crop=%v err=%v open=%v", pixels, err, state.activeSizeDialog() != nil)
+	}
+	state.openSizeDialog()
+	next := state.activeSizeDialog()
+	dialog.closed()
+	if state.activeSizeDialog() != next {
+		t.Fatal("a late close callback discarded the newly opened dialog")
+	}
+	next.closed()
+	if state.activeSizeDialog() != nil {
+		t.Fatal("external dialog close left the screenshot modal")
+	}
+}
+
+// TestScreenshotSizeDialogTabSelectsDimensions exercises forward and reverse traversal without changing pointer editing.
+func TestScreenshotSizeDialogTabSelectsDimensions(t *testing.T) {
+	state := &screenshotEditorOverlayState{
+		image: testScreenshotImage(t, 1200, 800), frameSize: Size{Width: 1200, Height: 800},
+		selection: Rect{X: 200, Y: 200, Width: 300, Height: 200}, hasSelection: true,
+	}
+	state.openSizeDialog()
+	dialog := state.activeSizeDialog()
+	dialog.host = woxwidget.NewHost(dialog.build)
+	dialog.host.AttachServices(&screenshotTestSurface{})
+	defer dialog.host.Dispose()
+	draw := func() { dialog.host.Frame(&DisplayList{}, FrameInfo{Size: dialog.size()}) }
+	draw()
+	draw()
+	if !dialog.host.HasFocus("screenshot.size.width") || dialog.width.State().Selection.Collapsed() {
+		t.Fatal("initial width must be focused and selected")
+	}
+	dialog.key(KeyEvent{Key: woxui.KeyTab, Down: true})
+	if !dialog.host.HasFocus("screenshot.size.swap") {
+		t.Fatal("Tab must retain the existing focus order")
+	}
+	dialog.key(KeyEvent{Key: woxui.KeyTab, Down: true})
+	if !dialog.host.HasFocus("screenshot.size.height") || dialog.height.State().Selection.Start() != 0 || dialog.height.State().Selection.End() != len([]rune(dialog.height.Text())) {
+		t.Fatal("Tab to height must select the complete value")
+	}
+	dialog.host.TextInput(TextInputEvent{Kind: TextInputCommit, Text: "151"})
+	if dialog.height.Text() != "151" {
+		t.Fatalf("typing after Tab should replace the height: %q", dialog.height.Text())
+	}
+	dialog.key(KeyEvent{Key: woxui.KeyTab, Modifiers: KeyModifierShift, Down: true})
+	dialog.key(KeyEvent{Key: woxui.KeyTab, Modifiers: KeyModifierShift, Down: true})
+	if !dialog.host.HasFocus("screenshot.size.width") || dialog.width.State().Selection.Start() != 0 || dialog.width.State().Selection.End() != len([]rune(dialog.width.Text())) {
+		t.Fatal("Shift+Tab to width must select the complete value")
+	}
+	draw()
+	var heightBounds Rect
+	for _, node := range dialog.host.Snapshot().Tree.Nodes {
+		if node.AutomationID == "screenshot.size.height" {
+			heightBounds = node.Bounds
+		}
+	}
+	point := Point{X: heightBounds.X + heightBounds.Width/2, Y: heightBounds.Y + heightBounds.Height/2}
+	dialog.host.Pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: point})
+	dialog.host.Pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: point})
+	if !dialog.host.HasFocus("screenshot.size.height") || !dialog.height.State().Selection.Collapsed() {
+		t.Fatal("pointer focus must place a caret instead of selecting the whole value")
+	}
+}
+
+// TestScreenshotSizeRatioPresetLayout checks translated labels and preset controls at each interface density.
+func TestScreenshotSizeRatioPresetLayout(t *testing.T) {
+	surface := &screenshotTestSurface{}
+	for _, density := range []float32{0.9, 1, 1.1} {
+		for _, label := range []string{"Aspect ratio presets", "常用宽高比", "アスペクト比のプリセット", "종횡비 프리셋", "Proporções predefinidas", "Готовые пропорции"} {
+			state := &screenshotEditorOverlayState{
+				image: testScreenshotImage(t, 1000, 800), frameSize: Size{Width: 1000, Height: 800},
+				selection: Rect{X: 100, Y: 100, Width: 300, Height: 200}, hasSelection: true,
+				sizeDialogOptions: ScreenshotOptions{SizeLabels: ScreenshotSizeLabels{RatioPresets: label}},
+			}
+			state.sizeDialogOptions.Theme.DensityScale = density
+			state.openSizeDialog()
+			dialog := state.activeSizeDialog()
+			dialog.host = woxwidget.NewHost(dialog.build)
+			dialog.host.AttachServices(surface)
+			dialog.host.Frame(&DisplayList{}, FrameInfo{Size: dialog.size()})
+			count := 0
+			for _, node := range dialog.host.Snapshot().Tree.Nodes {
+				if strings.HasPrefix(node.AutomationID, "screenshot.size.ratio.") {
+					count++
+					if node.Bounds.X < 20 || node.Bounds.X+node.Bounds.Width > dialog.size().Width-20 {
+						t.Fatalf("density=%v label=%q: preset outside content: %+v", density, label, node.Bounds)
+					}
+					metrics, _ := surface.MeasureText(node.Label, TextStyle{Size: 11 * density})
+					if metrics.Size.Width > node.Bounds.Width {
+						t.Fatalf("density=%v: preset %q clipped", density, node.Label)
+					}
+				}
+			}
+			if count != len(screenshotSizeRatioPresets) {
+				t.Fatalf("density=%v label=%q: got %d presets", density, label, count)
+			}
+			dialog.host.Dispose()
+		}
+	}
+}
+
+// TestScreenshotSizeRatioPresets covers selection, bounds, cancel, and the applied drag ratio.
+func TestScreenshotSizeRatioPresets(t *testing.T) {
+	state := &screenshotEditorOverlayState{
+		image: testScreenshotImage(t, 1200, 800), frameSize: Size{Width: 1200, Height: 800},
+		selection: Rect{X: 800, Y: 600, Width: 300, Height: 100}, hasSelection: true,
+		sizeDialogOptions: ScreenshotOptions{SizeLabels: ScreenshotSizeLabels{RatioPresets: "Aspect ratio presets"}},
+	}
+	state.openSizeDialog()
+	dialog := state.activeSizeDialog()
+	dialog.host = woxwidget.NewHost(dialog.build)
+	dialog.host.AttachServices(&screenshotTestSurface{})
+	defer dialog.host.Dispose()
+	draw := func() { dialog.host.Frame(&DisplayList{}, FrameInfo{Size: dialog.size()}) }
+	draw()
+	draw()
+	for _, preset := range screenshotSizeRatioPresets {
+		var bounds Rect
+		for _, node := range dialog.host.Snapshot().Tree.Nodes {
+			if node.AutomationID == "screenshot.size.ratio."+preset.label {
+				bounds = node.Bounds
+			}
+		}
+		if bounds.Width != 40 || bounds.X+bounds.Width > dialog.size().Width {
+			t.Fatalf("preset %s outside dialog: %+v", preset.label, bounds)
+		}
+		point := Point{X: bounds.X + bounds.Width/2, Y: bounds.Y + bounds.Height/2}
+		dialog.host.Pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: point})
+		dialog.host.Pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: point})
+		draw()
+		width, _ := strconv.Atoi(dialog.width.Text())
+		height, _ := strconv.Atoi(dialog.height.Text())
+		if !dialog.lockRatio || dialog.aspectRatio != preset.ratio || width < 1 || width > dialog.maxWidth || height < 1 || height > dialog.maxHeight || math.Abs(float64(height)-float64(width)/preset.ratio) > 1 {
+			t.Fatalf("preset %s produced %dx%d, ratio %v", preset.label, width, height, dialog.aspectRatio)
+		}
+		selected := false
+		for _, node := range dialog.host.Snapshot().Tree.Nodes {
+			if node.AutomationID == "screenshot.size.ratio."+preset.label {
+				selected = node.Selected
+			}
+		}
+		if !selected {
+			t.Fatalf("preset %s is not selected", preset.label)
+		}
+	}
+	if !dialog.host.FocusAutomationID("screenshot.size.ratio.16:9") || !dialog.key(KeyEvent{Key: woxui.KeySpace, Down: true}) || dialog.aspectRatio != 16.0/9 {
+		t.Fatal("keyboard activation did not select the preset")
+	}
+	dialog.width.SetText("0", false)
+	dialog.selectRatioPreset(1)
+	if !dialog.invalid || dialog.aspectRatio != 16.0/9 {
+		t.Fatal("an invalid width must not replace the selected preset")
+	}
+	original := state.selection
+	state.closeSizeDialog(false)
+	if state.selection != original || state.selectionAspectRatio != 0 {
+		t.Fatal("cancel applied the preset")
+	}
+	state.openSizeDialog()
+	dialog = state.activeSizeDialog()
+	dialog.selectRatioPreset(16.0 / 9)
+	dialog.apply()
+	if state.selectionAspectRatio != 16.0/9 {
+		t.Fatal("applied preset did not lock the selected ratio")
+	}
+	pixels, err := state.selectionPixelBoundsLocked()
+	if err != nil || pixels.Dx() != 300 || pixels.Dy() != 169 {
+		t.Fatalf("applied 16:9 crop = %v, err=%v", pixels, err)
+	}
+}
+
+// TestScreenshotSizeDialogRatioAndSwap routes pointer and text events through the actual form controls.
+func TestScreenshotSizeDialogRatioAndSwap(t *testing.T) {
+	state := &screenshotEditorOverlayState{
+		image: testScreenshotImage(t, 1200, 800), frameSize: Size{Width: 1200, Height: 800},
+		selection: Rect{X: 200, Y: 200, Width: 300, Height: 200}, hasSelection: true,
+		sizeDialogOptions: ScreenshotOptions{SizeLabels: ScreenshotSizeLabels{Title: "Edit size", Width: "Width", Height: "Height", Apply: "Apply", Cancel: "Cancel", LockAspectRatio: "Lock aspect ratio", Swap: "Swap", InvalidSize: "Width 1–%d, height 1–%d"}},
+	}
+	state.openSizeDialog()
+	dialog := state.activeSizeDialog()
+	dialog.host = woxwidget.NewHost(dialog.build)
+	dialog.host.AttachServices(&screenshotTestSurface{})
+	defer dialog.host.Dispose()
+	frame := FrameInfo{}
+	draw := func() {
+		t.Helper()
+		frame.Size = dialog.size()
+		dialog.draw(&DisplayList{}, frame)
+		var lock, ratios, apply, errorBounds Rect
+		for _, node := range dialog.host.Snapshot().Tree.Nodes {
+			switch node.AutomationID {
+			case "screenshot.size.lock-row":
+				lock = node.Bounds
+			case "screenshot.size.ratios":
+				ratios = node.Bounds
+			case "screenshot.size.apply":
+				apply = node.Bounds
+			case "screenshot.size.error":
+				errorBounds = node.Bounds
+			}
+		}
+		if bottom := frame.Size.Height - apply.Y - apply.Height; bottom != 20 {
+			t.Fatalf("footer bottom padding = %v, want 20", bottom)
+		}
+		if ratios.Y-lock.Y-lock.Height != 12 {
+			t.Fatalf("presets must follow lock row: lock=%+v ratios=%+v", lock, ratios)
+		}
+		previous := ratios
+		if dialog.invalid {
+			if errorBounds.Height != 36 || errorBounds.Y-ratios.Y-ratios.Height != 12 {
+				t.Fatalf("validation must fit between presets and actions: ratios=%+v error=%+v", ratios, errorBounds)
+			}
+			previous = errorBounds
+		} else if errorBounds != (Rect{}) {
+			t.Fatal("valid draft must not reserve validation space")
+		}
+		if gap := apply.Y - previous.Y - previous.Height; gap != 12 {
+			t.Fatalf("footer gap = %v, want 12", gap)
+		}
+	}
+	draw()
+	draw()
+	click := func(id string) {
+		t.Helper()
+		for _, node := range dialog.host.Snapshot().Tree.Nodes {
+			if node.AutomationID == "screenshot.size."+id {
+				if node.Bounds.X < 0 || node.Bounds.Y < 0 || node.Bounds.X+node.Bounds.Width > frame.Size.Width || node.Bounds.Y+node.Bounds.Height > frame.Size.Height {
+					t.Fatalf("control %s exceeds dialog: %+v", id, node.Bounds)
+				}
+				point := Point{X: node.Bounds.X + node.Bounds.Width/2, Y: node.Bounds.Y + node.Bounds.Height/2}
+				dialog.host.Pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: point})
+				dialog.host.Pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: point})
+				draw()
+				return
+			}
+		}
+		t.Fatalf("missing control %s", id)
+	}
+	typeValue := func(id, value string) {
+		t.Helper()
+		click(id)
+		primary := KeyModifierControl
+		if !primary.HasPrimary() {
+			primary = KeyModifierMeta
+		}
+		dialog.key(KeyEvent{Key: Key("a"), Down: true, Modifiers: primary})
+		dialog.host.TextInput(TextInputEvent{Kind: TextInputCommit, Text: value})
+		draw()
+	}
+	assertSize := func(width, height string) {
+		t.Helper()
+		if dialog.width.Text() != width || dialog.height.Text() != height {
+			t.Fatalf("draft = %s x %s, want %s x %s", dialog.width.Text(), dialog.height.Text(), width, height)
+		}
+	}
+	typeValue("width", "0")
+	click("lock-row")
+	if dialog.lockRatio || !dialog.invalid {
+		t.Fatal("invalid draft must not produce a locked ratio")
+	}
+	typeValue("width", "450")
+	typeValue("height", "150")
+	click("lock-row")
+	assertSize("450", "150")
+	if !dialog.lockRatio || dialog.aspectRatio != 3 {
+		t.Fatal("lock must use the entered 3:1 ratio")
+	}
+	typeValue("width", "501")
+	assertSize("501", "167")
+	typeValue("height", "100")
+	assertSize("300", "100")
+	click("swap")
+	assertSize("100", "300")
+	typeValue("width", "200")
+	assertSize("200", "600")
+	click("lock")
+	typeValue("width", "250")
+	assertSize("250", "600")
+	click("lock")
+	assertSize("250", "600")
+	if dialog.aspectRatio != 250.0/600 {
+		t.Fatal("relocking must use the current draft ratio")
+	}
+	original := state.selection
+	typeValue("width", "1001")
+	click("apply")
+	if !dialog.invalid || state.activeSizeDialog() != dialog || state.selection != original {
+		t.Fatalf("out-of-bounds linked dimensions: invalid=%v open=%v selection=%+v draft=%s x %s", dialog.invalid, state.activeSizeDialog() == dialog, state.selection, dialog.width.Text(), dialog.height.Text())
+	}
+	typeValue("height", "0")
+	click("apply")
+	if !dialog.invalid {
+		t.Fatal("zero dimensions must remain invalid while ratio is locked")
+	}
+	click("cancel")
+	if state.activeSizeDialog() != nil || state.selection != original {
+		t.Fatal("cancel changed the capture selection")
+	}
+}
+
+func TestWriteScreenshotImagePreservesOpaquePixelsInPNG(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "capture.png")
+	source := image.NewRGBA(image.Rect(0, 0, 32, 24))
+	draw.Draw(source, source.Bounds(), &image.Uniform{C: color.RGBA{R: 40, G: 80, B: 120, A: 255}}, image.Point{}, draw.Src)
+	if err := writeScreenshotImage(path, source); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	decoded, err := png.Decode(file)
+	if err != nil {
+		t.Fatalf("decode screenshot PNG: %v", err)
+	}
+	if decoded.Bounds().Size() != source.Bounds().Size() {
+		t.Fatalf("PNG size = %v, want %v", decoded.Bounds().Size(), source.Bounds().Size())
+	}
+	if color.RGBAModel.Convert(decoded.At(0, 0)) != source.RGBAAt(0, 0) {
+		t.Fatal("opaque screenshot lost color precision")
+	}
+}
+
+func TestNewScreenshotEditorImageSharesPackedRGBA(t *testing.T) {
+	source := image.NewRGBA(image.Rect(0, 0, 4, 2))
+	source.SetRGBA(1, 1, color.RGBA{R: 20, G: 40, B: 60, A: 255})
+
+	prepared, err := newScreenshotEditorImage(source)
+	if err != nil {
+		t.Fatalf("prepare screenshot image: %v", err)
+	}
+	source.SetRGBA(1, 1, color.RGBA{R: 80, G: 100, B: 120, A: 255})
+	if pixel := prepared.RGBAAt(1, 1); pixel.R != 80 || pixel.G != 100 || pixel.B != 120 {
+		t.Fatalf("packed screenshot pixels were copied: got %+v", pixel)
+	}
+	if prepared.Width != 4 || prepared.Height != 2 {
+		t.Fatalf("prepared size = %dx%d, want 4x2", prepared.Width, prepared.Height)
+	}
+}
+
+func TestScreenshotEditorWindowHostSerializesCallbacks(t *testing.T) {
+	host := &screenshotEditorWindowHost{}
+	first := &screenshotEditorOverlayState{}
+	second := &screenshotEditorOverlayState{}
+	if err := host.begin(first); err != nil {
+		t.Fatalf("begin first screenshot session: %v", err)
+	}
+	if err := host.begin(second); err == nil {
+		t.Fatal("second screenshot session should be rejected while the first is active")
+	}
+	host.end(second)
+	if host.current() != first {
+		t.Fatal("ending a different session cleared the active screenshot")
+	}
+	host.end(first)
+	if host.current() != nil {
+		t.Fatal("active screenshot session was not cleared")
+	}
+}
+
+func TestScreenshotHostKeepsScreenshotChromeUntilRecordingToolbarFits(t *testing.T) {
+	host := &screenshotEditorWindowHost{}
+	state := &screenshotEditorOverlayState{
+		image:        testScreenshotImage(t, 400, 300),
+		selection:    Rect{X: 40, Y: 40, Width: 200, Height: 120},
+		hasSelection: true,
+		frameSize:    Size{Width: 400, Height: 300},
+		result:       make(chan screenshotEditorOverlayOutcome, 1),
+	}
+	if err := host.begin(state); err != nil {
+		t.Fatal(err)
+	}
+	defer host.end(state)
+	state.recordingUI = &recordingToolbarState{editor: state}
+
+	fullscreen := &DisplayList{}
+	host.draw(fullscreen, FrameInfo{Size: Size{Width: 400, Height: 300}})
+	screenshotOnly := &DisplayList{}
+	state.recordingUI = nil
+	host.draw(screenshotOnly, FrameInfo{Size: Size{Width: 400, Height: 300}})
+	if err := fullscreen.Compare(screenshotOnly); err != nil {
+		t.Fatalf("fullscreen recording transition should keep screenshot chrome: %v", err)
+	}
+
+	state.recordingUI = &recordingToolbarState{editor: state}
+	toolbar := &DisplayList{}
+	host.draw(toolbar, FrameInfo{Size: Size{Width: recordingToolbarWidth, Height: recordingToolbarHeight}})
+	if state.frameSize != (Size{Width: 400, Height: 300}) {
+		t.Fatalf("recording toolbar frame replaced desktop frame size: %+v", state.frameSize)
+	}
+	if err := toolbar.Compare(screenshotOnly); err == nil {
+		t.Fatal("toolbar-sized frame should draw recording chrome instead of screenshot overlay")
+	}
+}
+
+func TestNewScreenshotEditorImageCopiesStridedRGBA(t *testing.T) {
+	source := image.NewRGBA(image.Rect(0, 0, 4, 2))
+	subImage := source.SubImage(image.Rect(1, 0, 3, 2)).(*image.RGBA)
+	subImage.SetRGBA(1, 0, color.RGBA{R: 10, G: 20, B: 30, A: 255})
+
+	prepared, err := newScreenshotEditorImage(subImage)
+	if err != nil {
+		t.Fatalf("prepare screenshot subimage: %v", err)
+	}
+	subImage.SetRGBA(1, 0, color.RGBA{R: 90, G: 100, B: 110, A: 255})
+	if pixel := prepared.RGBAAt(0, 0); pixel.R != 10 || pixel.G != 20 || pixel.B != 30 {
+		t.Fatalf("strided screenshot pixels did not use the normalized copy path: got %+v", pixel)
+	}
+	if prepared.Width != 2 || prepared.Height != 2 {
+		t.Fatalf("prepared size = %dx%d, want 2x2", prepared.Width, prepared.Height)
+	}
+}
+
+func TestScreenshotEditorSelectionMapsLogicalPointsToPixels(t *testing.T) {
+	state := &screenshotEditorOverlayState{frameSize: Size{Width: 1000, Height: 500}}
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: 400, Y: 300}})
+	if !state.colorInspectorDismissed {
+		t.Fatal("starting a screenshot selection should permanently dismiss the color inspector")
+	}
+	state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: 100, Y: 50}})
+	state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: Point{X: 100, Y: 50}})
+
+	wantSelection := Rect{X: 100, Y: 50, Width: 300, Height: 250}
+	if state.selection != wantSelection {
+		t.Fatalf("selection = %+v, want %+v", state.selection, wantSelection)
+	}
+	pixels, err := screenshotEditorPixelSelection(image.Rect(0, 0, 2000, 1000), state.selection, state.frameSize)
+	if err != nil {
+		t.Fatalf("map selection: %v", err)
+	}
+	wantPixels := image.Rect(200, 100, 800, 600)
+	if pixels != wantPixels {
+		t.Fatalf("pixels = %v, want %v", pixels, wantPixels)
+	}
+}
+
+func TestScreenshotEditorColorInspectorMapsPointerToCapturedPixel(t *testing.T) {
+	source := image.NewRGBA(image.Rect(0, 0, 4, 2))
+	source.SetRGBA(1, 1, color.RGBA{R: 203, G: 174, B: 140, A: 255})
+	prepared, err := NewImage(source)
+	if err != nil {
+		t.Fatalf("prepare color inspector image: %v", err)
+	}
+
+	x, y, pixel, ok := screenshotEditorPixelAtPoint(prepared, Size{Width: 100, Height: 100}, Point{X: 25, Y: 50})
+	if !ok || x != 1 || y != 1 {
+		t.Fatalf("mapped pixel = (%d, %d, %t), want (1, 1, true)", x, y, ok)
+	}
+	if pixel != (color.RGBA{R: 203, G: 174, B: 140, A: 255}) {
+		t.Fatalf("sampled color = %+v", pixel)
+	}
+	if _, _, _, ok := screenshotEditorPixelAtPoint(prepared, Size{Width: 100, Height: 100}, Point{X: 100, Y: 50}); ok {
+		t.Fatal("point outside the frame should not resolve a pixel")
+	}
+}
+
+func TestScreenshotEditorColorInspectorInfoRowFitsWidestRGB(t *testing.T) {
+	previewWidth := float32(12) * screenshotEditorInspectorColumns
+	panelWidth := previewWidth + screenshotEditorInspectorInfoExtraWidth
+	valueLeft := float32(104)
+	badgeLeft := panelWidth - 30
+	valueWidth := badgeLeft - valueLeft - screenshotEditorInspectorValueBadgeGap
+	widest := screenshotEditorEstimatedTextWidth("255, 255, 255", 11)
+	if valueWidth < widest {
+		t.Fatalf("RGB value slot = %v, widest RGB = %v", valueWidth, widest)
+	}
+}
+
+func TestScreenshotEditorColorInspectorLayoutAvoidsFrameEdges(t *testing.T) {
+	panel := Size{Width: 150, Height: 138}
+	if got := screenshotEditorInspectorRect(Size{Width: 800, Height: 600}, Point{X: 100, Y: 100}, panel, 1); got != (Rect{X: 120, Y: 120, Width: 150, Height: 138}) {
+		t.Fatalf("lower-right inspector = %+v", got)
+	}
+	if got := screenshotEditorInspectorRect(Size{Width: 800, Height: 600}, Point{X: 790, Y: 590}, panel, 1); got != (Rect{X: 620, Y: 432, Width: 150, Height: 138}) {
+		t.Fatalf("flipped inspector = %+v", got)
+	}
+}
+
+func TestScreenshotEditorDesktopPixelOriginUsesCaptureScale(t *testing.T) {
+	origin := screenshotEditorDesktopPixelOrigin(Rect{X: -100, Y: 50, Width: 1000, Height: 500}, image.NewRGBA(image.Rect(0, 0, 2000, 1000)))
+	if origin != (Point{X: -200, Y: 100}) {
+		t.Fatalf("desktop pixel origin = %+v", origin)
+	}
+}
+
+func TestScreenshotEditorPointerMovementTracksColorInspector(t *testing.T) {
+	state := &screenshotEditorOverlayState{}
+	state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: 45, Y: 67}})
+	if !state.pointerInside || state.pointerPosition != (Point{X: 45, Y: 67}) {
+		t.Fatalf("tracked pointer = %+v inside=%t", state.pointerPosition, state.pointerInside)
+	}
+	state.pointer(PointerEvent{Kind: PointerLeave})
+	if state.pointerInside {
+		t.Fatal("pointer leave should hide the color inspector")
+	}
+}
+
+func TestScreenshotEditorColorInspectorUsesPointerDisplayScaleBeforeSelection(t *testing.T) {
+	state := &screenshotEditorOverlayState{
+		image:           testScreenshotImage(t, 10, 10),
+		pointerInside:   true,
+		pointerPosition: Point{X: 500, Y: 300},
+		chromeScale: func(rect Rect) float32 {
+			if rect != (Rect{X: 500, Y: 300, Width: 1, Height: 1}) {
+				t.Fatalf("scale rect = %+v, want pointer display probe", rect)
+			}
+			return 2
+		},
+	}
+	state.draw(&DisplayList{}, FrameInfo{Size: Size{Width: 1000, Height: 600}})
+	if state.uiScale != 2 {
+		t.Fatalf("pre-selection UI scale = %v, want 2", state.uiScale)
+	}
+}
+
+func TestScreenshotEditorColorShortcutsCopyIndependentFormats(t *testing.T) {
+	source := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	source.SetRGBA(1, 1, color.RGBA{R: 203, G: 174, B: 140, A: 255})
+	prepared, err := NewImage(source)
+	if err != nil {
+		t.Fatalf("prepare shortcut image: %v", err)
+	}
+	for _, testCase := range []struct {
+		key  Key
+		want string
+	}{
+		{key: Key("g"), want: "rgb(203, 174, 140)"},
+		{key: Key("h"), want: "#CBAE8C"},
+	} {
+		var copied string
+		state := &screenshotEditorOverlayState{
+			image: prepared, frameSize: Size{Width: 2, Height: 2}, pointerInside: true, pointerPosition: Point{X: 1, Y: 1},
+			result: make(chan screenshotEditorOverlayOutcome, 1),
+			writeClipboardText: func(text string) error {
+				copied = text
+				return nil
+			},
+		}
+		if !state.key(KeyEvent{Key: testCase.key, Down: true}) {
+			t.Fatalf("color copy shortcut %q was not handled", testCase.key)
+		}
+		outcome := <-state.result
+		if copied != testCase.want || outcome.copiedColor != testCase.want {
+			t.Fatalf("shortcut %q copied=%q outcome=%q, want %q", testCase.key, copied, outcome.copiedColor, testCase.want)
+		}
+	}
+}
+
+func TestScreenshotEditorSelectionDisablesColorInteraction(t *testing.T) {
+	state := &screenshotEditorOverlayState{
+		image: testScreenshotImage(t, 2, 2), frameSize: Size{Width: 2, Height: 2},
+		pointerInside: true, pointerPosition: Point{X: 1, Y: 1}, colorInspectorDismissed: true,
+		writeClipboardText: func(string) error {
+			t.Fatal("dismissed color inspector should not write to the clipboard")
+			return nil
+		},
+	}
+	if state.key(KeyEvent{Key: Key("h"), Down: true}) {
+		t.Fatal("color shortcut should not be handled after selection starts")
+	}
+	if state.key(KeyEvent{Key: KeyArrowDown, Down: true}) {
+		t.Fatal("color nudge should not be handled after selection starts")
+	}
+}
+
+func TestScreenshotEditorArrowKeysNudgeOneCapturedPixel(t *testing.T) {
+	prepared := testScreenshotImage(t, 4, 4)
+	var moved Point
+	state := &screenshotEditorOverlayState{
+		image: prepared, frameSize: Size{Width: 8, Height: 8}, pointerInside: true, pointerPosition: Point{X: 3.25, Y: 3.75},
+		setPointerPosition: func(point Point) error {
+			moved = point
+			return nil
+		},
+	}
+	if !state.key(KeyEvent{Key: KeyArrowDown, Down: true}) {
+		t.Fatal("down arrow nudge was not handled")
+	}
+	if moved != (Point{X: 3.25, Y: 5}) || state.pointerPosition != moved {
+		t.Fatalf("down nudge = %+v pointer=%+v, want only Y to move one source pixel", moved, state.pointerPosition)
+	}
+	if !state.key(KeyEvent{Key: KeyArrowLeft, Down: true}) {
+		t.Fatal("left arrow nudge was not handled")
+	}
+	if moved != (Point{X: 1, Y: 5}) {
+		t.Fatalf("left nudge = %+v, want only X to move one source pixel", moved)
+	}
+}
+
+func TestNewScreenshotEditorOverlayStateAppliesNativeSelection(t *testing.T) {
+	initial := Rect{X: -10, Y: 20, Width: 160, Height: 90}
+	state := newScreenshotEditorOverlayState(
+		ScreenshotOptions{AutoConfirm: true, HideAnnotationToolbar: true},
+		&Image{},
+		screenshotEditorPlatform{
+			frameSize:        Size{Width: 120, Height: 80},
+			initialSelection: &initial,
+		},
+	)
+
+	if state.selection != (Rect{X: 0, Y: 20, Width: 120, Height: 60}) {
+		t.Fatalf("selection = %+v, want clamped native selection", state.selection)
+	}
+	if !state.hasSelection {
+		t.Fatal("native selection should be active")
+	}
+	if !state.colorInspectorDismissed {
+		t.Fatal("a native selection should start with the color inspector dismissed")
+	}
+	if !state.autoConfirm || !state.hideTools {
+		t.Fatalf("options were not preserved: autoConfirm=%t hideTools=%t", state.autoConfirm, state.hideTools)
+	}
+	if state.frameSize != (Size{Width: 120, Height: 80}) {
+		t.Fatalf("frame size = %+v", state.frameSize)
+	}
+}
+
+func TestScreenshotEditorToolbarUsesCompactCreationTools(t *testing.T) {
+	state := &screenshotEditorOverlayState{
+		image:        testScreenshotImage(t, 1, 1),
+		selection:    Rect{X: 100, Y: 100, Width: 900, Height: 400},
+		hasSelection: true,
+		result:       make(chan screenshotEditorOverlayOutcome, 1),
+	}
+	state.draw(&DisplayList{}, FrameInfo{Size: Size{Width: 1200, Height: 700}})
+
+	if state.toolbarRect.Width != 848 || state.toolbarRect.Height != 48 {
+		t.Fatalf("toolbar bounds = %+v, want 848x48", state.toolbarRect)
+	}
+	if state.toolbarRect.X != state.selection.X+state.selection.Width-state.toolbarRect.Width {
+		t.Fatalf("toolbar left = %v, want right-aligned to selection", state.toolbarRect.X)
+	}
+	if state.toolbarRect.Y != state.selection.Y+state.selection.Height+16 {
+		t.Fatalf("toolbar top = %v, want 16px below selection", state.toolbarRect.Y)
+	}
+	if state.pinRect.Width != 40 || state.cancelRect.Width != 40 || state.saveRect.Width != 40 || state.confirmRect.Width != 40 {
+		t.Fatalf("action bounds = pin %+v cancel %+v save %+v confirm %+v", state.pinRect, state.cancelRect, state.saveRect, state.confirmRect)
+	}
+	if state.toolRects[screenshotEditorToolSelect] != (Rect{}) {
+		t.Fatalf("select tool should not occupy toolbar space: %+v", state.toolRects[screenshotEditorToolSelect])
+	}
+	if state.toolRects[screenshotEditorToolRect].Width != 40 || state.toolRects[screenshotEditorToolMosaic].Width != 40 {
+		t.Fatalf("creation tool bounds = rect %+v mosaic %+v", state.toolRects[screenshotEditorToolRect], state.toolRects[screenshotEditorToolMosaic])
+	}
+	for tool := screenshotEditorToolRect + 1; tool < screenshotEditorToolCount; tool++ {
+		if gap := state.toolRects[tool].X - state.toolRects[tool-1].X; gap != 48 {
+			t.Fatalf("tool %d slot gap = %v, want 48", tool, gap)
+		}
+	}
+	rectTool := state.toolRects[screenshotEditorToolRect]
+	state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: rectTool.X + 20, Y: rectTool.Y + 20}})
+	if !state.hasHoveredTool || state.hoveredTool != int(screenshotEditorToolRect) {
+		t.Fatalf("hovered tool = active:%t index:%d, want rectangle", state.hasHoveredTool, state.hoveredTool)
+	}
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: rectTool.X + 20, Y: rectTool.Y + 20}})
+	if state.activeTool != screenshotEditorToolRect {
+		t.Fatalf("active tool = %d, want rectangle", state.activeTool)
+	}
+	state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: state.scrollRect.X + 20, Y: state.scrollRect.Y + 20}})
+	if !state.hasHoveredAction || state.hoveredAction != screenshotEditorActionScrollingCapture {
+		t.Fatalf("hovered action = active:%t action:%d, want scrolling capture", state.hasHoveredAction, state.hoveredAction)
+	}
+	state.draw(&DisplayList{}, FrameInfo{Size: Size{Width: 1200, Height: 700}})
+	if state.editBarRect.Y != state.toolbarRect.Y+state.toolbarRect.Height+8 {
+		t.Fatalf("secondary toolbar = %+v, main toolbar = %+v", state.editBarRect, state.toolbarRect)
+	}
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: state.pinRect.X + 20, Y: state.pinRect.Y + 20}})
+	if outcome := <-state.result; !outcome.pinned || outcome.cancelled {
+		t.Fatalf("pin outcome = %+v", outcome)
+	}
+}
+
+func TestScreenshotEditorToolbarGripDragsTheBar(t *testing.T) {
+	state := &screenshotEditorOverlayState{
+		image:        testScreenshotImage(t, 1, 1),
+		selection:    Rect{X: 100, Y: 100, Width: 900, Height: 400},
+		hasSelection: true,
+		result:       make(chan screenshotEditorOverlayOutcome, 1),
+	}
+	frame := FrameInfo{Size: Size{Width: 1200, Height: 700}}
+	state.draw(&DisplayList{}, frame)
+	origin := state.toolbarRect
+	firstTool := state.toolRects[screenshotEditorToolRect]
+	grip := state.toolbarGripRect
+	if grip.Width != 28 || grip.Height != 48 || grip.X != origin.X || grip.X+grip.Width > firstTool.X {
+		t.Fatalf("grip = %+v, toolbar = %+v, first tool = %+v", grip, origin, firstTool)
+	}
+	gripIcon := screenshotEditorToolbarIconRect(grip, 16, 1)
+	toolIcon := screenshotEditorToolbarIconRect(firstTool, 24, 1)
+	if gripIcon.Y+gripIcon.Height/2 != toolIcon.Y+toolIcon.Height/2 {
+		t.Fatalf("grip icon %+v is not on the tool icon center line %+v", gripIcon, toolIcon)
+	}
+	press := Point{X: grip.X + 4, Y: grip.Y + 8}
+	state.pointer(PointerEvent{Kind: PointerMove, Position: press})
+	if state.pointerCursor != PointerCursorMove || state.activeTool != screenshotEditorToolSelect {
+		t.Fatalf("grip hover cursor = %v tool = %d", state.pointerCursor, state.activeTool)
+	}
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: press})
+	if state.activeTool != screenshotEditorToolSelect || !state.toolbarDragging {
+		t.Fatalf("grip press activated tool %d or failed to drag", state.activeTool)
+	}
+	release := Point{X: press.X - 80, Y: press.Y - 40}
+	state.pointer(PointerEvent{Kind: PointerMove, Button: PointerButtonPrimary, Position: release})
+	state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: release})
+	if state.toolbarDragging || !state.toolbarMoved {
+		t.Fatalf("drag state dragging=%t moved=%t", state.toolbarDragging, state.toolbarMoved)
+	}
+	state.draw(&DisplayList{}, frame)
+	if state.toolbarRect.X != origin.X-80 || state.toolbarRect.Y != origin.Y-40 {
+		t.Fatalf("toolbar = %+v, want moved from %+v by (-80,-40)", state.toolbarRect, origin)
+	}
+	if state.toolRects[screenshotEditorToolRect].X != firstTool.X-80 || state.toolbarGripRect.X != grip.X-80 {
+		t.Fatalf("grip/tool did not follow the toolbar: grip %+v tool %+v", state.toolbarGripRect, state.toolRects[screenshotEditorToolRect])
+	}
+	state.draw(&DisplayList{}, frame)
+	if state.toolbarRect.X != origin.X-80 || state.toolbarRect.Y != origin.Y-40 {
+		t.Fatalf("toolbar snapped back to %+v", state.toolbarRect)
+	}
+}
+
+func TestScreenshotEditorToolbarShowsExtraActionsBetweenRecordAndCancel(t *testing.T) {
+	action := common.ScreenshotExtraAction{ID: "ai", Icon: "control.sparkles", Tooltip: "Send to AI Chat"}
+	state := newScreenshotEditorOverlayState(ScreenshotOptions{
+		AllowVideoRecording: true,
+		ExtraActions:        []common.ScreenshotExtraAction{action},
+	}, testScreenshotImage(t, 10, 10), screenshotEditorPlatform{})
+	state.selection = Rect{X: 100, Y: 100, Width: 900, Height: 400}
+	state.hasSelection = true
+	state.draw(&DisplayList{}, FrameInfo{Size: Size{Width: 1200, Height: 700}})
+	if state.toolbarRect.Width != 956 || len(state.extraActionRects) != 1 || state.extraActionRects[0].Width != 40 {
+		t.Fatalf("toolbar=%+v extra=%+v", state.toolbarRect, state.extraActionRects)
+	}
+	if state.extraActionRects[0].X <= state.recordRect.X || state.extraActionRects[0].X >= state.cancelRect.X {
+		t.Fatalf("extra=%+v should sit between record=%+v and cancel=%+v", state.extraActionRects[0], state.recordRect, state.cancelRect)
+	}
+
+	imageOnly := newScreenshotEditorOverlayState(ScreenshotOptions{ExtraActions: []common.ScreenshotExtraAction{action}}, testScreenshotImage(t, 10, 10), screenshotEditorPlatform{})
+	imageOnly.selection = state.selection
+	imageOnly.hasSelection = true
+	imageOnly.draw(&DisplayList{}, FrameInfo{Size: Size{Width: 1200, Height: 700}})
+	if imageOnly.toolbarRect.Width != 902 || imageOnly.recordRect != (Rect{}) {
+		t.Fatalf("image-only extra toolbar=%+v record=%+v", imageOnly.toolbarRect, imageOnly.recordRect)
+	}
+	if imageOnly.extraActionRects[0].X <= imageOnly.pinRect.X || imageOnly.extraActionRects[0].X >= imageOnly.cancelRect.X {
+		t.Fatalf("image-only extra=%+v should sit between pin=%+v and cancel=%+v", imageOnly.extraActionRects[0], imageOnly.pinRect, imageOnly.cancelRect)
+	}
+
+	state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: state.extraActionRects[0].X + 20, Y: state.extraActionRects[0].Y + 20}})
+	if state.hoveredExtraIndex != 0 {
+		t.Fatalf("hovered extra = %d, want 0", state.hoveredExtraIndex)
+	}
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: state.extraActionRects[0].X + 20, Y: state.extraActionRects[0].Y + 20}})
+	outcome := <-state.result
+	if outcome.extraActionID != "ai" || outcome.cancelled || outcome.pinned {
+		t.Fatalf("extra outcome = %+v", outcome)
+	}
+}
+
+func TestScreenshotEditorToolbarShowsRecordingOnlyWhenAllowed(t *testing.T) {
+	state := newScreenshotEditorOverlayState(ScreenshotOptions{AllowVideoRecording: true}, testScreenshotImage(t, 10, 10), screenshotEditorPlatform{})
+	state.selection = Rect{X: 100, Y: 100, Width: 900, Height: 400}
+	state.hasSelection = true
+	state.draw(&DisplayList{}, FrameInfo{Size: Size{Width: 1200, Height: 700}})
+	if state.toolbarRect.Width != 902 || state.recordRect.Width != 40 {
+		t.Fatalf("recording toolbar=%+v button=%+v", state.toolbarRect, state.recordRect)
+	}
+
+	imageOnly := newScreenshotEditorOverlayState(ScreenshotOptions{}, testScreenshotImage(t, 10, 10), screenshotEditorPlatform{})
+	imageOnly.selection = state.selection
+	imageOnly.hasSelection = true
+	imageOnly.draw(&DisplayList{}, FrameInfo{Size: Size{Width: 1200, Height: 700}})
+	if imageOnly.toolbarRect.Width != 848 || imageOnly.recordRect != (Rect{}) {
+		t.Fatalf("image-only toolbar=%+v button=%+v", imageOnly.toolbarRect, imageOnly.recordRect)
+	}
+}
+
+func TestScreenshotEditorSaveActionDownloadsToChosenPath(t *testing.T) {
+	state := &screenshotEditorOverlayState{
+		image:        testScreenshotImage(t, 1, 1),
+		selection:    Rect{X: 100, Y: 100, Width: 900, Height: 400},
+		hasSelection: true,
+		result:       make(chan screenshotEditorOverlayOutcome, 1),
+	}
+	state.draw(&DisplayList{}, FrameInfo{Size: Size{Width: 1200, Height: 700}})
+	if state.saveRect.Width != 40 {
+		t.Fatalf("save button = %+v", state.saveRect)
+	}
+	state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: state.saveRect.X + 20, Y: state.saveRect.Y + 20}})
+	if !state.hasHoveredAction || state.hoveredAction != screenshotEditorActionSave {
+		t.Fatalf("hovered action = active:%t action:%d, want save", state.hasHoveredAction, state.hoveredAction)
+	}
+
+	cancelled := 0
+	state.chooseSavePath = func() (string, error) {
+		cancelled++
+		return "", nil
+	}
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: state.saveRect.X + 20, Y: state.saveRect.Y + 20}})
+	select {
+	case outcome := <-state.result:
+		t.Fatalf("cancelled save dialog completed overlay: %+v", outcome)
+	default:
+	}
+	if cancelled != 1 {
+		t.Fatalf("save dialog calls = %d", cancelled)
+	}
+
+	state.chooseSavePath = func() (string, error) {
+		return filepath.Join(t.TempDir(), "shot"), nil
+	}
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: state.saveRect.X + 20, Y: state.saveRect.Y + 20}})
+	outcome := <-state.result
+	if outcome.cancelled || !strings.HasSuffix(outcome.saveAsPath, "shot.png") {
+		t.Fatalf("save outcome = %+v", outcome)
+	}
+}
+
+func TestScreenshotEditorSaveShortcutUsesPrimaryModifier(t *testing.T) {
+	state := &screenshotEditorOverlayState{
+		image:        testScreenshotImage(t, 1, 1),
+		selection:    Rect{X: 100, Y: 100, Width: 900, Height: 400},
+		hasSelection: true,
+		result:       make(chan screenshotEditorOverlayOutcome, 1),
+		chooseSavePath: func() (string, error) {
+			return filepath.Join(t.TempDir(), "shot.png"), nil
+		},
+	}
+	if !state.key(KeyEvent{Key: Key("s"), Down: true, Modifiers: KeyModifierControl | KeyModifierMeta}) {
+		t.Fatal("primary save shortcut was not handled")
+	}
+	outcome := <-state.result
+	if !strings.HasSuffix(outcome.saveAsPath, "shot.png") {
+		t.Fatalf("save shortcut path = %q", outcome.saveAsPath)
+	}
+}
+
+// The UI and caller-supplied export path share this normalization before writing.
+func TestScreenshotSaveAsExportPathUsesPNG(t *testing.T) {
+	for input, want := range map[string]string{
+		"shot": "shot.png", "shot.png": "shot.png", "shot.PNG": "shot.PNG",
+		"shot.jpg": "shot.png", "shot.JPEG": "shot.png", "shot.webp": "shot.png",
+		"capture.v2.jpg": "capture.v2.png", "  shot  ": "shot.png", "  ": "",
+	} {
+		if got := screenshotSaveAsExportPath(input); got != want {
+			t.Fatalf("path %q = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestScreenshotEditorToolbarPlacementKeepsSixteenPixelGap(t *testing.T) {
+	frame := Rect{Width: 1200, Height: 700}
+	belowSelection := Rect{X: 100, Y: 100, Width: 900, Height: 400}
+	below := screenshotEditorToolbarPlacement(belowSelection, frame, 686, 60, 124, 1)
+	if below.Y != belowSelection.Y+belowSelection.Height+16 {
+		t.Fatalf("below toolbar = %+v, want 16px under selection", below)
+	}
+	if got := screenshotEditorEditBarTop(below, belowSelection, 56, 8, 24); got != below.Y+below.Height+8 {
+		t.Fatalf("below property bar Y = %v, want under toolbar", got)
+	}
+
+	aboveSelection := Rect{X: 100, Y: 300, Width: 900, Height: 290}
+	above := screenshotEditorToolbarPlacement(aboveSelection, frame, 686, 60, 124, 1)
+	if above.Y+above.Height != aboveSelection.Y-16 {
+		t.Fatalf("above toolbar = %+v, want 16px over selection", above)
+	}
+	if got := screenshotEditorEditBarTop(above, aboveSelection, 56, 8, 24); got != above.Y-8-56 {
+		t.Fatalf("above property bar Y = %v, want over toolbar", got)
+	}
+
+	aboveLabel := screenshotEditorSizeLabelRect((*Window)(nil), "900 x 290", aboveSelection, above, Size{Width: 1200, Height: 700}, 1, false)
+	if aboveLabel.Y != aboveSelection.Y+8 {
+		t.Fatalf("above size label = %+v, want inside selection below the toolbar", aboveLabel)
+	}
+	if aboveLabel.Y < above.Y+above.Height && aboveLabel.Y+aboveLabel.Height > above.Y {
+		t.Fatalf("size label %+v overlaps toolbar %+v", aboveLabel, above)
+	}
+
+	belowLabel := screenshotEditorSizeLabelRect((*Window)(nil), "900 x 400", belowSelection, below, Size{Width: 1200, Height: 700}, 1, false)
+	if belowLabel.Y != belowSelection.Y-32 {
+		t.Fatalf("below size label = %+v, want above selection", belowLabel)
+	}
+}
+
+func TestScreenshotEditorToolbarKeepsSameGapAboveAndBelowSelection(t *testing.T) {
+	state := &screenshotEditorOverlayState{
+		image:        testScreenshotImage(t, 1, 1),
+		selection:    Rect{X: 100, Y: 300, Width: 900, Height: 290},
+		hasSelection: true,
+		result:       make(chan screenshotEditorOverlayOutcome, 1),
+	}
+	frame := FrameInfo{Size: Size{Width: 1200, Height: 700}}
+	state.draw(&DisplayList{}, frame)
+	initialToolbar := state.toolbarRect
+	if initialToolbar.Y+initialToolbar.Height != state.selection.Y-16 {
+		t.Fatalf("toolbar = %+v, want 16px above selection %+v", initialToolbar, state.selection)
+	}
+
+	rectTool := state.toolRects[screenshotEditorToolRect]
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: rectTool.X + 20, Y: rectTool.Y + 20}})
+	state.draw(&DisplayList{}, frame)
+	if state.toolbarRect != initialToolbar {
+		t.Fatalf("toolbar jumped after property bar appeared: before %+v, after %+v", initialToolbar, state.toolbarRect)
+	}
+	wantEditBarY := screenshotEditorEditBarTop(state.toolbarRect, state.selection, 56, 8, 24)
+	if state.editBarRect.Y != wantEditBarY || state.editBarRect.Y+state.editBarRect.Height+8 != state.toolbarRect.Y {
+		t.Fatalf("property bar = %+v, toolbar = %+v, want above toolbar at Y=%v", state.editBarRect, state.toolbarRect, wantEditBarY)
+	}
+}
+
+func TestScreenshotEditorToolbarIconsRenderFromSharedSVGs(t *testing.T) {
+	names := append(screenshotEditorToolIconNames[1:],
+		"control.undo",
+		"screenshot.scrolling-capture",
+		"screenshot.cursor",
+		"screenshot.pin",
+		"control.close",
+		"control.download",
+		"control.check",
+		"control.remove",
+		"control.add",
+		"control.delete",
+		"screenshot.video-camera",
+		"control.record",
+		"control.pause",
+		"control.play-circle",
+		"control.play-arrow",
+		"control.refresh",
+		"control.keyboard",
+		"control.stop",
+	)
+	for _, name := range names {
+		displayList := &DisplayList{}
+		drawScreenshotEditorToolbarIcon(displayList, name, Rect{Width: 40, Height: 40}, Color{R: 255, G: 255, B: 255, A: 255}, 1)
+		if displayList.CommandCount() != 1 {
+			t.Fatalf("toolbar icon %q did not render as an SVG image", name)
+		}
+		renderer, err := woxui.NewSoftwareRenderer(40, 40)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := renderer.Render(displayList); err != nil {
+			t.Fatalf("render toolbar icon %q: %v", name, err)
+		}
+		visible := false
+		for index := 3; index < len(renderer.RGBA().Pix); index += 4 {
+			if renderer.RGBA().Pix[index] > 0 {
+				visible = true
+				break
+			}
+		}
+		if !visible {
+			t.Fatalf("toolbar icon %q rendered blank", name)
+		}
+	}
+}
+
+func TestScreenshotEditorAnnotationToolsHaveTooltips(t *testing.T) {
+	configured := [screenshotEditorToolCount]string{"", "Localized rectangle"}
+	for tool := int(screenshotEditorToolRect); tool <= int(screenshotEditorToolMosaic); tool++ {
+		if tooltip := screenshotEditorToolTooltip(tool, configured); tooltip == "" {
+			t.Fatalf("tool %d tooltip is empty", tool)
+		}
+	}
+	if got := screenshotEditorToolTooltip(int(screenshotEditorToolRect), configured); got != "Localized rectangle (R)" {
+		t.Fatalf("configured tooltip = %q", got)
+	}
+	anchor, actionTooltip := screenshotEditorActionTooltip(screenshotEditorActionCursor, ScreenshotActionTooltips{Cursor: "Localized cursor"}, Rect{}, Rect{}, Rect{X: 10, Y: 20, Width: 40, Height: 40}, Rect{}, Rect{}, Rect{}, Rect{}, Rect{}, Rect{})
+	if anchor.X != 10 || actionTooltip != "Localized cursor (C)" {
+		t.Fatalf("cursor tooltip = anchor:%+v text:%q", anchor, actionTooltip)
+	}
+	backgroundAnchor, backgroundTooltip := screenshotEditorActionTooltip(screenshotEditorActionBackground, ScreenshotActionTooltips{Background: "Localized background"}, Rect{}, Rect{}, Rect{}, Rect{}, Rect{}, Rect{}, Rect{}, Rect{}, Rect{X: 80, Y: 20, Width: 40, Height: 40})
+	if backgroundAnchor.X != 80 || backgroundTooltip != "Localized background (Space)" {
+		t.Fatalf("background tooltip = anchor:%+v text:%q", backgroundAnchor, backgroundTooltip)
+	}
+	saveAnchor, saveTooltip := screenshotEditorActionTooltip(screenshotEditorActionSave, ScreenshotActionTooltips{Save: "Localized save"}, Rect{}, Rect{}, Rect{}, Rect{}, Rect{}, Rect{}, Rect{X: 40, Y: 20, Width: 40, Height: 40}, Rect{}, Rect{})
+	if saveAnchor.X != 40 || !strings.HasPrefix(saveTooltip, "Localized save (") {
+		t.Fatalf("save tooltip = anchor:%+v text:%q", saveAnchor, saveTooltip)
+	}
+	if got := screenshotEditorEstimatedTextWidth("椭圆", 12); got != 24 {
+		t.Fatalf("estimated CJK tooltip width = %v, want 24", got)
+	}
+	displayList := &DisplayList{}
+	drawScreenshotEditorToolTooltip(displayList, &screenshotTestSurface{}, Size{Width: 400, Height: 240}, Rect{X: 100, Y: 100, Width: 40, Height: 40}, Rect{}, "Rectangle", 1)
+	if displayList.CommandCount() != 2 {
+		t.Fatalf("tooltip commands = %d, want background and text", displayList.CommandCount())
+	}
+}
+
+func TestScreenshotEditorToolTooltipStaysOnSelectionSide(t *testing.T) {
+	frame := Size{Width: 1200, Height: 700}
+	anchor := Rect{X: 400, Y: 100, Width: 40, Height: 40}
+	belowSelection := Rect{X: 100, Y: 20, Width: 900, Height: 60}
+	above := screenshotEditorToolTooltipRect(&screenshotTestSurface{}, frame, anchor, belowSelection, "Arrow (A)", 1)
+	if above.Y != 64 {
+		t.Fatalf("below-toolbar tooltip = %+v, want 8px above the icon", above)
+	}
+
+	aboveSelection := Rect{X: 100, Y: 160, Width: 900, Height: 200}
+	below := screenshotEditorToolTooltipRect(&screenshotTestSurface{}, frame, anchor, aboveSelection, "Arrow (A)", 1)
+	if below.Y != 148 {
+		t.Fatalf("above-toolbar tooltip = %+v, want 8px below the icon", below)
+	}
+	editBar := Rect{X: 400, Y: 36, Width: 192, Height: 56}
+	if below.Y < editBar.Y+editBar.Height && below.Y+below.Height > editBar.Y {
+		t.Fatalf("tooltip %+v overlaps property bar %+v", below, editBar)
+	}
+}
+
+// TestScreenshotEditorTooltipUsesFontMetrics checks complete labels and centering at screen edges across DPI scales.
+func TestScreenshotEditorTooltipUsesFontMetrics(t *testing.T) {
+	surface := &screenshotTooltipTestSurface{}
+	frame := Size{Width: 1600, Height: 900}
+	for _, scale := range []float32{1, 1.25, 1.5, 2.5} {
+		for _, label := range []string{"Record video (V)", "录制视频 (V)", "Записать видео (V)"} {
+			for _, left := range []float32{0, 700, frame.Width - 40*scale} {
+				anchor := Rect{X: left, Y: 500, Width: 40 * scale, Height: 40 * scale}
+				style := TextStyle{Size: 12 * scale, Weight: FontWeightSemibold}
+				metrics, _ := surface.MeasureText(label, style)
+				rect := screenshotEditorToolTooltipRect(surface, frame, anchor, Rect{}, label, scale)
+				if rect.Width < metrics.Size.Width+20*scale || rect.Height < metrics.Size.Height+8*scale {
+					t.Fatalf("scale %v: tooltip %q bounds %+v clip measured text %+v", scale, label, rect, metrics.Size)
+				}
+				if rect.X < 8*scale || rect.X+rect.Width > frame.Width-8*scale {
+					t.Fatalf("scale %v: tooltip %q escapes frame: %+v", scale, label, rect)
+				}
+				actual := &DisplayList{}
+				drawScreenshotEditorToolTooltip(actual, surface, frame, anchor, Rect{}, label, scale)
+				expected := &DisplayList{}
+				expected.FillRoundedRect(rect, 8*scale, Color{R: 20, G: 18, B: 17, A: 240})
+				expected.DrawText(label, Rect{
+					X: rect.X + (rect.Width-metrics.Size.Width)/2, Y: rect.Y + (rect.Height-metrics.Size.Height)/2,
+					Width: metrics.Size.Width, Height: metrics.Size.Height,
+				}, style, Color{R: 255, G: 255, B: 255, A: 255})
+				if err := actual.Compare(expected); err != nil {
+					t.Fatalf("scale %v: tooltip %q should draw the complete centered label: %v", scale, label, err)
+				}
+				toolbar := Rect{X: 150, Y: 250}
+				origin := Point{X: -900, Y: -300}
+				localAnchor := Rect{X: anchor.X - toolbar.X, Y: anchor.Y - toolbar.Y, Width: anchor.Width, Height: anchor.Height}
+				local := recordingToolbarTooltipLocalRect(surface, frame, toolbar, localAnchor, Rect{}, origin, label, scale)
+				if math.Abs(float64(local.X+origin.X-rect.X)) > 0.001 || local.Y+origin.Y != rect.Y || local.Width != rect.Width || local.Height != rect.Height {
+					t.Fatalf("scale %v: recording tooltip %q lost measured bounds after origin conversion: %+v, want %+v", scale, label, local, rect)
+				}
+			}
+		}
+	}
+}
+
+func TestScreenshotEditorChromeUsesSelectionMonitorScale(t *testing.T) {
+	state := &screenshotEditorOverlayState{
+		image:        testScreenshotImage(t, 2000, 1200),
+		selection:    Rect{X: 200, Y: 100, Width: 1400, Height: 800},
+		hasSelection: true,
+		chromeScale:  func(Rect) float32 { return 1.5 },
+	}
+	state.draw(&DisplayList{}, FrameInfo{Size: Size{Width: 2000, Height: 1200}})
+	if state.uiScale != 1.5 {
+		t.Fatalf("chrome scale = %.2f, want 1.5", state.uiScale)
+	}
+	if state.toolbarRect.Width != 1272 || state.toolbarRect.Height != 72 {
+		t.Fatalf("scaled toolbar = %+v, want 1272x72", state.toolbarRect)
+	}
+	if state.confirmRect.Width != 60 || state.confirmRect.Height != 60 {
+		t.Fatalf("scaled confirm action = %+v, want 60x60", state.confirmRect)
+	}
+}
+
+func TestScreenshotEditorCursorToggleAndExport(t *testing.T) {
+	source := image.NewRGBA(image.Rect(0, 0, 400, 200))
+	mapped := screenshotEditorCursorPixelFromDesktop(Point{X: -50, Y: 25}, Rect{X: -100, Width: 200, Height: 100}, source)
+	if mapped == nil || *mapped != (Point{X: 100, Y: 50}) {
+		t.Fatalf("mapped cursor = %+v, want source pixel 100,50", mapped)
+	}
+	if outside := screenshotEditorCursorPixelFromDesktop(Point{X: 100, Y: 25}, Rect{X: -100, Width: 200, Height: 100}, source); outside != nil {
+		t.Fatalf("outside cursor should be unavailable, got %+v", outside)
+	}
+
+	cursorPixel := Point{X: 80, Y: 60}
+	state := &screenshotEditorOverlayState{
+		image:        testScreenshotImage(t, 200, 120),
+		frameSize:    Size{Width: 200, Height: 120},
+		selection:    Rect{X: 20, Y: 20, Width: 140, Height: 80},
+		hasSelection: true,
+		cursorPixel:  &cursorPixel,
+	}
+	state.draw(&DisplayList{}, FrameInfo{Size: state.frameSize})
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: state.cursorRect.X + 20, Y: state.cursorRect.Y + 20}})
+	if !state.showCursor {
+		t.Fatal("cursor toolbar action did not enable the captured pointer")
+	}
+
+	target := image.NewRGBA(image.Rect(0, 0, 200, 120))
+	draw.Draw(target, target.Bounds(), image.NewUniform(color.RGBA{R: 255, G: 255, B: 255, A: 255}), image.Point{}, draw.Src)
+	if err := renderScreenshotEditorCursor(target, cursorPixel, state.selection, state.frameSize, nil); err != nil {
+		t.Fatalf("render cursor: %v", err)
+	}
+	foundDarkPixel := false
+	for y := 55; y < 90 && !foundDarkPixel; y++ {
+		for x := 75; x < 115; x++ {
+			pixel := target.RGBAAt(x, y)
+			if pixel.R < 80 && pixel.G < 80 && pixel.B < 80 && pixel.A > 0 {
+				foundDarkPixel = true
+				break
+			}
+		}
+	}
+	if !foundDarkPixel {
+		t.Fatal("exported cursor marker did not contain its dark outline")
+	}
+
+	nativeCursor := image.NewRGBA(image.Rect(0, 0, 3, 4))
+	nativeCursor.SetRGBA(1, 2, color.RGBA{R: 200, G: 30, B: 20, A: 255})
+	nativeTarget := image.NewRGBA(image.Rect(0, 0, 200, 120))
+	if err := renderScreenshotEditorCursor(nativeTarget, Point{X: 80, Y: 60}, state.selection, state.frameSize, &screenshotEditorCapturedCursor{
+		raster: nativeCursor, hotspot: Point{X: 1, Y: 2},
+	}); err != nil {
+		t.Fatalf("render captured native cursor: %v", err)
+	}
+	if got := nativeTarget.RGBAAt(80, 60); got.R != 200 || got.G != 30 || got.B != 20 || got.A != 255 {
+		t.Fatalf("native cursor hotspot pixel = %+v", got)
+	}
+}
+
+func TestScreenshotEditorAnnotationDrawUndoAndExport(t *testing.T) {
+	state := &screenshotEditorOverlayState{
+		image:        testScreenshotImage(t, 1, 1),
+		frameSize:    Size{Width: 100, Height: 50},
+		selection:    Rect{Width: 100, Height: 50},
+		hasSelection: true,
+		activeTool:   screenshotEditorToolRect,
+	}
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: 20, Y: 10}})
+	state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: 50, Y: 30}})
+	state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: Point{X: 50, Y: 30}})
+	if len(state.annotations) != 1 || state.annotations[0].rect != (Rect{X: 20, Y: 10, Width: 30, Height: 20}) {
+		t.Fatalf("annotations = %+v", state.annotations)
+	}
+
+	source := image.NewRGBA(image.Rect(0, 0, 200, 100))
+	for y := 0; y < 100; y++ {
+		for x := 0; x < 200; x++ {
+			source.SetRGBA(x, y, color.RGBA{R: 255, G: 255, B: 255, A: 255})
+		}
+	}
+	composited, err := renderScreenshotEditorAnnotations(source, state.annotations, state.selection, state.frameSize, 1)
+	if err != nil {
+		t.Fatalf("render annotations: %v", err)
+	}
+	if pixel := composited.RGBAAt(40, 20); pixel.R != 255 || pixel.G != 91 || pixel.B != 54 {
+		t.Fatalf("annotation pixel = %+v", pixel)
+	}
+
+	state.draw(&DisplayList{}, FrameInfo{Size: state.frameSize})
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: state.undoRect.X + 20, Y: state.undoRect.Y + 20}})
+	if len(state.annotations) != 0 {
+		t.Fatalf("undo left %d annotations", len(state.annotations))
+	}
+}
+
+func TestScreenshotEditorCreatesEveryAnnotationTool(t *testing.T) {
+	for _, tool := range []screenshotEditorTool{
+		screenshotEditorToolRect,
+		screenshotEditorToolEllipse,
+		screenshotEditorToolArrow,
+		screenshotEditorToolMosaic,
+	} {
+		state := &screenshotEditorOverlayState{
+			frameSize:    Size{Width: 200, Height: 100},
+			selection:    Rect{Width: 200, Height: 100},
+			hasSelection: true,
+			activeTool:   tool,
+		}
+		state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: 20, Y: 20}})
+		state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: 80, Y: 60}})
+		state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: Point{X: 80, Y: 60}})
+		if len(state.annotations) != 1 || state.annotations[0].tool != tool {
+			t.Fatalf("tool %d annotations = %+v", tool, state.annotations)
+		}
+		if !state.hasSelectedMark || state.selectedAnnotation != 0 || state.activeTool != tool {
+			t.Fatalf("tool %d selection = selected:%t index:%d active:%d, want tool kept", tool, state.hasSelectedMark, state.selectedAnnotation, state.activeTool)
+		}
+	}
+
+	textState := &screenshotEditorOverlayState{
+		frameSize:    Size{Width: 200, Height: 100},
+		selection:    Rect{Width: 200, Height: 100},
+		hasSelection: true,
+		activeTool:   screenshotEditorToolText,
+	}
+	textState.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: 20, Y: 20}})
+	textState.caretVisible = false
+	textState.textInput(TextInputEvent{Kind: TextInputCommit, Text: "中文"})
+	if !textState.caretVisible {
+		t.Fatal("text input did not immediately reveal the caret")
+	}
+	textState.key(KeyEvent{Key: KeyEnter, Down: true})
+	if textState.activeTool != screenshotEditorToolText {
+		t.Fatalf("text tool = %d, want kept after commit", textState.activeTool)
+	}
+	if len(textState.annotations) != 1 || textState.annotations[0].text != "中文" {
+		t.Fatalf("text annotations = %+v", textState.annotations)
+	}
+	if !textState.hasSelectedMark || textState.selectedAnnotation != 0 {
+		t.Fatalf("committed text selection = selected:%t index:%d", textState.hasSelectedMark, textState.selectedAnnotation)
+	}
+}
+
+func TestScreenshotEditorKeepsDrawingToolForConsecutiveAnnotations(t *testing.T) {
+	state := &screenshotEditorOverlayState{
+		frameSize:    Size{Width: 400, Height: 240},
+		selection:    Rect{X: 20, Y: 20, Width: 360, Height: 200},
+		hasSelection: true,
+		activeTool:   screenshotEditorToolArrow,
+	}
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: 60, Y: 60}})
+	state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: 140, Y: 100}})
+	state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: Point{X: 140, Y: 100}})
+	if state.activeTool != screenshotEditorToolArrow || len(state.annotations) != 1 {
+		t.Fatalf("after first arrow: tool=%d annotations=%d", state.activeTool, len(state.annotations))
+	}
+
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: 200, Y: 80}})
+	state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: 280, Y: 140}})
+	state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: Point{X: 280, Y: 140}})
+	if state.activeTool != screenshotEditorToolArrow {
+		t.Fatalf("tool = %d, want arrow kept for the second stroke", state.activeTool)
+	}
+	if len(state.annotations) != 2 || state.annotations[1].tool != screenshotEditorToolArrow {
+		t.Fatalf("second stroke annotations = %+v, want a second arrow instead of moving the selection", state.annotations)
+	}
+	if state.selection != (Rect{X: 20, Y: 20, Width: 360, Height: 200}) {
+		t.Fatalf("selection = %+v, consecutive drawing should not move the capture", state.selection)
+	}
+}
+
+func TestScreenshotEditorNumberToolCreatesConsecutiveMovableMarkers(t *testing.T) {
+	state := &screenshotEditorOverlayState{
+		frameSize:       Size{Width: 240, Height: 140},
+		selection:       Rect{Width: 240, Height: 140},
+		hasSelection:    true,
+		activeTool:      screenshotEditorToolNumber,
+		annotationColor: screenshotEditorAnnotationColor,
+		nextNumber:      1,
+	}
+	points := []Point{{X: 40, Y: 40}, {X: 100, Y: 60}, {X: 160, Y: 90}}
+	for index, point := range points {
+		state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: point})
+		state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: point})
+		if len(state.annotations) != index+1 || state.annotations[index].number != index+1 || state.annotations[index].start != point {
+			t.Fatalf("number click %d annotations = %+v", index+1, state.annotations)
+		}
+		if state.activeTool != screenshotEditorToolNumber {
+			t.Fatalf("number tool stopped after click %d: active=%d", index+1, state.activeTool)
+		}
+	}
+
+	state.pointer(PointerEvent{Kind: PointerMove, Position: points[1]})
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: points[1]})
+	state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: 120, Y: 80}})
+	state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: Point{X: 120, Y: 80}})
+	if state.annotations[1].start != (Point{X: 120, Y: 80}) {
+		t.Fatalf("moved number marker = %+v", state.annotations[1])
+	}
+}
+
+// TestScreenshotEditorNumberColorPersistsAfterRecoloring catches a palette showing the selected color while creation still uses the old one.
+func TestScreenshotEditorNumberColorPersistsAfterRecoloring(t *testing.T) {
+	for _, scale := range []float32{1, 1.5, 2} {
+		state := &screenshotEditorOverlayState{
+			image: testScreenshotImage(t, 1, 1), frameSize: Size{Width: 1600, Height: 1000},
+			selection: Rect{X: 100, Y: 100, Width: 800, Height: 500}, hasSelection: true,
+			activeTool: screenshotEditorToolNumber, annotationColor: screenshotEditorPalette[1],
+			chromeScale: func(Rect) float32 { return scale },
+		}
+		click := func(point Point) {
+			state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: point})
+			state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: point})
+			state.draw(&DisplayList{}, FrameInfo{Size: state.frameSize})
+		}
+		click(Point{X: 200, Y: 200})
+		red := state.editColorRects[0]
+		click(Point{X: red.X + red.Width/2, Y: red.Y + red.Height/2})
+		if state.annotations[0].color != screenshotEditorPalette[0] {
+			t.Fatal("palette did not recolor the selected number")
+		}
+		for index, point := range []Point{{X: 350, Y: 200}, {X: 500, Y: 200}} {
+			click(point)
+			if len(state.annotations) != index+2 || state.annotations[index+1].color != screenshotEditorPalette[0] || state.annotationColor != screenshotEditorPalette[0] {
+				t.Fatalf("scale %v: number %d reverted to the old color: %+v", scale, index+2, state.annotations)
+			}
+			if state.annotations[index+1].number != index+2 || state.activeTool != screenshotEditorToolNumber {
+				t.Fatal("continuing in the new color changed number sequencing or the active tool")
+			}
+		}
+		// Explicit selection edits change only that marker, preserving the creation preference.
+		click(Point{X: 200, Y: 200})
+		if state.activeTool != screenshotEditorToolSelect {
+			t.Fatal("clicking an existing number did not enter selection mode")
+		}
+		blue := state.editColorRects[3]
+		click(Point{X: blue.X + blue.Width/2, Y: blue.Y + blue.Height/2})
+		if state.annotations[0].color != screenshotEditorPalette[3] || state.annotations[1].color != screenshotEditorPalette[0] || state.annotationColor != screenshotEditorPalette[0] {
+			t.Fatal("recoloring a selected marker changed other marks or the creation preference")
+		}
+	}
+}
+
+func TestScreenshotEditorNumberAnnotationDrawsAndExports(t *testing.T) {
+	annotation := screenshotEditorAnnotation{
+		tool: screenshotEditorToolNumber, start: Point{X: 40, Y: 30}, number: 12, color: screenshotEditorAnnotationColor,
+		textSize: Size{Width: 15, Height: 17}, measuredSize: screenshotEditorNumberFontSize,
+	}
+	_, _, textRect := screenshotEditorNumberTextLayout(annotation, 1)
+	if textRect.X+textRect.Width/2 != annotation.start.X || textRect.Y+textRect.Height/2 != annotation.start.Y {
+		t.Fatalf("number text rect = %+v, want center %+v", textRect, annotation.start)
+	}
+	displayList := &DisplayList{}
+	drawScreenshotEditorAnnotations(displayList, nil, []screenshotEditorAnnotation{annotation}, nil, Size{Width: 80, Height: 60}, 1)
+	if displayList.CommandCount() != 2 {
+		t.Fatalf("number preview commands = %d, want circle and text", displayList.CommandCount())
+	}
+
+	source := image.NewRGBA(image.Rect(0, 0, 80, 60))
+	exported, err := renderScreenshotEditorAnnotations(source, []screenshotEditorAnnotation{annotation}, Rect{Width: 80, Height: 60}, Size{Width: 80, Height: 60}, 1)
+	if err != nil {
+		t.Fatalf("export number annotation: %v", err)
+	}
+	if pixel := exported.RGBAAt(28, 30); pixel.R != 255 || pixel.G != 91 || pixel.B != 54 {
+		t.Fatalf("number marker fill = %+v", pixel)
+	}
+	if !screenshotEditorAnnotationContains(annotation, Point{X: 40, Y: 30}, 1) {
+		t.Fatal("number marker center was not interactive")
+	}
+}
+
+func TestScreenshotEditorTextToolUsesTextCursorInsideSelection(t *testing.T) {
+	state := &screenshotEditorOverlayState{
+		frameSize:    Size{Width: 240, Height: 140},
+		selection:    Rect{X: 20, Y: 20, Width: 180, Height: 100},
+		hasSelection: true,
+		activeTool:   screenshotEditorToolText,
+		annotations: []screenshotEditorAnnotation{{
+			tool: screenshotEditorToolEllipse, rect: Rect{X: 50, Y: 35, Width: 80, Height: 60}, color: screenshotEditorAnnotationColor,
+		}},
+	}
+	state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: 80, Y: 60}})
+	if state.pointerCursor != PointerCursorText {
+		t.Fatalf("text tool cursor = %d, want text", state.pointerCursor)
+	}
+	if state.hasHoveredMark {
+		t.Fatal("text tool should not reveal shape controls under its input target")
+	}
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: 80, Y: 60}})
+	if !state.textEditing || state.hasSelectedMark || len(state.annotations) != 1 {
+		t.Fatalf("text over shape = editing:%t selected:%t annotations:%d", state.textEditing, state.hasSelectedMark, len(state.annotations))
+	}
+	state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: 10, Y: 10}})
+	if state.pointerCursor != PointerCursorDefault {
+		t.Fatalf("text tool cursor outside selection = %d, want default", state.pointerCursor)
+	}
+}
+
+func TestScreenshotEditorTextUsesDisplayScaleAndClickEditsInPlace(t *testing.T) {
+	annotation := screenshotEditorAnnotation{
+		tool: screenshotEditorToolText, start: Point{X: 30, Y: 30}, text: "Before", color: screenshotEditorAnnotationColor, fontSize: 20,
+		textSize: Size{Width: 70, Height: 28}, measuredSize: 20,
+	}
+	if got := screenshotEditorAnnotationRenderedFontSize(annotation, 1.5); got != 30 {
+		t.Fatalf("rendered text size = %v, want 30", got)
+	}
+	if !screenshotEditorAnnotationContains(annotation, Point{X: 40, Y: 60}, 1.5) || screenshotEditorAnnotationContains(annotation, Point{X: 40, Y: 60}, 1) {
+		t.Fatal("text hit bounds did not follow display scale")
+	}
+	state := &screenshotEditorOverlayState{
+		frameSize: Size{Width: 240, Height: 140}, selection: Rect{Width: 240, Height: 140}, hasSelection: true,
+		activeTool: screenshotEditorToolSelect, annotations: []screenshotEditorAnnotation{annotation}, uiScale: 1.5,
+	}
+	click := Point{X: 45, Y: 42}
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: click})
+	state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: click})
+	if !state.textEditing || !state.hasEditingText || state.editingTextIndex != 0 || state.textDraft != "Before" {
+		t.Fatalf("click edit state = editing:%t existing:%t index:%d draft:%q", state.textEditing, state.hasEditingText, state.editingTextIndex, state.textDraft)
+	}
+	state.textDraft = "After"
+	state.key(KeyEvent{Key: KeyEnter, Down: true})
+	if len(state.annotations) != 1 || state.annotations[0].text != "After" {
+		t.Fatalf("edited text annotations = %+v", state.annotations)
+	}
+	if state.annotations[0].textSize != (Size{}) || state.annotations[0].measuredSize != 0 {
+		t.Fatalf("edited text retained stale metrics: %+v", state.annotations[0])
+	}
+}
+
+func TestScreenshotEditorTextBoundsPreferMeasuredMetrics(t *testing.T) {
+	annotation := screenshotEditorAnnotation{
+		tool: screenshotEditorToolText, start: Point{X: 20, Y: 30}, text: "撒旦发射点发", fontSize: 48,
+		textSize: Size{Width: 302, Height: 58}, measuredSize: 48,
+	}
+	if got := screenshotEditorAnnotationBounds(annotation, 1); got != (Rect{X: 20, Y: 30, Width: 302, Height: 58}) {
+		t.Fatalf("measured text bounds = %+v", got)
+	}
+	if got := screenshotEditorTextFrame(annotation, 1); got != (Rect{X: 16, Y: 26, Width: 310, Height: 66}) {
+		t.Fatalf("measured text frame = %+v", got)
+	}
+}
+
+func TestScreenshotEditorCaretEstimateTracksMixedGlyphWidths(t *testing.T) {
+	fontSize := float32(40)
+	text := "asdfasfsdfsaf"
+	width := screenshotEditorEstimatedTextWidth(text, fontSize)
+	if width >= float32(len(text))*fontSize*0.6 || width <= float32(len(text))*fontSize*0.4 {
+		t.Fatalf("caret width = %v, want a compact mixed-lowercase estimate", width)
+	}
+	if cjk := screenshotEditorEstimatedTextWidth("文字", fontSize); cjk != 2*fontSize {
+		t.Fatalf("CJK caret width = %v, want %v", cjk, 2*fontSize)
+	}
+}
+
+func TestScreenshotEditorClickPositionsCaretInsideExistingText(t *testing.T) {
+	annotation := screenshotEditorAnnotation{
+		tool: screenshotEditorToolText, start: Point{X: 30, Y: 30}, text: "测试一下", color: screenshotEditorAnnotationColor, fontSize: 20,
+	}
+	state := &screenshotEditorOverlayState{
+		frameSize: Size{Width: 240, Height: 140}, selection: Rect{Width: 240, Height: 140}, hasSelection: true,
+		activeTool: screenshotEditorToolText, annotations: []screenshotEditorAnnotation{annotation}, uiScale: 1,
+	}
+	clickAfterFirstRune := Point{X: 49, Y: 40}
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: clickAfterFirstRune})
+	if !state.textEditing || state.textCaret != 1 {
+		t.Fatalf("positioned edit = editing:%t caret:%d, want caret 1", state.textEditing, state.textCaret)
+	}
+	state.textInput(TextInputEvent{Kind: TextInputCommit, Text: "含"})
+	if state.textDraft != "测含试一下" || state.textCaret != 2 {
+		t.Fatalf("inserted text = %q caret:%d", state.textDraft, state.textCaret)
+	}
+	state.key(KeyEvent{Key: KeyEnter, Down: true})
+	if len(state.annotations) != 1 || state.annotations[0].text != "测含试一下" {
+		t.Fatalf("committed positioned edit = %+v", state.annotations)
+	}
+}
+
+func TestScreenshotEditorCompositionRendersAtCaret(t *testing.T) {
+	value, caretPrefix := screenshotEditorTextEditingValue("测试", "含", 1)
+	if value != "测含试" || caretPrefix != "测含" {
+		t.Fatalf("composition value = %q prefix = %q", value, caretPrefix)
+	}
+}
+
+func TestScreenshotEditorTextFrameSeparatesEditingAndDragging(t *testing.T) {
+	annotation := screenshotEditorAnnotation{
+		tool: screenshotEditorToolText, start: Point{X: 50, Y: 40}, text: "Wox", color: screenshotEditorAnnotationColor, fontSize: 20,
+	}
+	state := &screenshotEditorOverlayState{
+		frameSize: Size{Width: 240, Height: 140}, selection: Rect{Width: 240, Height: 140}, hasSelection: true,
+		activeTool: screenshotEditorToolSelect, annotations: []screenshotEditorAnnotation{annotation}, uiScale: 1,
+	}
+	bodyPoint := Point{X: 60, Y: 50}
+	state.pointer(PointerEvent{Kind: PointerMove, Position: bodyPoint})
+	if !state.hasHoveredMark || state.pointerCursor != PointerCursorText {
+		t.Fatalf("text content hover = hovered:%t cursor:%d, want text", state.hasHoveredMark, state.pointerCursor)
+	}
+
+	frame := screenshotEditorTextFrame(annotation, 1)
+	borderPoint := Point{X: frame.X + frame.Width/2, Y: frame.Y}
+	state.pointer(PointerEvent{Kind: PointerMove, Position: borderPoint})
+	if !state.hasHoveredMark || state.pointerCursor != PointerCursorMove {
+		t.Fatalf("text border hover = hovered:%t cursor:%d, want move", state.hasHoveredMark, state.pointerCursor)
+	}
+	displayList := &DisplayList{}
+	drawScreenshotEditorAnnotationHandles(displayList, annotation, 1)
+	if displayList.CommandCount() == 0 {
+		t.Fatal("hovered text did not draw its dashed frame")
+	}
+
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: borderPoint})
+	movedPoint := Point{X: borderPoint.X + 20, Y: borderPoint.Y + 10}
+	state.pointer(PointerEvent{Kind: PointerMove, Position: movedPoint})
+	state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: movedPoint})
+	if got := state.annotations[0].start; got != (Point{X: 70, Y: 50}) {
+		t.Fatalf("dragged text start = %+v, want {70 50}", got)
+	}
+
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: 80, Y: 60}})
+	state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: Point{X: 80, Y: 60}})
+	if !state.textEditing || state.textDraft != "Wox" {
+		t.Fatalf("text click did not enter editing: editing:%t draft:%q", state.textEditing, state.textDraft)
+	}
+}
+
+func TestScreenshotEditorTextToolDragsFromDashedFrame(t *testing.T) {
+	annotation := screenshotEditorAnnotation{
+		tool: screenshotEditorToolText, start: Point{X: 50, Y: 40}, text: "Wox", color: screenshotEditorAnnotationColor, fontSize: 20,
+	}
+	state := &screenshotEditorOverlayState{
+		frameSize: Size{Width: 240, Height: 140}, selection: Rect{Width: 240, Height: 140}, hasSelection: true,
+		activeTool: screenshotEditorToolText, annotations: []screenshotEditorAnnotation{annotation}, uiScale: 1,
+	}
+	frame := screenshotEditorTextFrame(annotation, 1)
+	borderPoint := Point{X: frame.X + frame.Width/2, Y: frame.Y}
+	state.pointer(PointerEvent{Kind: PointerMove, Position: borderPoint})
+	if !state.hasHoveredMark || state.pointerCursor != PointerCursorMove {
+		t.Fatalf("text-tool border hover = hovered:%t cursor:%d, want move", state.hasHoveredMark, state.pointerCursor)
+	}
+
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: borderPoint})
+	if state.textEditing || state.editMode != screenshotEditorEditMoveAnnotation {
+		t.Fatalf("text-tool border press = editing:%t mode:%d, want move", state.textEditing, state.editMode)
+	}
+	movedPoint := Point{X: borderPoint.X + 20, Y: borderPoint.Y + 10}
+	state.pointer(PointerEvent{Kind: PointerMove, Position: movedPoint})
+	state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: movedPoint})
+	if got := state.annotations[0].start; got != (Point{X: 70, Y: 50}) {
+		t.Fatalf("text-tool dragged start = %+v, want {70 50}", got)
+	}
+	if state.textDraft != "" || len(state.annotations) != 1 {
+		t.Fatalf("text-tool drag created a new label: draft=%q annotations=%d", state.textDraft, len(state.annotations))
+	}
+}
+
+func screenshotEditorPrimaryModifier() KeyModifiers {
+	if runtime.GOOS == "darwin" {
+		return KeyModifierMeta
+	}
+	return KeyModifierControl
+}
+
+func TestScreenshotEditorTextEditingSupportsSelectionShortcutsAndMultiClick(t *testing.T) {
+	annotation := screenshotEditorAnnotation{
+		tool: screenshotEditorToolText, start: Point{X: 30, Y: 30}, text: "Hello World", color: screenshotEditorAnnotationColor, fontSize: 20,
+	}
+	state := &screenshotEditorOverlayState{
+		frameSize: Size{Width: 320, Height: 160}, selection: Rect{Width: 320, Height: 160}, hasSelection: true,
+		activeTool: screenshotEditorToolSelect, annotations: []screenshotEditorAnnotation{annotation}, uiScale: 1,
+	}
+	click := Point{X: 45, Y: 40}
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: click})
+	state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: click})
+	if !state.textEditing || state.textDraft != "Hello World" {
+		t.Fatalf("edit start = editing:%t draft:%q", state.textEditing, state.textDraft)
+	}
+
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: click})
+	state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: click})
+	if got := state.textEditor.SelectedText(); got != "Hello" {
+		t.Fatalf("double-click selected %q, want Hello", got)
+	}
+
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: click})
+	state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: click})
+	if got := state.textEditor.SelectedText(); got != "Hello World" {
+		t.Fatalf("triple-click selected %q, want Hello World", got)
+	}
+
+	state.textEditor.SetCaret(5)
+	state.syncTextEditorLocked()
+	if !state.key(KeyEvent{Key: Key("a"), Down: true, Modifiers: screenshotEditorPrimaryModifier()}) {
+		t.Fatal("select-all shortcut was not handled")
+	}
+	if got := state.textEditor.SelectedText(); got != "Hello World" {
+		t.Fatalf("Ctrl+A selected %q, want Hello World", got)
+	}
+
+	state.textEditor.SetCaret(11)
+	state.syncTextEditorLocked()
+	state.textInput(TextInputEvent{Kind: TextInputCommit, Text: "!"})
+	if state.textDraft != "Hello World!" {
+		t.Fatalf("typed draft = %q", state.textDraft)
+	}
+	if !state.key(KeyEvent{Key: Key("z"), Down: true, Modifiers: screenshotEditorPrimaryModifier()}) {
+		t.Fatal("undo shortcut was not handled")
+	}
+	if state.textDraft != "Hello World" {
+		t.Fatalf("undo draft = %q, want Hello World", state.textDraft)
+	}
+}
+
+func TestScreenshotEditorAnnotationDirtyRectCoversMove(t *testing.T) {
+	annotation := screenshotEditorAnnotation{
+		tool: screenshotEditorToolText, start: Point{X: 50, Y: 40}, text: "Wox", fontSize: 20,
+		textSize: Size{Width: 40, Height: 24}, measuredSize: 20,
+	}
+	before := screenshotEditorAnnotationDirtyRect(annotation, 1)
+	moved := annotation
+	moved.start = Point{X: 70, Y: 50}
+	after := screenshotEditorAnnotationDirtyRect(moved, 1)
+	combined := unionScreenshotEditorRects(before, after)
+	if combined.X > before.X || combined.Y > before.Y || combined.X+combined.Width < after.X+after.Width {
+		t.Fatalf("move dirty rect = %+v, before=%+v after=%+v", combined, before, after)
+	}
+}
+
+// TestScreenshotEditorDragCanRepaintReusedBuffers covers native damage expansion after commands are recorded.
+func TestScreenshotEditorDragCanRepaintReusedBuffers(t *testing.T) {
+	source := image.NewRGBA(image.Rect(0, 0, 800, 600))
+	draw.Draw(source, source.Bounds(), image.NewUniform(color.RGBA{R: 100, G: 140, B: 200, A: 255}), image.Point{}, draw.Src)
+	background, err := NewImage(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, scale := range []float32{1, 1.25, 1.5, 2} {
+		state := &screenshotEditorOverlayState{
+			image: background, frameSize: Size{Width: 800, Height: 600},
+			selection: Rect{X: 40, Y: 40, Width: 700, Height: 400}, hasSelection: true,
+			activeTool: screenshotEditorToolSelect, hasSelectedMark: true, colorInspectorDismissed: true,
+			chromeScale: func(Rect) float32 { return scale },
+			annotations: []screenshotEditorAnnotation{{
+				tool: screenshotEditorToolEllipse, rect: Rect{X: 100, Y: 100, Width: 80, Height: 60}, color: screenshotEditorAnnotationColor,
+			}, {
+				tool: screenshotEditorToolRect, rect: Rect{X: 600, Y: 300, Width: 100, Height: 70}, color: screenshotEditorAnnotationColor,
+			}},
+		}
+		frame := FrameInfo{Size: state.frameSize, Scale: scale}
+		state.draw(&DisplayList{}, frame)
+		state.editMode = screenshotEditorEditMoveAnnotation
+		state.editOriginalMark = state.annotations[0]
+		state.start = Point{X: 140, Y: 130}
+		for _, point := range []Point{{X: 200.3, Y: 160.7}, {X: 340.8, Y: 220.2}, {X: 170.6, Y: 140.9}} {
+			damage := state.updateSelectEditLocked(point, 0)
+			if damage.Width <= 0 || damage.Height <= 0 {
+				t.Fatal("annotation drag did not produce partial damage")
+			}
+			partial := &DisplayList{}
+			frame.Damage = damage
+			state.draw(partial, frame)
+			if partial.NativeDamage() != damage {
+				t.Fatalf("scale %v: lost annotation damage: %+v, want %+v", scale, partial.NativeDamage(), damage)
+			}
+			full := &DisplayList{}
+			frame.Damage = Rect{}
+			state.draw(full, frame)
+			// A fresh or sufficiently old native back buffer can require the complete frame.
+			partial.SetDamage(Rect{})
+			actual, _ := woxui.NewSoftwareRenderer(800, 600)
+			expected, _ := woxui.NewSoftwareRenderer(800, 600)
+			if err := actual.Render(partial); err != nil {
+				t.Fatal(err)
+			}
+			if err := expected.Render(full); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(actual.RGBA().Pix, expected.RGBA().Pix) {
+				t.Fatalf("scale %v: expanded annotation repaint lost scene pixels at pointer %+v", scale, point)
+			}
+		}
+	}
+}
+
+func TestScreenshotEditorExportCropsBeforeAnnotating(t *testing.T) {
+	source := image.NewRGBA(image.Rect(0, 0, 800, 400))
+	draw.Draw(source, source.Bounds(), image.NewUniform(color.RGBA{R: 20, G: 30, B: 40, A: 255}), image.Point{}, draw.Src)
+	source.SetRGBA(500, 250, color.RGBA{R: 9, G: 8, B: 7, A: 255})
+	selection := Rect{X: 400, Y: 200, Width: 200, Height: 100}
+	frame := Size{Width: 800, Height: 400}
+	output, err := renderScreenshotEditorAnnotations(source, []screenshotEditorAnnotation{{
+		tool: screenshotEditorToolRect, rect: Rect{X: 450, Y: 220, Width: 40, Height: 20}, color: screenshotEditorAnnotationColor,
+	}}, selection, frame, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output.Bounds() != image.Rect(400, 200, 600, 300) {
+		t.Fatalf("export bounds = %v, want cropped selection", output.Bounds())
+	}
+	if got := output.RGBAAt(500, 250); got.R != 9 || got.G != 8 || got.B != 7 {
+		t.Fatalf("cropped source pixel = %+v, want 9,8,7", got)
+	}
+	if got := output.RGBAAt(470, 220); got.R != screenshotEditorAnnotationColor.R || got.G != screenshotEditorAnnotationColor.G || got.B != screenshotEditorAnnotationColor.B {
+		t.Fatalf("cropped annotation pixel = %+v", got)
+	}
+	if output.Stride != output.Rect.Dx()*4 || len(output.Pix) < output.Rect.Dy()*output.Stride {
+		t.Fatalf("cropped buffer stride = %d pix=%d, want tightly packed RGBA", output.Stride, len(output.Pix))
+	}
+
+	cursor := Point{X: 500, Y: 250}
+	cursorRaster := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	cursorRaster.SetRGBA(0, 0, color.RGBA{R: 200, G: 30, B: 20, A: 255})
+	exported, err := exportScreenshotSelection(source, nil, selection, frame, 1, &cursor, true, &screenshotEditorCapturedCursor{
+		raster: cursorRaster, hotspot: Point{},
+	})
+	if err != nil {
+		t.Fatalf("export crop with cursor: %v", err)
+	}
+	if got := exported.RGBAAt(500, 250); got.R != 200 || got.G != 30 || got.B != 20 {
+		t.Fatalf("cropped cursor pixel = %+v", got)
+	}
+}
+
+func TestScreenshotEditorArrowShaftStopsInsideHead(t *testing.T) {
+	source := image.NewRGBA(image.Rect(0, 0, 120, 80))
+	draw.Draw(source, source.Bounds(), image.NewUniform(color.RGBA{R: 255, G: 255, B: 255, A: 255}), image.Point{}, draw.Src)
+	output, err := renderScreenshotEditorAnnotations(source, []screenshotEditorAnnotation{{
+		tool: screenshotEditorToolArrow, start: Point{X: 20, Y: 40}, end: Point{X: 80, Y: 40}, color: screenshotEditorAnnotationColor,
+	}}, Rect{Width: 120, Height: 80}, Size{Width: 120, Height: 80}, 1)
+	if err != nil {
+		t.Fatalf("render arrow: %v", err)
+	}
+	if got := output.RGBAAt(81, 40); got.R != 255 || got.G != 255 || got.B != 255 {
+		t.Fatalf("arrow protruded beyond tip: %+v", got)
+	}
+	if got := output.RGBAAt(79, 40); got.R != screenshotEditorAnnotationColor.R || got.G != screenshotEditorAnnotationColor.G || got.B != screenshotEditorAnnotationColor.B {
+		t.Fatalf("arrow tip was not filled: %+v", got)
+	}
+}
+
+func TestScreenshotEditorShiftConstrainsNewShapes(t *testing.T) {
+	for _, tool := range []screenshotEditorTool{screenshotEditorToolRect, screenshotEditorToolEllipse} {
+		state := &screenshotEditorOverlayState{
+			frameSize:    Size{Width: 200, Height: 120},
+			selection:    Rect{Width: 200, Height: 120},
+			hasSelection: true,
+			activeTool:   tool,
+		}
+		state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: 20, Y: 20}})
+		state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: 80, Y: 50}, Modifiers: KeyModifierShift})
+		state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: Point{X: 80, Y: 50}, Modifiers: KeyModifierShift})
+		if len(state.annotations) != 1 {
+			t.Fatalf("tool %d annotations = %+v", tool, state.annotations)
+		}
+		if got := state.annotations[0].rect; got != (Rect{X: 20, Y: 20, Width: 60, Height: 60}) {
+			t.Fatalf("tool %d constrained rect = %+v, want 60x60", tool, got)
+		}
+	}
+}
+
+func TestScreenshotEditorShiftConstrainsResizedShapes(t *testing.T) {
+	for _, tool := range []screenshotEditorTool{screenshotEditorToolRect, screenshotEditorToolEllipse} {
+		state := &screenshotEditorOverlayState{
+			frameSize:          Size{Width: 240, Height: 160},
+			selection:          Rect{X: 10, Y: 10, Width: 210, Height: 130},
+			hasSelection:       true,
+			activeTool:         screenshotEditorToolSelect,
+			annotations:        []screenshotEditorAnnotation{{tool: tool, rect: Rect{X: 50, Y: 40, Width: 40, Height: 30}}},
+			selectedAnnotation: 0,
+			hasSelectedMark:    true,
+		}
+		state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: 90, Y: 70}})
+		state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: 120, Y: 90}, Modifiers: KeyModifierShift})
+		state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: Point{X: 120, Y: 90}, Modifiers: KeyModifierShift})
+		if got := state.annotations[0].rect; got != (Rect{X: 50, Y: 40, Width: 70, Height: 70}) {
+			t.Fatalf("tool %d shifted resize = %+v, want 70x70", tool, got)
+		}
+	}
+}
+
+func TestScreenshotEditorToolbarKeyboardShortcuts(t *testing.T) {
+	cursor := Point{X: 20, Y: 20}
+	state := &screenshotEditorOverlayState{
+		selection: Rect{Width: 200, Height: 100}, hasSelection: true, cursorPixel: &cursor,
+		annotations: []screenshotEditorAnnotation{{tool: screenshotEditorToolRect, rect: Rect{Width: 20, Height: 20}}},
+	}
+	for key, tool := range map[Key]screenshotEditorTool{
+		Key("r"): screenshotEditorToolRect,
+		Key("e"): screenshotEditorToolEllipse,
+		Key("t"): screenshotEditorToolText,
+		Key("a"): screenshotEditorToolArrow,
+		Key("n"): screenshotEditorToolNumber,
+		Key("m"): screenshotEditorToolMosaic,
+	} {
+		if !state.key(KeyEvent{Key: key, Down: true}) || state.activeTool != tool {
+			t.Fatalf("shortcut %q selected tool %d, want %d", key, state.activeTool, tool)
+		}
+	}
+	if !state.key(KeyEvent{Key: Key("c"), Down: true}) || !state.showCursor {
+		t.Fatal("cursor shortcut did not toggle captured cursor")
+	}
+	if !state.key(KeyEvent{Key: Key("u"), Down: true}) || len(state.annotations) != 0 {
+		t.Fatalf("undo shortcut left annotations = %+v", state.annotations)
+	}
+	state.textEditing = true
+	state.activeTool = screenshotEditorToolText
+	if state.key(KeyEvent{Key: Key("r"), Down: true}) || state.activeTool != screenshotEditorToolText {
+		t.Fatal("tool shortcut should not run while entering annotation text")
+	}
+	state.allowVideoRecording = true
+	state.result = make(chan screenshotEditorOverlayOutcome, 1)
+	if state.key(KeyEvent{Key: Key("v"), Down: true}) {
+		t.Fatal("recording shortcut should leave annotation text input alone")
+	}
+	state.textEditing = false
+	state.allowVideoRecording = false
+	if state.key(KeyEvent{Key: Key("v"), Down: true}) {
+		t.Fatal("recording shortcut should not run for image-only requests")
+	}
+	state.allowVideoRecording = true
+	if !state.key(KeyEvent{Key: Key("v"), Down: true}) {
+		t.Fatal("recording shortcut was not handled")
+	}
+	select {
+	case outcome := <-state.result:
+		if !outcome.record || outcome.cancelled || outcome.pinned {
+			t.Fatalf("recording shortcut outcome = %+v", outcome)
+		}
+	default:
+		t.Fatal("recording shortcut did not enter the recording flow")
+	}
+}
+
+func TestScreenshotEditorSelectMovesResizesAndDeletesAnnotation(t *testing.T) {
+	state := &screenshotEditorOverlayState{
+		frameSize:    Size{Width: 240, Height: 140},
+		selection:    Rect{X: 20, Y: 20, Width: 160, Height: 100},
+		hasSelection: true,
+		activeTool:   screenshotEditorToolSelect,
+		annotations:  []screenshotEditorAnnotation{{tool: screenshotEditorToolRect, rect: Rect{X: 50, Y: 40, Width: 40, Height: 30}}},
+	}
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: 65, Y: 55}})
+	state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: 85, Y: 65}})
+	state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: Point{X: 85, Y: 65}})
+	if got := state.annotations[0].rect; got != (Rect{X: 70, Y: 50, Width: 40, Height: 30}) {
+		t.Fatalf("moved annotation = %+v", got)
+	}
+
+	bottomRight := Point{X: 110, Y: 80}
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: bottomRight})
+	state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: 130, Y: 95}})
+	state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: Point{X: 130, Y: 95}})
+	if got := state.annotations[0].rect; got != (Rect{X: 70, Y: 50, Width: 60, Height: 45}) {
+		t.Fatalf("resized annotation = %+v", got)
+	}
+
+	if !state.key(KeyEvent{Key: KeyDelete, Down: true}) || len(state.annotations) != 0 {
+		t.Fatalf("delete left annotations = %+v", state.annotations)
+	}
+
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: 60, Y: 70}})
+	state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: 80, Y: 80}})
+	state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: Point{X: 80, Y: 80}})
+	if got := state.selection; got != (Rect{X: 40, Y: 30, Width: 160, Height: 100}) {
+		t.Fatalf("moved selection = %+v", got)
+	}
+}
+
+func TestScreenshotEditorHoverShowsHandlesAndMovesAnnotationFromDrawingTool(t *testing.T) {
+	state := &screenshotEditorOverlayState{
+		frameSize:    Size{Width: 240, Height: 140},
+		selection:    Rect{X: 20, Y: 20, Width: 180, Height: 100},
+		hasSelection: true,
+		activeTool:   screenshotEditorToolRect,
+		annotations:  []screenshotEditorAnnotation{{tool: screenshotEditorToolRect, rect: Rect{X: 50, Y: 40, Width: 60, Height: 40}}},
+	}
+
+	state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: 80, Y: 60}})
+	if !state.hasHoveredMark || state.hoveredAnnotation != 0 || state.pointerCursor != PointerCursorMove {
+		t.Fatalf("annotation hover = hovered:%t index:%d cursor:%d", state.hasHoveredMark, state.hoveredAnnotation, state.pointerCursor)
+	}
+
+	state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: 50, Y: 40}})
+	if state.pointerCursor != PointerCursorResizeNWSE {
+		t.Fatalf("top-left handle cursor = %d, want northwest-southeast resize", state.pointerCursor)
+	}
+
+	state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: 43, Y: 50}})
+	if state.hasHoveredMark || state.pointerCursor != PointerCursorDefault {
+		t.Fatalf("cursor outside annotation = hovered:%t cursor:%d, want default", state.hasHoveredMark, state.pointerCursor)
+	}
+	state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: 160, Y: 80}})
+	if state.pointerCursor != PointerCursorDefault {
+		t.Fatalf("cursor in selection but outside annotation = %d, want default", state.pointerCursor)
+	}
+
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: 80, Y: 60}})
+	state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: 100, Y: 70}})
+	state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: Point{X: 100, Y: 70}})
+	if state.activeTool != screenshotEditorToolSelect {
+		t.Fatalf("active tool = %d, want select after picking an existing annotation", state.activeTool)
+	}
+	if got := state.annotations[0].rect; got != (Rect{X: 70, Y: 50, Width: 60, Height: 40}) {
+		t.Fatalf("moved annotation = %+v", got)
+	}
+}
+
+func TestScreenshotEditorHoverAndClickPreferNestedTextOverEnclosingShape(t *testing.T) {
+	state := &screenshotEditorOverlayState{
+		frameSize:          Size{Width: 320, Height: 220},
+		selection:          Rect{X: 10, Y: 10, Width: 300, Height: 200},
+		hasSelection:       true,
+		activeTool:         screenshotEditorToolSelect,
+		selectedAnnotation: 1,
+		hasSelectedMark:    true,
+		annotations: []screenshotEditorAnnotation{
+			{tool: screenshotEditorToolText, start: Point{X: 110, Y: 90}, text: "Nested", fontSize: 20},
+			{tool: screenshotEditorToolRect, rect: Rect{X: 40, Y: 40, Width: 240, Height: 140}},
+		},
+	}
+	point := Point{X: 125, Y: 100}
+
+	state.pointer(PointerEvent{Kind: PointerMove, Position: point})
+	if !state.hasHoveredMark || state.hoveredAnnotation != 0 || state.pointerCursor != PointerCursorText {
+		t.Fatalf("nested text hover = hovered:%t index:%d cursor:%d", state.hasHoveredMark, state.hoveredAnnotation, state.pointerCursor)
+	}
+
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: point})
+	if !state.textEditing || !state.hasEditingText || state.editingTextIndex != 0 {
+		t.Fatalf("nested text click = editing:%t hasIndex:%t index:%d", state.textEditing, state.hasEditingText, state.editingTextIndex)
+	}
+}
+
+func TestScreenshotEditorTextToolHoverShowsNestedTextWithoutSelectingShape(t *testing.T) {
+	state := &screenshotEditorOverlayState{
+		frameSize:    Size{Width: 320, Height: 220},
+		selection:    Rect{X: 10, Y: 10, Width: 300, Height: 200},
+		hasSelection: true,
+		activeTool:   screenshotEditorToolText,
+		annotations: []screenshotEditorAnnotation{
+			{tool: screenshotEditorToolText, start: Point{X: 110, Y: 90}, text: "Nested", fontSize: 20},
+			{tool: screenshotEditorToolEllipse, rect: Rect{X: 40, Y: 40, Width: 240, Height: 140}},
+		},
+	}
+
+	state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: 125, Y: 100}})
+	if !state.hasHoveredMark || state.hoveredAnnotation != 0 || state.pointerCursor != PointerCursorText {
+		t.Fatalf("text-tool hover = hovered:%t index:%d cursor:%d", state.hasHoveredMark, state.hoveredAnnotation, state.pointerCursor)
+	}
+	state.pointer(PointerEvent{Kind: PointerMove, Position: Point{X: 70, Y: 70}})
+	if state.hasHoveredMark || state.pointerCursor != PointerCursorText {
+		t.Fatalf("shape interior should remain a text creation target: hovered:%t cursor:%d", state.hasHoveredMark, state.pointerCursor)
+	}
+}
+
+func TestScreenshotEditorAnnotationResizeHandles(t *testing.T) {
+	displayList := &DisplayList{}
+	drawScreenshotEditorAnnotationHandles(displayList, screenshotEditorAnnotation{
+		tool: screenshotEditorToolRect,
+		rect: Rect{X: 20, Y: 20, Width: 80, Height: 50},
+	}, 1)
+	if displayList.CommandCount() != 16 {
+		t.Fatalf("rectangle handle commands = %d, want 16", displayList.CommandCount())
+	}
+	expected := &DisplayList{}
+	for _, point := range screenshotEditorRectHandlePoints(Rect{X: 20, Y: 20, Width: 80, Height: 50}) {
+		expected.StrokeRoundedRect(Rect{X: point.X - 5, Y: point.Y - 5, Width: 10, Height: 10}, 5, 1.5, Color{R: 255, G: 255, B: 255, A: 255})
+	}
+	drawScreenshotEditorRectRadiusHandles(expected, screenshotEditorAnnotation{tool: screenshotEditorToolRect, rect: Rect{X: 20, Y: 20, Width: 80, Height: 50}}, 1)
+	if err := displayList.Compare(expected); err != nil {
+		t.Fatalf("rectangle resize handles changed when adding radius controls: %v", err)
+	}
+	arrowDisplayList := &DisplayList{}
+	drawScreenshotEditorAnnotationHandles(arrowDisplayList, screenshotEditorAnnotation{
+		tool: screenshotEditorToolArrow, start: Point{X: 20, Y: 20}, end: Point{X: 80, Y: 50}, color: screenshotEditorAnnotationColor,
+	}, 1)
+	arrowExpected := &DisplayList{}
+	for _, point := range []Point{{X: 20, Y: 20}, {X: 50, Y: 35}, {X: 80, Y: 50}} {
+		arrowExpected.StrokeRoundedRect(Rect{X: point.X - 5, Y: point.Y - 5, Width: 10, Height: 10}, 5, 1.5, Color{R: 255, G: 255, B: 255, A: 255})
+	}
+	if err := arrowDisplayList.Compare(arrowExpected); err != nil {
+		t.Fatalf("arrow handles are not uniform small white circles: %v", err)
+	}
+	if screenshotEditorAnnotationStroke != 3 {
+		t.Fatalf("logical annotation stroke = %v, want 3", screenshotEditorAnnotationStroke)
+	}
+	if got := screenshotEditorAnnotationPreviewStroke(1); got != 3 {
+		t.Fatalf("1x preview stroke = %v, want 3", got)
+	}
+	if got := screenshotEditorAnnotationPreviewStroke(1.5); got != 4.5 {
+		t.Fatalf("1.5x preview stroke = %v, want 4.5", got)
+	}
+}
+
+func TestScreenshotEditorEditBarUpdatesCreationAndSelectedAnnotation(t *testing.T) {
+	state := &screenshotEditorOverlayState{
+		image:           testScreenshotImage(t, 1, 1),
+		frameSize:       Size{Width: 800, Height: 600},
+		selection:       Rect{X: 100, Y: 100, Width: 400, Height: 300},
+		hasSelection:    true,
+		activeTool:      screenshotEditorToolRect,
+		annotationColor: screenshotEditorAnnotationColor,
+		mosaicRadius:    screenshotEditorMosaicRadius,
+		textFontSize:    screenshotEditorTextFontSize,
+	}
+	state.draw(&DisplayList{}, FrameInfo{Size: state.frameSize})
+	if state.editBarRect.Height != 56 || state.editBarRect.Y != state.toolbarRect.Y+state.toolbarRect.Height+8 {
+		t.Fatalf("secondary toolbar = %+v, main toolbar = %+v", state.editBarRect, state.toolbarRect)
+	}
+	greenRect := state.editColorRects[2]
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: greenRect.X + 10, Y: greenRect.Y + 10}})
+	if state.annotationColor != screenshotEditorPalette[2] {
+		t.Fatalf("creation color = %+v, want %+v", state.annotationColor, screenshotEditorPalette[2])
+	}
+
+	state.activeTool = screenshotEditorToolMosaic
+	state.draw(&DisplayList{}, FrameInfo{Size: state.frameSize})
+	largeRect := state.editSizeRects[2]
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: largeRect.X + 16, Y: largeRect.Y + 16}})
+	if state.mosaicRadius != 28 {
+		t.Fatalf("mosaic radius = %v, want 28", state.mosaicRadius)
+	}
+
+	state.activeTool = screenshotEditorToolText
+	state.hasSelectedMark = false
+	state.draw(&DisplayList{}, FrameInfo{Size: state.frameSize})
+	slider := state.editFontSizeRect
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: slider.X + slider.Width/2, Y: slider.Y + 21}})
+	state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary})
+	if state.textFontSize != 30 {
+		t.Fatalf("creation text font size = %v, want 30", state.textFontSize)
+	}
+
+	state.activeTool = screenshotEditorToolSelect
+	state.annotations = []screenshotEditorAnnotation{{tool: screenshotEditorToolText, start: Point{X: 200, Y: 180}, text: "Wox", fontSize: 20}}
+	state.selectedAnnotation = 0
+	state.hasSelectedMark = true
+	state.draw(&DisplayList{}, FrameInfo{Size: state.frameSize})
+	slider = state.editFontSizeRect
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: slider.X + slider.Width/2, Y: slider.Y + 21}})
+	state.pointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary})
+	if state.annotations[0].fontSize != 30 {
+		t.Fatalf("text font size = %v, want 30", state.annotations[0].fontSize)
+	}
+	deleteRect := state.editDeleteRect
+	state.pointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: deleteRect.X + 21, Y: deleteRect.Y + 21}})
+	if len(state.annotations) != 0 {
+		t.Fatalf("delete left annotations = %+v", state.annotations)
+	}
+}
+
+func testScreenshotImage(t *testing.T, width, height int) *Image {
+	t.Helper()
+	prepared, err := NewImage(image.NewRGBA(image.Rect(0, 0, width, height)))
+	if err != nil {
+		t.Fatalf("prepare test screenshot image: %v", err)
+	}
+	return prepared
+}
+
+func TestScreenshotScrollingCaptureMatchesAndStitchesBothDirections(t *testing.T) {
+	document := image.NewRGBA(image.Rect(0, 0, 120, 900))
+	for y := 0; y < document.Bounds().Dy(); y++ {
+		for x := 0; x < document.Bounds().Dx(); x++ {
+			document.SetRGBA(x, y, color.RGBA{
+				R: uint8((x*7 + y*3) % 251),
+				G: uint8((x*11 + y*5) % 253),
+				B: uint8((x*13 + y*17) % 255),
+				A: 255,
+			})
+		}
+	}
+	viewport := func(top int) *image.RGBA {
+		frame := image.NewRGBA(image.Rect(0, 0, 120, 300))
+		draw.Draw(frame, frame.Bounds(), document, image.Pt(0, top), draw.Src)
+		return frame
+	}
+
+	frames, accepted := appendScreenshotScrollingFrame(nil, viewport(180))
+	if !accepted {
+		t.Fatal("first frame was rejected")
+	}
+	frames, accepted = appendScreenshotScrollingFrame(frames, viewport(0))
+	if !accepted || len(frames) != 2 {
+		t.Fatalf("prepend accepted=%v frames=%d", accepted, len(frames))
+	}
+	frames, accepted = appendScreenshotScrollingFrame(frames, viewport(360))
+	if !accepted || len(frames) != 3 {
+		t.Fatalf("append accepted=%v frames=%d", accepted, len(frames))
+	}
+	if _, accepted = appendScreenshotScrollingFrame(frames, viewport(360)); accepted {
+		t.Fatal("duplicate frame was accepted")
+	}
+
+	stitched, err := stitchScreenshotScrollingFrames(frames)
+	if err != nil {
+		t.Fatalf("stitch frames: %v", err)
+	}
+	if stitched.Bounds() != image.Rect(0, 0, 120, 660) {
+		t.Fatalf("stitched bounds = %v, want 120x660", stitched.Bounds())
+	}
+	for _, point := range []image.Point{{X: 17, Y: 0}, {X: 71, Y: 299}, {X: 23, Y: 479}, {X: 99, Y: 659}} {
+		if got, want := stitched.RGBAAt(point.X, point.Y), document.RGBAAt(point.X, point.Y); got != want {
+			t.Fatalf("pixel %v = %+v, want %+v", point, got, want)
+		}
+	}
+}
+
+func TestScreenshotScrollingControlLayoutIncludesSave(t *testing.T) {
+	toolbar, cancel, save, confirm := screenshotScrollingControlLayout(Size{Width: 216, Height: 300}, 1)
+	if toolbar != (Rect{X: 22, Y: 244, Width: 172, Height: 56}) {
+		t.Fatalf("toolbar = %+v", toolbar)
+	}
+	if cancel != (Rect{X: 40, Y: 252, Width: 40, Height: 40}) {
+		t.Fatalf("cancel = %+v", cancel)
+	}
+	if save != (Rect{X: 88, Y: 252, Width: 40, Height: 40}) {
+		t.Fatalf("save = %+v", save)
+	}
+	if confirm != (Rect{X: 136, Y: 252, Width: 40, Height: 40}) {
+		t.Fatalf("confirm = %+v", confirm)
+	}
+
+	toolbar, cancel, save, confirm = screenshotScrollingControlLayout(Size{Width: 324, Height: 450}, 1.5)
+	if toolbar != (Rect{X: 33, Y: 366, Width: 258, Height: 84}) {
+		t.Fatalf("scaled toolbar = %+v", toolbar)
+	}
+	if cancel != (Rect{X: 60, Y: 378, Width: 60, Height: 60}) {
+		t.Fatalf("scaled cancel = %+v", cancel)
+	}
+	if save != (Rect{X: 132, Y: 378, Width: 60, Height: 60}) {
+		t.Fatalf("scaled save = %+v", save)
+	}
+	if confirm != (Rect{X: 204, Y: 378, Width: 60, Height: 60}) {
+		t.Fatalf("scaled confirm = %+v", confirm)
+	}
+}

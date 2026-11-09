@@ -1,0 +1,1513 @@
+package component
+
+import (
+	"net/url"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
+
+	"wox/common"
+	woxui "wox/ui/runtime"
+)
+
+// NoteBlockRange maps one document block onto the editor's plain-text backing value.
+type NoteBlockRange struct {
+	Block     int
+	Start     int
+	Marker    int
+	TextStart int
+	TextEnd   int
+	End       int
+}
+
+// NoteTextRun is the Notes-owned rich run, including document decorations.
+type NoteTextRun struct {
+	Start          int
+	End            int
+	Style          woxui.TextStyle
+	Color          woxui.Color
+	Underline      bool
+	Strike         bool
+	Background     woxui.Color
+	Checkbox       bool
+	Checked        bool
+	LeadingBar     bool
+	HorizontalRule bool
+	HangingIndent  bool
+	// ListMarker replaces the backing prefix with the shared fixed-width list gutter.
+	ListMarker string
+	// BlockGap is extra space after the visual line that ends this run.
+	BlockGap float32
+	// LineBox reserves vertical space for this run or an empty separator line.
+	LineBox float32
+}
+
+type noteInlineStyle struct {
+	bold, italic, underline, strike, code bool
+	link                                  string
+}
+
+// NoteDocumentSegment is one linear text run or one structural table/image block.
+type NoteDocumentSegment struct {
+	Start int
+	End   int
+	Table bool
+	Image bool
+}
+
+// Structural reports segments that render outside the linear text field.
+func (s NoteDocumentSegment) Structural() bool {
+	return s.Table || s.Image
+}
+
+var noteInlineRules = []struct {
+	pattern *regexp.Regexp
+	apply   func(*common.NoteSpan)
+}{
+	{regexp.MustCompile(`\[([^\]]+)\]\(([^\s)]+)\)`), func(span *common.NoteSpan) { span.Link = "$2" }},
+	{regexp.MustCompile("`([^`]+)`"), func(span *common.NoteSpan) { span.Code = true }},
+	{regexp.MustCompile(`\*\*([^*]+)\*\*`), func(span *common.NoteSpan) { span.Bold = true }},
+	{regexp.MustCompile(`~~([^~]+)~~`), func(span *common.NoteSpan) { span.Strike = true }},
+	{regexp.MustCompile(`\*([^*]+)\*`), func(span *common.NoteSpan) { span.Italic = true }},
+}
+
+var noteOrderedPrefix = regexp.MustCompile(`^\d+\. `)
+
+// noteParagraphGap is the extra space after a prose block in the rich note view.
+// Four units is a slight separation on the 24-unit line box, not a blank line.
+// An explicit empty paragraph still renders as that full empty line.
+const noteParagraphGap = float32(8)
+
+// FieldRun converts a Notes decoration into a generic text-field run.
+func (run NoteTextRun) FieldRun() TextFieldRichRun {
+	field := TextFieldRichRun{
+		Start: run.Start, End: run.End, Style: run.Style, Color: run.Color,
+		Underline: run.Underline, Strike: run.Strike, Background: run.Background,
+		BlockGap: run.BlockGap, LineBox: run.LineBox,
+	}
+	if run.Checkbox {
+		size, color, checked := run.Style.Size, run.Color, run.Checked
+		field.Advance = documentCheckboxWidth(size)
+		field.HideText = true
+		field.HangingIndent = true
+		field.Paint = func(displayList *woxui.DisplayList, bounds woxui.Rect) {
+			paintDocumentCheckbox(displayList, bounds, size, color, checked)
+		}
+	}
+	if run.HangingIndent {
+		field.HangingIndent = true
+	}
+	if run.ListMarker != "" {
+		marker, style, color := run.ListMarker, run.Style, run.Color
+		field.Advance = documentListMarkerWidth(marker)
+		field.HideText = true
+		field.Paint = func(displayList *woxui.DisplayList, bounds woxui.Rect) {
+			displayList.DrawText(marker, bounds, style, color)
+		}
+	}
+	if run.LeadingBar {
+		size, color := run.Style.Size, run.Color
+		field.LineGutter = true
+		field.LineGutterWidth = documentQuoteWidth(size)
+		field.PaintLineGutter = func(displayList *woxui.DisplayList, bounds woxui.Rect) {
+			paintDocumentQuoteBar(displayList, bounds, size, color)
+		}
+	}
+	if run.HorizontalRule {
+		color := run.Color
+		field.HideText = true
+		field.Paint = func(displayList *woxui.DisplayList, bounds woxui.Rect) {
+			paintDocumentHorizontalRule(displayList, woxui.Rect{
+				X: bounds.X, Y: bounds.Y + (bounds.Height-documentRuleHeight)/2,
+				Width: bounds.Width, Height: documentRuleHeight,
+			}, color)
+		}
+	}
+	return field
+}
+
+// NoteFieldRuns converts Notes-owned decorations into generic text-field runs.
+func NoteFieldRuns(runs []NoteTextRun) []TextFieldRichRun {
+	fields := make([]TextFieldRichRun, 0, len(runs))
+	for _, run := range runs {
+		fields = append(fields, run.FieldRun())
+	}
+	return fields
+}
+
+// ProjectNoteDocument creates the editor's plain-text backing value and its non-overlapping visual runs.
+func ProjectNoteDocument(document common.NoteDocument, base woxui.TextStyle, theme ControlTheme) (string, []NoteTextRun, []NoteBlockRange) {
+	var output strings.Builder
+	runs := make([]NoteTextRun, 0)
+	ranges := make([]NoteBlockRange, 0, len(document.Blocks))
+	ordered := [common.NoteMaximumIndent + 1]int{1, 1, 1}
+	offset := 0
+	codeBackground := theme.InputBackground
+	codeBackground.A = min(uint8(150), codeBackground.A)
+	first := true
+	for index, block := range document.Blocks {
+		if block.IsStructural() {
+			ordered = [common.NoteMaximumIndent + 1]int{1, 1, 1}
+			continue
+		}
+		if !first {
+			output.WriteRune('\n')
+			offset++
+		}
+		first = false
+		start := offset
+		indent := max(0, min(common.NoteMaximumIndent, block.Indent))
+		marker := start + indent*4
+		prefix := strings.Repeat("    ", indent) + noteBlockPrefix(block, ordered[indent])
+		if block.Type == common.NoteBlockOrdered {
+			ordered[indent]++
+			for level := indent + 1; level < len(ordered); level++ {
+				ordered[level] = 1
+			}
+		} else if block.Type != common.NoteBlockBullet && block.Type != common.NoteBlockTask {
+			ordered = [common.NoteMaximumIndent + 1]int{1, 1, 1}
+		}
+		output.WriteString(prefix)
+		textStart := start + utf8.RuneCountInString(prefix)
+		offset = textStart
+		value := block.Text
+		if block.Type == common.NoteBlockDivider {
+			value = "────────"
+		}
+		output.WriteString(value)
+		textEnd := textStart + utf8.RuneCountInString(value)
+		offset = textEnd
+		ranges = append(ranges, NoteBlockRange{Block: index, Start: start, Marker: marker, TextStart: textStart, TextEnd: textEnd, End: textEnd})
+		if block.Type == common.NoteBlockTask {
+			runs = append(runs, NoteTextRun{Start: marker, End: marker + 1, Style: base, Color: DocumentListMarkerColor, Checkbox: true, Checked: block.Checked})
+		} else if block.Type == common.NoteBlockBullet || block.Type == common.NoteBlockOrdered {
+			runs = append(runs, NoteTextRun{Start: marker, End: textStart, Style: base, Color: DocumentListMarkerColor, HangingIndent: true, ListMarker: strings.TrimSpace(prefix)})
+		}
+		if block.Type == common.NoteBlockQuote {
+			runs = append(runs, NoteTextRun{Start: start, End: textEnd, Style: base, Color: DocumentListMarkerColor, LeadingBar: true})
+		}
+		if block.Type == common.NoteBlockDivider {
+			runs = append(runs, NoteTextRun{Start: textStart, End: textEnd, Style: base, Color: theme.Border, HorizontalRule: true})
+			continue
+		}
+		styles := noteBlockStyles(block, value)
+		for offset := 0; offset < len(styles); {
+			end := offset + 1
+			for end < len(styles) && styles[end] == styles[offset] {
+				end++
+			}
+			style := base
+			scale := base.Size / 14
+			if scale <= 0 {
+				scale = 1
+			}
+			switch block.Type {
+			case common.NoteBlockHeading1:
+				style.Size, style.Weight = 20*scale, woxui.FontWeightSemibold
+			case common.NoteBlockHeading2:
+				style.Size, style.Weight = 17*scale, woxui.FontWeightSemibold
+			case common.NoteBlockHeading3:
+				style.Size, style.Weight = 15*scale, woxui.FontWeightSemibold
+			case common.NoteBlockCode:
+				style.Family = woxui.FontFamilyMonospace
+			}
+			inline := styles[offset]
+			if inline.bold {
+				style.Weight = woxui.FontWeightSemibold
+			}
+			style.Italic = inline.italic
+			if inline.code {
+				style.Family = woxui.FontFamilyMonospace
+			}
+			background := woxui.Color{}
+			color := woxui.Color{}
+			if inline.code || block.Type == common.NoteBlockCode {
+				background = codeBackground
+			}
+			if block.Type == common.NoteBlockTask && block.Checked {
+				color = theme.TextSecondary
+			}
+			link := NoteOpenableLink(inline.link)
+			if link != "" && color == (woxui.Color{}) {
+				color = DocumentListMarkerColor
+			}
+			lineBox := float32(0)
+			if block.Type == common.NoteBlockHeading1 || block.Type == common.NoteBlockHeading2 || block.Type == common.NoteBlockHeading3 {
+				// Heading glyphs need more room than the body line height, including when wrapped.
+				lineBox = style.Size * 1.4
+			}
+			runs = append(runs, NoteTextRun{
+				Start: textStart + offset, End: textStart + end, Style: style,
+				LineBox: lineBox,
+				Color:   color, Underline: inline.underline || inline.link != "",
+				Strike: inline.strike || block.Type == common.NoteBlockTask && block.Checked, Background: background,
+			})
+			offset = end
+		}
+		if noteParagraphSeparates(document.Blocks, index) {
+			noteMarkParagraphGap(runs, textEnd, noteParagraphGapSize(base))
+		}
+		if noteSeparatorParagraph(document.Blocks, index) {
+			// A markdown blank line is the paragraph break. Keep the block so editing
+			// can still land here, but draw it as the slight gap instead of a full line.
+			runs = append(runs, NoteTextRun{Start: textStart, End: textEnd, LineBox: noteParagraphGapSize(base)})
+		}
+	}
+	return output.String(), runs, ranges
+}
+
+// noteParagraphGapSize tracks note zoom, which is already baked into the editor font size.
+func noteParagraphGapSize(base woxui.TextStyle) float32 {
+	scale := base.Size / 14
+	if scale <= 0 {
+		scale = 1
+	}
+	return noteParagraphGap * scale
+}
+
+// noteParagraphSeparates reports whether this prose block should open space before the next one.
+// A following empty paragraph already is that space, so another gap would stack on the blank line.
+func noteParagraphSeparates(blocks []common.NoteBlock, index int) bool {
+	if index < 0 || index+1 >= len(blocks) {
+		return false
+	}
+	block := blocks[index]
+	if strings.TrimSpace(block.Text) == "" {
+		return false
+	}
+	switch block.Type {
+	case common.NoteBlockParagraph, common.NoteBlockHeading1, common.NoteBlockHeading2, common.NoteBlockHeading3:
+	default:
+		return false
+	}
+	next := blocks[index+1]
+	return next.Type != common.NoteBlockParagraph || strings.TrimSpace(next.Text) != ""
+}
+
+// noteSeparatorParagraph reports an empty paragraph that only separates two prose blocks.
+// Extra blank lines and the caret gaps around images stay full height.
+func noteSeparatorParagraph(blocks []common.NoteBlock, index int) bool {
+	if index <= 0 || index+1 >= len(blocks) {
+		return false
+	}
+	block := blocks[index]
+	if block.Type != common.NoteBlockParagraph || strings.TrimSpace(block.Text) != "" {
+		return false
+	}
+	return noteProseBlock(blocks[index-1]) && noteProseBlock(blocks[index+1])
+}
+
+func noteProseBlock(block common.NoteBlock) bool {
+	if strings.TrimSpace(block.Text) == "" {
+		return false
+	}
+	switch block.Type {
+	case common.NoteBlockParagraph, common.NoteBlockHeading1, common.NoteBlockHeading2, common.NoteBlockHeading3:
+		return true
+	default:
+		return false
+	}
+}
+
+// noteMarkParagraphGap attaches the gap to the run that finishes the block.
+func noteMarkParagraphGap(runs []NoteTextRun, textEnd int, gap float32) {
+	for index := len(runs) - 1; index >= 0; index-- {
+		if runs[index].End == textEnd && runs[index].Start < runs[index].End {
+			runs[index].BlockGap = gap
+			return
+		}
+	}
+}
+
+func noteBlockPrefix(block common.NoteBlock, ordered int) string {
+	switch block.Type {
+	case common.NoteBlockQuote:
+		return "│ "
+	case common.NoteBlockBullet:
+		return "• "
+	case common.NoteBlockOrdered:
+		return strconv.Itoa(ordered) + ". "
+	case common.NoteBlockTask:
+		if block.Checked {
+			return "☑ "
+		}
+		return "☐ "
+	default:
+		return ""
+	}
+}
+
+func noteBlockStyles(block common.NoteBlock, value string) []noteInlineStyle {
+	styles := make([]noteInlineStyle, utf8.RuneCountInString(value))
+	for _, span := range block.Spans {
+		start := max(0, min(len(styles), span.Start))
+		end := max(start, min(len(styles), span.End))
+		for index := start; index < end; index++ {
+			styles[index] = noteInlineStyle{
+				bold: styles[index].bold || span.Bold, italic: styles[index].italic || span.Italic,
+				underline: styles[index].underline || span.Underline, strike: styles[index].strike || span.Strike,
+				code: styles[index].code || span.Code, link: noteFirstNonEmpty(styles[index].link, span.Link),
+			}
+		}
+	}
+	return styles
+}
+
+func noteFirstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// DocumentFromEditor applies Markdown input rules and preserves existing inline styles across local edits.
+func DocumentFromEditor(value string, previous common.NoteDocument) common.NoteDocument {
+	previous.Blocks = flattenNoteBlockLines(previous.Blocks)
+	lines := strings.Split(strings.ReplaceAll(value, "\r\n", "\n"), "\n")
+
+	// Match lines to previous blocks through the unchanged leading and trailing lines instead of by
+	// index. Headings have no prefix in the editor text, so index matching made inserted or removed
+	// lines shift heading types onto neighboring lines.
+	oldValue, _, oldRanges := ProjectNoteDocument(previous, woxui.TextStyle{}, ControlTheme{})
+	oldLines := strings.Split(oldValue, "\n")
+	oldCount := len(oldRanges)
+	prefix := 0
+	for prefix < len(lines) && prefix < oldCount && lines[prefix] == oldLines[prefix] {
+		prefix++
+	}
+	suffix := 0
+	for suffix < len(lines)-prefix && suffix < oldCount-prefix && lines[len(lines)-1-suffix] == oldLines[oldCount-1-suffix] {
+		suffix++
+	}
+
+	blocks := make([]common.NoteBlock, 0, len(lines))
+	inCodeFence := false
+	for lineIndex, raw := range lines {
+		if strings.HasPrefix(strings.TrimSpace(raw), "```") {
+			inCodeFence = !inCodeFence
+			continue
+		}
+		oldLine := -1
+		switch {
+		case lineIndex < prefix:
+			oldLine = lineIndex
+		case lineIndex >= len(lines)-suffix:
+			oldLine = lineIndex - len(lines) + oldCount
+		case lineIndex < oldCount-suffix:
+			// Changed lines between the unchanged ends are edits of the previous line at the same position.
+			oldLine = lineIndex
+		}
+		old := common.NoteBlock{ID: uuid.NewString(), Type: common.NoteBlockParagraph}
+		index := len(blocks)
+		if oldLine >= 0 {
+			old = previous.Blocks[oldRanges[oldLine].Block]
+		} else if index > 0 && blocks[index-1].Type == common.NoteBlockCode {
+			old.Type = common.NoteBlockCode
+		}
+		if inCodeFence {
+			old.Type = common.NoteBlockCode
+		}
+		blockType, checked, indent, text := old.Type, old.Checked, old.Indent, raw
+		var spans []common.NoteSpan
+		if blockType == common.NoteBlockCode {
+			checked = false
+		} else {
+			blockType, checked, indent, text = parseNoteBlock(raw, old.Type, old.Checked)
+			spans = remapNoteSpans(old.Text, text, old.Spans)
+			text, spans = parseNoteInlineMarkdown(text, spans)
+		}
+		blocks = append(blocks, common.NoteBlock{ID: old.ID, Type: blockType, Text: text, Checked: checked, Indent: indent, Spans: compactNoteSpans(text, spans)})
+	}
+	if len(blocks) == 0 {
+		blocks = append(blocks, common.NoteBlock{ID: uuid.NewString(), Type: common.NoteBlockParagraph})
+	}
+	return common.NoteDocument{Version: 1, Blocks: promoteTypedTables(blocks)}
+}
+
+func parseNoteBlock(raw string, previous common.NoteBlockType, checked bool) (common.NoteBlockType, bool, int, string) {
+	type prefixRule struct {
+		prefix string
+		typeID common.NoteBlockType
+	}
+	for _, rule := range []prefixRule{{"### ", common.NoteBlockHeading3}, {"## ", common.NoteBlockHeading2}, {"# ", common.NoteBlockHeading1}, {"> ", common.NoteBlockQuote}, {"│ ", common.NoteBlockQuote}} {
+		if strings.HasPrefix(strings.ToLower(raw), strings.ToLower(rule.prefix)) {
+			return rule.typeID, false, 0, raw[len(rule.prefix):]
+		}
+	}
+	indent, listValue := noteListIndent(raw)
+	// "- " turns the line into a bullet on the keystroke that completes it, so by the time the
+	// checkbox is typed the marker has already been consumed and reprojected as "• ". Strip the
+	// bullet marker first and retry the task prefix on what is left, otherwise "- [ ] " is only
+	// ever reachable when a whole line arrives at once (Markdown import or paste).
+	for _, marker := range []string{"- ", "• "} {
+		if !strings.HasPrefix(listValue, marker) {
+			continue
+		}
+		rest := listValue[len(marker):]
+		if blockType, taskChecked, text, ok := parseNoteTaskPrefix(rest); ok {
+			return blockType, taskChecked, indent, text
+		}
+		return common.NoteBlockBullet, false, indent, rest
+	}
+	if blockType, taskChecked, text, ok := parseNoteTaskPrefix(listValue); ok {
+		return blockType, taskChecked, indent, text
+	}
+	if noteOrderedPrefix.MatchString(listValue) {
+		return common.NoteBlockOrdered, false, indent, noteOrderedPrefix.ReplaceAllString(listValue, "")
+	}
+	if raw == "---" || raw == "────────" {
+		return common.NoteBlockDivider, false, 0, ""
+	}
+	if previous == common.NoteBlockBullet || previous == common.NoteBlockOrdered || previous == common.NoteBlockTask || previous == common.NoteBlockQuote || previous == common.NoteBlockDivider || previous == common.NoteBlockTable || previous == common.NoteBlockImage {
+		previous = common.NoteBlockParagraph
+	}
+	return previous, checked && previous == common.NoteBlockTask, 0, raw
+}
+
+// parseNoteTaskPrefix reports whether value opens with a checkbox marker, returning the task block
+// it describes and the text that follows the marker.
+func parseNoteTaskPrefix(value string) (common.NoteBlockType, bool, string, bool) {
+	for _, rule := range []struct {
+		prefix  string
+		checked bool
+	}{{"[ ] ", false}, {"[x] ", true}, {"\u2610 ", false}, {"\u2611 ", true}} {
+		if strings.HasPrefix(strings.ToLower(value), rule.prefix) {
+			return common.NoteBlockTask, rule.checked, value[len(rule.prefix):], true
+		}
+	}
+	return common.NoteBlockParagraph, false, value, false
+}
+
+func noteListIndent(value string) (int, string) {
+	indent := 0
+	for indent < common.NoteMaximumIndent {
+		switch {
+		case strings.HasPrefix(value, "    "):
+			value = strings.TrimPrefix(value, "    ")
+		case strings.HasPrefix(value, "\t"):
+			value = strings.TrimPrefix(value, "\t")
+		default:
+			return indent, value
+		}
+		indent++
+	}
+	return indent, value
+}
+
+func promoteTypedTables(blocks []common.NoteBlock) []common.NoteBlock {
+	promoted := make([]common.NoteBlock, 0, len(blocks))
+	for index := 0; index < len(blocks); {
+		if table, consumed := typedTableAt(blocks, index); consumed > 0 {
+			promoted = append(promoted, common.NoteBlock{ID: blocks[index].ID, Type: common.NoteBlockTable, Table: table, Text: noteTableMarkdown(*table)})
+			index += consumed
+			continue
+		}
+		promoted = append(promoted, blocks[index])
+		index++
+	}
+	return promoted
+}
+
+func typedTableAt(blocks []common.NoteBlock, start int) (*common.NoteTable, int) {
+	if start+1 >= len(blocks) || blocks[start].Type == common.NoteBlockCode || blocks[start+1].Type == common.NoteBlockCode {
+		return nil, 0
+	}
+	lines := []string{blocks[start].Text, blocks[start+1].Text}
+	if !strings.Contains(lines[0], "|") || !noteTypedTableSeparator(lines[1]) {
+		return nil, 0
+	}
+	end := start + 2
+	for end < len(blocks) && blocks[end].Type != common.NoteBlockCode && strings.Contains(blocks[end].Text, "|") {
+		lines = append(lines, blocks[end].Text)
+		end++
+	}
+	table := noteTableFromPipeLines(lines)
+	if table == nil {
+		return nil, 0
+	}
+	return table, end - start
+}
+
+func noteTableFromPipeLines(lines []string) *common.NoteTable {
+	if len(lines) < 2 {
+		return nil
+	}
+	table := common.NoteTable{HeaderRows: 1}
+	for index, line := range lines {
+		if index == 1 && noteTypedTableSeparator(line) {
+			continue
+		}
+		cells := splitNotePipeRow(line)
+		if len(cells) == 0 {
+			return nil
+		}
+		table.Rows = append(table.Rows, cells)
+	}
+	if len(table.Rows) == 0 {
+		return nil
+	}
+	return &table
+}
+
+func splitNotePipeRow(line string) []common.NoteTableCell {
+	line = strings.TrimSpace(line)
+	line = strings.Trim(line, "|")
+	if strings.TrimSpace(line) == "" {
+		return nil
+	}
+	parts := strings.Split(line, "|")
+	cells := make([]common.NoteTableCell, 0, len(parts))
+	for _, part := range parts {
+		text, spans := parseNoteInlineMarkdown(strings.TrimSpace(part), nil)
+		cells = append(cells, common.NoteTableCell{Text: text, Spans: compactNoteSpans(text, spans)})
+	}
+	return cells
+}
+
+func noteTableMarkdown(table common.NoteTable) string {
+	if len(table.Rows) == 0 {
+		return ""
+	}
+	columns := noteTableColumns(table)
+	lines := make([]string, 0, len(table.Rows)+1)
+	for index, row := range table.Rows {
+		cells := make([]string, columns)
+		for column := 0; column < columns; column++ {
+			value := ""
+			if column < len(row) {
+				value = row[column].Text
+			}
+			cells[column] = " " + strings.ReplaceAll(value, "|", "\\|") + " "
+		}
+		lines = append(lines, "|"+strings.Join(cells, "|")+"|")
+		if index+1 == max(1, table.HeaderRows) || (table.HeaderRows == 0 && index == 0) {
+			sep := make([]string, columns)
+			for column := range sep {
+				sep[column] = " --- "
+			}
+			lines = append(lines, "|"+strings.Join(sep, "|")+"|")
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func defaultNoteTable() common.NoteTable {
+	row := func() []common.NoteTableCell { return []common.NoteTableCell{{}, {}, {}} }
+	return common.NoteTable{HeaderRows: 1, Rows: [][]common.NoteTableCell{row(), row()}}
+}
+
+func noteTypedTableSeparator(value string) bool {
+	value = strings.TrimSpace(value)
+	if !strings.Contains(value, "-") {
+		return false
+	}
+	trimmed := strings.Trim(value, "|")
+	for _, cell := range strings.Split(trimmed, "|") {
+		cell = strings.TrimSpace(strings.Trim(strings.TrimSpace(cell), ":"))
+		if cell != "" && strings.Trim(cell, "-") != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// flattenNoteBlockLines splits stored blocks that still contain newlines so each
+// editor line remaps against the matching previous line's spans.
+func flattenNoteBlockLines(blocks []common.NoteBlock) []common.NoteBlock {
+	flattened := make([]common.NoteBlock, 0, len(blocks))
+	for _, block := range blocks {
+		if block.IsStructural() || !strings.Contains(block.Text, "\n") {
+			flattened = append(flattened, block)
+			continue
+		}
+		lines := strings.Split(strings.ReplaceAll(block.Text, "\r\n", "\n"), "\n")
+		offset := 0
+		for index, line := range lines {
+			part := block
+			part.Text = line
+			part.Spans = noteSpansIntersectingLine(block.Spans, offset, utf8.RuneCountInString(line))
+			if index > 0 {
+				part.ID = uuid.NewString()
+			}
+			flattened = append(flattened, part)
+			offset += utf8.RuneCountInString(line) + 1
+		}
+	}
+	return flattened
+}
+
+func noteSpansIntersectingLine(spans []common.NoteSpan, start, length int) []common.NoteSpan {
+	end := start + length
+	intersected := make([]common.NoteSpan, 0, len(spans))
+	for _, span := range spans {
+		from, to := max(span.Start, start), min(span.End, end)
+		if to <= from {
+			continue
+		}
+		span.Start = from - start
+		span.End = to - start
+		intersected = append(intersected, span)
+	}
+	return intersected
+}
+
+func remapNoteSpans(oldValue, newValue string, spans []common.NoteSpan) []common.NoteSpan {
+	oldRunes, newRunes := []rune(oldValue), []rune(newValue)
+	prefix := 0
+	for prefix < len(oldRunes) && prefix < len(newRunes) && oldRunes[prefix] == newRunes[prefix] {
+		prefix++
+	}
+	suffix := 0
+	for suffix < len(oldRunes)-prefix && suffix < len(newRunes)-prefix && oldRunes[len(oldRunes)-1-suffix] == newRunes[len(newRunes)-1-suffix] {
+		suffix++
+	}
+	oldEnd, newEnd := len(oldRunes)-suffix, len(newRunes)-suffix
+	delta := newEnd - oldEnd
+	result := make([]common.NoteSpan, 0, len(spans))
+	for _, span := range spans {
+		if span.End <= prefix {
+			result = append(result, span)
+			continue
+		}
+		if span.Start >= oldEnd {
+			span.Start += delta
+			span.End += delta
+			result = append(result, span)
+			continue
+		}
+		span.Start = min(span.Start, prefix)
+		span.End = max(span.Start, span.End+delta)
+		if span.End > span.Start {
+			result = append(result, span)
+		}
+	}
+	return result
+}
+
+func parseNoteInlineMarkdown(value string, spans []common.NoteSpan) (string, []common.NoteSpan) {
+	for _, rule := range noteInlineRules {
+		for {
+			match := rule.pattern.FindStringSubmatchIndex(value)
+			if match == nil {
+				break
+			}
+			runes := []rune(value)
+			byteToRune := func(byteOffset int) int { return utf8.RuneCountInString(value[:byteOffset]) }
+			fullStart, fullEnd := byteToRune(match[0]), byteToRune(match[1])
+			contentStart, contentEnd := byteToRune(match[2]), byteToRune(match[3])
+			content := string(runes[contentStart:contentEnd])
+			span := common.NoteSpan{Start: fullStart, End: fullStart + utf8.RuneCountInString(content)}
+			rule.apply(&span)
+			if span.Link == "$2" && len(match) >= 6 {
+				span.Link = value[match[4]:match[5]]
+			}
+			value = string(runes[:fullStart]) + content + string(runes[fullEnd:])
+			spans = remapNoteSpans(string(runes), value, spans)
+			spans = append(spans, span)
+		}
+	}
+	return value, spans
+}
+
+func compactNoteSpans(value string, spans []common.NoteSpan) []common.NoteSpan {
+	styles := make([]noteInlineStyle, utf8.RuneCountInString(value))
+	for _, span := range spans {
+		for index := max(0, span.Start); index < min(len(styles), span.End); index++ {
+			styles[index].bold = styles[index].bold || span.Bold
+			styles[index].italic = styles[index].italic || span.Italic
+			styles[index].underline = styles[index].underline || span.Underline
+			styles[index].strike = styles[index].strike || span.Strike
+			styles[index].code = styles[index].code || span.Code
+			styles[index].link = noteFirstNonEmpty(styles[index].link, span.Link)
+		}
+	}
+	return spansFromNoteStyles(styles)
+}
+
+// ToggleNoteInline applies or removes one style across every selected block range.
+func ToggleNoteInline(document common.NoteDocument, ranges []NoteBlockRange, selection woxui.TextSelection, kind string, link string) common.NoteDocument {
+	start, end := selection.Start(), selection.End()
+	if start == end {
+		return document
+	}
+	allActive := true
+	for _, blockRange := range ranges {
+		from, to := max(start, blockRange.TextStart), min(end, blockRange.TextEnd)
+		// Dividers project a placeholder rule but own no inline text to style.
+		if from >= to || document.Blocks[blockRange.Block].Type == common.NoteBlockDivider {
+			continue
+		}
+		styles := noteBlockStyles(document.Blocks[blockRange.Block], document.Blocks[blockRange.Block].Text)
+		for index := from - blockRange.TextStart; index < to-blockRange.TextStart; index++ {
+			if !noteStyleActive(styles[index], kind, link) {
+				allActive = false
+			}
+		}
+	}
+	for _, blockRange := range ranges {
+		from, to := max(start, blockRange.TextStart), min(end, blockRange.TextEnd)
+		if from >= to || document.Blocks[blockRange.Block].Type == common.NoteBlockDivider {
+			continue
+		}
+		block := &document.Blocks[blockRange.Block]
+		styles := noteBlockStyles(*block, block.Text)
+		for index := from - blockRange.TextStart; index < to-blockRange.TextStart; index++ {
+			setNoteStyle(&styles[index], kind, !allActive, link)
+		}
+		block.Spans = spansFromNoteStyles(styles)
+	}
+	return document
+}
+
+// ToggleNoteTableInline applies one inline style to the focused table cell.
+func ToggleNoteTableInline(document common.NoteDocument, block, row, column int, kind, link string) common.NoteDocument {
+	cell := noteTableCell(document, block, row, column)
+	if cell == nil || cell.Text == "" {
+		return document
+	}
+	styles := noteBlockStyles(common.NoteBlock{Text: cell.Text, Spans: cell.Spans}, cell.Text)
+	allActive := len(styles) > 0
+	for _, style := range styles {
+		if !noteStyleActive(style, kind, link) {
+			allActive = false
+			break
+		}
+	}
+	for index := range styles {
+		setNoteStyle(&styles[index], kind, !allActive, link)
+	}
+	cell.Spans = spansFromNoteStyles(styles)
+	return document
+}
+
+func noteTableCell(document common.NoteDocument, block, row, column int) *common.NoteTableCell {
+	if block < 0 || block >= len(document.Blocks) || document.Blocks[block].Table == nil {
+		return nil
+	}
+	table := document.Blocks[block].Table
+	if row < 0 || row >= len(table.Rows) || column < 0 || column >= len(table.Rows[row]) {
+		return nil
+	}
+	return &table.Rows[row][column]
+}
+
+// NoteActiveFormats reports which format-bar controls match the caret or selection.
+func NoteActiveFormats(document common.NoteDocument, ranges []NoteBlockRange, selection woxui.TextSelection) map[string]bool {
+	active := map[string]bool{}
+	if len(document.Blocks) == 0 {
+		return active
+	}
+	if len(ranges) > 0 {
+		index := NoteBlockAt(ranges, selection.Focus)
+		if index >= 0 && index < len(document.Blocks) {
+			applyNoteBlockFormat(active, document.Blocks[index].Type)
+		}
+		inline := noteInlineStyleAt(document, ranges, selection)
+		applyNoteInlineFormat(active, inline)
+	}
+	return active
+}
+
+// NoteActiveFormatsForTable reports format-bar state for a focused table cell.
+// Block styles come from the table itself, not leftover text-caret selection outside the grid.
+func NoteActiveFormatsForTable(document common.NoteDocument, block, row, column int) map[string]bool {
+	active := map[string]bool{}
+	applyNoteBlockFormat(active, common.NoteBlockTable)
+	cell := noteTableCell(document, block, row, column)
+	if cell == nil || cell.Text == "" {
+		return active
+	}
+	styles := noteBlockStyles(common.NoteBlock{Text: cell.Text, Spans: cell.Spans}, cell.Text)
+	if len(styles) == 0 {
+		return active
+	}
+	combined := styles[0]
+	for _, style := range styles[1:] {
+		combined.bold = combined.bold && style.bold
+		combined.italic = combined.italic && style.italic
+		combined.underline = combined.underline && style.underline
+		combined.strike = combined.strike && style.strike
+		combined.code = combined.code && style.code
+		if combined.link != style.link {
+			combined.link = ""
+		}
+	}
+	applyNoteInlineFormat(active, combined)
+	return active
+}
+
+func applyNoteBlockFormat(active map[string]bool, blockType common.NoteBlockType) {
+	switch blockType {
+	case common.NoteBlockHeading1, common.NoteBlockHeading2, common.NoteBlockHeading3:
+		active["block"] = true
+	case common.NoteBlockCode:
+		active["code"] = true
+	case common.NoteBlockBullet:
+		active["bullet"] = true
+	case common.NoteBlockOrdered:
+		active["ordered"] = true
+	case common.NoteBlockTask:
+		active["task"] = true
+	case common.NoteBlockQuote:
+		active["quote"] = true
+	case common.NoteBlockDivider:
+		active["divider"] = true
+	case common.NoteBlockTable:
+		active["table"] = true
+	}
+}
+
+func applyNoteInlineFormat(active map[string]bool, inline noteInlineStyle) {
+	if inline.bold {
+		active["bold"] = true
+	}
+	if inline.italic {
+		active["italic"] = true
+	}
+	if inline.underline {
+		active["underline"] = true
+	}
+	if inline.strike {
+		active["strike"] = true
+	}
+	if inline.code {
+		active["code"] = true
+	}
+	if inline.link != "" {
+		active["link"] = true
+	}
+}
+
+func noteInlineStyleAt(document common.NoteDocument, ranges []NoteBlockRange, selection woxui.TextSelection) noteInlineStyle {
+	start, end := selection.Start(), selection.End()
+	if start == end {
+		return noteInlineStyleAtOffset(document, ranges, start)
+	}
+	var combined *noteInlineStyle
+	for _, blockRange := range ranges {
+		from, to := max(start, blockRange.TextStart), min(end, blockRange.TextEnd)
+		// A divider's placeholder rule has no backing text, so select-all must not index its styles.
+		if from >= to || document.Blocks[blockRange.Block].Type == common.NoteBlockDivider {
+			continue
+		}
+		styles := noteBlockStyles(document.Blocks[blockRange.Block], document.Blocks[blockRange.Block].Text)
+		for index := from - blockRange.TextStart; index < to-blockRange.TextStart; index++ {
+			style := styles[index]
+			if combined == nil {
+				current := style
+				combined = &current
+				continue
+			}
+			combined.bold = combined.bold && style.bold
+			combined.italic = combined.italic && style.italic
+			combined.underline = combined.underline && style.underline
+			combined.strike = combined.strike && style.strike
+			combined.code = combined.code && style.code
+			if combined.link != style.link {
+				combined.link = ""
+			}
+		}
+	}
+	if combined == nil {
+		return noteInlineStyle{}
+	}
+	return *combined
+}
+
+func noteInlineStyleAtOffset(document common.NoteDocument, ranges []NoteBlockRange, offset int) noteInlineStyle {
+	index := NoteBlockAt(ranges, offset)
+	if index < 0 || index >= len(document.Blocks) {
+		return noteInlineStyle{}
+	}
+	blockRange := ranges[0]
+	for _, candidate := range ranges {
+		if candidate.Block == index {
+			blockRange = candidate
+			break
+		}
+	}
+	styles := noteBlockStyles(document.Blocks[index], document.Blocks[index].Text)
+	if len(styles) == 0 {
+		return noteInlineStyle{}
+	}
+	runeOffset := offset - blockRange.TextStart
+	if runeOffset >= len(styles) {
+		runeOffset = len(styles) - 1
+	}
+	if runeOffset < 0 {
+		return noteInlineStyle{}
+	}
+	return styles[runeOffset]
+}
+
+func noteStyleActive(style noteInlineStyle, kind, link string) bool {
+	switch kind {
+	case "bold":
+		return style.bold
+	case "italic":
+		return style.italic
+	case "underline":
+		return style.underline
+	case "strike":
+		return style.strike
+	case "code":
+		return style.code
+	case "link":
+		return style.link != "" && (link == "" || style.link == link)
+	default:
+		return false
+	}
+}
+
+func setNoteStyle(style *noteInlineStyle, kind string, enabled bool, link string) {
+	switch kind {
+	case "bold":
+		style.bold = enabled
+	case "italic":
+		style.italic = enabled
+	case "underline":
+		style.underline = enabled
+	case "strike":
+		style.strike = enabled
+	case "code":
+		style.code = enabled
+	case "link":
+		if enabled {
+			style.link = link
+		} else {
+			style.link = ""
+		}
+	}
+}
+
+func spansFromNoteStyles(styles []noteInlineStyle) []common.NoteSpan {
+	spans := make([]common.NoteSpan, 0)
+	for start := 0; start < len(styles); {
+		if styles[start] == (noteInlineStyle{}) {
+			start++
+			continue
+		}
+		end := start + 1
+		for end < len(styles) && styles[end] == styles[start] {
+			end++
+		}
+		style := styles[start]
+		spans = append(spans, common.NoteSpan{Start: start, End: end, Bold: style.bold, Italic: style.italic, Underline: style.underline, Strike: style.strike, Code: style.code, Link: style.link})
+		start = end
+	}
+	return spans
+}
+
+// NoteBlockAt returns the document block that contains the projected caret offset.
+func NoteBlockAt(ranges []NoteBlockRange, offset int) int {
+	for _, blockRange := range ranges {
+		if offset <= blockRange.End {
+			return blockRange.Block
+		}
+	}
+	if len(ranges) == 0 {
+		return 0
+	}
+	return ranges[len(ranges)-1].Block
+}
+
+// NoteOpenableLink keeps pointer activation on the same schemes Window.OpenExternalURL accepts.
+func NoteOpenableLink(target string) string {
+	target = strings.TrimSpace(target)
+	parsed, err := url.ParseRequestURI(target)
+	if err != nil {
+		return ""
+	}
+	if (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != "" {
+		return parsed.String()
+	}
+	if parsed.Scheme == "mailto" && parsed.Opaque != "" {
+		return parsed.String()
+	}
+	return ""
+}
+
+// NoteLinkAtOffset returns the openable URL under a projected editor offset.
+func NoteLinkAtOffset(document common.NoteDocument, ranges []NoteBlockRange, offset int) string {
+	if len(document.Blocks) == 0 || len(ranges) == 0 {
+		return ""
+	}
+	index := NoteBlockAt(ranges, offset)
+	blockRange := NoteRangeForBlock(ranges, index)
+	if offset < blockRange.TextStart || offset > blockRange.TextEnd {
+		return ""
+	}
+	block := document.Blocks[index]
+	styles := noteBlockStyles(block, block.Text)
+	if len(styles) == 0 {
+		return ""
+	}
+	runeOffset := offset - blockRange.TextStart
+	if runeOffset < 0 || runeOffset > len(styles) {
+		return ""
+	}
+	if runeOffset < len(styles) {
+		if link := NoteOpenableLink(styles[runeOffset].link); link != "" {
+			return link
+		}
+	}
+	if runeOffset > 0 {
+		return NoteOpenableLink(styles[runeOffset-1].link)
+	}
+	return ""
+}
+
+// NoteRangeForBlock resolves a document block index to offsets within the projected text segment.
+func NoteRangeForBlock(ranges []NoteBlockRange, block int) NoteBlockRange {
+	for _, blockRange := range ranges {
+		if blockRange.Block == block {
+			return blockRange
+		}
+	}
+	return ranges[0]
+}
+
+// NoteTaskAtCaret returns the task block that contains the caret, or -1.
+func NoteTaskAtCaret(document common.NoteDocument, ranges []NoteBlockRange, selection woxui.TextSelection) int {
+	if len(document.Blocks) == 0 || len(ranges) == 0 {
+		return -1
+	}
+	index := NoteBlockAt(ranges, selection.Focus)
+	if index < 0 || index >= len(document.Blocks) || document.Blocks[index].Type != common.NoteBlockTask {
+		return -1
+	}
+	return index
+}
+
+// NoteTaskGroup reports the inclusive start and exclusive end of a task plus
+// following more-indented list items that should move with it.
+func NoteTaskGroup(document common.NoteDocument, index int) (int, int) {
+	if index < 0 || index >= len(document.Blocks) || document.Blocks[index].Type != common.NoteBlockTask {
+		return index, index
+	}
+	end := index + 1
+	indent := document.Blocks[index].Indent
+	for end < len(document.Blocks) {
+		block := document.Blocks[end]
+		if !noteListBlock(block) || block.Indent <= indent {
+			break
+		}
+		end++
+	}
+	return index, end
+}
+
+func noteListBlock(block common.NoteBlock) bool {
+	return block.Type == common.NoteBlockBullet || block.Type == common.NoteBlockOrdered || block.Type == common.NoteBlockTask
+}
+
+// NoteTaskLiveDest maps a document-local Y onto an insert-before index using
+// wrapped-line midpoints so neighboring items do not oscillate while dragging.
+func NoteTaskLiveDest(document common.NoteDocument, ranges []NoteBlockRange, from int, contentY, lineHeight, innerWidth float32, value string, runs []NoteTextRun, style woxui.TextStyle, window *woxui.Window) int {
+	var measurer textFieldMeasurer
+	if window != nil {
+		measurer = window
+	}
+	return noteTaskLiveDest(document, ranges, from, contentY, lineHeight, textFieldRichLines(value, measurer, style, innerWidth, true, NoteFieldRuns(runs)))
+}
+
+func noteTaskLiveDest(document common.NoteDocument, ranges []NoteBlockRange, from int, contentY, lineHeight float32, lines []textFieldLine) int {
+	start, end := NoteTaskGroup(document, from)
+	if start >= end || lineHeight <= 0 || len(lines) == 0 {
+		return start
+	}
+	target := -1
+	var targetTop, targetBottom float32
+	for _, blockRange := range ranges {
+		top, bottom, ok := noteRangeContentSpan(ranges, lines, lineHeight, blockRange.Block)
+		if !ok {
+			continue
+		}
+		if contentY >= top && contentY < bottom {
+			target = blockRange.Block
+			targetTop, targetBottom = top, bottom
+		}
+	}
+	if target < 0 {
+		if contentY < 0 {
+			return 0
+		}
+		return len(document.Blocks)
+	}
+	if target >= start && target < end {
+		return start
+	}
+	mid := (targetTop + targetBottom) / 2
+	if target < start {
+		if contentY < mid {
+			return target
+		}
+		return target + 1
+	}
+	if contentY > mid {
+		return target + 1
+	}
+	return target
+}
+
+func noteRangeContentSpan(ranges []NoteBlockRange, lines []textFieldLine, lineHeight float32, block int) (float32, float32, bool) {
+	blockRange, ok := noteBlockRangeByIndex(ranges, block)
+	if !ok {
+		return 0, 0, false
+	}
+	first, last := -1, -1
+	for index, line := range lines {
+		if line.end < blockRange.Start || line.start > blockRange.End {
+			continue
+		}
+		if first < 0 {
+			first = index
+		}
+		last = index
+	}
+	if first < 0 {
+		return 0, 0, false
+	}
+	layout := textFieldLayoutLines(lines, lineHeight)
+	top := layout.top(first)
+	bottom := layout.top(last) + layout.box(last)
+	if last+1 < layout.count {
+		bottom = layout.top(last + 1)
+	}
+	return top, bottom, true
+}
+
+func noteBlockRangeByIndex(ranges []NoteBlockRange, block int) (NoteBlockRange, bool) {
+	for _, blockRange := range ranges {
+		if blockRange.Block == block {
+			return blockRange, true
+		}
+	}
+	return NoteBlockRange{}, false
+}
+
+// noteTaskInsertLineY is the document Y of the gap before dest.
+func noteTaskInsertLineY(document common.NoteDocument, ranges []NoteBlockRange, dest int, lineHeight float32, lines []textFieldLine) (float32, bool) {
+	if lineHeight <= 0 || len(lines) == 0 {
+		return 0, false
+	}
+	if dest <= 0 {
+		return 0, true
+	}
+	if dest >= len(document.Blocks) {
+		return textFieldLayoutLines(lines, lineHeight).total, true
+	}
+	top, _, ok := noteRangeContentSpan(ranges, lines, lineHeight, dest)
+	return top, ok
+}
+
+// NoteTaskDropDest maps a pointer offset onto an insert-before index for MoveNoteTaskGroup.
+func NoteTaskDropDest(document common.NoteDocument, ranges []NoteBlockRange, from, offset int) int {
+	start, end := NoteTaskGroup(document, from)
+	if start >= end || len(ranges) == 0 {
+		return start
+	}
+	target := NoteBlockAt(ranges, offset)
+	if target < start {
+		return target
+	}
+	if target >= end {
+		return target + 1
+	}
+	return start
+}
+
+// NoteTaskNudgeDest moves a task group one slot up or down.
+func NoteTaskNudgeDest(document common.NoteDocument, from, delta int) int {
+	start, end := NoteTaskGroup(document, from)
+	if start >= end {
+		return start
+	}
+	if delta < 0 {
+		return max(0, start-1)
+	}
+	return min(len(document.Blocks), end+1)
+}
+
+// MoveNoteTaskGroup moves the task at from (and its indented descendants) so the
+// group starts at dest in the resulting document. dest is an insert-before index
+// in the original document; dest == len(Blocks) appends.
+func MoveNoteTaskGroup(document common.NoteDocument, from, dest int) (common.NoteDocument, int) {
+	start, end := NoteTaskGroup(document, from)
+	if start >= end {
+		return document, from
+	}
+	if dest < 0 {
+		dest = 0
+	}
+	if dest > len(document.Blocks) {
+		dest = len(document.Blocks)
+	}
+	if dest >= start && dest <= end {
+		return document, start
+	}
+	updated := CloneNoteDocument(document)
+	group := append([]common.NoteBlock(nil), updated.Blocks[start:end]...)
+	updated.Blocks = slices.Delete(updated.Blocks, start, end)
+	if dest > start {
+		dest -= end - start
+	}
+	updated.Blocks = slices.Insert(updated.Blocks, dest, group...)
+	return updated, dest
+}
+
+// NoteTaskAtOffset limits task activation to the rendered checkbox prefix.
+func NoteTaskAtOffset(document common.NoteDocument, ranges []NoteBlockRange, offset int) (int, bool) {
+	if len(document.Blocks) == 0 || len(ranges) == 0 {
+		return 0, false
+	}
+	index := NoteBlockAt(ranges, offset)
+	blockRange := NoteRangeForBlock(ranges, index)
+	return index, document.Blocks[index].Type == common.NoteBlockTask && offset >= blockRange.Marker && offset <= blockRange.TextStart
+}
+
+// NoteDividerAtOffset treats a horizontal rule as an atomic visual block rather than selectable placeholder text.
+func NoteDividerAtOffset(document common.NoteDocument, ranges []NoteBlockRange, offset int) bool {
+	if len(document.Blocks) == 0 || len(ranges) == 0 {
+		return false
+	}
+	index := NoteBlockAt(ranges, offset)
+	blockRange := NoteRangeForBlock(ranges, index)
+	return document.Blocks[index].Type == common.NoteBlockDivider && offset >= blockRange.Start && offset <= blockRange.End
+}
+
+// ContinueNoteBlock splits a list or quote and keeps the same marker on the new block.
+func ContinueNoteBlock(document common.NoteDocument, ranges []NoteBlockRange, selection woxui.TextSelection) (common.NoteDocument, int, bool) {
+	if !selection.Collapsed() || len(document.Blocks) == 0 || len(ranges) == 0 {
+		return document, 0, false
+	}
+	index := NoteBlockAt(ranges, selection.Focus)
+	block := document.Blocks[index]
+	switch block.Type {
+	case common.NoteBlockBullet, common.NoteBlockOrdered, common.NoteBlockTask, common.NoteBlockQuote:
+	default:
+		return document, 0, false
+	}
+
+	updated := CloneNoteDocument(document)
+	if block.Text == "" {
+		updated.Blocks[index].Type = common.NoteBlockParagraph
+		updated.Blocks[index].Checked = false
+		updated.Blocks[index].Indent = 0
+		return updated, index, true
+	}
+
+	runes := []rune(block.Text)
+	blockRange := NoteRangeForBlock(ranges, index)
+	offset := max(0, min(len(runes), selection.Focus-blockRange.TextStart))
+	styles := noteBlockStyles(block, block.Text)
+	updated.Blocks[index].Text = string(runes[:offset])
+	updated.Blocks[index].Spans = spansFromNoteStyles(styles[:offset])
+	next := common.NoteBlock{ID: uuid.NewString(), Type: block.Type, Text: string(runes[offset:]), Indent: block.Indent, Spans: spansFromNoteStyles(styles[offset:])}
+	updated.Blocks = slices.Insert(updated.Blocks, index+1, next)
+	return updated, index + 1, true
+}
+
+// AdjustNoteListIndent changes the active list item without exposing indentation as document text.
+func AdjustNoteListIndent(document common.NoteDocument, ranges []NoteBlockRange, selection woxui.TextSelection, delta int) (common.NoteDocument, int, bool, bool) {
+	if !selection.Collapsed() || len(document.Blocks) == 0 || len(ranges) == 0 {
+		return document, 0, false, false
+	}
+	index := NoteBlockAt(ranges, selection.Focus)
+	block := document.Blocks[index]
+	if block.Type != common.NoteBlockBullet && block.Type != common.NoteBlockOrdered && block.Type != common.NoteBlockTask {
+		return document, index, false, false
+	}
+	next := max(0, min(common.NoteMaximumIndent, block.Indent+delta))
+	if delta > 0 {
+		if index == 0 {
+			next = block.Indent
+		} else {
+			previous := document.Blocks[index-1]
+			if (previous.Type != common.NoteBlockBullet && previous.Type != common.NoteBlockOrdered && previous.Type != common.NoteBlockTask) || previous.Indent < block.Indent {
+				next = block.Indent
+			}
+		}
+	}
+	if next == block.Indent {
+		return document, index, false, true
+	}
+	updated := CloneNoteDocument(document)
+	updated.Blocks[index].Indent = next
+	return updated, index, true, true
+}
+
+// CloneNoteDocument copies blocks, spans, and table cells for undo snapshots.
+func CloneNoteDocument(document common.NoteDocument) common.NoteDocument {
+	clone := common.NoteDocument{Version: document.Version, Blocks: make([]common.NoteBlock, len(document.Blocks))}
+	for index, block := range document.Blocks {
+		clone.Blocks[index] = block
+		clone.Blocks[index].Spans = append([]common.NoteSpan(nil), block.Spans...)
+		if block.Table != nil {
+			table := *block.Table
+			table.Rows = make([][]common.NoteTableCell, len(block.Table.Rows))
+			for rowIndex, row := range block.Table.Rows {
+				table.Rows[rowIndex] = make([]common.NoteTableCell, len(row))
+				for column, cell := range row {
+					table.Rows[rowIndex][column] = cell
+					table.Rows[rowIndex][column].Spans = append([]common.NoteSpan(nil), cell.Spans...)
+				}
+			}
+			clone.Blocks[index].Table = &table
+		}
+		if block.Image != nil {
+			image := *block.Image
+			clone.Blocks[index].Image = &image
+		}
+	}
+	return clone
+}
+
+// NoteDocumentSegments splits a document into linear text runs and table blocks.
+func NoteDocumentSegments(document common.NoteDocument) []NoteDocumentSegment {
+	return noteDocumentSegments(document)
+}
+
+// NoteSegmentDocument returns the blocks owned by one editor segment.
+func NoteSegmentDocument(document common.NoteDocument, segment NoteDocumentSegment) common.NoteDocument {
+	return noteSegmentDocument(document, segment)
+}
+
+func noteDocumentSegments(document common.NoteDocument) []NoteDocumentSegment {
+	segments := make([]NoteDocumentSegment, 0)
+	start := 0
+	for index, block := range document.Blocks {
+		if !block.IsStructural() {
+			continue
+		}
+		if start < index {
+			segments = append(segments, NoteDocumentSegment{Start: start, End: index})
+		}
+		segments = append(segments, NoteDocumentSegment{Start: index, End: index + 1, Table: block.Type == common.NoteBlockTable, Image: block.Type == common.NoteBlockImage})
+		start = index + 1
+	}
+	if start < len(document.Blocks) || len(segments) == 0 {
+		segments = append(segments, NoteDocumentSegment{Start: start, End: max(start, len(document.Blocks))})
+	}
+	return segments
+}
+
+// ProjectNoteSegment projects one text segment and remaps ranges onto the full document.
+func ProjectNoteSegment(document common.NoteDocument, segment NoteDocumentSegment, base woxui.TextStyle, theme ControlTheme) (string, []NoteTextRun, []NoteBlockRange) {
+	value, runs, ranges := ProjectNoteDocument(noteSegmentDocument(document, segment), base, theme)
+	for index := range ranges {
+		ranges[index].Block += segment.Start
+	}
+	return value, runs, ranges
+}
+
+// ReplaceNoteSegment writes parsed text-segment blocks back without disturbing neighboring tables.
+func ReplaceNoteSegment(document common.NoteDocument, segment NoteDocumentSegment, blocks []common.NoteBlock) common.NoteDocument {
+	return replaceNoteSegment(document, segment, blocks)
+}
+
+// NoteSegmentAtBlock returns the text or table segment that contains the document block.
+func NoteSegmentAtBlock(document common.NoteDocument, block int) NoteDocumentSegment {
+	for _, segment := range noteDocumentSegments(document) {
+		if block >= segment.Start && block < segment.End {
+			return segment
+		}
+	}
+	return NoteDocumentSegment{Start: 0, End: len(document.Blocks)}
+}
+
+func noteSegmentDocument(document common.NoteDocument, segment NoteDocumentSegment) common.NoteDocument {
+	if segment.Start >= len(document.Blocks) {
+		return common.NoteDocument{Version: document.Version, Blocks: []common.NoteBlock{{ID: uuid.NewString(), Type: common.NoteBlockParagraph}}}
+	}
+	return common.NoteDocument{Version: document.Version, Blocks: append([]common.NoteBlock(nil), document.Blocks[segment.Start:segment.End]...)}
+}
+
+func noteBlockIsEmptyText(block common.NoteBlock) bool {
+	if block.IsStructural() {
+		return false
+	}
+	return strings.TrimSpace(block.Text) == ""
+}
+
+// NoteSegmentIsEmpty reports whether a text segment contains only blank blocks.
+func NoteSegmentIsEmpty(document common.NoteDocument, segment NoteDocumentSegment) bool {
+	if segment.Structural() || segment.Start < 0 || segment.Start >= segment.End || segment.End > len(document.Blocks) {
+		return false
+	}
+	for index := segment.Start; index < segment.End; index++ {
+		if !noteBlockIsEmptyText(document.Blocks[index]) {
+			return false
+		}
+	}
+	return true
+}
+
+func ensureNoteDocumentHasTextBlock(document common.NoteDocument) common.NoteDocument {
+	if len(document.Blocks) == 0 {
+		document.Blocks = []common.NoteBlock{{ID: uuid.NewString(), Type: common.NoteBlockParagraph}}
+		return document
+	}
+	hasText := false
+	for _, block := range document.Blocks {
+		if !block.IsStructural() {
+			hasText = true
+			break
+		}
+	}
+	if !hasText {
+		document.Blocks = append(document.Blocks, common.NoteBlock{ID: uuid.NewString(), Type: common.NoteBlockParagraph})
+	}
+	return ensureNoteImageEditGaps(document)
+}
+
+// ensureNoteImageEditGaps keeps empty paragraphs around images so clicks and arrow keys can land a caret.
+func ensureNoteImageEditGaps(document common.NoteDocument) common.NoteDocument {
+	if len(document.Blocks) == 0 {
+		return document
+	}
+	blocks := make([]common.NoteBlock, 0, len(document.Blocks)+2)
+	if document.Blocks[0].Type == common.NoteBlockImage {
+		blocks = append(blocks, common.NoteBlock{ID: uuid.NewString(), Type: common.NoteBlockParagraph})
+	}
+	for index, block := range document.Blocks {
+		if index > 0 && document.Blocks[index-1].Type == common.NoteBlockImage && block.Type == common.NoteBlockImage {
+			blocks = append(blocks, common.NoteBlock{ID: uuid.NewString(), Type: common.NoteBlockParagraph})
+		}
+		blocks = append(blocks, block)
+	}
+	if blocks[len(blocks)-1].Type == common.NoteBlockImage {
+		blocks = append(blocks, common.NoteBlock{ID: uuid.NewString(), Type: common.NoteBlockParagraph})
+	}
+	document.Blocks = blocks
+	return document
+}
+
+// RemoveEmptyNoteSegment deletes a blank text run so neighboring tables can sit together.
+func RemoveEmptyNoteSegment(document common.NoteDocument, segment NoteDocumentSegment) (common.NoteDocument, bool) {
+	if !NoteSegmentIsEmpty(document, segment) || len(document.Blocks) <= segment.End-segment.Start {
+		return document, false
+	}
+	updated := CloneNoteDocument(document)
+	updated.Blocks = slices.Delete(updated.Blocks, segment.Start, segment.End)
+	return ensureNoteDocumentHasTextBlock(updated), true
+}
+
+func replaceNoteSegment(document common.NoteDocument, segment NoteDocumentSegment, blocks []common.NoteBlock) common.NoteDocument {
+	updated := CloneNoteDocument(document)
+	if segment.Start == segment.End && len(updated.Blocks) == 0 {
+		updated.Blocks = blocks
+		return updated
+	}
+	updated.Blocks = slices.Replace(updated.Blocks, segment.Start, min(segment.End, len(updated.Blocks)), blocks...)
+	if len(updated.Blocks) == 0 {
+		updated.Blocks = []common.NoteBlock{{ID: uuid.NewString(), Type: common.NoteBlockParagraph}}
+	}
+	return updated
+}

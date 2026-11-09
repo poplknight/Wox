@@ -1,0 +1,320 @@
+.PHONY: clean build pack-resources help ui-resources sync-ai-skills window-hook-build crash-handler-build file-index-service-build woxmr-build
+
+SQLITE_BUILD_TAGS ?= sqlite_fts5
+
+# Determine the current platform
+ifeq ($(OS),Windows_NT)
+    PLATFORM := windows
+    ARCH := amd64
+    GOARCH := amd64
+else
+    UNAME_S := $(shell uname -s)
+    ifeq ($(UNAME_S),Linux)
+        PLATFORM := linux
+        ARCH := amd64
+        GOARCH := amd64
+    endif
+    ifeq ($(UNAME_S),Darwin)
+        PLATFORM := macos
+        ARCH := $(shell uname -m)
+        ifeq ($(ARCH),x86_64)
+            GOARCH := amd64
+        else
+            GOARCH := $(ARCH)
+        endif
+    endif
+endif
+
+RELEASE_DIR := ../release
+WOX_PLUGIN_CREATOR_SKILL_SOURCE := ../.agents/skills/wox-plugin-creator
+WOX_PLUGIN_CREATOR_SKILL_DESTINATION := resource/ai/skills/wox-plugin-creator
+
+# GNU Make on Windows can detect Git's sh.exe while still leaving Git's
+# usr/bin tools out of PATH. The build uses sed/rm and POSIX env assignments, so
+# add the sibling usr/bin directory when that shell is in use instead of
+# requiring every PowerShell session to configure the same PATH manually.
+ifeq ($(OS),Windows_NT)
+    GIT_USR_BIN := $(patsubst %/bin/sh.exe,%/usr/bin,$(SHELL))
+    ifneq ($(GIT_USR_BIN),$(SHELL))
+        export PATH := $(GIT_USR_BIN);$(PATH)
+    endif
+endif
+
+# Extract version string from updater/version.go
+# Expected format: const CURRENT_VERSION = "x.y.z[-prerelease]"
+VERSION := $(shell sed -n 's/^const CURRENT_VERSION = "\(.*\)"/\1/p' updater/version.go)
+
+help:
+	@echo "Available commands:"
+	@echo "  make clean         - Clean build artifacts"
+	@echo "  make build         - Build Wox with the embedded Go UI for current platform ($(PLATFORM))"
+	@echo "  make ui-resources  - Prepare platform resources used by the embedded Go UI"
+	@echo "  File Search performance reports run in the root make smoke target (launcher/plugin/filesearch)."
+	@echo "  make woxmr-build   - Build and install WoxMR.bundle for current platform ($(PLATFORM))"
+
+clean:
+	rm -rf $(RELEASE_DIR) .build/assets
+	rm -f resource_windows.syso rsrc_windows.syso
+
+ui-resources:
+ifeq ($(PLATFORM),windows)
+	@echo "WebView2Loader.dll is managed under resource/others/webview for Windows builds"
+else
+	@echo "The embedded Go UI does not require staged resources on $(PLATFORM)"
+endif
+
+# Keep the repository skill as the only authored copy; go:embed consumes this staged tree.
+sync-ai-skills:
+	test -f $(WOX_PLUGIN_CREATOR_SKILL_SOURCE)/SKILL.md
+	rm -rf $(WOX_PLUGIN_CREATOR_SKILL_DESTINATION)
+	mkdir -p $(dir $(WOX_PLUGIN_CREATOR_SKILL_DESTINATION))
+	cp -R $(WOX_PLUGIN_CREATOR_SKILL_SOURCE) $(WOX_PLUGIN_CREATOR_SKILL_DESTINATION)
+	rm -rf $(WOX_PLUGIN_CREATOR_SKILL_DESTINATION)/scripts/__pycache__
+	test -f ../.agents/skills/wox-theme-creator/SKILL.md
+	mkdir -p resource/ai/skills/wox-theme-creator
+	cp ../.agents/skills/wox-theme-creator/SKILL.md resource/ai/skills/wox-theme-creator/SKILL.md
+
+# Run after all helper builds/signing; the overlay contains the exact final bytes.
+pack-resources:
+	go run ./cmd/assetpack -tags "$(SQLITE_BUILD_TAGS)" -goos $(if $(filter macos,$(PLATFORM)),darwin,$(PLATFORM)) -goarch $(GOARCH)
+
+build: clean sync-ai-skills
+	$(MAKE) woxmr-build
+	$(MAKE) window-hook-build
+	$(MAKE) crash-handler-build
+	$(MAKE) file-index-service-build
+	$(MAKE) pack-resources
+ifeq ($(PLATFORM),windows)
+	# Generate Windows VERSIONINFO using the version from updater.CURRENT_VERSION
+	cd . && go run github.com/josephspurrier/goversioninfo/cmd/goversioninfo@v1.5.0 \
+		-o resource_windows.syso -64 -icon resource/app.ico \
+		-manifest resource/wox.exe.manifest \
+		-product-name "Wox" -description "Wox" -internal-name "Wox" -original-name "wox-windows-$(GOARCH).exe" \
+		-product-version "$(VERSION)" -file-version "$(VERSION)" \
+		-propagate-ver-strings
+	# Keep Go symbols and DWARF data so crash minidumps can be symbolized against the exact release executable.
+	CGO_ENABLED=1 GOOS=windows GOARCH=$(GOARCH) go build -overlay .build/assets/overlay.json -tags "$(SQLITE_BUILD_TAGS)" -ldflags "-s -w -H windowsgui -X 'wox/util.ProdEnv=true' -X 'wox/util/filesearchservice.EmbeddedVersion=$(FILE_INDEX_SERVICE_VERSION)'" -o $(RELEASE_DIR)/wox-windows-$(GOARCH).exe
+endif
+
+ifeq ($(PLATFORM),linux)
+	# Keep symbols in release binaries so native crash reports retain actionable stack information.
+	CGO_ENABLED=1 GOOS=linux GOARCH=$(GOARCH) go build -overlay .build/assets/overlay.json -tags "$(SQLITE_BUILD_TAGS)" -ldflags "-s -w -X 'wox/util.ProdEnv=true'" -o $(RELEASE_DIR)/wox-linux-$(GOARCH)
+endif
+ifeq ($(PLATFORM),macos)
+	# Keep symbols in release binaries so macOS diagnostic reports can be symbolized with the shipped executable.
+	CGO_ENABLED=1 GOOS=darwin GOARCH=$(GOARCH) CGO_CFLAGS="-mmacosx-version-min=12.0" CGO_LDFLAGS="-mmacosx-version-min=12.0 -Wl,-no_warn_duplicate_libraries" go build -overlay .build/assets/overlay.json -tags "$(SQLITE_BUILD_TAGS)" -ldflags "-s -w -X 'wox/util.ProdEnv=true'" -o $(RELEASE_DIR)/wox-mac-$(GOARCH)
+endif
+
+WINDOW_HOOK_SOURCE := util/windowhook/hook/window_hook.c
+WINDOW_HOOK_DIR := resource/others/window_hook
+WINDOW_HOOK_DLL := $(WINDOW_HOOK_DIR)/WoxWindowHook64.dll
+WINDOW_HOOK_DLL32 := $(WINDOW_HOOK_DIR)/WoxWindowHook32.dll
+WINDOW_HOOK_HELPER32 := $(WINDOW_HOOK_DIR)/wox-window-hook-helper32.exe
+# The helper is a visible Wox process, so it carries Wox's icon and version strings.
+# Note the missing -64: goversioninfo defaults to a 32-bit resource, which is what a
+# GOARCH=386 binary needs. The .syso is deleted right after linking, exactly as the file
+# index service does, so an i386 resource can never be picked up by an amd64 build.
+WINDOW_HOOK_HELPER32_VERSIONINFO := cmd/window_hook_helper/resource_windows.syso
+WINDOW_HOOK_LIBS := -lole32 -lshell32 -luuid -lcomctl32
+# An injected DLL is loaded by whatever process owns the dialog, so it can only depend on
+# system DLLs: nothing puts the toolchain's redistributables on that process's search path,
+# and a missing one makes injection fail silently. MSYS2's i686 gcc uses dwarf2 exceptions
+# and would otherwise pull in libgcc_s_dw2-1.dll.
+WINDOW_HOOK_CFLAGS := -shared -O2 -s -static-libgcc
+# 32-bit stdcall exports are decorated as name@bytes, so without --kill-at the helper's
+# FindProc("WoxWindowHookAttachSticky") misses an export actually named
+# "WoxWindowHookAttachSticky@16". x64 has no such decoration, which is why only the
+# 32-bit link needs this and why the mismatch cannot show up in the 64-bit build.
+WINDOW_HOOK_CFLAGS32 := $(WINDOW_HOOK_CFLAGS) -Wl,--kill-at
+
+# SetWindowsHookEx cannot inject across bitness, and a 64-bit process cannot even load a
+# 32-bit DLL to obtain the module handle the call needs. Hooking a 32-bit host such as
+# Foxmail or 32-bit Office therefore needs a second DLL built by an i686 compiler, plus
+# the 32-bit helper below that installs it. The helper is pure Go and cross-compiles with
+# no extra toolchain; only the DLL needs one.
+#
+# Installing i686-w64-mingw32-gcc on Windows (it coexists with the 64-bit mingw; MSYS2
+# keeps the two toolchains in separate /mingw32 and /mingw64 prefixes):
+#
+#   scoop install msys2
+#   %USERPROFILE%\scoop\apps\msys2\current\msys2_shell.cmd -defterm -no-start -mingw64 -c "pacman -S --noconfirm mingw-w64-i686-gcc"
+#
+# That lands the compiler at:
+#   %USERPROFILE%\scoop\apps\msys2\current\mingw32\bin\i686-w64-mingw32-gcc.exe
+#
+# MSYS2 does not put mingw32/bin on PATH, which is deliberate: it would shadow the 64-bit
+# gcc that CGO uses. Point WINDOW_HOOK_CC32 at the absolute path instead, for example
+#   make window-hook-build WINDOW_HOOK_CC32="$$USERPROFILE/scoop/apps/msys2/current/mingw32/bin/i686-w64-mingw32-gcc.exe"
+#
+# The recipe still has to prepend that bin directory to PATH for the compile itself. The
+# gcc driver runs fine without it, but the cc1 it spawns needs the toolchain's own DLLs
+# from there, and when they are missing gcc exits 1 printing absolutely nothing. The
+# prefix is scoped to that one command so the 64-bit gcc is never shadowed, and it goes
+# through cygpath first because a "C:/..." entry would be split at its colon by the
+# POSIX PATH separator and silently do nothing.
+#
+# On Debian/Ubuntu the equivalent package is gcc-mingw-w64-i686.
+WINDOW_HOOK_CC32 ?= i686-w64-mingw32-gcc
+WINDOW_HOOK_PREBUILT ?= 0
+
+# Build the native window hook only for Windows so other platform binaries never embed it.
+window-hook-build:
+ifeq ($(PLATFORM),windows)
+ifeq ($(WINDOW_HOOK_PREBUILT),1)
+	# Preserve the helper signed by CI before embedding the hook resources.
+	test -f $(WINDOW_HOOK_DLL)
+	test -f $(WINDOW_HOOK_DLL32)
+	test -f $(WINDOW_HOOK_HELPER32)
+else
+	rm -rf $(WINDOW_HOOK_DIR)
+	mkdir -p $(WINDOW_HOOK_DIR)
+	gcc $(WINDOW_HOOK_CFLAGS) -o $(WINDOW_HOOK_DLL) $(WINDOW_HOOK_SOURCE) $(WINDOW_HOOK_LIBS)
+	rm -f $(WINDOW_HOOK_HELPER32_VERSIONINFO)
+	cd . && go run github.com/josephspurrier/goversioninfo/cmd/goversioninfo@v1.5.0 \
+		-o $(WINDOW_HOOK_HELPER32_VERSIONINFO) -icon resource/app.ico \
+		-product-name "Wox" -description "Wox Window Hook Helper" \
+		-internal-name "WoxWindowHookHelper" -original-name "wox-window-hook-helper32.exe" \
+		-product-version "$(VERSION)" -file-version "$(VERSION)" \
+		-propagate-ver-strings
+	CGO_ENABLED=0 GOOS=windows GOARCH=386 go build -ldflags "-s -w" -o $(WINDOW_HOOK_HELPER32) ./cmd/window_hook_helper
+	rm -f $(WINDOW_HOOK_HELPER32_VERSIONINFO)
+	@if command -v $(WINDOW_HOOK_CC32) >/dev/null 2>&1; then \
+		cc32="$$(command -v $(WINDOW_HOOK_CC32))"; \
+		bin32="$$(dirname "$$cc32")"; \
+		if command -v cygpath >/dev/null 2>&1; then bin32="$$(cygpath -u "$$bin32")"; fi; \
+		set -x; \
+		PATH="$$bin32:$$PATH" "$$cc32" $(WINDOW_HOOK_CFLAGS32) -o $(WINDOW_HOOK_DLL32) $(WINDOW_HOOK_SOURCE) $(WINDOW_HOOK_LIBS); \
+	elif [ "$(WINDOW_HOOK_REQUIRE_32)" = "1" ]; then \
+		echo "ERROR: $(WINDOW_HOOK_CC32) not found. Release builds must ship WoxWindowHook32.dll." >&2; exit 1; \
+	else \
+		echo "WARNING: $(WINDOW_HOOK_CC32) not found, skipping WoxWindowHook32.dll." >&2; \
+		echo "WARNING: overlays on 32-bit apps will fall back to polling and visibly lag." >&2; \
+		echo "WARNING: see the install notes above WINDOW_HOOK_CC32 in wox.core/Makefile." >&2; \
+	fi
+endif
+else
+	rm -rf $(WINDOW_HOOK_DIR)
+	@echo "Window hook is only supported on Windows"
+endif
+
+CRASH_HANDLER_SOURCE := supervisor/native/wox_crash_handler.c
+CRASH_HANDLER_DIR := resource/others/crash_handler
+
+FILE_INDEX_SERVICE_DIR := resource/others/file_index_service
+FILE_INDEX_SERVICE_EXE := $(FILE_INDEX_SERVICE_DIR)/wox-file-index-service.exe
+FILE_INDEX_SERVICE_VERSIONINFO := cmd/file_index_service/resource_windows.syso
+FILE_INDEX_SERVICE_VERSION := $(shell sed -n 's/^var EmbeddedVersion = "\(.*\)"/\1/p' util/filesearchservice/service.go)
+FILE_INDEX_SERVICE_PREBUILT ?= 0
+
+# Build the privileged helper before the main binary so it is embedded in Wox's resources.
+file-index-service-build:
+ifeq ($(PLATFORM),windows)
+ifeq ($(FILE_INDEX_SERVICE_PREBUILT),1)
+	test -f $(FILE_INDEX_SERVICE_EXE)
+else
+	rm -f $(FILE_INDEX_SERVICE_EXE) $(FILE_INDEX_SERVICE_VERSIONINFO)
+	mkdir -p $(FILE_INDEX_SERVICE_DIR)
+	cd . && go run github.com/josephspurrier/goversioninfo/cmd/goversioninfo@v1.5.0 \
+		-o $(FILE_INDEX_SERVICE_VERSIONINFO) -64 -icon resource/app.ico \
+		-product-name "Wox File Index Service" -description "Wox File Index Service" \
+		-internal-name "WoxFileIndexService" -original-name "wox-file-index-service.exe" \
+		-product-version "$(FILE_INDEX_SERVICE_VERSION)" -file-version "$(FILE_INDEX_SERVICE_VERSION)" \
+		-propagate-ver-strings
+	CGO_ENABLED=0 GOOS=windows GOARCH=$(GOARCH) go build -ldflags "-s -w -H windowsgui -X 'wox/util/filesearchservice.EmbeddedVersion=$(FILE_INDEX_SERVICE_VERSION)'" -o $(FILE_INDEX_SERVICE_EXE) ./cmd/file_index_service
+	rm -f $(FILE_INDEX_SERVICE_VERSIONINFO)
+endif
+else
+	mkdir -p $(FILE_INDEX_SERVICE_DIR)
+	@echo "File index service is only supported on Windows"
+endif
+CRASH_HANDLER_DLL := $(CRASH_HANDLER_DIR)/WoxCrashHandler64.dll
+
+# WER loads this module in its own process after Wox has crashed.
+crash-handler-build:
+	rm -rf $(CRASH_HANDLER_DIR)
+ifeq ($(PLATFORM),windows)
+	mkdir -p $(CRASH_HANDLER_DIR)
+	gcc -shared -O2 -s -o $(CRASH_HANDLER_DLL) $(CRASH_HANDLER_SOURCE) -ldbghelp -ladvapi32
+else
+	@echo "Crash handler is only supported on Windows"
+endif
+
+# -----------------------------
+# MediaRemote XS (Perl) builder
+# -----------------------------
+# Build and install WoxMR.pm + WoxMR.bundle into resource/others so that
+# resource/others/mediaremote_adapter.pl can `use WoxMR` at runtime.
+# Only meaningful on macOS.
+
+WOXMR_DIR := plugin/system/mediaplayer/woxmr
+WOXMR_INSTALL_DIR := resource/others/woxmr
+WOXMR_OUT_BUNDLE := $(WOXMR_INSTALL_DIR)/woxmr.bundle
+WOXMR_OUT_PM := $(WOXMR_INSTALL_DIR)/WoxMR.pm
+
+woxmr-clean:
+	@echo "Cleaning WoxMR build artifacts..."
+	rm -rf $(WOXMR_DIR)/build_arm64 $(WOXMR_DIR)/build_x86_64
+	rm -rf $(WOXMR_INSTALL_DIR)
+
+# Auto-detect current machine arch and build single-arch bundle
+woxmr-build:
+ifeq ($(PLATFORM),macos)
+	$(MAKE) woxmr-clean
+	$(MAKE) woxmr-$(ARCH)
+else
+	@echo "woxmr-build is only supported on macOS" && exit 0
+endif
+
+# Build arm64 bundle (Apple Silicon)
+woxmr-arm64:
+ifeq ($(PLATFORM),macos)
+	@echo "Building WoxMR (arm64)..."
+	rm -rf $(WOXMR_DIR)/build_arm64
+	mkdir -p $(WOXMR_DIR)/build_arm64
+	cp $(WOXMR_DIR)/WoxMR.pm $(WOXMR_DIR)/WoxMR.xs $(WOXMR_DIR)/wox_mr.m $(WOXMR_DIR)/Makefile.PL $(WOXMR_DIR)/build_arm64/
+	cd $(WOXMR_DIR)/build_arm64 && ARCHFLAGS="-arch arm64" perl Makefile.PL
+	cd $(WOXMR_DIR)/build_arm64 && ARCHFLAGS="-arch arm64" make
+	mkdir -p $(WOXMR_INSTALL_DIR)
+	cp -f $(WOXMR_DIR)/WoxMR.pm $(WOXMR_OUT_PM)
+	cp -f $(WOXMR_DIR)/adapter.pl $(WOXMR_INSTALL_DIR)/adapter.pl
+	cp -f $(WOXMR_DIR)/build_arm64/blib/arch/auto/WoxMR/WoxMR.bundle $(WOXMR_OUT_BUNDLE)
+	$(MAKE) woxmr-sign
+	rm -rf $(WOXMR_DIR)/build_arm64
+else
+	@echo "woxmr-arm64 is only supported on macOS" && exit 0
+endif
+
+# Build x86_64 bundle (Intel Macs)
+woxmr-x86_64:
+ifeq ($(PLATFORM),macos)
+	@echo "Building WoxMR (x86_64)..."
+	rm -rf $(WOXMR_DIR)/build_x86_64
+	mkdir -p $(WOXMR_DIR)/build_x86_64
+	cp $(WOXMR_DIR)/WoxMR.pm $(WOXMR_DIR)/WoxMR.xs $(WOXMR_DIR)/wox_mr.m $(WOXMR_DIR)/Makefile.PL $(WOXMR_DIR)/build_x86_64/
+	cd $(WOXMR_DIR)/build_x86_64 && ARCHFLAGS="-arch x86_64" perl Makefile.PL
+	cd $(WOXMR_DIR)/build_x86_64 && ARCHFLAGS="-arch x86_64" make
+	mkdir -p $(WOXMR_INSTALL_DIR)
+	cp -f $(WOXMR_DIR)/WoxMR.pm $(WOXMR_OUT_PM)
+	cp -f $(WOXMR_DIR)/adapter.pl $(WOXMR_INSTALL_DIR)/adapter.pl
+	cp -f $(WOXMR_DIR)/build_x86_64/blib/arch/auto/WoxMR/WoxMR.bundle $(WOXMR_OUT_BUNDLE)
+	$(MAKE) woxmr-sign
+	rm -rf $(WOXMR_DIR)/build_x86_64
+else
+	@echo "woxmr-x86_64 is only supported on macOS" && exit 0
+endif
+
+# Codesign WoxMR.bundle (always, with default identity if not overridden)
+woxmr-sign:
+ifeq ($(PLATFORM),macos)
+	@if [ -z "$(MACOS_SIGN_IDENTITY)" ]; then \
+		echo "MACOS_SIGN_IDENTITY is empty; skip signing"; \
+	elif [ -f "$(WOXMR_OUT_BUNDLE)" ]; then \
+		echo "Signing with identity: $(MACOS_SIGN_IDENTITY)"; \
+		codesign --force --sign "$(MACOS_SIGN_IDENTITY)" --timestamp=none "$(WOXMR_OUT_BUNDLE)"; \
+	else \
+		echo "$(WOXMR_OUT_BUNDLE) not found, skip signing"; \
+		exit 1; \
+	fi
+else
+	@echo "woxmr-sign is only meaningful on macOS" && exit 0
+endif

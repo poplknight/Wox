@@ -1,0 +1,30 @@
+package definition
+
+import "context"
+
+type PluginSettingValueCheckBox struct {
+	Key          string
+	Label        string
+	DefaultValue string
+	Tooltip      string
+	Style        PluginSettingValueStyle `json:"-"` // Deprecated: ignored on load so Wox keeps setting layouts consistent.
+}
+
+func (p *PluginSettingValueCheckBox) GetPluginSettingType() PluginSettingDefinitionType {
+	return PluginSettingDefinitionTypeCheckBox
+}
+
+func (p *PluginSettingValueCheckBox) GetKey() string {
+	return p.Key
+}
+
+func (p *PluginSettingValueCheckBox) GetDefaultValue() string {
+	return p.DefaultValue
+}
+
+func (p *PluginSettingValueCheckBox) Translate(translator func(ctx context.Context, key string) string) PluginSettingDefinitionValue {
+	copy := *p
+	copy.Label = translator(context.Background(), p.Label)
+	copy.Tooltip = translator(context.Background(), p.Tooltip)
+	return &copy
+}

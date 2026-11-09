@@ -1,0 +1,511 @@
+import { ResultActions } from "./resultActions"
+import {
+  ChangeQueryParam,
+  Context,
+  CopyParams,
+  MapString,
+  PublicAPI,
+  PushAttentionRequest,
+  Query,
+  RefreshQueryParam,
+  Result,
+  ResultAction,
+  ScreenshotOption,
+  ScreenshotResult,
+  GetThemeColorsOption,
+  GetThemeColorsResult,
+  RegisterTriggerKeywordOption,
+  RegisterTriggerKeywordResult,
+  DragOutEvent,
+  DragOutListenOption,
+  DragOutListenResult,
+  UnregisterTriggerKeywordOption,
+  UnregisterTriggerKeywordResult,
+  RegisterPluginToolOption,
+  RegisterPluginToolResult,
+  UnregisterPluginToolOption,
+  UnregisterPluginToolResult,
+  ListPluginToolsOption,
+  ListPluginToolsResult,
+  InvokePluginToolOption,
+  InvokePluginToolResult,
+  PluginToolHandler,
+  SetSettingOption,
+  SetSettingResult,
+  ShowToastMsgOption,
+  ShowToastMsgResult,
+  UpdatableResult
+} from "@wox-launcher/wox-plugin"
+import { WebSocket } from "ws"
+import * as crypto from "crypto"
+import { currentConnection, waitingForResponse } from "./connection"
+import Deferred from "promise-deferred"
+import { logger } from "./logger"
+import { MetadataCommand, PluginSettingDefinitionItem } from "@wox-launcher/wox-plugin/types/setting"
+import { AI } from "@wox-launcher/wox-plugin/types/ai"
+import { MRUData } from "@wox-launcher/wox-plugin"
+import { PluginJsonRpcTypeRequest, pluginInstances } from "./jsonrpc"
+import { PluginJsonRpcRequest } from "./types"
+
+// Core stores conversation images as WoxImage. The SDK accepts raw PNG bytes.
+function aiConversationPayload(conversation: AI.Conversation): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    Role: conversation.Role,
+    Text: conversation.Text,
+    Timestamp: conversation.Timestamp
+  }
+  if (conversation.Reasoning) {
+    payload.Reasoning = conversation.Reasoning
+  }
+  if (conversation.ToolCallInfo) {
+    payload.ToolCallInfo = conversation.ToolCallInfo
+  }
+  if (conversation.Images && conversation.Images.length > 0) {
+    payload.Images = conversation.Images.map(image => ({
+      ImageType: "base64",
+      ImageData: `data:image/png;base64,${Buffer.from(image).toString("base64")}`
+    }))
+  }
+  return payload
+}
+
+// TimeoutMs is the plugin-facing unit. Core stores LoopPolicy.Timeout as nanoseconds.
+function aiChatOptionsPayload(options: AI.ChatOptions | undefined): Record<string, unknown> {
+  if (!options) {
+    return {}
+  }
+  const payload: Record<string, unknown> = {}
+  if (options.ThinkingMode) {
+    payload.ThinkingMode = options.ThinkingMode
+  }
+  if (options.LoopPolicy) {
+    const policy: Record<string, unknown> = {}
+    if (options.LoopPolicy.MaxIterations !== undefined) {
+      policy.MaxIterations = options.LoopPolicy.MaxIterations
+    }
+    if (options.LoopPolicy.RetryOnFailure !== undefined) {
+      policy.RetryOnFailure = options.LoopPolicy.RetryOnFailure
+    }
+    if (options.LoopPolicy.MaxRetries !== undefined) {
+      policy.MaxRetries = options.LoopPolicy.MaxRetries
+    }
+    if (options.LoopPolicy.TimeoutMs !== undefined) {
+      policy.Timeout = Math.trunc(options.LoopPolicy.TimeoutMs * 1_000_000)
+    }
+    payload.LoopPolicy = policy
+  }
+  return payload
+}
+
+export class PluginAPI implements PublicAPI {
+  toastCallbacks = new Map<string, NonNullable<ShowToastMsgOption["Action"]>["Action"]>()
+  pluginId: string
+  pluginName: string
+  settingChangeCallbacks: Map<string, (ctx: Context, key: string, value: string) => void>
+  getDynamicSettingCallbacks: Map<string, (ctx: Context, key: string) => PluginSettingDefinitionItem>
+  deepLinkCallbacks: Map<string, (ctx: Context, params: MapString) => void>
+  unloadCallbacks: Map<string, (ctx: Context) => Promise<void>>
+  enterPluginQueryCallbacks: Map<string, (ctx: Context) => Promise<void> | void>
+  leavePluginQueryCallbacks: Map<string, (ctx: Context) => Promise<void> | void>
+  dragOutCallbacks: Map<string, (ctx: Context, event: DragOutEvent) => Promise<void> | void>
+  llmStreamCallbacks: Map<string, AI.ChatStreamFunc>
+  mruRestoreCallbacks: Map<string, (ctx: Context, mruData: MRUData) => Promise<Result | null>>
+  pluginToolCallbacks: Map<string, PluginToolHandler>
+  pluginToolCallbackIds: Map<string, string>
+  pluginToolCalls = new Set<Promise<unknown>>()
+  pluginToolsStopping = false
+
+  constructor(
+    _ws: WebSocket,
+    pluginId: string,
+    pluginName: string,
+    readonly resultActions = new ResultActions()
+  ) {
+    this.pluginId = pluginId
+    this.pluginName = pluginName
+    this.settingChangeCallbacks = new Map<string, (ctx: Context, key: string, value: string) => void>()
+    this.getDynamicSettingCallbacks = new Map<string, (ctx: Context, key: string) => PluginSettingDefinitionItem>()
+    this.deepLinkCallbacks = new Map<string, (ctx: Context, params: MapString) => void>()
+    this.unloadCallbacks = new Map<string, (ctx: Context) => Promise<void>>()
+    this.enterPluginQueryCallbacks = new Map<string, (ctx: Context) => Promise<void> | void>()
+    this.leavePluginQueryCallbacks = new Map<string, (ctx: Context) => Promise<void> | void>()
+    this.dragOutCallbacks = new Map<string, (ctx: Context, event: DragOutEvent) => Promise<void> | void>()
+    this.llmStreamCallbacks = new Map<string, AI.ChatStreamFunc>()
+    this.mruRestoreCallbacks = new Map<string, (ctx: Context, mruData: MRUData) => Promise<Result | null>>()
+    this.pluginToolCallbacks = new Map<string, PluginToolHandler>()
+    this.pluginToolCallbackIds = new Map<string, string>()
+  }
+
+  async invokeMethod(ctx: Context, method: string, params: { [key: string]: string }): Promise<unknown> {
+    const requestId = crypto.randomUUID()
+    const traceId = ctx.Get("traceId") || crypto.randomUUID()
+
+    if (method !== "Log") {
+      logger.info(ctx, `<${this.pluginName}> start invoke method to Wox: ${method}, id: ${requestId}`)
+    }
+
+    const ws = currentConnection
+    if (ws === undefined || ws.readyState !== WebSocket.OPEN) {
+      throw new Error("host websocket is not connected")
+    }
+
+    const deferred = new Deferred<unknown>()
+    waitingForResponse[requestId] = deferred
+    ws.send(
+      JSON.stringify({
+        TraceId: traceId,
+        SessionId: ctx.Values.SessionId,
+        QueryId: ctx.Values.QueryId,
+        Id: requestId,
+        Method: method,
+        Type: PluginJsonRpcTypeRequest,
+        Params: params,
+        PluginId: this.pluginId,
+        PluginName: this.pluginName
+      } as PluginJsonRpcRequest),
+      (error?: Error) => {
+        if (!error || waitingForResponse[requestId] !== deferred) {
+          return
+        }
+        delete waitingForResponse[requestId]
+        deferred.reject(error)
+      }
+    )
+
+    return await deferred.promise
+  }
+
+  async ChangeQuery(ctx: Context, query: ChangeQueryParam): Promise<void> {
+    if (query.QueryType !== "input" && query.QueryType !== "selection") throw new Error("ChangeQuery requires QueryType")
+    if (query.QueryType === "input" && typeof query.QueryText !== "string") throw new Error("ChangeQuery input requires complete QueryText")
+    if (query.QueryType === "selection" && !query.QuerySelection) throw new Error("ChangeQuery selection requires QuerySelection")
+    await this.invokeMethod(ctx, "ChangeQuery", {
+      queryType: query.QueryType,
+      queryHint: JSON.stringify(query.QueryHint ?? null),
+      queryText: query.QueryText === undefined ? "" : query.QueryText,
+      querySelection: JSON.stringify(query.QuerySelection),
+      queryContextData: JSON.stringify(query.ContextData ?? {})
+    })
+  }
+
+  async HideApp(ctx: Context): Promise<void> {
+    await this.invokeMethod(ctx, "HideApp", {})
+  }
+
+  async Log(ctx: Context, level: "Info" | "Error" | "Debug" | "Warning", msg: string): Promise<void> {
+    await this.invokeMethod(ctx, "Log", { msg, level })
+  }
+
+  async ShowApp(ctx: Context): Promise<void> {
+    await this.invokeMethod(ctx, "ShowApp", {})
+  }
+
+  async IsVisible(ctx: Context): Promise<boolean> {
+    return (await this.invokeMethod(ctx, "IsVisible", {})) as boolean
+  }
+
+  async Notify(ctx: Context, message: string): Promise<void> {
+    await this.invokeMethod(ctx, "Notify", { message })
+  }
+
+  async ShowToastMsg(ctx: Context, option: ShowToastMsgOption): Promise<ShowToastMsgResult> {
+    if (option.Action && typeof option.Action.Action !== "function") return { Success: false, ErrMsg: "action callback is required" }
+    const callbackId = option.Action ? crypto.randomUUID() : ""
+    if (option.Action) this.toastCallbacks.set(callbackId, option.Action.Action)
+    try {
+      const result = (await this.invokeMethod(ctx, "ShowToastMsg", {
+        option: JSON.stringify({ ...option, Action: option.Action && { Name: option.Action.Name, ContextData: option.Action.ContextData, CallbackId: callbackId } })
+      })) as ShowToastMsgResult
+      if (!result.Success) this.toastCallbacks.delete(callbackId)
+      return result
+    } catch (error) {
+      this.toastCallbacks.delete(callbackId)
+      throw error
+    }
+  }
+
+  async PushAttention(ctx: Context, request: PushAttentionRequest): Promise<void> {
+    await this.invokeMethod(ctx, "PushAttention", { request: JSON.stringify(request) })
+  }
+
+  async ShowToolbarMsg(ctx: Context, msg: unknown): Promise<void> {
+    const pluginInstance = pluginInstances.get(this.pluginId)
+    if (pluginInstance && msg && typeof msg === "object") {
+      const maybeMsg = msg as { Actions?: Array<{ Id?: string; Action?: unknown }> }
+      for (const action of maybeMsg.Actions ?? []) {
+        if (!action.Id) {
+          action.Id = crypto.randomUUID()
+        }
+        if (typeof action.Action === "function") {
+          pluginInstance.ToolbarMsgActions.set(
+            action.Id,
+            action.Action as (ctx: Context, actionContext: { ToolbarMsgId: string; ToolbarMsgActionId: string; ContextData: MapString }) => Promise<void> | void
+          )
+        }
+      }
+    }
+
+    await this.invokeMethod(ctx, "ShowToolbarMsg", { msg: JSON.stringify(msg) })
+  }
+
+  async ClearToolbarMsg(ctx: Context, toolbarMsgId: string): Promise<void> {
+    await this.invokeMethod(ctx, "ClearToolbarMsg", { toolbarMsgId })
+  }
+
+  async GetTranslation(ctx: Context, key: string): Promise<string> {
+    return (await this.invokeMethod(ctx, "GetTranslation", { key })) as string
+  }
+
+  async GetSetting(ctx: Context, key: string): Promise<string> {
+    return (await this.invokeMethod(ctx, "GetSetting", { key })) as string
+  }
+
+  async SaveSetting(ctx: Context, key: string, value: string, isPlatformSpecific: boolean): Promise<void> {
+    await this.invokeMethod(ctx, "SaveSetting", { key, value, isPlatformSpecific: isPlatformSpecific.toString() })
+  }
+
+  async SetSetting(ctx: Context, option: SetSettingOption): Promise<SetSettingResult> {
+    return (await this.invokeMethod(ctx, "SetSetting", { option: JSON.stringify(option) })) as SetSettingResult
+  }
+
+  async OnSettingChanged(ctx: Context, callback: (ctx: Context, key: string, value: string) => void): Promise<void> {
+    const callbackId = crypto.randomUUID()
+    this.settingChangeCallbacks.set(callbackId, callback)
+    await this.invokeMethod(ctx, "OnPluginSettingChanged", { callbackId })
+  }
+
+  async OnGetDynamicSetting(ctx: Context, callback: (ctx: Context, key: string) => PluginSettingDefinitionItem): Promise<void> {
+    const callbackId = crypto.randomUUID()
+    this.getDynamicSettingCallbacks.set(callbackId, callback)
+    await this.invokeMethod(ctx, "OnGetDynamicSetting", { callbackId })
+  }
+
+  async OnDeepLink(ctx: Context, callback: (ctx: Context, params: MapString) => void): Promise<void> {
+    const callbackId = crypto.randomUUID()
+    this.deepLinkCallbacks.set(callbackId, callback)
+    await this.invokeMethod(ctx, "OnDeepLink", { callbackId })
+  }
+
+  async OnUnload(ctx: Context, callback: (ctx: Context) => Promise<void>): Promise<void> {
+    const callbackId = crypto.randomUUID()
+    this.unloadCallbacks.set(callbackId, callback)
+    await this.invokeMethod(ctx, "OnUnload", { callbackId })
+  }
+
+  async OnEnterPluginQuery(ctx: Context, callback: (ctx: Context) => Promise<void> | void): Promise<void> {
+    const callbackId = crypto.randomUUID()
+    this.enterPluginQueryCallbacks.set(callbackId, callback)
+    await this.invokeMethod(ctx, "OnEnterPluginQuery", { callbackId })
+  }
+
+  async OnLeavePluginQuery(ctx: Context, callback: (ctx: Context) => Promise<void> | void): Promise<void> {
+    const callbackId = crypto.randomUUID()
+    this.leavePluginQueryCallbacks.set(callbackId, callback)
+    await this.invokeMethod(ctx, "OnLeavePluginQuery", { callbackId })
+  }
+
+  async OnDragOut(ctx: Context, option: DragOutListenOption): Promise<DragOutListenResult> {
+    if (!option?.Callback) {
+      return { Success: false }
+    }
+    const callbackId = crypto.randomUUID()
+    this.dragOutCallbacks.set(callbackId, option.Callback)
+    return (await this.invokeMethod(ctx, "OnDragOut", { callbackId })) as DragOutListenResult
+  }
+
+  async RegisterQueryCommands(ctx: Context, commands: MetadataCommand[]): Promise<void> {
+    await this.invokeMethod(ctx, "RegisterQueryCommands", { commands: JSON.stringify(commands) })
+  }
+
+  async RegisterTriggerKeyword(ctx: Context, option: RegisterTriggerKeywordOption): Promise<RegisterTriggerKeywordResult> {
+    return (await this.invokeMethod(ctx, "RegisterTriggerKeyword", { option: JSON.stringify(option) })) as RegisterTriggerKeywordResult
+  }
+
+  async UnregisterTriggerKeyword(ctx: Context, option: UnregisterTriggerKeywordOption): Promise<UnregisterTriggerKeywordResult> {
+    return (await this.invokeMethod(ctx, "UnregisterTriggerKeyword", { option: JSON.stringify(option) })) as UnregisterTriggerKeywordResult
+  }
+
+  async RegisterPluginTool(ctx: Context, option: RegisterPluginToolOption): Promise<RegisterPluginToolResult> {
+    const callbackId = crypto.randomUUID()
+    this.pluginToolCallbacks.set(callbackId, option.Handler)
+    try {
+      const result = (await this.invokeMethod(ctx, "RegisterPluginTool", {
+        option: JSON.stringify({ Tool: option.Tool, CallbackId: callbackId })
+      })) as RegisterPluginToolResult
+      if (result?.Error) {
+        this.dropPluginToolCallback(option.Tool.Name, callbackId)
+      } else {
+        this.pluginToolCallbackIds.set(option.Tool.Name, callbackId)
+      }
+      return result
+    } catch (error) {
+      this.dropPluginToolCallback(option.Tool.Name, callbackId)
+      throw error
+    }
+  }
+
+  async UnregisterPluginTool(ctx: Context, option: UnregisterPluginToolOption): Promise<UnregisterPluginToolResult> {
+    const result = (await this.invokeMethod(ctx, "UnregisterPluginTool", { option: JSON.stringify(option) })) as UnregisterPluginToolResult
+    const callbackId = this.pluginToolCallbackIds.get(option.Name)
+    if (!result?.Error && callbackId) {
+      this.dropPluginToolCallback(option.Name, callbackId)
+    }
+    return result
+  }
+
+  async ListPluginTools(ctx: Context, option: ListPluginToolsOption): Promise<ListPluginToolsResult> {
+    return (await this.invokeMethod(ctx, "ListPluginTools", { option: JSON.stringify(option ?? {}) })) as ListPluginToolsResult
+  }
+
+  async InvokePluginTool(ctx: Context, option: InvokePluginToolOption): Promise<InvokePluginToolResult> {
+    return (await this.invokeMethod(ctx, "InvokePluginTool", {
+      option: JSON.stringify(option),
+      PluginToolCallId: ctx.Get("PluginToolCallId") ?? ""
+    })) as InvokePluginToolResult
+  }
+
+  dropPluginToolCallback(name: string, callbackId: string): void {
+    this.pluginToolCallbacks.delete(callbackId)
+    if (this.pluginToolCallbackIds.get(name) === callbackId) {
+      this.pluginToolCallbackIds.delete(name)
+    }
+  }
+
+  // Core may stop waiting before JavaScript finishes; drain actual work before releasing plugin resources.
+  async stopPluginTools(): Promise<void> {
+    this.pluginToolsStopping = true
+    await Promise.allSettled(Array.from(this.pluginToolCalls))
+  }
+
+  async AIChatStream(ctx: Context, model: AI.AIModel, conversations: AI.Conversation[], options: AI.ChatOptions, callback: AI.ChatStreamFunc): Promise<void> {
+    if (model == null || !model.Provider || !model.Name) {
+      throw new Error("AIChatStream requires a model with Provider and Name")
+    }
+    if (typeof callback !== "function") {
+      throw new Error("AIChatStream(ctx, model, conversations, options, callback) requires options and a callback. Pass {} when no chat options are needed.")
+    }
+    const callbackId = crypto.randomUUID()
+    this.llmStreamCallbacks.set(callbackId, callback)
+    try {
+      await this.invokeMethod(ctx, "AIChatStream", {
+        callbackId,
+        model: JSON.stringify({
+          Name: model.Name,
+          Provider: model.Provider,
+          ProviderAlias: model.ProviderAlias ?? ""
+        }),
+        conversations: JSON.stringify((conversations ?? []).map(aiConversationPayload)),
+        options: JSON.stringify(aiChatOptionsPayload(options))
+      })
+    } catch (error) {
+      // A failed request may never receive a terminal stream event.
+      this.llmStreamCallbacks.delete(callbackId)
+      throw error
+    }
+  }
+
+  async OnMRURestore(ctx: Context, callback: (ctx: Context, mruData: MRUData) => Promise<Result | null>): Promise<void> {
+    const callbackId = crypto.randomUUID()
+    this.mruRestoreCallbacks.set(callbackId, callback)
+    await this.invokeMethod(ctx, "OnMRURestore", { callbackId })
+  }
+
+  async GetUpdatableResult(ctx: Context, resultId: string): Promise<UpdatableResult | null> {
+    const response = await this.invokeMethod(ctx, "GetUpdatableResult", { resultId })
+    if (response === null || response === undefined) {
+      return null
+    }
+
+    // Parse the response into UpdatableResult
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const responseData = (typeof response === "string" ? JSON.parse(response) : response) as any
+    const updatableResult: UpdatableResult = { Id: resultId }
+
+    if (responseData.Title !== undefined) {
+      updatableResult.Title = responseData.Title
+    }
+    if (responseData.SubTitle !== undefined) {
+      updatableResult.SubTitle = responseData.SubTitle
+    }
+    if (responseData.Icon !== undefined) {
+      updatableResult.Icon = responseData.Icon
+    }
+    if (responseData.Tails !== undefined) {
+      updatableResult.Tails = responseData.Tails
+    }
+    if (responseData.Preview !== undefined) {
+      updatableResult.Preview = responseData.Preview
+    }
+    if (responseData.Actions !== undefined) {
+      const callbacks = this.resultActions.forContext(ctx, resultId)?.results.get(resultId)
+      updatableResult.Actions = responseData.Actions.map((action: ResultAction) => {
+        const cached = callbacks?.get(action.Id ?? "")
+        return action.Type === "form" ? { ...action, OnSubmit: cached?.Type === "form" ? cached.OnSubmit : undefined } : { ...action, Action: cached?.Type !== "form" ? cached?.Action : undefined }
+      })
+    }
+
+    return updatableResult
+  }
+
+  async UpdateResult(ctx: Context, result: UpdatableResult): Promise<boolean> {
+    const callbacks = this.resultActions.forContext(ctx, result.Id)
+    if (callbacks) {
+      callbacks.cache(result, true)
+    } else if (result.Actions?.length) {
+      logger.warn(
+        ctx,
+        `<${this.pluginName}> UpdateResult could not cache actions for result ${result.Id}: query scope is missing, ambiguous or released; preserve the original query Context (SessionId/QueryId)`
+      )
+    }
+
+    const response = await this.invokeMethod(ctx, "UpdateResult", { result: JSON.stringify(result) })
+    return response === true
+  }
+
+  async PushResults(ctx: Context, query: Query, results: Result[]): Promise<boolean> {
+    const callbacks = this.resultActions.find(query.SessionId ?? "", query.Id, "")
+    for (const result of results) callbacks?.cache(result)
+
+    const response = await this.invokeMethod(ctx, "PushResults", {
+      query: JSON.stringify(query),
+      results: JSON.stringify(results)
+    })
+    return response === true
+  }
+
+  async RefreshQuery(ctx: Context, param: RefreshQueryParam): Promise<void> {
+    const params: { [key: string]: string } = {
+      preserveSelectedIndex: param.PreserveSelectedIndex.toString()
+    }
+    if (param.SelectedResultId) {
+      params.selectedResultId = param.SelectedResultId
+    }
+    await this.invokeMethod(ctx, "RefreshQuery", params)
+  }
+
+  async Copy(ctx: Context, params: CopyParams): Promise<void> {
+    await this.invokeMethod(ctx, "Copy", {
+      type: params.type,
+      text: params.text,
+      woxImage: params.woxImage ? JSON.stringify(params.woxImage) : ""
+    })
+  }
+
+  async Screenshot(ctx: Context, option: ScreenshotOption): Promise<ScreenshotResult> {
+    // Keep screenshot options as one JSON payload so the host/core boundary can
+    // add fields later without changing the websocket method's parameter list.
+    return (await this.invokeMethod(ctx, "Screenshot", {
+      option: JSON.stringify(option)
+    })) as ScreenshotResult
+  }
+
+  async GetCacheFolder(ctx: Context): Promise<string> {
+    return (await this.invokeMethod(ctx, "GetCacheFolder", {})) as string
+  }
+
+  async GetThemeColors(ctx: Context, option: GetThemeColorsOption = {}): Promise<GetThemeColorsResult> {
+    return (await this.invokeMethod(ctx, "GetThemeColors", {
+      option: JSON.stringify(option ?? {})
+    })) as GetThemeColorsResult
+  }
+}

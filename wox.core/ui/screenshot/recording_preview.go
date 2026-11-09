@@ -1,0 +1,210 @@
+package screenshot
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"image"
+	"io"
+	"math"
+	"os/exec"
+	"strconv"
+	"time"
+
+	woxwidget "wox/ui/widget"
+	"wox/util/ffmpeg"
+)
+
+const (
+	recordingCountdownLogicalSize  = float32(160)
+	recordingCountdownFadeDuration = 180 * time.Millisecond
+	recordingPreviewMaxEdge        = 1280
+)
+
+var recordingCountdownFill = Color{R: 255, G: 59, B: 48, A: 255}
+var recordingCountdownStroke = Color{R: 255, G: 255, B: 255, A: 255}
+
+// recordingCountdownFontSize scales the pre-roll digit with DPI while keeping it inside the selection.
+func recordingCountdownFontSize(selection Rect, uiScale float32) float32 {
+	scale := max(float32(1), uiScale)
+	size := recordingCountdownLogicalSize * scale
+	limit := min(selection.Width*0.55, selection.Height*0.62)
+	if limit > 0 && size > limit {
+		return max(48*scale, limit)
+	}
+	return size
+}
+
+// drawRecordingCountdown fades each digit in without moving it away from the selection center.
+func drawRecordingCountdown(displayList *DisplayList, window woxwidget.HostServices, selection Rect, remaining time.Duration, uiScale float32) {
+	if displayList == nil || remaining <= 0 {
+		return
+	}
+	seconds := int((remaining + time.Second - 1) / time.Second)
+	elapsed := time.Duration(seconds)*time.Second - remaining
+	opacity := min(float32(1), float32(elapsed)/float32(recordingCountdownFadeDuration))
+	fill, stroke := recordingCountdownFill, recordingCountdownStroke
+	fill.A = uint8(float32(fill.A) * opacity)
+	stroke.A = uint8(float32(stroke.A) * opacity)
+	label := strconv.Itoa(seconds)
+	size := recordingCountdownFontSize(selection, uiScale)
+	strokeWidth := max(float32(4), size*0.05)
+	style := TextStyle{Size: size, Weight: FontWeightSemibold}
+	textSize := Size{Width: screenshotEditorEstimatedTextWidth(label, size), Height: size * 1.5}
+	// Font size is not the line height: fallback fonts can raise the baseline enough to clip digits.
+	if window != nil {
+		if metrics, err := window.MeasureText(label, style); err == nil && metrics.Size.Width > 0 && metrics.Size.Height > 0 {
+			textSize = metrics.Size
+		}
+	}
+	woxwidget.PaintStateless(window, woxwidget.Align{
+		Width: selection.Width, Height: selection.Height, Horizontal: 0.5, Vertical: 0.5,
+		Child: woxwidget.Container{
+			Padding: woxwidget.UniformInsets(strokeWidth),
+			Child: woxwidget.Painter{Width: textSize.Width, Height: textSize.Height, Paint: func(displayList *DisplayList, bounds Rect) {
+				drawRecordingOutlinedText(displayList, label, bounds, style, fill, stroke, strokeWidth)
+			}},
+		},
+	}, displayList, selection)
+}
+
+// drawRecordingOutlinedText draws a solid halo first so the fill stays readable on any desktop.
+func drawRecordingOutlinedText(displayList *DisplayList, text string, rect Rect, style TextStyle, fill, stroke Color, strokeWidth float32) {
+	for _, offset := range recordingOutlineOffsets(strokeWidth) {
+		displayList.DrawText(text, Rect{X: rect.X + offset.X, Y: rect.Y + offset.Y, Width: rect.Width, Height: rect.Height}, style, stroke)
+	}
+	displayList.DrawText(text, rect, style, fill)
+}
+
+// recordingOutlineOffsets samples a round halo densely enough to keep glyph terminals smooth.
+func recordingOutlineOffsets(strokeWidth float32) []Point {
+	if strokeWidth <= 0 {
+		return nil
+	}
+	// Eight radial spokes leave notches at open terminals and overthicken diagonals.
+	// Half-unit spacing around the perimeter keeps the outline smooth at Retina scale.
+	steps := max(8, int(math.Ceil(4*math.Pi*float64(strokeWidth))))
+	offsets := make([]Point, steps)
+	for step := range offsets {
+		angle := 2 * math.Pi * float64(step) / float64(steps)
+		offsets[step] = Point{X: strokeWidth * float32(math.Cos(angle)), Y: strokeWidth * float32(math.Sin(angle))}
+	}
+	return offsets
+}
+
+// recordingPreviewPixelSize keeps in-overlay playback within a decode budget while preserving aspect.
+func recordingPreviewPixelSize(width, height float32) (int, int) {
+	w := max(2, int(math.Round(float64(width))))
+	h := max(2, int(math.Round(float64(height))))
+	if w > recordingPreviewMaxEdge || h > recordingPreviewMaxEdge {
+		if w >= h {
+			h = max(2, h*recordingPreviewMaxEdge/w)
+			w = recordingPreviewMaxEdge
+		} else {
+			w = max(2, w*recordingPreviewMaxEdge/h)
+			h = recordingPreviewMaxEdge
+		}
+	}
+	if w%2 != 0 {
+		w--
+	}
+	if h%2 != 0 {
+		h--
+	}
+	return max(2, w), max(2, h)
+}
+
+func recordingPreviewFrameBytes(width, height int) int {
+	return width * height * 4
+}
+
+// extractRecordingPreviewFrame decodes the first MP4 frame into packed RGBA at the preview size.
+func extractRecordingPreviewFrame(path string, width, height int) (*image.RGBA, error) {
+	if path == "" || width < 2 || height < 2 {
+		return nil, errors.New("recording preview frame is unavailable")
+	}
+	ffmpegPath, err := recordingFFmpegPath()
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.Command(ffmpegPath,
+		"-hide_banner", "-loglevel", "error", "-i", path, "-an",
+		"-vf", "scale="+strconv.Itoa(width)+":"+strconv.Itoa(height),
+		"-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1",
+	)
+	ffmpeg.Prepare(cmd)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("decode recording poster: %w", err)
+	}
+	return recordingRGBAFrame(output, width, height)
+}
+
+// startRecordingPreviewDecode opens a real-time RGBA stream for in-overlay playback.
+func startRecordingPreviewDecode(ctx context.Context, path string, width, height int) (*exec.Cmd, io.ReadCloser, error) {
+	if path == "" || width < 2 || height < 2 {
+		return nil, nil, errors.New("recording preview stream is unavailable")
+	}
+	ffmpegPath, err := recordingFFmpegPath()
+	if err != nil {
+		return nil, nil, err
+	}
+	cmd := exec.CommandContext(ctx, ffmpegPath,
+		"-hide_banner", "-loglevel", "error", "-re", "-i", path, "-an",
+		"-vf", "scale="+strconv.Itoa(width)+":"+strconv.Itoa(height),
+		"-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1",
+	)
+	ffmpeg.Prepare(cmd)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, nil, fmt.Errorf("start recording preview: %w", err)
+	}
+	return cmd, stdout, nil
+}
+
+func recordingRGBAFrame(pixels []byte, width, height int) (*image.RGBA, error) {
+	needed := recordingPreviewFrameBytes(width, height)
+	if len(pixels) < needed {
+		return nil, fmt.Errorf("recording preview frame is truncated: %d < %d", len(pixels), needed)
+	}
+	frame := image.NewRGBA(image.Rect(0, 0, width, height))
+	copy(frame.Pix, pixels[:needed])
+	return frame, nil
+}
+
+// pumpRecordingPreview decodes the MP4 in real time and delivers packed RGBA frames until the context ends.
+func pumpRecordingPreview(ctx context.Context, path string, width, height int, onFrame func(*image.RGBA) error) error {
+	cmd, stdout, err := startRecordingPreviewDecode(ctx, path, width, height)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = stdout.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	}()
+	buffer := make([]byte, recordingPreviewFrameBytes(width, height))
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, err := io.ReadFull(stdout, buffer); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return nil
+			}
+			return err
+		}
+		frame, err := recordingRGBAFrame(buffer, width, height)
+		if err != nil {
+			return err
+		}
+		if err := onFrame(frame); err != nil {
+			return err
+		}
+	}
+}

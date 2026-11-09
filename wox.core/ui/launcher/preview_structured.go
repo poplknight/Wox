@@ -1,0 +1,264 @@
+package launcher
+
+import (
+	"encoding/json"
+	"strings"
+
+	woxcomponent "wox/ui/launcher/component"
+	previewview "wox/ui/launcher/view/preview"
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+)
+
+type pluginDetailPreviewData struct {
+	ID             string   `json:"Id"`
+	Name           string   `json:"Name"`
+	Description    string   `json:"Description"`
+	Author         string   `json:"Author"`
+	Version        string   `json:"Version"`
+	Icon           woxImage `json:"Icon"`
+	Website        string   `json:"Website"`
+	Runtime        string   `json:"Runtime"`
+	ScreenshotURLs []string `json:"ScreenshotUrls"`
+}
+
+// buildPluginDetailPreview resolves controller-owned images before rendering the pure metadata view.
+func (a *App) buildPluginDetailPreview(data pluginDetailPreviewData, palette uiPalette, width, height float32) woxwidget.Widget {
+	var screenshot woxwidget.Widget
+	headerHeight := min(float32(108), height)
+	if len(data.ScreenshotURLs) > 0 && height > headerHeight+20 {
+		screenshotHeight := max(float32(0), height-headerHeight-10)
+		source := woxImage{ImageType: "url", ImageData: data.ScreenshotURLs[0]}
+		screenshot = a.previews.buildPreviewImage(source, source, palette, width, screenshotHeight)
+	}
+	return previewview.PluginDetailPreviewView(previewview.PluginDetailPreviewProps{
+		Width: width, Height: height, Theme: palette.componentTheme(), Name: data.Name, Description: data.Description,
+		Author: data.Author, Version: data.Version, Runtime: data.Runtime, Website: data.Website,
+		Icon: a.imageFor(data.Icon), HasIcon: data.Icon.ImageType != "" && data.Icon.ImageData != "", Screenshot: screenshot,
+	})
+}
+
+type updatePreviewData struct {
+	CurrentVersion    string `json:"currentVersion"`
+	LatestVersion     string `json:"latestVersion"`
+	ReleaseChannel    string `json:"releaseChannel"`
+	ReleaseNotes      string `json:"releaseNotes"`
+	DownloadURL       string `json:"downloadUrl"`
+	Status            string `json:"status"`
+	HasUpdate         bool   `json:"hasUpdate"`
+	Error             string `json:"error"`
+	AutoUpdateEnabled bool   `json:"autoUpdateEnabled"`
+}
+
+type aiStreamPreviewData struct {
+	Answer         string `json:"answer"`
+	Reasoning      string `json:"reasoning"`
+	Status         string `json:"status"`
+	StatusLabel    string `json:"statusLabel"`
+	ReasoningTitle string `json:"reasoningTitle"`
+	AnswerTitle    string `json:"answerTitle"`
+}
+
+type dictationHistoryPreviewData struct {
+	RefinedText         string `json:"refinedText"`
+	OriginalText        string `json:"originalText"`
+	RefinedLabel        string `json:"refinedLabel"`
+	OriginalLabel       string `json:"originalLabel"`
+	StatusLabel         string `json:"statusLabel"`
+	IsChanged           bool   `json:"isChanged"`
+	RawAudioPath        string `json:"rawAudioPath"`
+	ProcessedAudioPath  string `json:"processedAudioPath"`
+	AudioLabel          string `json:"audioLabel"`
+	RawAudioLabel       string `json:"rawAudioLabel"`
+	ProcessedAudioLabel string `json:"processedAudioLabel"`
+}
+
+type hotkeyOverviewPreviewData struct {
+	Search string `json:"search"`
+}
+
+func decodeStructuredPreview[T any](value string) (T, error) {
+	var data T
+	if err := json.Unmarshal([]byte(value), &data); err != nil {
+		return data, err
+	}
+	return data, nil
+}
+
+func previewTagsForValues(values ...string) []previewTag {
+	tags := make([]previewTag, 0, len(values))
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			tags = append(tags, previewTag{Label: value})
+		}
+	}
+	return tags
+}
+
+// buildUpdatePreview maps update state and translated labels into the dedicated Flutter-aligned view.
+func (a *App) buildUpdatePreview(id string, data updatePreviewData, palette uiPalette, width, height, imageScale float32) woxwidget.Widget {
+	// The header title carries the update state and the pill carries the version,
+	// so the panel does not echo the "update" query as a bare "Update" heading.
+	title := a.language.translate("i18n:plugin_update_title")
+	status := ""
+	statusColor := woxui.Color{R: 76, G: 175, B: 80, A: 255}
+	if !data.AutoUpdateEnabled {
+		status = a.language.translate("i18n:plugin_update_status_auto_update_disabled")
+		statusColor = woxui.Color{R: 255, G: 152, B: 0, A: 255}
+	} else if !data.HasUpdate {
+		version := strings.TrimSpace(data.LatestVersion)
+		if version == "" {
+			version = strings.TrimSpace(data.CurrentVersion)
+		}
+		if version == "" {
+			status = a.language.translate("i18n:plugin_update_status_none")
+		} else {
+			title = a.language.translate("i18n:plugin_update_title_up_to_date")
+			status = version
+		}
+	} else {
+		current := strings.TrimSpace(data.CurrentVersion)
+		latest := strings.TrimSpace(data.LatestVersion)
+		unknown := a.language.translate("i18n:plugin_update_unknown")
+		if current == "" {
+			current = unknown
+		}
+		if latest == "" {
+			latest = unknown
+		}
+		status = current + "\u2192" + latest
+		statusColor = woxui.Color{R: 255, G: 152, B: 0, A: 255}
+	}
+	if data.AutoUpdateEnabled {
+		switch strings.ToLower(data.Status) {
+		case "error":
+			statusColor = woxui.Color{R: 244, G: 67, B: 54, A: 255}
+		case "downloading":
+			statusColor = woxui.Color{R: 33, G: 150, B: 243, A: 255}
+		}
+	}
+	if data.HasUpdate {
+		title = a.language.translate("i18n:plugin_doctor_version_update_available")
+	}
+	betaLabel := ""
+	if strings.EqualFold(data.ReleaseChannel, "beta") {
+		betaLabel = a.language.translate("i18n:plugin_update_release_channel_beta")
+	}
+	scale := a.appearance.densityMetrics.normalized().scale
+	return previewview.UpdatePreviewView(previewview.UpdatePreviewProps{
+		ID: id, Width: width, Height: height, Scale: scale, Window: a.window, Theme: palette.componentTheme(), Title: title, Error: data.Error,
+		BetaLabel: betaLabel, StatusLabel: status, StatusColor: statusColor, AutoUpdateEnabled: data.AutoUpdateEnabled,
+		DisabledTitle: a.language.translate("i18n:plugin_update_auto_update_disabled_title"), DisabledDescription: a.language.translate("i18n:plugin_update_auto_update_disabled_desc"),
+		DisabledAction: a.language.translate("i18n:plugin_update_action_enable_auto_update") + " (enter)", OnPrimaryAction: a.activateSelected,
+		ReleaseNotes: data.ReleaseNotes, NoReleaseNotes: a.language.translate("i18n:plugin_update_no_release_notes"),
+		SectionNew: a.language.translate("i18n:plugin_update_section_new"), SectionImprovements: a.language.translate("i18n:plugin_update_section_improvements"),
+		SectionFixes: a.language.translate("i18n:plugin_update_section_fixes"), SectionChanged: a.language.translate("i18n:plugin_update_section_changed"),
+		SectionRemoved: a.language.translate("i18n:plugin_update_section_removed"), SectionSecurity: a.language.translate("i18n:plugin_update_section_security"),
+		SectionStore: a.language.translate("i18n:plugin_update_section_store"), GroupPlugin: a.language.translate("i18n:plugin_update_group_plugin"),
+		GroupTheme: a.language.translate("i18n:plugin_update_group_theme"),
+		MeasureText: func(value string, style woxui.TextStyle) float32 {
+			metrics, _ := a.window.MeasureText(value, style)
+			return metrics.Size.Width
+		},
+		RenderMarkdown: func(markdownID, value string, markdownWidth float32) woxwidget.Widget {
+			return woxcomponent.WoxMarkdown(a.previews.markdownProps(markdownID, value, "", palette, markdownWidth, imageScale))
+		},
+	})
+}
+
+func formatAIStreamPreview(data aiStreamPreviewData) string {
+	parts := make([]string, 0, 2)
+	if reasoning := strings.TrimSpace(data.Reasoning); reasoning != "" {
+		title := strings.TrimSpace(data.ReasoningTitle)
+		if title == "" {
+			title = "Reasoning"
+		}
+		parts = append(parts, title+"\n\n"+reasoning)
+	}
+	answer := strings.TrimSpace(data.Answer)
+	if answer == "" {
+		answer = strings.TrimSpace(data.StatusLabel)
+	}
+	if answer == "" {
+		answer = "Waiting for answer\u2026"
+	}
+	if data.AnswerTitle != "" && len(parts) > 0 {
+		answer = data.AnswerTitle + "\n\n" + answer
+	}
+	parts = append(parts, answer)
+	return strings.Join(parts, "\n\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n")
+}
+
+// buildHotkeyOverviewPreview prepares the live settings and built-in shortcuts for the pure preview view.
+func (a *App) buildHotkeyOverviewPreview(data hotkeyOverviewPreviewData, palette uiPalette, width, height float32) woxwidget.Widget {
+	settings := a.generalSettings.Data()
+	entry := func(shortcut, action, scope, source, detail string, keyboard bool) previewview.HotkeyOverviewPreviewEntry {
+		labels := []string{strings.TrimSpace(shortcut)}
+		if keyboard {
+			labels = formatHotkeyLabels(shortcut)
+		}
+		return previewview.HotkeyOverviewPreviewEntry{RawShortcut: strings.TrimSpace(shortcut), Labels: labels, Action: action, Detail: detail, Scope: scope, Source: source}
+	}
+	globalScope := a.language.translate("i18n:ui_hotkey_overview_global")
+	windowScope := a.language.translate("i18n:ui_hotkey_overview_window")
+	launcherScope := a.language.translate("i18n:ui_hotkey_overview_launcher")
+	previewScope := a.language.translate("i18n:ui_hotkey_overview_preview")
+	settingSource := a.language.translate("i18n:ui_hotkey_overview_source_setting")
+	builtinSource := a.language.translate("i18n:ui_hotkey_overview_source_builtin")
+	userSource := a.language.translate("i18n:ui_hotkey_overview_source_user")
+	sections := []previewview.HotkeyOverviewPreviewSection{
+		{Title: globalScope, Entries: []previewview.HotkeyOverviewPreviewEntry{
+			entry(settings.MainHotkey, a.language.translate("i18n:ui_hotkey_overview_open_wox"), globalScope, settingSource, "", true),
+			entry(settings.SelectionHotkey, a.language.translate("i18n:ui_hotkey_overview_search_selection"), globalScope, settingSource, "", true),
+		}},
+		{Title: windowScope, Entries: []previewview.HotkeyOverviewPreviewEntry{
+			entry(primaryHotkey(","), a.language.translate("i18n:ui_hotkey_overview_open_settings"), windowScope, builtinSource, "", true),
+			entry(primaryHotkey("w"), a.language.translate("i18n:ui_hotkey_overview_close_window"), windowScope, builtinSource, a.language.translate("i18n:ui_hotkey_overview_close_window_detail"), true),
+		}},
+		{Title: launcherScope, Entries: []previewview.HotkeyOverviewPreviewEntry{
+			entry(primaryHotkey("p"), a.language.translate("i18n:ui_hotkey_overview_preview_toggle"), launcherScope, builtinSource, "", true),
+			entry(a.actionPanelHotkey(), a.language.translate("i18n:ui_hotkey_overview_more_actions"), launcherScope, settingSource, "", true),
+			entry(a.refinementHotkey(), a.language.translate("i18n:ui_hotkey_overview_filters"), launcherScope, settingSource, "", true),
+			entry(primaryHotkey("u"), a.language.translate("i18n:ui_hotkey_overview_attention"), launcherScope, builtinSource, "", true),
+		}},
+		{Title: previewScope, Entries: []previewview.HotkeyOverviewPreviewEntry{
+			entry(primaryHotkey("b"), a.language.translate("i18n:ui_hotkey_overview_preview_fullscreen"), previewScope, builtinSource, "", true),
+			entry(primaryHotkey("shift+f"), a.language.translate("i18n:ui_hotkey_overview_preview_search"), previewScope, builtinSource, "", true),
+			entry(primaryHotkey("l"), a.language.translate("i18n:ui_hotkey_overview_file_preview_load"), previewScope, builtinSource, "", true),
+			entry(primaryHotkey("r"), a.language.translate("i18n:ui_hotkey_overview_webview_refresh"), previewScope, builtinSource, "", true),
+			entry(primaryHotkey("["), a.language.translate("i18n:ui_hotkey_overview_webview_back"), previewScope, builtinSource, "", true),
+			entry(primaryHotkey("]"), a.language.translate("i18n:ui_hotkey_overview_webview_forward"), previewScope, builtinSource, "", true),
+			entry(primaryHotkey("o"), a.language.translate("i18n:ui_hotkey_overview_webview_open_in_browser"), previewScope, builtinSource, "", true),
+			entry(primaryHotkey("h"), a.language.translate("i18n:ui_hotkey_overview_webview_hide_page"), previewScope, builtinSource, "", true),
+			entry(primaryHotkey("w"), a.language.translate("i18n:ui_hotkey_overview_webview_close_page"), previewScope, builtinSource, "", true),
+		}},
+	}
+	queryHotkeys := previewview.HotkeyOverviewPreviewSection{Title: a.language.translate("i18n:ui_hotkey_overview_query_hotkeys")}
+	for _, item := range settings.QueryHotkeys {
+		if item.Disabled || strings.TrimSpace(item.Hotkey) == "" || strings.TrimSpace(item.Query) == "" {
+			continue
+		}
+		action := strings.TrimSpace(item.Name)
+		if action == "" {
+			action = item.Query
+		}
+		detail := ""
+		if strings.TrimSpace(item.Query) != strings.TrimSpace(action) {
+			detail = item.Query
+		}
+		queryHotkeys.Entries = append(queryHotkeys.Entries, entry(item.Hotkey, action, queryHotkeys.Title, userSource, detail, true))
+	}
+	sections = append(sections, queryHotkeys)
+	queryAliases := previewview.HotkeyOverviewPreviewSection{Title: a.language.translate("i18n:ui_hotkey_overview_query_shortcuts")}
+	for _, item := range settings.QueryAliases {
+		if !item.Disabled && strings.TrimSpace(item.Alias) != "" && strings.TrimSpace(item.Query) != "" {
+			queryAliases.Entries = append(queryAliases.Entries, entry(item.Alias, item.Query, queryAliases.Title, userSource, "", false))
+		}
+	}
+	sections = append(sections, queryAliases)
+	return previewview.HotkeyOverviewPreviewView(previewview.HotkeyOverviewPreviewProps{
+		Width: width, Height: height, Scale: a.appearance.densityMetrics.normalized().scale, Search: data.Search,
+		Title: a.language.translate("i18n:ui_hotkey_overview_title"), Subtitle: a.language.translate("i18n:ui_hotkey_overview_subtitle"),
+		Count: a.language.translate("i18n:ui_hotkey_overview_count"), Empty: a.language.translate("i18n:ui_hotkey_overview_empty"), Sections: sections, Theme: palette.componentTheme(),
+	})
+}

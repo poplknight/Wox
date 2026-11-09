@@ -1,0 +1,250 @@
+package launcher
+
+import (
+	"testing"
+	"time"
+
+	"wox/cloudsync"
+	"wox/common/icons"
+	"wox/ui/contract"
+)
+
+func TestCloudSyncNeedsBootstrapAfterAuthentication(t *testing.T) {
+	account := cloudAccountStatus{LoggedIn: true, SyncEligible: true}
+	if !cloudSyncNeedsBootstrap(cloudSettingsSnapshot{Account: account}) {
+		t.Fatal("eligible authenticated account without a key should continue bootstrap")
+	}
+
+	account.SyncEnabled = true
+	ready := cloudSettingsSnapshot{
+		Account: account,
+		Sync: cloudSyncStatus{
+			KeyStatus: cloudSyncKeyStatus{Available: true},
+			State:     &cloudSyncState{Bootstrapped: true},
+		},
+	}
+	if cloudSyncNeedsBootstrap(ready) {
+		t.Fatal("fully bootstrapped account should not restart bootstrap")
+	}
+}
+
+func TestCloudSyncPresentationShowsUnknownTotalProgress(t *testing.T) {
+	app := bindTestApp(&App{
+		language: languageCatalog{
+			translations: map[string]string{
+				"ui_cloud_sync_syncing":              "Syncing...",
+				"ui_cloud_sync_progress_starting":    "Preparing sync...",
+				"ui_cloud_sync_progress_count":       " ({count} items processed)",
+				"ui_cloud_sync_progress_restoring":   "Restoring {target}{count}",
+				"ui_cloud_sync_progress_plugin":      "plugin {plugin}",
+				"ui_cloud_sync_progress_data":        "sync data",
+				"ui_cloud_sync_progress_uploading":   "Uploading {target}{count}",
+				"ui_cloud_sync_progress_wox_setting": "Wox settings",
+			},
+		},
+		pluginSettings: newPluginSettingsController(CommonDeps{}),
+	})
+	_, detail, _, _ := app.cloudSettings.cloudSyncPresentation(settingsSnapshot{
+		cloud: cloudSettingsSnapshot{
+			Sync: cloudSyncStatus{
+				Progress: &cloudSyncProgress{
+					Active:     true,
+					Operation:  cloudsync.CloudSyncProgressOperationRestore,
+					EntityType: cloudsync.EntityInstalledPlugin,
+					PluginID:   "plugin-deepl",
+					Current:    17,
+				},
+			},
+		},
+	})
+	if detail != "Restoring plugin plugin-deepl (17 items processed)" {
+		t.Fatalf("restore detail = %q, want %q", detail, "Restoring plugin plugin-deepl (17 items processed)")
+	}
+
+	label, detail, _, _ := app.cloudSettings.cloudSyncPresentation(settingsSnapshot{cloud: cloudSettingsSnapshot{Busy: "sync"}})
+	if label != "Syncing..." || detail != "Preparing sync..." {
+		t.Fatalf("busy sync presentation = %q / %q, want Syncing... / Preparing sync...", label, detail)
+	}
+}
+
+func TestNewCloudBootstrapFormUsesI18nKeys(t *testing.T) {
+	restore := newCloudBootstrapForm(contract.CloudBootstrapStatus{HasRemoteData: true})
+	if restore.title != "i18n:ui_cloud_sync_bootstrap_restore_title" {
+		t.Fatalf("restore title = %q", restore.title)
+	}
+	if len(restore.definitions) != 1 || restore.definitions[0].Value.Label != "i18n:ui_cloud_sync_recovery_code" {
+		t.Fatalf("restore fields = %#v", restore.definitions)
+	}
+
+	start := newCloudBootstrapForm(contract.CloudBootstrapStatus{HasRemoteData: false})
+	if start.title != "i18n:ui_cloud_sync_bootstrap_start_title" {
+		t.Fatalf("start title = %q", start.title)
+	}
+	if len(start.definitions) != 2 || start.definitions[1].Value.Label != "i18n:ui_cloud_sync_recovery_code_confirm" {
+		t.Fatalf("start fields = %#v", start.definitions)
+	}
+	if got := cloudFormDescription(&cloudFormSnapshot{kind: "bootstrap", hasRemoteData: true}); got != "i18n:ui_cloud_sync_bootstrap_restore_description" {
+		t.Fatalf("restore description = %q", got)
+	}
+	if got := validateCloudForm("bootstrap", map[string]string{"RecoveryCode": ""}, true); got != "i18n:ui_cloud_sync_recovery_code_required" {
+		t.Fatalf("required validation = %q", got)
+	}
+}
+
+func TestCloudBillingPriceTextPrefersFormattedServerPrice(t *testing.T) {
+	amount := 300
+	if got := cloudBillingPriceText(cloudBillingPlanPrice{Formatted: "$3/month", Currency: "usd", UnitAmount: &amount, Interval: "month"}); got != "$3/month" {
+		t.Fatalf("formatted price = %q, want $3/month", got)
+	}
+	if got := cloudBillingPriceText(cloudBillingPlanPrice{Currency: "usd", UnitAmount: &amount, Interval: "month"}); got != "USD 3/month" {
+		t.Fatalf("reconstructed price = %q, want USD 3/month", got)
+	}
+	if got := cloudBillingPriceText(cloudBillingPlanPrice{}); got != "" {
+		t.Fatalf("empty price = %q, want empty", got)
+	}
+}
+
+func TestCloudBillingPriceWithTrial(t *testing.T) {
+	app := bindTestApp(&App{
+		language: languageCatalog{
+			translations: map[string]string{
+				"ui_cloud_sync_plan_trial_one_month":  "1 month free trial",
+				"ui_cloud_sync_plan_trial_months":     "{count} months free trial",
+				"ui_cloud_sync_plan_trial_days":       "{days}-day free trial",
+				"ui_cloud_sync_plan_price_with_trial": "{price} · {trial}",
+				"ui_cloud_sync_plan_price_loading":    "Loading...",
+			},
+		},
+	})
+	price := cloudBillingPlanPrice{Formatted: "$1.99/month"}
+	monthTrial := &cloudBillingPlanTrial{Days: 30, Interval: "month", IntervalCount: 1, Formatted: "1 month free"}
+	if got := cloudBillingPriceWithTrial(&app.language, price, monthTrial, true); got != "$1.99/month · 1 month free trial" {
+		t.Fatalf("month trial = %q", got)
+	}
+	if got := cloudBillingPriceWithTrial(&app.language, price, nil, true); got != "$1.99/month" {
+		t.Fatalf("no trial = %q", got)
+	}
+	if got := cloudBillingPriceWithTrial(&app.language, cloudBillingPlanPrice{}, nil, false); got != "Loading..." {
+		t.Fatalf("loading price = %q", got)
+	}
+}
+
+func TestFormatCloudSyncProgressUsesCachedPluginName(t *testing.T) {
+	app := bindTestApp(&App{
+		language: languageCatalog{
+			translations: map[string]string{
+				"ui_cloud_sync_progress_count":     " ({count} items processed)",
+				"ui_cloud_sync_progress_restoring": "Restoring {target}{count}",
+				"ui_cloud_sync_progress_plugin":    "plugin {plugin}",
+			},
+		},
+		pluginSettings: newPluginSettingsController(CommonDeps{}),
+	})
+	app.pluginSettings.cachePlugins(false, []pluginSettingsPlugin{{
+		ID:   "ea521bb8-4414-44be-bf42-4b2851ae32ad",
+		Name: "DeepL",
+	}})
+	detail := app.cloudSettings.formatCloudSyncProgress(&cloudSyncProgress{
+		Active:     true,
+		Operation:  cloudsync.CloudSyncProgressOperationRestore,
+		EntityType: cloudsync.EntityInstalledPlugin,
+		PluginID:   "ea521bb8-4414-44be-bf42-4b2851ae32ad",
+		Current:    100,
+	}, false)
+	if detail != "Restoring plugin DeepL (100 items processed)" {
+		t.Fatalf("restore detail = %q, want plugin display name", detail)
+	}
+}
+
+func TestFormatCloudSyncProgressUsesPushTargetAndTotal(t *testing.T) {
+	app := bindTestApp(&App{
+		language: languageCatalog{
+			translations: map[string]string{
+				"ui_cloud_sync_progress_count":       " ({count} items processed)",
+				"ui_cloud_sync_progress_uploading":   "Uploading {target}{count}",
+				"ui_cloud_sync_progress_wox_setting": "Wox settings",
+			},
+		},
+		pluginSettings: newPluginSettingsController(CommonDeps{}),
+	})
+	detail := app.cloudSettings.formatCloudSyncProgress(&cloudSyncProgress{
+		Active:     true,
+		Operation:  cloudsync.CloudSyncProgressOperationPush,
+		EntityType: cloudsync.EntityWoxSetting,
+		Current:    3,
+		Total:      10,
+	}, false)
+	if detail != "Uploading Wox settings (3/10 items processed)" {
+		t.Fatalf("push detail = %q", detail)
+	}
+}
+
+func TestCloudDeviceInactiveHidesStaleDevices(t *testing.T) {
+	now := time.Date(2026, 8, 25, 11, 34, 0, 0, time.Local)
+	stale := now.Add(-14*24*time.Hour - time.Second).UnixMilli()
+	fresh := now.Add(-14*24*time.Hour + time.Second).UnixMilli()
+
+	if !cloudDeviceInactive(cloudDevice{DeviceID: "old", LastSeenAt: stale}, now) {
+		t.Fatal("device unseen for more than two weeks should be hidden")
+	}
+	if cloudDeviceInactive(cloudDevice{DeviceID: "recent", LastSeenAt: fresh}, now) {
+		t.Fatal("device seen within two weeks should stay visible")
+	}
+	if cloudDeviceInactive(cloudDevice{DeviceID: "current", LastSeenAt: stale, Current: true}, now) {
+		t.Fatal("current device should stay visible even when last seen is stale")
+	}
+	if cloudDeviceInactive(cloudDevice{DeviceID: "unknown"}, now) {
+		t.Fatal("device without a last-seen timestamp should stay visible")
+	}
+}
+
+// TestCloudDevicePlatformIcons keeps aliases and unknown devices distinct from known platforms.
+func TestCloudDevicePlatformIcons(t *testing.T) {
+	for platform, want := range map[string]string{"windows": icons.SystemWindows, " win32 ": icons.SystemWindows, "WIN": icons.SystemWindows, "darwin": icons.SystemMacOS, "macOS": icons.SystemMacOS, "mac": icons.SystemMacOS, "Linux": icons.SystemLinux, "": icons.SystemDevice, "other": icons.SystemDevice} {
+		if got := cloudDevicePlatformIcon(platform); got != want || icons.Get(got).IsEmpty() {
+			t.Errorf("platform %q icon = %q, want registered %q", platform, got, want)
+		}
+	}
+}
+
+// TestCloudActivityTime uses the viewer's local date, including year and day transitions.
+func TestCloudActivityTime(t *testing.T) {
+	app := bindTestApp(&App{language: languageCatalog{translations: map[string]string{"ui_cloud_sync_today": "Today", "ui_cloud_sync_never": "Never"}}})
+	now := time.Date(2026, 1, 2, 0, 30, 0, 0, time.FixedZone("local", 8*3600))
+	for _, test := range []struct {
+		date time.Time
+		want string
+	}{
+		{now, "Today 00:30"},
+		{now.Add(-time.Hour), "01-01 23:30"},
+		{now.Add(-48 * time.Hour), "2025-12-31 00:30"},
+	} {
+		if got := app.cloudSettings.formatCloudActivityTime(test.date.UnixMilli(), now); got != test.want {
+			t.Errorf("time = %q, want %q", got, test.want)
+		}
+	}
+	if got := app.cloudSettings.formatCloudActivityTime(0, now); got != "Never" {
+		t.Fatalf("unset activity = %q", got)
+	}
+}
+
+// TestCloudSyncStatusIcons never presents loading, errors or disabled sync as successful.
+func TestCloudSyncStatusIcons(t *testing.T) {
+	app := bindTestApp(&App{})
+	ready := cloudSettingsSnapshot{Account: cloudAccountStatus{SyncEligible: true, SyncEnabled: true}, Sync: cloudSyncStatus{Enabled: true, KeyStatus: cloudSyncKeyStatus{Available: true}, State: &cloudSyncState{Bootstrapped: true}}}
+	for _, test := range []struct {
+		state cloudSettingsSnapshot
+		icon  string
+	}{
+		{ready, icons.ControlCheckCircle},
+		{cloudSettingsSnapshot{Loading: true}, icons.ControlHourglassEmpty},
+		{cloudSettingsSnapshot{Busy: "sync"}, icons.ControlHourglassEmpty},
+		{cloudSettingsSnapshot{Error: "Network unavailable"}, icons.ControlError},
+		{cloudSettingsSnapshot{}, icons.SettingsDataCloudsync},
+	} {
+		_, _, _, got := app.cloudSettings.cloudSyncPresentation(settingsSnapshot{cloud: test.state})
+		if got != test.icon {
+			t.Errorf("state %+v icon = %q, want %q", test.state, got, test.icon)
+		}
+	}
+}

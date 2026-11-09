@@ -1,0 +1,1766 @@
+package system
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/user"
+	"path"
+	"path/filepath"
+	"sort"
+	"strings"
+	texttmpl "text/template"
+	"time"
+	"wox/common"
+	"wox/common/icons"
+	"wox/i18n"
+	"wox/plugin"
+	"wox/setting/definition"
+	"wox/setting/validator"
+	"wox/util"
+	"wox/util/clipboard"
+	"wox/util/shell"
+	"wox/util/trash"
+
+	"github.com/fsnotify/fsnotify"
+	"github.com/google/uuid"
+	cp "github.com/otiai10/copy"
+	"github.com/samber/lo"
+)
+
+var wpmIcon = icons.Get(icons.PluginWPM)
+var localPluginDirectoriesKey = "local_plugin_directories"
+
+const (
+	wpmInstallStatusRefinementKey          = "wpm_install_status"
+	wpmInstallStatusRefinementAll          = "all"
+	wpmInstallStatusRefinementInstalled    = "installed"
+	wpmInstallStatusRefinementNotInstalled = "not_installed"
+	wpmInstallStatusRefinementUpgradable   = "upgradable"
+)
+
+var pluginTemplates = []pluginTemplate{
+	{
+		Runtime: plugin.PLUGIN_RUNTIME_PYTHON,
+		Name:    "Wox.Plugin.Template.Python",
+		Url:     "https://codeload.github.com/Wox-launcher/Wox.Plugin.Template.Python/zip/refs/heads/main",
+	},
+	{
+		Runtime: plugin.PLUGIN_RUNTIME_NODEJS,
+		Name:    "Wox.Plugin.Template.Nodejs",
+		Url:     "https://codeload.github.com/Wox-launcher/Wox.Plugin.Template.Nodejs/zip/refs/heads/main",
+	},
+}
+
+var singleFilePluginTemplates = []pluginTemplate{
+	{
+		Runtime: plugin.PLUGIN_RUNTIME_PYTHON,
+		Name:    "plugin_wpm_singlefile_template_python",
+		Url:     "template.py",
+	},
+	{
+		Runtime: plugin.PLUGIN_RUNTIME_NODEJS,
+		Name:    "plugin_wpm_singlefile_template_nodejs",
+		Url:     "template.js",
+	},
+}
+
+// LocalPlugin is the persisted settings-table row for local plugin directories.
+// The JSON key must stay "path" so the table column can read it; encoding/json
+// would otherwise write "Path" and the plugin manager would show blank cells.
+type LocalPlugin struct {
+	Path string `json:"path"`
+}
+
+func init() {
+	plugin.AllSystemPlugin = append(plugin.AllSystemPlugin, &WPMPlugin{
+		reloadPluginTimers: util.NewHashMap[string, *time.Timer](),
+	})
+}
+
+type WPMPlugin struct {
+	api                    plugin.API
+	localPluginDirectories []string
+	localPlugins           []localPlugin
+	reloadPluginTimers     *util.HashMap[string, *time.Timer]
+}
+
+type pluginTemplate struct {
+	Runtime plugin.Runtime
+	Name    string
+	Url     string
+}
+
+type localPlugin struct {
+	metadata plugin.Metadata
+	watcher  *util.DirectoryWatch
+}
+
+func (w *WPMPlugin) getLocalPluginName(ctx context.Context, metadata plugin.Metadata) string {
+	return metadata.GetName(ctx)
+}
+
+func (w *WPMPlugin) getLocalPluginDescription(ctx context.Context, metadata plugin.Metadata) string {
+	return metadata.GetDescription(ctx)
+}
+
+func (w *WPMPlugin) GetMetadata() plugin.Metadata {
+	commandHint := &common.QueryHint{CommandSuggestions: true, Elements: []common.QueryElement{
+		{Id: "operation", Kind: common.QueryElementArgument, Suggestions: []string{"create", "install", "uninstall", "update", "dev.list", "dev.add", "dev.remove", "dev.reload"}},
+	}}
+	return plugin.Metadata{
+		Id:            "e2c5f005-6c73-43c8-bc53-ab04def265b2",
+		Name:          "i18n:plugin_wpm_plugin_name",
+		Author:        "Wox Launcher",
+		Website:       "https://github.com/Wox-launcher/Wox",
+		Version:       "1.0.0",
+		MinWoxVersion: "2.0.0",
+		Runtime:       "Go",
+		Description:   "i18n:plugin_wpm_plugin_description",
+		Icon:          wpmIcon.String(),
+		Entry:         "",
+		TriggerKeywords: []string{
+			"wpm",
+			"store",
+			"pm",
+			"*",
+		},
+		TriggerQueryHints: map[string]*common.QueryHint{"wpm": commandHint, "store": commandHint, "pm": commandHint},
+		Features: []plugin.MetadataFeature{
+			{
+				Name: plugin.MetadataFeatureIgnoreAutoScore,
+			},
+			{
+				Name: plugin.MetadataFeatureResultPreviewWidthRatio,
+				Params: map[string]any{
+					"WidthRatio": 0.35,
+				},
+			},
+			{
+				Name: plugin.MetadataFeatureMRU,
+				Params: map[string]any{
+					"HashBy": "identityKey",
+				},
+			},
+		},
+		Commands: []plugin.MetadataCommand{
+			{
+				Command:     "install",
+				Description: "i18n:plugin_wpm_command_install",
+			},
+			{
+				Command:     "update",
+				Description: "i18n:plugin_wpm_command_update",
+			},
+			{
+				Command:     "uninstall",
+				Description: "i18n:plugin_wpm_command_uninstall",
+			},
+			{
+				Command:     "create",
+				Description: "i18n:plugin_wpm_command_create",
+			},
+			{
+				Command:     "dev.list",
+				Description: "i18n:plugin_wpm_command_dev_list",
+			},
+			{
+				Command:     "dev.add",
+				Description: "i18n:plugin_wpm_command_dev_add",
+			},
+			{
+				Command:     "dev.remove",
+				Description: "i18n:plugin_wpm_command_dev_remove",
+			},
+			{
+				Command:     "dev.reload",
+				Description: "i18n:plugin_wpm_command_dev_reload",
+			},
+		},
+		SupportedOS: []string{
+			"Windows",
+			"Macos",
+			"Linux",
+		},
+		SettingDefinitions: definition.PluginSettingDefinitions{
+			{
+				Type:               definition.PluginSettingDefinitionTypeTable,
+				IsPlatformSpecific: true,
+				Value: &definition.PluginSettingValueTable{
+					Key:     localPluginDirectoriesKey,
+					Title:   "i18n:plugin_wpm_local_plugin_directories",
+					Tooltip: "i18n:plugin_wpm_local_plugin_directories_tooltip",
+					Columns: []definition.PluginSettingValueTableColumn{
+						{
+							Key:   "path",
+							Label: "i18n:plugin_wpm_path",
+							Type:  definition.PluginSettingValueTableColumnTypeDirPath,
+							Validators: []validator.PluginSettingValidator{
+								{
+									Type:  validator.PluginSettingValidatorTypeNotEmpty,
+									Value: &validator.PluginSettingValidatorNotEmpty{},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func (w *WPMPlugin) Init(ctx context.Context, initParams plugin.InitParams) {
+	w.api = initParams.API
+	w.api.OnMRURestore(ctx, w.handleMRURestore)
+	if util.IsThirdPartyPluginsDisabled() {
+		return
+	}
+
+	w.reloadAllDevPlugins(ctx)
+	w.api.OnSettingChanged(ctx, func(callbackCtx context.Context, key string, value string) {
+		if key != localPluginDirectoriesKey {
+			return
+		}
+		w.applyLocalPluginDirectories(callbackCtx, value)
+	})
+
+	util.Go(ctx, "reload dev plugins in dist", func() {
+		// must delay reload, because host env is not ready when system plugin init
+		time.Sleep(time.Second * 5)
+
+		newCtx := util.NewTraceContext()
+		for _, lp := range w.localPlugins {
+			w.reloadLocalDistPlugin(newCtx, lp.metadata, "reload after startup")
+		}
+	})
+}
+
+func (w *WPMPlugin) reloadAllDevPlugins(ctx context.Context) {
+	w.applyLocalPluginDirectories(ctx, w.api.GetSetting(ctx, localPluginDirectoriesKey))
+}
+
+// applyLocalPluginDirectories keeps the in-memory local plugin list aligned with
+// the persisted settings table, including live edits that only write the setting.
+func (w *WPMPlugin) applyLocalPluginDirectories(ctx context.Context, raw string) {
+	localPluginDirs, err := parseLocalPluginDirectorySettings(raw)
+	if err != nil {
+		w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to unmarshal local plugin directories: %s", err.Error()))
+		return
+	}
+
+	var pluginDirs []string
+	for _, pluginDir := range localPluginDirs {
+		directory := strings.TrimSpace(pluginDir.Path)
+		if directory == "" {
+			continue
+		}
+		if _, statErr := os.Stat(directory); statErr != nil {
+			w.api.Log(ctx, plugin.LogLevelWarning, fmt.Sprintf("Failed to stat local plugin directory, remove it: %s", statErr.Error()))
+			os.RemoveAll(directory)
+			continue
+		}
+		if !containsLocalPluginDirectory(pluginDirs, directory) {
+			pluginDirs = append(pluginDirs, directory)
+		}
+	}
+
+	for _, lp := range append([]localPlugin(nil), w.localPlugins...) {
+		if !containsLocalPluginDirectory(pluginDirs, lp.metadata.Directory) {
+			w.unloadLocalPluginByDirectory(ctx, lp.metadata.Directory)
+		}
+	}
+
+	w.localPluginDirectories = pluginDirs
+	for _, directory := range pluginDirs {
+		if !w.hasLocalPluginDirectory(directory) {
+			w.loadDevPlugin(ctx, directory)
+		}
+	}
+}
+
+// parseLocalPluginDirectorySettings reads the settings-table JSON, including
+// legacy rows that used a capital Path key from Go's default field name.
+func parseLocalPluginDirectorySettings(raw string) ([]LocalPlugin, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "null" {
+		return nil, nil
+	}
+
+	var localPluginDirs []LocalPlugin
+	if err := json.Unmarshal([]byte(raw), &localPluginDirs); err != nil {
+		return nil, err
+	}
+	return localPluginDirs, nil
+}
+
+func containsLocalPluginDirectory(directories []string, candidate string) bool {
+	for _, directory := range directories {
+		if sameLocalPluginDirectory(directory, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+// sameLocalPluginDirectory compares local plugin directories after cleaning,
+// and ignores case on Windows so picker paths and saved rows stay aligned.
+func sameLocalPluginDirectory(left string, right string) bool {
+	left = filepath.Clean(strings.TrimSpace(left))
+	right = filepath.Clean(strings.TrimSpace(right))
+	if left == right {
+		return true
+	}
+	if util.IsWindows() {
+		return strings.EqualFold(left, right)
+	}
+	return false
+}
+
+func (w *WPMPlugin) loadDevPlugin(ctx context.Context, pluginDirectory string) {
+	if util.IsThirdPartyPluginsDisabled() {
+		return
+	}
+	w.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("start to load dev plugin: %s", pluginDirectory))
+
+	metadata, err := w.parseMetadata(ctx, pluginDirectory)
+	if err != nil {
+		w.api.Log(ctx, plugin.LogLevelError, err.Error())
+		return
+	}
+
+	lp := localPlugin{
+		metadata: metadata,
+	}
+
+	// check if plugin is already loaded
+	existingLocalPlugin, exist := lo.Find(w.localPlugins, func(lp localPlugin) bool {
+		return lp.metadata.Id == metadata.Id
+	})
+	if exist {
+		w.api.Log(ctx, plugin.LogLevelInfo, "plugin already loaded, unload first")
+		w.closeLocalPluginResources(ctx, existingLocalPlugin)
+		w.localPlugins = lo.Filter(w.localPlugins, func(lp localPlugin, _ int) bool {
+			return lp.metadata.Id != metadata.Id
+		})
+	}
+
+	// watch dist directory changes and auto reload plugin
+	distDirectory := path.Join(pluginDirectory, "dist")
+	if _, statErr := os.Stat(distDirectory); statErr == nil {
+		watcher, watchErr := util.WatchDirectoryChanges(ctx, distDirectory, func(e fsnotify.Event) {
+			if e.Op != fsnotify.Chmod {
+				// debounce reload plugin to avoid reload multiple times in a short time
+				if t, ok := w.reloadPluginTimers.Load(metadata.Id); ok {
+					t.Stop()
+				}
+				w.reloadPluginTimers.Store(metadata.Id, time.AfterFunc(time.Second*2, func() {
+					w.reloadLocalDistPlugin(ctx, metadata, "dist directory changed")
+				}))
+			}
+		})
+		if watchErr != nil {
+			w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to watch dist directory: %s", watchErr.Error()))
+		} else {
+			w.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("Watching dist directory: %s", distDirectory))
+			lp.watcher = watcher
+		}
+	}
+
+	w.localPlugins = append(w.localPlugins, lp)
+}
+
+func (w *WPMPlugin) parseMetadata(ctx context.Context, directory string) (plugin.Metadata, error) {
+	// parse plugin.json in directory
+	metadata, metadataErr := plugin.GetPluginManager().ParseMetadata(ctx, directory)
+	if metadataErr != nil {
+		return plugin.Metadata{}, fmt.Errorf("failed to parse plugin.json in %s: %s", directory, metadataErr.Error())
+	}
+	return metadata, nil
+}
+
+func (w *WPMPlugin) Query(ctx context.Context, query plugin.Query) plugin.QueryResponse {
+	if query.IsGlobalQuery() {
+		return plugin.NewQueryResponse(w.globalQueryCommand(ctx, query))
+	}
+
+	if query.Command == "" {
+		// Plugin-scoped queries do not receive fallback command suggestions from the UI.
+		var results []plugin.QueryResult
+		search := strings.ToLower(strings.TrimSpace(query.Search))
+		for _, command := range w.GetMetadata().Commands {
+			if !strings.Contains(command.Command, search) {
+				continue
+			}
+			results = append(results, plugin.QueryResult{
+				Title:       command.Command,
+				SubTitle:    string(command.Description),
+				IdentityKey: command.Command,
+				Icon:        wpmIcon,
+				Actions: []plugin.QueryResultAction{{
+					Name:                   command.Command,
+					Icon:                   icons.Get(icons.ActionOpen),
+					IsDefault:              true,
+					PreventHideAfterAction: true,
+					Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+						w.api.ChangeQuery(ctx, common.PlainQuery{
+							QueryType: plugin.QueryTypeInput,
+							QueryText: fmt.Sprintf("%s %s ", query.TriggerKeyword, command.Command),
+						})
+					},
+				}},
+			})
+		}
+		return plugin.NewQueryResponse(results)
+	}
+
+	if query.Command == "create" {
+		return plugin.NewQueryResponse(w.createCommand(ctx, query))
+	}
+
+	if query.Command == "install" {
+		response := plugin.NewQueryResponse(w.installCommand(ctx, query))
+		response.Refinements = []plugin.QueryRefinement{w.buildInstallStatusRefinement()}
+		return response
+	}
+
+	if query.Command == "update" {
+		return plugin.NewQueryResponse(w.updateCommand(ctx, query))
+	}
+
+	if query.Command == "uninstall" {
+		return plugin.NewQueryResponse(w.uninstallCommand(ctx, query))
+	}
+
+	if query.Command == "dev.add" {
+		return plugin.NewQueryResponse(w.addDevCommand(ctx, query))
+	}
+
+	if query.Command == "dev.remove" {
+		return plugin.NewQueryResponse(w.removeDevCommand(ctx, query))
+	}
+
+	if query.Command == "dev.reload" {
+		return plugin.NewQueryResponse(w.reloadDevCommand(ctx))
+	}
+
+	if query.Command == "dev.list" {
+		return plugin.NewQueryResponse(w.listDevCommand(ctx))
+	}
+
+	return plugin.QueryResponse{}
+}
+
+func (w *WPMPlugin) globalQueryCommand(ctx context.Context, query plugin.Query) []plugin.QueryResult {
+	if strings.TrimSpace(query.Search) == "" {
+		return []plugin.QueryResult{}
+	}
+
+	// Feature addition: global query should be discovery-only. The explicit
+	// "wpm install" command can show installed, upgradable, and uninstallable
+	// rows, but global search stays focused on plugins the user does not have.
+	installedById := w.buildInstalledPluginLookup()
+	results := []plugin.QueryResult{}
+	for _, pluginManifest := range w.searchStorePlugins(ctx, query.Search) {
+		if _, installed := installedById[pluginManifest.Id]; installed {
+			continue
+		}
+
+		results = append(results, w.buildGlobalStorePluginResult(ctx, pluginManifest))
+	}
+
+	return results
+}
+
+func (w *WPMPlugin) buildGlobalStorePluginResult(ctx context.Context, pluginManifest plugin.StorePluginManifest) plugin.QueryResult {
+	pluginName := pluginManifest.GetName(ctx)
+
+	// Feature addition: Enter from global query changes the launcher into the
+	// explicit WPM install command instead of installing immediately. This keeps
+	// the existing install preview and confirmation flow in one place.
+	return plugin.QueryResult{
+		Id:          uuid.NewString(),
+		Title:       pluginName,
+		SubTitle:    pluginManifest.GetDescription(ctx),
+		Icon:        w.buildPluginDetailIcon(pluginManifest),
+		IdentityKey: pluginManifest.Id,
+		Tails:       []plugin.QueryResultTail{plugin.NewQueryResultTailText(i18n.GetI18nManager().TranslateWox(ctx, "plugin_wpm_plugin_store"))},
+		Preview:     w.buildPluginDetailPreview(ctx, pluginManifest, false, false),
+		Actions: attachWPMMRUContext([]plugin.QueryResultAction{
+			{
+				Name:                   "i18n:plugin_wpm_view_install",
+				Icon:                   icons.Get(icons.ActionOpen),
+				IsDefault:              true,
+				PreventHideAfterAction: true,
+				Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+					w.api.ChangeQuery(ctx, common.PlainQuery{
+						QueryType: plugin.QueryTypeInput,
+						QueryText: fmt.Sprintf("wpm install %s", pluginName),
+					})
+				},
+			},
+		}, pluginManifest.Id),
+	}
+}
+
+func (w *WPMPlugin) buildInstallStatusRefinement() plugin.QueryRefinement {
+	// Feature addition: WPM install can now narrow store results by install
+	// state through the shared QueryRefinement channel. The default "All"
+	// value preserves the old install search behavior until the user explicitly
+	// chooses a status filter.
+	return plugin.QueryRefinement{
+		Id:           wpmInstallStatusRefinementKey,
+		Title:        "i18n:plugin_wpm_refinement_status",
+		Type:         plugin.QueryRefinementTypeSingleSelect,
+		DefaultValue: []string{wpmInstallStatusRefinementAll},
+		Hotkey:       wpmInstallStatusRefinementHotkey(),
+		Persist:      false,
+		Options: []plugin.QueryRefinementOption{
+			{Value: wpmInstallStatusRefinementAll, Title: "i18n:plugin_wpm_refinement_status_all"},
+			{Value: wpmInstallStatusRefinementInstalled, Title: "i18n:plugin_wpm_refinement_status_installed"},
+			{Value: wpmInstallStatusRefinementNotInstalled, Title: "i18n:plugin_wpm_refinement_status_not_installed"},
+			{Value: wpmInstallStatusRefinementUpgradable, Title: "i18n:plugin_wpm_refinement_status_upgradable"},
+		},
+	}
+}
+
+func wpmInstallStatusRefinementHotkey() string {
+	return util.PrimaryHotkey("s")
+}
+
+func selectedWPMInstallStatus(query plugin.Query) string {
+	selectedStatus := query.Refinements[wpmInstallStatusRefinementKey]
+	if selectedStatus == "" {
+		return wpmInstallStatusRefinementAll
+	}
+
+	switch selectedStatus {
+	case wpmInstallStatusRefinementInstalled, wpmInstallStatusRefinementNotInstalled, wpmInstallStatusRefinementUpgradable:
+		return selectedStatus
+	default:
+		return wpmInstallStatusRefinementAll
+	}
+}
+
+func wpmInstallStatusMatches(selectedStatus string, installed bool, upgradable bool) bool {
+	switch selectedStatus {
+	case wpmInstallStatusRefinementInstalled:
+		return installed
+	case wpmInstallStatusRefinementNotInstalled:
+		return !installed
+	case wpmInstallStatusRefinementUpgradable:
+		return upgradable
+	default:
+		return true
+	}
+}
+
+func (w *WPMPlugin) searchStorePlugins(ctx context.Context, keyword string) []plugin.StorePluginManifest {
+	pluginManifests := plugin.GetStoreManager().Search(ctx, keyword)
+
+	// Refactor support: global query and explicit install query both need the
+	// same stable ordering. Keeping the sort in one helper prevents discovery
+	// results from drifting away from the WPM install command.
+	sort.SliceStable(pluginManifests, func(i, j int) bool {
+		return pluginManifests[i].GetName(ctx) < pluginManifests[j].GetName(ctx)
+	})
+
+	return pluginManifests
+}
+
+func (w *WPMPlugin) buildInstalledPluginLookup() map[string]*plugin.Instance {
+	// Refactor support: install filtering and global discovery both need an
+	// exact installed-state lookup. A map keeps the behavior consistent without
+	// repeatedly scanning every installed plugin for each store row.
+	installedById := map[string]*plugin.Instance{}
+	for _, installedPlugin := range plugin.GetPluginManager().GetPluginInstances() {
+		installedById[installedPlugin.Metadata.Id] = installedPlugin
+	}
+
+	return installedById
+}
+
+func (w *WPMPlugin) createCommand(ctx context.Context, query plugin.Query) []plugin.QueryResult {
+	// Check if user has entered a plugin name
+	pluginName := strings.TrimSpace(query.Search)
+	if pluginName == "" {
+		return []plugin.QueryResult{
+			{
+				Id:       uuid.NewString(),
+				Title:    "i18n:plugin_wpm_enter_plugin_name",
+				SubTitle: "i18n:plugin_wpm_enter_plugin_name_subtitle",
+				Icon:     wpmIcon,
+			},
+		}
+	}
+
+	prompt := fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "plugin_wpm_ai_prompt"), "Wox.Plugin."+strings.TrimPrefix(pluginName, "Wox.Plugin."))
+	results := []plugin.QueryResult{{
+		Id:       uuid.NewString(),
+		Title:    "i18n:plugin_wpm_create_with_ai",
+		SubTitle: "i18n:plugin_wpm_create_with_ai_description",
+		Icon:     wpmIcon,
+		Tails:    []plugin.QueryResultTail{plugin.NewQueryResultTailText("i18n:plugin_wpm_create_with_ai_recommended")},
+		Actions: []plugin.QueryResultAction{{
+			Name:      "i18n:plugin_wpm_copy_ai_prompt",
+			Icon:      icons.Get(icons.ActionCopy),
+			IsDefault: true,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				if err := clipboard.WriteText(prompt); err != nil {
+					util.GetLogger().Error(ctx, fmt.Sprintf("Failed to copy plugin creation prompt: %s", err))
+					w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_wpm_copy_ai_prompt_failed"})
+					return
+				}
+				w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_wpm_ai_prompt_copied"})
+			},
+		}},
+	}}
+
+	// Add regular plugin templates with group
+	for _, template := range pluginTemplates {
+		templateCopy := template // Create a copy for the closure
+		results = append(results, plugin.QueryResult{
+			Id:       uuid.NewString(),
+			Title:    fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "plugin_wpm_create_plugin"), string(template.Runtime)),
+			SubTitle: fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "plugin_wpm_create_plugin_name"), query.Search),
+			Icon:     wpmIcon,
+			Group:    i18n.GetI18nManager().TranslateWox(ctx, "plugin_wpm_group_regular_plugins"),
+			Actions: []plugin.QueryResultAction{
+				{
+					Name:                   "i18n:plugin_wpm_create",
+					Icon:                   icons.Get(icons.ActionAdd),
+					PreventHideAfterAction: true,
+					Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+						pluginName := query.Search
+						util.Go(ctx, "create plugin", func() {
+							w.createPlugin(ctx, templateCopy, pluginName, query)
+						})
+						w.api.ChangeQuery(ctx, common.PlainQuery{
+							QueryType: plugin.QueryTypeInput,
+							QueryText: fmt.Sprintf("%s create ", query.TriggerKeyword),
+						})
+					},
+				},
+			}})
+	}
+
+	for _, template := range singleFilePluginTemplates {
+		templateCopy := template
+		templateDisplayName := i18n.GetI18nManager().TranslateWox(ctx, template.Name)
+		exists, fileName := w.checkSingleFilePluginExists(pluginName, template.Url)
+
+		var title, subtitle string
+		var actions []plugin.QueryResultAction
+		if exists {
+			title = fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "plugin_wpm_singlefile_plugin_exists_title"), templateDisplayName)
+			subtitle = fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "plugin_wpm_script_plugin_exists_subtitle"), fileName)
+			actions = []plugin.QueryResultAction{
+				{
+					Name: "i18n:plugin_wpm_script_plugin_open_existing_file",
+					Icon: icons.Get(icons.ActionOpen),
+					Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+						scriptFilePath := path.Join(util.GetLocation().GetUserSingleFilePluginsDirectory(), fileName)
+						openErr := shell.Open(scriptFilePath)
+						if openErr != nil {
+							w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "plugin_wpm_open_file_failed"), openErr.Error())})
+						}
+					},
+				},
+				{
+					Name:                   "i18n:plugin_wpm_script_plugin_overwrite_existing_file",
+					Icon:                   icons.Get(icons.ActionUpdate),
+					PreventHideAfterAction: true,
+					Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+						pluginName := query.Search
+						util.Go(ctx, "overwrite single-file plugin", func() {
+							w.createSingleFilePluginWithTemplate(ctx, templateCopy, pluginName, query)
+						})
+						w.api.ChangeQuery(ctx, common.PlainQuery{
+							QueryType: plugin.QueryTypeInput,
+							QueryText: fmt.Sprintf("%s create ", query.TriggerKeyword),
+						})
+					},
+				},
+			}
+		} else {
+			title = fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "plugin_wpm_singlefile_plugin_create_title"), templateDisplayName)
+			subtitle = fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "plugin_wpm_create_plugin_name"), query.Search)
+			actions = []plugin.QueryResultAction{
+				{
+					Name:                   "i18n:plugin_wpm_create",
+					Icon:                   icons.Get(icons.ActionAdd),
+					PreventHideAfterAction: true,
+					Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+						pluginName := query.Search
+						util.Go(ctx, "create single-file plugin", func() {
+							w.createSingleFilePluginWithTemplate(ctx, templateCopy, pluginName, query)
+						})
+					},
+				},
+			}
+		}
+
+		results = append(results, plugin.QueryResult{
+			Id:       uuid.NewString(),
+			Title:    title,
+			SubTitle: subtitle,
+			Icon:     wpmIcon,
+			Group:    i18n.GetI18nManager().TranslateWox(ctx, "plugin_wpm_group_singlefile_plugins"),
+			Actions:  actions,
+		})
+	}
+
+	return results
+}
+
+func (w *WPMPlugin) uninstallCommand(ctx context.Context, query plugin.Query) []plugin.QueryResult {
+	var results []plugin.QueryResult
+	plugins := plugin.GetPluginManager().GetPluginInstances()
+	plugins = lo.Filter(plugins, func(pluginInstance *plugin.Instance, _ int) bool {
+		return !pluginInstance.IsSystemPlugin
+	})
+	if query.Search != "" {
+		plugins = lo.Filter(plugins, func(pluginInstance *plugin.Instance, _ int) bool {
+			isNameMatch := plugin.IsStringMatch(ctx, pluginInstance.GetName(ctx), query.Search)
+			isDescriptionMatch := plugin.IsStringMatch(ctx, pluginInstance.GetDescription(ctx), query.Search)
+			isTriggerKeywordMatch := lo.SomeBy(pluginInstance.Metadata.TriggerKeywords, func(kw string) bool {
+				return plugin.IsStringMatchNoPinYin(ctx, kw, query.Search)
+			})
+			return isNameMatch || isDescriptionMatch || isTriggerKeywordMatch
+		})
+	}
+
+	results = lo.Map(plugins, func(pluginInstanceShadow *plugin.Instance, _ int) plugin.QueryResult {
+		// action will be executed in another go routine, so we need to copy the variable
+		pluginInstance := pluginInstanceShadow
+
+		icon := common.ParseWoxImageOrDefault(pluginInstance.Metadata.Icon, wpmIcon)
+		icon = common.ConvertRelativePathToAbsolutePath(ctx, icon, pluginInstance.PluginDirectory)
+
+		return plugin.QueryResult{
+			Id:          uuid.NewString(),
+			Title:       pluginInstance.GetName(ctx),
+			SubTitle:    pluginInstance.GetDescription(ctx),
+			Icon:        icon,
+			IdentityKey: pluginInstance.Metadata.Id,
+			Actions: attachWPMMRUContext([]plugin.QueryResultAction{
+				{
+					Name:                   "i18n:plugin_wpm_uninstall",
+					Icon:                   icons.Get(icons.ActionDelete),
+					PreventHideAfterAction: true,
+					Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+						pluginName := pluginInstance.GetName(ctx)
+						w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(
+							w.api.GetTranslation(ctx, "i18n:plugin_installer_action_start"),
+							w.api.GetTranslation(ctx, "i18n:plugin_installer_uninstall"),
+							pluginName,
+						)})
+						if err := plugin.GetStoreManager().UninstallWithProgress(ctx, pluginInstance, false, func(message string) {
+							w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("%s: %s", pluginName, message)})
+						}); err != nil {
+							w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(
+								w.api.GetTranslation(ctx, "i18n:plugin_installer_action_failed"),
+								w.api.GetTranslation(ctx, "i18n:plugin_installer_uninstall"),
+								fmt.Sprintf("%s: %s", pluginName, err.Error()),
+							)})
+						} else {
+							w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(
+								w.api.GetTranslation(ctx, "i18n:plugin_installer_action_success"),
+								pluginName,
+								w.api.GetTranslation(ctx, "i18n:plugin_installer_verb_uninstall_past"),
+							)})
+						}
+					},
+				},
+			}, pluginInstance.Metadata.Id),
+		}
+	})
+	return results
+}
+
+// buildPluginDetailIcon returns the display icon for a store plugin manifest.
+func (w *WPMPlugin) buildPluginDetailIcon(manifest plugin.StorePluginManifest) common.WoxImage {
+	if manifest.IconEmoji != "" {
+		return common.NewWoxImageEmoji(manifest.IconEmoji)
+	}
+	if manifest.IconUrl != "" {
+		return common.NewWoxImageUrl(manifest.IconUrl)
+	}
+	return wpmIcon
+}
+
+// buildPluginDetailPreview constructs the WoxPreview shown in the preview panel
+// for a plugin listed in installCommand results.
+// isInstalled reflects whether the plugin is currently installed.
+// isInstalling reflects whether an install/upgrade is currently in progress;
+// the preview intentionally no longer serializes either state. The result tail
+// and toolbar message already carry install progress, and repeating the same
+// state inside plugin detail preview made the UI feel noisy.
+func (w *WPMPlugin) buildPluginDetailPreview(ctx context.Context, manifest plugin.StorePluginManifest, isInstalled bool, isInstalling bool) plugin.WoxPreview {
+	icon := w.buildPluginDetailIcon(manifest)
+	pluginDetailData := map[string]interface{}{
+		"Id":             manifest.Id,
+		"Name":           manifest.GetName(ctx),
+		"Description":    manifest.GetDescription(ctx),
+		"Author":         manifest.Author,
+		"Version":        manifest.Version,
+		"Icon":           icon,
+		"Website":        manifest.Website,
+		"Runtime":        manifest.Runtime,
+		"ScreenshotUrls": manifest.ScreenshotUrls,
+	}
+	pluginDetailJSON, _ := json.Marshal(pluginDetailData)
+	return plugin.WoxPreview{
+		PreviewType: plugin.WoxPreviewTypePluginDetail,
+		PreviewData: string(pluginDetailJSON),
+	}
+}
+
+// buildPostInstallActions returns the actions to show after a successful
+// install or upgrade: always includes Uninstall, and adds "Start Using" when
+// the plugin has a non-wildcard trigger keyword.
+func (w *WPMPlugin) buildPostInstallActions(ctx context.Context, pluginManifest plugin.StorePluginManifest) []plugin.QueryResultAction {
+	newActions := []plugin.QueryResultAction{w.createUninstallAction(pluginManifest)}
+
+	// Brief wait for plugin manager to register the newly-loaded plugin so its
+	// trigger keywords are already available when we build the action list.
+	time.Sleep(500 * time.Millisecond)
+	instances := plugin.GetPluginManager().GetPluginInstances()
+	if len(instances) > 0 {
+		if inst, ok := lo.Find(instances, func(it *plugin.Instance) bool { return it.Metadata.Id == pluginManifest.Id }); ok {
+			// Global plugins can still expose a keyword after "*", and users may override it.
+			if kw := inst.PrimaryTriggerKeyword(); strings.TrimSpace(kw) != "" {
+				newActions = append(newActions, plugin.QueryResultAction{
+					Name:                   "i18n:plugin_wpm_start_using",
+					Icon:                   icons.Get(icons.ActionOpen),
+					PreventHideAfterAction: true,
+					IsDefault:              true,
+					Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+						w.api.ChangeQuery(ctx, common.PlainQuery{QueryType: plugin.QueryTypeInput, QueryText: kw + " "})
+					},
+				})
+			}
+		}
+	}
+	return newActions
+}
+
+// createInstallAction creates an install action with immediate UI lock:
+// as soon as the user presses Enter the install action is removed and the
+// preview shows "Installing..." so they cannot trigger a second install while
+// one is already in flight. On failure the install action is restored.
+func (w *WPMPlugin) createInstallAction(pluginManifest plugin.StorePluginManifest) plugin.QueryResultAction {
+	return plugin.QueryResultAction{
+		Name:                   "i18n:plugin_wpm_install",
+		Icon:                   icons.Get(icons.ActionInstall),
+		PreventHideAfterAction: true,
+		Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+			// Lock the UI immediately (before spawning the goroutine) so the user
+			// cannot press Enter again while the install is running.
+			if updatable := w.api.GetUpdatableResult(ctx, actionContext.ResultId); updatable != nil {
+				emptyActions := []plugin.QueryResultAction{}
+				updatable.Actions = &emptyActions
+				installingPreview := w.buildPluginDetailPreview(ctx, pluginManifest, false, true)
+				updatable.Preview = &installingPreview
+				w.api.UpdateResult(ctx, *updatable)
+			}
+
+			util.Go(ctx, "install plugin", func() {
+				pluginName := pluginManifest.GetName(ctx)
+				w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(
+					w.api.GetTranslation(ctx, "i18n:plugin_installer_action_start"),
+					w.api.GetTranslation(ctx, "i18n:plugin_installer_install"),
+					pluginName,
+				)})
+
+				installErr := plugin.GetStoreManager().InstallWithProgress(ctx, pluginManifest, func(message string) {
+					w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("%s: %s", pluginName, message)})
+				})
+
+				if installErr != nil {
+					// Restore the install action so the user can retry after a failure.
+					if updatable := w.api.GetUpdatableResult(ctx, actionContext.ResultId); updatable != nil {
+						restoredActions := []plugin.QueryResultAction{w.createInstallAction(pluginManifest)}
+						updatable.Actions = &restoredActions
+						restoredPreview := w.buildPluginDetailPreview(ctx, pluginManifest, false, false)
+						updatable.Preview = &restoredPreview
+						w.api.UpdateResult(ctx, *updatable)
+					}
+					w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(
+						w.api.GetTranslation(ctx, "i18n:plugin_installer_action_failed"),
+						w.api.GetTranslation(ctx, "i18n:plugin_installer_install"),
+						formatStorePluginInstallError(ctx, w.api, pluginManifest, installErr),
+					)})
+					return
+				}
+
+				// Update tails, preview, and actions to the installed state.
+				if updatable := w.api.GetUpdatableResult(ctx, actionContext.ResultId); updatable != nil {
+					newTails := []plugin.QueryResultTail{{Type: plugin.QueryResultTailTypeImage, Image: icons.Get(icons.StatusInstalled)}}
+					updatable.Tails = &newTails
+					successPreview := w.buildPluginDetailPreview(ctx, pluginManifest, true, false)
+					updatable.Preview = &successPreview
+					newActions := w.buildPostInstallActions(ctx, pluginManifest)
+					updatable.Actions = &newActions
+					w.api.UpdateResult(ctx, *updatable)
+				}
+
+				w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(
+					w.api.GetTranslation(ctx, "i18n:plugin_installer_action_success"),
+					pluginName,
+					w.api.GetTranslation(ctx, "i18n:plugin_installer_verb_install_past"),
+				)})
+			})
+		},
+	}
+}
+
+// createUpgradeAction creates an upgrade action with the same UI-lock pattern
+// as createInstallAction: the action is immediately removed when triggered to
+// prevent double-upgrades, and restored if the upgrade fails.
+func (w *WPMPlugin) createUpgradeAction(pluginManifest plugin.StorePluginManifest, showPreview bool) plugin.QueryResultAction {
+	return plugin.QueryResultAction{
+		Name:                   "i18n:plugin_wpm_upgrade",
+		Icon:                   icons.Get(icons.ActionUpdate),
+		PreventHideAfterAction: true,
+		Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+			// Lock the UI immediately so the user cannot press Enter again
+			// while the upgrade is running.
+			if updatable := w.api.GetUpdatableResult(ctx, actionContext.ResultId); updatable != nil {
+				emptyActions := []plugin.QueryResultAction{}
+				updatable.Actions = &emptyActions
+				if showPreview {
+					installingPreview := w.buildPluginDetailPreview(ctx, pluginManifest, true, true)
+					updatable.Preview = &installingPreview
+				}
+				w.api.UpdateResult(ctx, *updatable)
+			}
+
+			util.Go(ctx, "upgrade plugin", func() {
+				pluginName := pluginManifest.GetName(ctx)
+				w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(
+					w.api.GetTranslation(ctx, "i18n:plugin_installer_action_start"),
+					w.api.GetTranslation(ctx, "i18n:plugin_installer_upgrade"),
+					pluginName,
+				)})
+
+				installErr := plugin.GetStoreManager().InstallWithProgress(ctx, pluginManifest, func(message string) {
+					w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("%s: %s", pluginName, message)})
+				})
+
+				if installErr != nil {
+					// Restore upgrade + uninstall actions so the user can retry.
+					if updatable := w.api.GetUpdatableResult(ctx, actionContext.ResultId); updatable != nil {
+						restoredActions := []plugin.QueryResultAction{w.createUpgradeAction(pluginManifest, showPreview), w.createUninstallAction(pluginManifest)}
+						updatable.Actions = &restoredActions
+						if showPreview {
+							restoredPreview := w.buildPluginDetailPreview(ctx, pluginManifest, true, false)
+							updatable.Preview = &restoredPreview
+						} else {
+							restoredActions = restoredActions[:1]
+						}
+						w.api.UpdateResult(ctx, *updatable)
+					}
+					w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(
+						w.api.GetTranslation(ctx, "i18n:plugin_installer_action_failed"),
+						w.api.GetTranslation(ctx, "i18n:plugin_installer_upgrade"),
+						formatStorePluginInstallError(ctx, w.api, pluginManifest, installErr),
+					)})
+					return
+				}
+
+				// Update tails, preview, and actions to the installed state.
+				if updatable := w.api.GetUpdatableResult(ctx, actionContext.ResultId); updatable != nil {
+					if !showPreview {
+						w.api.RefreshQuery(ctx, plugin.RefreshQueryParam{})
+					} else {
+						newTails := []plugin.QueryResultTail{{Type: plugin.QueryResultTailTypeImage, Image: icons.Get(icons.StatusInstalled)}}
+						updatable.Tails = &newTails
+						successPreview := w.buildPluginDetailPreview(ctx, pluginManifest, true, false)
+						updatable.Preview = &successPreview
+						newActions := w.buildPostInstallActions(ctx, pluginManifest)
+						updatable.Actions = &newActions
+						w.api.UpdateResult(ctx, *updatable)
+					}
+				}
+
+				w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(
+					w.api.GetTranslation(ctx, "i18n:plugin_installer_action_success"),
+					pluginName,
+					w.api.GetTranslation(ctx, "i18n:plugin_installer_verb_upgrade_past"),
+				)})
+			})
+		},
+	}
+}
+
+// createUninstallAction creates an uninstall action that updates to install action after success
+func (w *WPMPlugin) createUninstallAction(pluginManifest plugin.StorePluginManifest) plugin.QueryResultAction {
+	return plugin.QueryResultAction{
+		Name:                   "i18n:plugin_wpm_uninstall",
+		Icon:                   icons.Get(icons.ActionDelete),
+		PreventHideAfterAction: true,
+		Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+			pluginName := pluginManifest.GetName(ctx)
+			instances := plugin.GetPluginManager().GetPluginInstances()
+			if inst, ok := lo.Find(instances, func(it *plugin.Instance) bool { return it.Metadata.Id == pluginManifest.Id }); ok {
+				util.Go(ctx, "uninstall plugin", func() {
+					w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(
+						w.api.GetTranslation(ctx, "i18n:plugin_installer_action_start"),
+						w.api.GetTranslation(ctx, "i18n:plugin_installer_uninstall"),
+						pluginName,
+					)})
+
+					uninstallErr := plugin.GetStoreManager().UninstallWithProgress(ctx, inst, false, func(message string) {
+						w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("%s: %s", pluginName, message)})
+					})
+					if uninstallErr != nil {
+						w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(
+							w.api.GetTranslation(ctx, "i18n:plugin_installer_action_failed"),
+							w.api.GetTranslation(ctx, "i18n:plugin_installer_uninstall"),
+							fmt.Sprintf("%s(%s): %s", pluginName, pluginManifest.Version, uninstallErr.Error()),
+						)})
+						return
+					}
+
+					// Update tails, preview, and actions to the uninstalled state.
+					if updatable := w.api.GetUpdatableResult(ctx, actionContext.ResultId); updatable != nil {
+						newTails := []plugin.QueryResultTail{}
+						updatable.Tails = &newTails
+						uninstalledPreview := w.buildPluginDetailPreview(ctx, pluginManifest, false, false)
+						updatable.Preview = &uninstalledPreview
+						newActions := []plugin.QueryResultAction{w.createInstallAction(pluginManifest)}
+						updatable.Actions = &newActions
+						w.api.UpdateResult(ctx, *updatable)
+					}
+
+					w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(
+						w.api.GetTranslation(ctx, "i18n:plugin_installer_action_success"),
+						pluginName,
+						w.api.GetTranslation(ctx, "i18n:plugin_installer_verb_uninstall_past"),
+					)})
+				})
+			}
+		},
+	}
+}
+
+func (w *WPMPlugin) installCommand(ctx context.Context, query plugin.Query) []plugin.QueryResult {
+	var results []plugin.QueryResult
+	pluginManifests := w.searchStorePlugins(ctx, query.Search)
+
+	// Feature addition: build one installed-plugin lookup and use it for both
+	// filtering and row decoration. The previous per-row scans were acceptable
+	// for tails/actions only, but refinement filtering needs the same status
+	// decision to stay consistent across the whole result.
+	installedById := w.buildInstalledPluginLookup()
+	selectedStatus := selectedWPMInstallStatus(query)
+
+	for _, pluginManifest := range pluginManifests {
+		installedPlugin, installedFlag := installedById[pluginManifest.Id]
+		upgradeFlag := installedFlag && plugin.IsVersionUpgradable(installedPlugin.Metadata.Version, pluginManifest.Version)
+		if !wpmInstallStatusMatches(selectedStatus, installedFlag, upgradeFlag) {
+			continue
+		}
+
+		// build tails to indicate installation/upgrade status
+		var tails []plugin.QueryResultTail
+		if installedFlag {
+			// plugin is installed, check if upgrade is available
+			if upgradeFlag {
+				// show an upgrade icon
+				tails = append(tails, plugin.QueryResultTail{Type: plugin.QueryResultTailTypeImage, Image: icons.Get(icons.ActionUpgrade)})
+			} else {
+				// show an installed icon
+				tails = append(tails, plugin.QueryResultTail{Type: plugin.QueryResultTailTypeImage, Image: icons.Get(icons.StatusInstalled)})
+			}
+		}
+
+		// decide actions based on install/upgrade status
+		var actions []plugin.QueryResultAction
+		if installedFlag {
+			if upgradeFlag {
+				// Upgrade is available: show Upgrade + Uninstall actions.
+				actions = []plugin.QueryResultAction{
+					w.createUpgradeAction(pluginManifest, true),
+					w.createUninstallAction(pluginManifest),
+				}
+			} else {
+				// installed and up-to-date: provide uninstall
+				actions = []plugin.QueryResultAction{w.createUninstallAction(pluginManifest)}
+			}
+		} else {
+			// not installed: show Install
+			actions = []plugin.QueryResultAction{w.createInstallAction(pluginManifest)}
+		}
+
+		// Add common actions for all plugins
+		if pluginManifest.Website != "" {
+			actions = append(actions, plugin.QueryResultAction{
+				Name: "i18n:plugin_wpm_visit_website",
+				Icon: icons.Get(icons.ActionOpen),
+				Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+					shell.Open(pluginManifest.Website)
+				},
+			})
+		}
+
+		if pluginManifest.DownloadUrl != "" {
+			actions = append(actions, plugin.QueryResultAction{
+				Name: "i18n:plugin_wpm_manual_download",
+				Icon: icons.Get(icons.ActionInstall),
+				Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+					shell.Open(pluginManifest.DownloadUrl)
+				},
+			})
+		}
+
+		icon := w.buildPluginDetailIcon(pluginManifest)
+		pluginName := pluginManifest.GetName(ctx)
+		pluginDescription := pluginManifest.GetDescription(ctx)
+
+		results = append(results, plugin.QueryResult{
+			Id:          uuid.NewString(),
+			Title:       pluginName,
+			SubTitle:    pluginDescription,
+			Icon:        icon,
+			IdentityKey: pluginManifest.Id,
+			Tails:       tails,
+			Preview:     w.buildPluginDetailPreview(ctx, pluginManifest, installedFlag, false),
+			Actions:     attachWPMMRUContext(actions, pluginManifest.Id),
+		})
+	}
+	return results
+}
+
+// wpmUpgradeablePlugins selects store entries with a newer version than the installed plugin.
+func wpmUpgradeablePlugins(manifests []plugin.StorePluginManifest, installed map[string]*plugin.Instance) []plugin.StorePluginManifest {
+	var upgrades []plugin.StorePluginManifest
+	for _, manifest := range manifests {
+		if instance, ok := installed[manifest.Id]; ok && plugin.IsVersionUpgradable(instance.Metadata.Version, manifest.Version) {
+			upgrades = append(upgrades, manifest)
+		}
+	}
+	return upgrades
+}
+
+// updateCommand lists upgradeable plugins and offers a sequential upgrade of all of them.
+func (w *WPMPlugin) updateCommand(ctx context.Context, query plugin.Query) []plugin.QueryResult {
+	installed := w.buildInstalledPluginLookup()
+	upgrades := wpmUpgradeablePlugins(w.searchStorePlugins(ctx, ""), installed)
+	if len(upgrades) == 0 {
+		return []plugin.QueryResult{{Title: "i18n:plugin_wpm_all_up_to_date", Icon: wpmIcon}}
+	}
+
+	query.Refinements = map[string]string{wpmInstallStatusRefinementKey: wpmInstallStatusRefinementUpgradable}
+	results := w.installCommand(ctx, query)
+	for i := range results {
+		for _, manifest := range upgrades {
+			if results[i].IdentityKey == manifest.Id {
+				results[i].Preview = plugin.WoxPreview{}
+				results[i].Tails = []plugin.QueryResultTail{plugin.NewQueryResultTailText(fmt.Sprintf("%s → %s", installed[manifest.Id].Metadata.Version, manifest.Version))}
+				results[i].Actions = attachWPMMRUContext([]plugin.QueryResultAction{w.createUpgradeAction(manifest, false)}, manifest.Id)
+				break
+			}
+		}
+	}
+	all := plugin.QueryResult{
+		Title: "i18n:plugin_wpm_upgrade_all", Icon: icons.Get(icons.ActionUpdate),
+		IdentityKey: "wpm:upgrade-all", Score: 1000000,
+		Actions: []plugin.QueryResultAction{{
+			Name: "i18n:plugin_wpm_upgrade_all", Icon: icons.Get(icons.ActionUpdate), PreventHideAfterAction: true,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				if updatable := w.api.GetUpdatableResult(ctx, actionContext.ResultId); updatable != nil {
+					empty := []plugin.QueryResultAction{}
+					updatable.Actions = &empty
+					w.api.UpdateResult(ctx, *updatable)
+				}
+				util.Go(ctx, "upgrade all plugins", func() {
+					for _, manifest := range upgrades {
+						name := manifest.GetName(ctx)
+						w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(w.api.GetTranslation(ctx, "i18n:plugin_installer_action_start"), w.api.GetTranslation(ctx, "i18n:plugin_installer_upgrade"), name)})
+						err := plugin.GetStoreManager().InstallWithProgress(ctx, manifest, func(message string) {
+							w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("%s: %s", name, message)})
+						})
+						if err != nil {
+							w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(w.api.GetTranslation(ctx, "i18n:plugin_installer_action_failed"), w.api.GetTranslation(ctx, "i18n:plugin_installer_upgrade"), formatStorePluginInstallError(ctx, w.api, manifest, err))})
+							continue
+						}
+						w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(w.api.GetTranslation(ctx, "i18n:plugin_installer_action_success"), name, w.api.GetTranslation(ctx, "i18n:plugin_installer_verb_upgrade_past"))})
+					}
+					if w.api.GetUpdatableResult(ctx, actionContext.ResultId) != nil {
+						w.api.RefreshQuery(ctx, plugin.RefreshQueryParam{})
+					}
+				})
+			},
+		}},
+	}
+	return append([]plugin.QueryResult{all}, results...)
+}
+
+func (w *WPMPlugin) listDevCommand(ctx context.Context) []plugin.QueryResult {
+	//list all local plugins
+	return lo.Map(w.localPlugins, func(lp localPlugin, _ int) plugin.QueryResult {
+		pluginName := w.getLocalPluginName(ctx, lp.metadata)
+		pluginDescription := w.getLocalPluginDescription(ctx, lp.metadata)
+		iconImage := common.ParseWoxImageOrDefault(lp.metadata.Icon, wpmIcon)
+		iconImage, _ = common.ConvertPluginIcon(ctx, iconImage, lp.metadata.Id, lp.metadata.Directory, common.IconConversion{})
+
+		return plugin.QueryResult{
+			Id:       uuid.NewString(),
+			Title:    pluginName,
+			SubTitle: pluginDescription,
+			Icon:     iconImage,
+			Preview: plugin.WoxPreview{
+				PreviewType: plugin.WoxPreviewTypeMarkdown,
+				PreviewData: fmt.Sprintf(`
+- **Directory**: %s
+- **Name**: %s
+- **Description**: %s
+- **Author**: %s
+- **Website**: %s
+- **Version**: %s
+- **MinWoxVersion**: %s
+- **Runtime**: %s
+- **Entry**: %s
+- **TriggerKeywords**: %s
+- **Commands**: %v
+- **SupportedOS**: %s
+- **Features**: %v
+`, lp.metadata.Directory, pluginName, pluginDescription, lp.metadata.Author,
+					lp.metadata.Website, lp.metadata.Version, lp.metadata.MinWoxVersion,
+					lp.metadata.Runtime, lp.metadata.Entry, lp.metadata.TriggerKeywords,
+					lp.metadata.Commands, lp.metadata.SupportedOS, lp.metadata.Features),
+			},
+			Actions: []plugin.QueryResultAction{
+				{
+					Name:      "i18n:plugin_wpm_reload",
+					Icon:      icons.Get(icons.ActionUpdate),
+					IsDefault: true,
+					Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+						w.reloadLocalDistPlugin(ctx, lp.metadata, "reload by user")
+					},
+				},
+				{
+					Name: "i18n:plugin_wpm_open_directory",
+					Icon: icons.Get(icons.ActionOpenContainingFolder),
+					Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+						openErr := shell.Open(lp.metadata.Directory)
+						if openErr != nil {
+							w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "plugin_wpm_open_directory_failed"), openErr.Error())})
+						}
+					},
+				},
+				{
+					Name: "i18n:plugin_wpm_remove",
+					Icon: icons.Get(icons.ActionHide),
+					Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+						w.removeLocalPluginDirectory(ctx, lp.metadata.Directory)
+					},
+				},
+				{
+					Name: "i18n:plugin_wpm_remove_and_delete",
+					Icon: icons.Get(icons.ActionDelete),
+					Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+						deleteErr := trash.MoveToTrash(lp.metadata.Directory)
+						if deleteErr != nil {
+							w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to delete plugin directory: %s", deleteErr.Error()))
+							return
+						}
+
+						w.removeLocalPluginDirectory(ctx, lp.metadata.Directory)
+					},
+				},
+			},
+		}
+	})
+}
+
+func (w *WPMPlugin) reloadDevCommand(ctx context.Context) []plugin.QueryResult {
+	return []plugin.QueryResult{
+		{
+			Title:       "i18n:plugin_wpm_reload_all_plugins",
+			IdentityKey: "wpm:reload-all",
+			Icon:        wpmIcon,
+			Actions: []plugin.QueryResultAction{
+				{
+					Name:                   "i18n:plugin_wpm_reload",
+					Icon:                   icons.Get(icons.ActionUpdate),
+					PreventHideAfterAction: true,
+					Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+						w.reloadAllDevPlugins(ctx)
+						util.Go(ctx, "reload dev plugins in dist", func() {
+							newCtx := util.NewTraceContext()
+							for _, lp := range w.localPlugins {
+								w.reloadLocalDistPlugin(newCtx, lp.metadata, "reload after user action")
+							}
+						})
+					},
+				},
+			},
+		},
+	}
+}
+
+func (w *WPMPlugin) addDevCommand(ctx context.Context, query plugin.Query) []plugin.QueryResult {
+	w.api.Log(ctx, plugin.LogLevelInfo, "Please choose a directory to add local plugin")
+	pluginDirectories := plugin.GetPluginManager().GetUI().PickFiles(ctx, common.PickFilesParams{IsDirectory: true})
+	if len(pluginDirectories) == 0 {
+		w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_wpm_choose_directory"})
+		return []plugin.QueryResult{}
+	}
+
+	pluginDirectory := pluginDirectories[0]
+
+	if containsLocalPluginDirectory(w.localPluginDirectories, pluginDirectory) {
+		w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_wpm_directory_already_added"})
+		return []plugin.QueryResult{}
+	}
+
+	w.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("Add local plugin: %s", pluginDirectory))
+	w.localPluginDirectories = append(w.localPluginDirectories, pluginDirectory)
+	w.saveLocalPluginDirectories(ctx)
+	w.loadDevPlugin(ctx, pluginDirectory)
+	return []plugin.QueryResult{}
+}
+
+func (w *WPMPlugin) removeDevCommand(ctx context.Context, query plugin.Query) []plugin.QueryResult {
+	if len(query.Search) == 0 {
+		w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_wpm_input_directory"})
+		return []plugin.QueryResult{}
+	}
+
+	pluginDirectory := query.Search
+	if !containsLocalPluginDirectory(w.localPluginDirectories, pluginDirectory) {
+		w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_wpm_directory_not_found"})
+		return []plugin.QueryResult{}
+	}
+
+	w.removeLocalPluginDirectory(ctx, pluginDirectory)
+	return []plugin.QueryResult{}
+}
+
+func (w *WPMPlugin) createPlugin(ctx context.Context, template pluginTemplate, pluginName string, query plugin.Query) {
+	w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_wpm_downloading_template"})
+
+	tempPluginDirectory := path.Join(os.TempDir(), uuid.NewString())
+	if err := util.GetLocation().EnsureDirectoryExist(tempPluginDirectory); err != nil {
+		w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to create temp plugin directory: %s", err.Error()))
+		w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "plugin_wpm_create_temp_dir_failed"), err.Error())})
+		return
+	}
+
+	w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "plugin_wpm_downloading_template_to"), template.Runtime, tempPluginDirectory)})
+	tempZipPath := path.Join(tempPluginDirectory, "template.zip")
+	err := util.HttpDownload(ctx, template.Url, tempZipPath)
+	if err != nil {
+		w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to download template: %s", err.Error()))
+		w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "plugin_wpm_download_template_failed"), err.Error())})
+		return
+	}
+
+	w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_wpm_extracting_template"})
+	err = util.Unzip(tempZipPath, tempPluginDirectory)
+	if err != nil {
+		w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to extract template: %s", err.Error()))
+		w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "plugin_wpm_extract_template_failed"), err.Error())})
+		return
+	}
+
+	w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_wpm_choose_directory_prompt"})
+	pluginDirectories := plugin.GetPluginManager().GetUI().PickFiles(ctx, common.PickFilesParams{IsDirectory: true})
+	if len(pluginDirectories) == 0 {
+		w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "You need to choose a directory to create the plugin"})
+		return
+	}
+	pluginDirectory := path.Join(pluginDirectories[0], pluginName)
+	w.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("Creating plugin in directory: %s", pluginDirectory))
+
+	cpErr := cp.Copy(path.Join(tempPluginDirectory, template.Name+"-main"), pluginDirectory)
+	if cpErr != nil {
+		w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to copy template: %s", cpErr.Error()))
+		w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("Failed to copy template: %s", cpErr.Error())})
+		return
+	}
+
+	// replace variables in plugin.json
+	pluginJsonPath := path.Join(pluginDirectory, "plugin.json")
+	pluginJson, readErr := os.ReadFile(pluginJsonPath)
+	if readErr != nil {
+		w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to read plugin.json: %s", readErr.Error()))
+		w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("Failed to read plugin.json: %s", readErr.Error())})
+		return
+	}
+
+	pluginJsonString := renderPluginTemplateManifest(string(pluginJson), pluginName, template.Runtime)
+
+	writeErr := os.WriteFile(pluginJsonPath, []byte(pluginJsonString), 0644)
+	if writeErr != nil {
+		w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to write plugin.json: %s", writeErr.Error()))
+		w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("Failed to write plugin.json: %s", writeErr.Error())})
+		return
+	}
+
+	// replace variables in package.json
+	if template.Runtime == plugin.PLUGIN_RUNTIME_NODEJS {
+		packageJsonPath := path.Join(pluginDirectory, "package.json")
+		packageJson, readPackageErr := os.ReadFile(packageJsonPath)
+		if readPackageErr != nil {
+			w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to read package.json: %s", readPackageErr.Error()))
+			w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("Failed to read package.json: %s", readPackageErr.Error())})
+			return
+		}
+
+		packageJsonString := string(packageJson)
+		packageName := strings.ReplaceAll(strings.ToLower(pluginName), ".", "_")
+		packageJsonString = strings.ReplaceAll(packageJsonString, "replace_me_with_name", packageName)
+
+		writePackageErr := os.WriteFile(packageJsonPath, []byte(packageJsonString), 0644)
+		if writePackageErr != nil {
+			w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to write package.json: %s", writePackageErr.Error()))
+			w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("Failed to write package.json: %s", writePackageErr.Error())})
+			return
+		}
+	}
+
+	w.localPluginDirectories = append(w.localPluginDirectories, pluginDirectory)
+	w.saveLocalPluginDirectories(ctx)
+	w.loadDevPlugin(ctx, pluginDirectory)
+	w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("Plugin created successfully: %s", pluginName)})
+	w.api.ChangeQuery(ctx, common.PlainQuery{
+		QueryType: plugin.QueryTypeInput,
+		QueryText: fmt.Sprintf("%s dev ", query.TriggerKeyword),
+	})
+}
+
+func (w *WPMPlugin) saveLocalPluginDirectories(ctx context.Context) {
+	var localPluginDirs []LocalPlugin
+	for _, directory := range w.localPluginDirectories {
+		localPluginDirs = append(localPluginDirs, LocalPlugin{Path: directory})
+	}
+
+	data, marshalErr := json.Marshal(localPluginDirs)
+	if marshalErr != nil {
+		w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to marshal local plugin directories: %s", marshalErr.Error()))
+		return
+	}
+	w.api.SaveSetting(ctx, localPluginDirectoriesKey, string(data), true)
+}
+
+// removeLocalPluginDirectory persists the remaining directories and drops the
+// in-memory local plugin so wpm dev.list matches the settings table immediately.
+func (w *WPMPlugin) removeLocalPluginDirectory(ctx context.Context, pluginDirectory string) {
+	w.localPluginDirectories = lo.Filter(w.localPluginDirectories, func(directory string, _ int) bool {
+		return !sameLocalPluginDirectory(directory, pluginDirectory)
+	})
+	w.saveLocalPluginDirectories(ctx)
+	w.unloadLocalPluginByDirectory(ctx, pluginDirectory)
+}
+
+func (w *WPMPlugin) hasLocalPluginDirectory(directory string) bool {
+	for _, lp := range w.localPlugins {
+		if sameLocalPluginDirectory(lp.metadata.Directory, directory) {
+			return true
+		}
+	}
+	return false
+}
+
+// unloadLocalPluginByDirectory stops watching a removed local plugin directory
+// and unloads the matching dev plugin instance if it is currently running.
+func (w *WPMPlugin) unloadLocalPluginByDirectory(ctx context.Context, directory string) {
+	remaining := make([]localPlugin, 0, len(w.localPlugins))
+	for _, lp := range w.localPlugins {
+		if !sameLocalPluginDirectory(lp.metadata.Directory, directory) {
+			remaining = append(remaining, lp)
+			continue
+		}
+		w.closeLocalPluginResources(ctx, lp)
+		w.unloadLoadedDevPluginInstance(ctx, directory)
+	}
+	w.localPlugins = remaining
+}
+
+// closeLocalPluginResources releases the directory watcher and pending reload timer.
+func (w *WPMPlugin) closeLocalPluginResources(ctx context.Context, lp localPlugin) {
+	lp.watcher.Close()
+	if w.reloadPluginTimers == nil || lp.metadata.Id == "" {
+		return
+	}
+	if timer, ok := w.reloadPluginTimers.Load(lp.metadata.Id); ok && timer != nil {
+		timer.Stop()
+	}
+	w.reloadPluginTimers.Delete(lp.metadata.Id)
+}
+
+// unloadLoadedDevPluginInstance unloads a running plugin that was loaded from
+// this local development directory.
+func (w *WPMPlugin) unloadLoadedDevPluginInstance(ctx context.Context, directory string) {
+	manager := plugin.GetPluginManager()
+	if manager == nil {
+		return
+	}
+	for _, instance := range manager.GetPluginInstances() {
+		if instance == nil || !instance.IsDevPlugin {
+			continue
+		}
+		if sameLocalPluginDirectory(instance.DevPluginDirectory, directory) {
+			manager.UnloadPlugin(ctx, instance)
+		}
+	}
+}
+
+func (w *WPMPlugin) reloadLocalDistPlugin(ctx context.Context, localPlugin plugin.Metadata, reason string) error {
+	localPluginName := w.getLocalPluginName(ctx, localPlugin)
+	w.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("Reloading plugin: %s, reason: %s", localPluginName, reason))
+
+	// find dist directory, if not exist, prompt user to build it
+	distDirectory := path.Join(localPlugin.Directory, "dist")
+	_, statErr := os.Stat(distDirectory)
+	if statErr != nil {
+		w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to stat dist directory: %s", statErr.Error()))
+		return statErr
+	}
+
+	distPluginMetadata, err := w.parseMetadata(ctx, distDirectory)
+	if err != nil {
+		w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to load local plugin: %s", err.Error()))
+		return err
+	}
+	distPluginMetadata.IsDev = true
+	distPluginMetadata.DevPluginDirectory = localPlugin.Directory
+
+	reloadErr := plugin.GetPluginManager().ReloadPlugin(ctx, distPluginMetadata)
+	if reloadErr != nil {
+		w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to reload plugin: %s", reloadErr.Error()))
+		return reloadErr
+	} else {
+		w.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("Reloaded plugin: %s", localPluginName))
+	}
+
+	w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "plugin_wpm_reload_success"), localPluginName, reason)})
+	return nil
+}
+
+// renderPluginTemplateManifest supports both legacy and current official template placeholders.
+func renderPluginTemplateManifest(manifest string, name string, runtime plugin.Runtime) string {
+	for key, value := range map[string]string{
+		"Id": uuid.NewString(), "Name": name, "Runtime": strings.ToLower(string(runtime)),
+		"TriggerKeyword": "np", "Description": name, "Author": "Wox User", "Website": "",
+	} {
+		encoded, _ := json.Marshal(value)
+		manifest = strings.ReplaceAll(manifest, `"{{.`+key+`}}"`, string(encoded))
+		if key == "TriggerKeyword" {
+			key = "Trigger Keyword"
+		}
+		manifest = strings.ReplaceAll(manifest, `"[`+key+`]"`, string(encoded))
+	}
+	return manifest
+}
+
+func singleFilePluginFileName(pluginName string, templateFile string) string {
+	safeName := strings.TrimSpace(pluginName)
+	safeName = strings.ReplaceAll(safeName, " ", "")
+	safeName = strings.Map(func(r rune) rune {
+		if r == '.' || r == '_' || r == '-' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			return r
+		}
+		return -1
+	}, safeName)
+	if safeName == "" {
+		safeName = "Plugin"
+	}
+	fileExtension := ".js"
+	if templateFile == "template.py" {
+		fileExtension = ".py"
+	}
+	return "Wox.Plugin." + safeName + fileExtension
+}
+
+func (w *WPMPlugin) checkSingleFilePluginExists(pluginName string, templateFile string) (bool, string) {
+	fileName := singleFilePluginFileName(pluginName, templateFile)
+	filePath := path.Join(util.GetLocation().GetUserSingleFilePluginsDirectory(), fileName)
+	if _, err := os.Stat(filePath); err == nil {
+		return true, fileName
+	}
+	return false, fileName
+}
+
+func (w *WPMPlugin) createSingleFilePluginWithTemplate(ctx context.Context, template pluginTemplate, pluginName string, query plugin.Query) {
+	w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_wpm_creating_singlefile_plugin"})
+
+	directory := util.GetLocation().GetUserSingleFilePluginsDirectory()
+	if err := util.GetLocation().EnsureDirectoryExist(directory); err != nil {
+		w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to create single-file plugin directory: %s", err.Error()))
+		w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("i18n:plugin_wpm_create_script_dir_failed: %s", err.Error())})
+		return
+	}
+
+	templateFile := template.Url
+	w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_wpm_copying_template"})
+	templatePath := path.Join(util.GetLocation().GetSingleFilePluginTemplatesDirectory(), templateFile)
+	templateContent, err := os.ReadFile(templatePath)
+	if err != nil {
+		w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to read template file: %s", err.Error()))
+		w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("i18n:plugin_wpm_read_template_failed: %s", err.Error())})
+		return
+	}
+
+	cleanPluginName := strings.TrimSpace(pluginName)
+	if cleanPluginName == "" {
+		w.api.Log(ctx, plugin.LogLevelError, "Plugin name is empty")
+		w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_wpm_plugin_name_empty"})
+		return
+	}
+
+	scriptFileName := singleFilePluginFileName(cleanPluginName, templateFile)
+	scriptFilePath := path.Join(directory, scriptFileName)
+	if _, err := os.Stat(scriptFilePath); err == nil {
+		w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("i18n:plugin_wpm_overwriting_script_plugin: %s", scriptFileName)})
+	}
+
+	triggerKeyword := strings.ToLower(strings.ReplaceAll(cleanPluginName, " ", ""))
+	if len(triggerKeyword) > 10 {
+		triggerKeyword = triggerKeyword[:10]
+	}
+	triggerKeywordsJSON, err := json.Marshal([]string{triggerKeyword})
+	if err != nil {
+		w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to render template: %s", err.Error()))
+		w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("i18n:plugin_wpm_render_template_failed: %s", err.Error())})
+		return
+	}
+
+	author := "Wox User"
+	if currentUser, userErr := user.Current(); userErr == nil {
+		if currentUser.Name != "" {
+			author = currentUser.Name
+		} else if currentUser.Username != "" {
+			author = currentUser.Username
+		}
+	}
+
+	templateData := struct {
+		PluginID            string
+		Name                string
+		Author              string
+		Description         string
+		TriggerKeywordsJSON string
+		Runtime             string
+		MinWoxVersion       string
+	}{
+		PluginID:            uuid.NewString(),
+		Name:                cleanPluginName,
+		Author:              author,
+		Description:         fmt.Sprintf("A single-file SDK plugin for %s", cleanPluginName),
+		TriggerKeywordsJSON: string(triggerKeywordsJSON),
+		Runtime:             string(template.Runtime),
+		MinWoxVersion:       plugin.SingleFilePluginMinWoxVersion,
+	}
+
+	scriptTemplate, err := texttmpl.New("single-file-plugin").Option("missingkey=error").Parse(string(templateContent))
+	if err != nil {
+		w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to render template: %s", err.Error()))
+		w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("i18n:plugin_wpm_render_template_failed: %s", err.Error())})
+		return
+	}
+
+	var renderedTemplate bytes.Buffer
+	if err := scriptTemplate.Execute(&renderedTemplate, templateData); err != nil {
+		w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to render template: %s", err.Error()))
+		w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("i18n:plugin_wpm_render_template_failed: %s", err.Error())})
+		return
+	}
+
+	pluginManager := plugin.GetPluginManager()
+	pluginManager.IgnoreSingleFileWatch(scriptFilePath)
+	if err := os.WriteFile(scriptFilePath, renderedTemplate.Bytes(), 0644); err != nil {
+		w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to write plugin file: %s", err.Error()))
+		w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("i18n:plugin_wpm_create_script_file_failed: %s", err.Error())})
+		return
+	}
+
+	w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("i18n:plugin_wpm_singlefile_plugin_created_success: %s", scriptFileName)})
+	w.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("Created single-file plugin: %s", scriptFilePath))
+	if openErr := shell.Open(scriptFilePath); openErr != nil {
+		w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "plugin_wpm_open_file_failed"), openErr.Error())})
+	}
+
+	util.Go(ctx, "load single-file plugin immediately", func() {
+		metadata, parseErr := pluginManager.ParseSingleFilePluginMetadata(ctx, scriptFilePath)
+		if parseErr != nil {
+			w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to parse single-file metadata: %s", parseErr.Error()))
+			w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("i18n:plugin_wpm_script_plugin_manual_try: %s", triggerKeyword)})
+			return
+		}
+		if loadErr := pluginManager.ReloadPlugin(ctx, metadata); loadErr != nil {
+			w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to load single-file plugin: %s", loadErr.Error()))
+			w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("i18n:plugin_wpm_script_plugin_manual_try: %s", triggerKeyword)})
+			return
+		}
+		w.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("Successfully loaded single-file plugin: %s", metadata.GetName(ctx)))
+		initCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		if initErr := pluginManager.WaitPluginInit(initCtx, metadata.Id); initErr != nil {
+			w.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Single-file plugin failed to initialize: %s", initErr.Error()))
+			w.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("i18n:plugin_wpm_script_plugin_manual_try: %s", triggerKeyword)})
+			return
+		}
+		w.api.ChangeQuery(ctx, common.PlainQuery{
+			QueryType: plugin.QueryTypeInput,
+			QueryText: fmt.Sprintf("%s ", triggerKeyword),
+		})
+	})
+}
+
+func attachWPMMRUContext(actions []plugin.QueryResultAction, pluginID string) []plugin.QueryResultAction {
+	for i := range actions {
+		if actions[i].ContextData == nil {
+			actions[i].ContextData = common.ContextData{"pluginId": pluginID}
+			continue
+		}
+		actions[i].ContextData["pluginId"] = pluginID
+	}
+	return actions
+}
+
+// handleMRURestore opens a still-available store or installed plugin from its id.
+func (w *WPMPlugin) handleMRURestore(ctx context.Context, mruData plugin.MRUData) (*plugin.QueryResult, error) {
+	pluginID := strings.TrimSpace(mruData.ContextData["pluginId"])
+	if pluginID == "" {
+		return nil, fmt.Errorf("empty plugin id in context data")
+	}
+	if inst, ok := lo.Find(plugin.GetPluginManager().GetPluginInstances(), func(item *plugin.Instance) bool {
+		return item.Metadata.Id == pluginID
+	}); ok {
+		icon := common.ParseWoxImageOrDefault(inst.Metadata.Icon, wpmIcon)
+		icon = common.ConvertRelativePathToAbsolutePath(ctx, icon, inst.PluginDirectory)
+		result := plugin.QueryResult{
+			Title:       inst.GetName(ctx),
+			SubTitle:    inst.GetDescription(ctx),
+			Icon:        icon,
+			IdentityKey: inst.Metadata.Id,
+			Actions: attachWPMMRUContext([]plugin.QueryResultAction{
+				{
+					Name:                   "i18n:plugin_wpm_start_using",
+					Icon:                   icons.Get(icons.ActionOpen),
+					PreventHideAfterAction: true,
+					Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+						if keyword := inst.PrimaryTriggerKeyword(); keyword != "" {
+							w.api.ChangeQuery(ctx, common.PlainQuery{QueryType: plugin.QueryTypeInput, QueryText: keyword + " "})
+						}
+					},
+				},
+			}, inst.Metadata.Id),
+		}
+		return &result, nil
+	}
+	for _, manifest := range w.searchStorePlugins(ctx, "") {
+		if manifest.Id != pluginID {
+			continue
+		}
+		result := w.buildGlobalStorePluginResult(ctx, manifest)
+		return &result, nil
+	}
+	return nil, fmt.Errorf("plugin is no longer installed or in the store: %s", pluginID)
+}

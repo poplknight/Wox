@@ -1,0 +1,63 @@
+package shell
+
+import (
+	"fmt"
+	"os/exec"
+	"strings"
+	"wox/util"
+)
+
+func Open(path string) error {
+	if strings.HasSuffix(path, ".app") {
+		_, err := Run("open", "-a", path)
+		return err
+	}
+
+	_, err := Run("open", path)
+	return err
+}
+
+func Run(name string, arg ...string) (*exec.Cmd, error) {
+	return RunWithEnv(name, []string{}, arg...)
+}
+
+func RunWithEnv(name string, envs []string, arg ...string) (*exec.Cmd, error) {
+	cmd := BuildCommand(name, envs, arg...)
+	cmd.Stdout = util.GetLogger().GetWriter()
+	cmd.Stderr = util.GetLogger().GetWriter()
+	cmd.Dir = getWorkingDirectory(name)
+	cmdErr := cmd.Start()
+	if cmdErr != nil {
+		return nil, cmdErr
+	}
+
+	return cmd, nil
+}
+
+func RunOutput(name string, arg ...string) ([]byte, error) {
+	cmd := BuildCommand(name, nil, arg...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if output != nil {
+			return nil, fmt.Errorf("%s: %s", err, output)
+		}
+
+		return nil, err
+	} else {
+		return output, nil
+	}
+}
+
+func OpenFileInFolder(path string) error {
+	return exec.Command("open", "-R", path).Start()
+}
+
+// RunElevated is only implemented on Windows, where UAC can elevate a process.
+func RunElevated(file string, parameters string, directory string) (WaitFunc, error) {
+	return nil, fmt.Errorf("elevated execution is only supported on Windows")
+}
+
+// HideWindowCmd is a no-op on macOS as there's no console window to hide
+func HideWindowCmd(cmd *exec.Cmd) {
+	// No-op on macOS
+}

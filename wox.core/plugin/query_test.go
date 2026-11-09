@@ -1,0 +1,323 @@
+package plugin
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+	"wox/common"
+	"wox/setting"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestPreviewOnlyQueryLayoutHidesResultList(t *testing.T) {
+	icon := common.NewWoxImageEmoji("🔗")
+	layout := previewOnlyQueryLayout(&icon)
+
+	assert.Equal(t, &icon, layout.Icon)
+	if assert.NotNil(t, layout.ResultPreviewWidthRatio) {
+		assert.Equal(t, 0.0, *layout.ResultPreviewWidthRatio)
+	}
+	assert.Nil(t, layout.GridLayout)
+	assert.False(t, layout.ChatMode)
+}
+
+func TestQueryResponseAutoRecordQueryHistoryStaysInsideCore(t *testing.T) {
+	data, err := json.Marshal(QueryResponse{AutoRecordQueryHistory: true})
+	assert.NoError(t, err)
+	assert.False(t, strings.Contains(string(data), "AutoRecordQueryHistory"))
+
+	var response QueryResponse
+	assert.NoError(t, json.Unmarshal([]byte(`{"AutoRecordQueryHistory":true}`), &response))
+	assert.False(t, response.AutoRecordQueryHistory)
+}
+
+// TestQueryLayoutWindowSizeStaysInsideCore guards the internal sizing contract in both directions.
+func TestQueryLayoutWindowSizeStaysInsideCore(t *testing.T) {
+	layout := QueryLayout{WindowWidth: 640, WindowHeight: 720}
+	merged := (&Manager{}).mergeQueryLayouts(QueryLayout{}, layout)
+	assert.Equal(t, layout, merged)
+
+	data, err := json.Marshal(QueryResponse{Layout: merged})
+	assert.NoError(t, err)
+	assert.NotContains(t, string(data), "WindowWidth")
+	assert.NotContains(t, string(data), "WindowHeight")
+	var response QueryResponse
+	assert.NoError(t, json.Unmarshal([]byte(`{"Layout":{"WindowWidth":640,"WindowHeight":720}}`), &response))
+	assert.Zero(t, response.Layout.WindowWidth)
+	assert.Zero(t, response.Layout.WindowHeight)
+}
+
+func getFakePluginInstances() []*Instance {
+	return []*Instance{
+		{
+			Metadata: Metadata{
+				TriggerKeywords: []string{"wpm", "*"},
+				Commands: []MetadataCommand{
+					{
+						Command:     "install",
+						Description: common.I18nString("Install Wox plugins"),
+					},
+					{
+						Command:     "uninstall",
+						Description: common.I18nString("Uninstall Wox plugins"),
+					},
+					{
+						Command:     "dev.list",
+						Description: common.I18nString("List dev plugins"),
+					},
+					{
+						Command:     "dev.remove",
+						Description: common.I18nString("Remove dev plugin"),
+					},
+					{
+						Command:     "dev.reload",
+						Description: common.I18nString("Reload dev plugin"),
+					},
+				},
+			},
+			Setting: &setting.PluginSetting{},
+		},
+	}
+}
+
+func Test_NewQuery(t *testing.T) {
+	q, _ := newQueryInputWithPlugins("wpm", getFakePluginInstances())
+	assert.Equal(t, q.TriggerKeyword, "")
+	assert.Equal(t, q.Command, "")
+	assert.Equal(t, q.Search, "wpm")
+
+	q, _ = newQueryInputWithPlugins("wpm install", getFakePluginInstances())
+	assert.Equal(t, q.TriggerKeyword, "wpm")
+	assert.Equal(t, q.Command, "")
+	assert.Equal(t, q.Search, "install")
+
+	q, _ = newQueryInputWithPlugins("wpm install ", getFakePluginInstances())
+	assert.Equal(t, q.TriggerKeyword, "wpm")
+	assert.Equal(t, q.Command, "install")
+	assert.Equal(t, q.Search, "")
+
+	q, _ = newQueryInputWithPlugins("wpm install q q1", getFakePluginInstances())
+	assert.Equal(t, q.TriggerKeyword, "wpm")
+	assert.Equal(t, q.Command, "install")
+	assert.Equal(t, q.Search, "q q1")
+
+	q, _ = newQueryInputWithPlugins("other install q q1", getFakePluginInstances())
+	assert.Equal(t, q.TriggerKeyword, "")
+	assert.Equal(t, q.Command, "")
+	assert.Equal(t, q.Search, "other install q q1")
+}
+
+func Test_BuildQueryCompletionHint_Command(t *testing.T) {
+	q, pluginInstance := newQueryInputWithPlugins("wpm i", getFakePluginInstances())
+
+	hint := BuildQueryCompletionHint(q, pluginInstance, nil)
+
+	assert.NotNil(t, hint)
+	assert.Equal(t, "wpm i", hint.InputPrefix)
+	assert.Equal(t, "wpm install ", hint.CompletionText)
+	assert.Equal(t, "nstall ", hint.Suffix)
+	assert.Equal(t, QueryCompletionSourceCommand, hint.Source)
+}
+
+func Test_BuildQueryCompletionHint_History(t *testing.T) {
+	q, pluginInstance := newQueryInputWithPlugins("wpm xyz", getFakePluginInstances())
+	histories := []setting.QueryHistory{
+		{
+			Query: common.PlainQuery{
+				QueryType: QueryTypeInput,
+				QueryText: "wpm xyz github",
+			},
+			Timestamp: 1,
+		},
+	}
+
+	hint := BuildQueryCompletionHint(q, pluginInstance, histories)
+
+	assert.NotNil(t, hint)
+	assert.Equal(t, "wpm xyz github", hint.CompletionText)
+	assert.Equal(t, " github", hint.Suffix)
+	assert.Equal(t, QueryCompletionSourceHistory, hint.Source)
+}
+
+func Test_BuildQueryCompletionHint_CommandBeatsOlderHistory(t *testing.T) {
+	q, pluginInstance := newQueryInputWithPlugins("wpm i", getFakePluginInstances())
+	histories := []setting.QueryHistory{
+		{
+			Query: common.PlainQuery{
+				QueryType: QueryTypeInput,
+				QueryText: "wpm install old",
+			},
+			Timestamp: 1,
+		},
+	}
+
+	hint := BuildQueryCompletionHint(q, pluginInstance, histories)
+
+	assert.NotNil(t, hint)
+	assert.Equal(t, "wpm install ", hint.CompletionText)
+	assert.Equal(t, QueryCompletionSourceCommand, hint.Source)
+}
+
+func Test_BuildQueryCompletionHint_NoHintForCompletedCommand(t *testing.T) {
+	q, pluginInstance := newQueryInputWithPlugins("wpm install", getFakePluginInstances())
+
+	hint := BuildQueryCompletionHint(q, pluginInstance, nil)
+
+	assert.Nil(t, hint)
+}
+
+func Test_BuildQueryCompletionHint_NoHintForNonPrefixHistory(t *testing.T) {
+	q, pluginInstance := newQueryInputWithPlugins("wpm z", getFakePluginInstances())
+	histories := []setting.QueryHistory{
+		{
+			Query: common.PlainQuery{
+				QueryType: QueryTypeInput,
+				QueryText: "wpm install github",
+			},
+			Timestamp: 1,
+		},
+	}
+
+	hint := BuildQueryCompletionHint(q, pluginInstance, histories)
+
+	assert.Nil(t, hint)
+}
+
+func Test_BuildQueryCompletionHint_NoCommandHintForAmbiguousCommandPrefix(t *testing.T) {
+	q, pluginInstance := newQueryInputWithPlugins("wpm d", getFakePluginInstances())
+
+	hint := BuildQueryCompletionHint(q, pluginInstance, nil)
+
+	assert.Nil(t, hint)
+}
+
+func Test_BuildQueryCompletionHint_CommandHintWhenPrefixBecomesUnique(t *testing.T) {
+	q, pluginInstance := newQueryInputWithPlugins("wpm dev.rel", getFakePluginInstances())
+
+	hint := BuildQueryCompletionHint(q, pluginInstance, nil)
+
+	assert.NotNil(t, hint)
+	assert.Equal(t, "wpm dev.reload ", hint.CompletionText)
+	assert.Equal(t, "oad ", hint.Suffix)
+	assert.Equal(t, QueryCompletionSourceCommand, hint.Source)
+}
+
+func Test_BuildQueryCompletionHint_NoGlobalHistoryForShortInput(t *testing.T) {
+	q, pluginInstance := newQueryInputWithPlugins("gi", getFakePluginInstances())
+	histories := []setting.QueryHistory{
+		{
+			Query: common.PlainQuery{
+				QueryType: QueryTypeInput,
+				QueryText: "git status",
+			},
+			Timestamp: 1,
+		},
+	}
+
+	hint := BuildQueryCompletionHint(q, pluginInstance, histories)
+
+	assert.Nil(t, hint)
+}
+
+func Test_BuildQueryCompletionHint_GlobalHistoryAfterMinimumInput(t *testing.T) {
+	q, pluginInstance := newQueryInputWithPlugins("git", getFakePluginInstances())
+	histories := []setting.QueryHistory{
+		{
+			Query: common.PlainQuery{
+				QueryType: QueryTypeInput,
+				QueryText: "git status",
+			},
+			Timestamp: 1,
+		},
+	}
+
+	hint := BuildQueryCompletionHint(q, pluginInstance, histories)
+
+	assert.NotNil(t, hint)
+	assert.Equal(t, "git status", hint.CompletionText)
+	assert.Equal(t, " status", hint.Suffix)
+	assert.Equal(t, QueryCompletionSourceHistory, hint.Source)
+	assert.Equal(t, queryCompletionGlobalHistoryMinLen, hint.DeletionReuseMinLength)
+}
+
+func Test_BuildQueryCompletionHint_CommandPrefixBeatsLongerHistory(t *testing.T) {
+	q, pluginInstance := newQueryInputWithPlugins("wpm ins", getFakePluginInstances())
+	histories := []setting.QueryHistory{
+		{
+			Query: common.PlainQuery{
+				QueryType: QueryTypeInput,
+				QueryText: "wpm install github",
+			},
+			Timestamp: 1,
+		},
+	}
+
+	hint := BuildQueryCompletionHint(q, pluginInstance, histories)
+
+	assert.NotNil(t, hint)
+	assert.Equal(t, "wpm install ", hint.CompletionText)
+	assert.Equal(t, "tall ", hint.Suffix)
+	assert.Equal(t, QueryCompletionSourceCommand, hint.Source)
+	assert.Zero(t, hint.DeletionReuseMinLength)
+}
+
+func Test_BuildQueryCompletionHint_CommandArgumentHistory(t *testing.T) {
+	q, pluginInstance := newQueryInputWithPlugins("wpm install gi", getFakePluginInstances())
+	histories := []setting.QueryHistory{
+		{
+			Query: common.PlainQuery{
+				QueryType: QueryTypeInput,
+				QueryText: "wpm install github",
+			},
+			Timestamp: 1,
+		},
+	}
+
+	hint := BuildQueryCompletionHint(q, pluginInstance, histories)
+
+	assert.NotNil(t, hint)
+	assert.Equal(t, "wpm install github", hint.CompletionText)
+	assert.Equal(t, "thub", hint.Suffix)
+	assert.Equal(t, QueryCompletionSourceHistory, hint.Source)
+	assert.Zero(t, hint.DeletionReuseMinLength)
+}
+
+func Test_BuildQueryCompletionHint_NoHintWhenOriginalInputPrefixDoesNotMatchCompletion(t *testing.T) {
+	q, pluginInstance := newQueryInputWithPlugins("wpm i", getFakePluginInstances())
+
+	hint := BuildQueryCompletionHintForInputPrefix(q, pluginInstance, nil, "wi")
+
+	assert.Nil(t, hint)
+}
+
+func TestRankAboveUsageIsNotDecodedFromPluginJSON(t *testing.T) {
+	var result QueryResult
+	err := json.Unmarshal([]byte(`{"Title":"..","RankAboveUsage":true,"Score":1000}`), &result)
+	assert.NoError(t, err)
+	assert.False(t, result.RankAboveUsage)
+	assert.Equal(t, "..", result.Title)
+	assert.Equal(t, int64(1000), result.Score)
+}
+
+func TestQueryResultAcceptsLegacyScoreKey(t *testing.T) {
+	var legacy QueryResult
+	err := json.Unmarshal([]byte(`{"Title":"Open","ScoreKey":"open_system_settings"}`), &legacy)
+	assert.NoError(t, err)
+	assert.Equal(t, "open_system_settings", legacy.IdentityKey)
+
+	var snake QueryResult
+	err = json.Unmarshal([]byte(`{"Title":"Open","score_key":"open_system_settings"}`), &snake)
+	assert.NoError(t, err)
+	assert.Equal(t, "open_system_settings", snake.IdentityKey)
+
+	var current QueryResult
+	err = json.Unmarshal([]byte(`{"Title":"Open","IdentityKey":"open_system_settings","score_key":"old"}`), &current)
+	assert.NoError(t, err)
+	assert.Equal(t, "open_system_settings", current.IdentityKey)
+
+	var snakeIdentity QueryResult
+	err = json.Unmarshal([]byte(`{"Title":"Open","identity_key":"open_system_settings","score_key":"old"}`), &snakeIdentity)
+	assert.NoError(t, err)
+	assert.Equal(t, "open_system_settings", snakeIdentity.IdentityKey)
+}

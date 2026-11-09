@@ -1,0 +1,733 @@
+package view
+
+import (
+	"testing"
+
+	woxcomponent "wox/ui/launcher/component"
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+)
+
+// TestPreviewButtonUsesLogicalBounds verifies the icon stays clickable beside tails at different display scales.
+func TestPreviewButtonUsesLogicalBounds(t *testing.T) {
+	for _, scale := range []float32{1, 1.5, 2} {
+		opened, activated := 0, 0
+		tooltip := ""
+		host := woxwidget.NewHost(func(woxui.FrameInfo) woxwidget.Widget {
+			return LauncherResultsView(LauncherResultsProps{
+				Width: 320, Height: 50, ContentHeight: 50, RowHeight: 50,
+				Items: []LauncherResultItem{{
+					ID: "preview", Title: "A long file name that must not cover the preview button", Selected: true,
+					PreviewIcon: &woxui.Image{}, PreviewTooltip: "Open preview (Ctrl+P)",
+					OnOpenPreview: func() { opened++ }, OnActivate: func() { activated++ },
+					OnTooltip: func(inside bool, text string, _ woxui.Rect) {
+						if inside {
+							tooltip = text
+						}
+					},
+					Tails: []LauncherResultTail{{Text: "1ms", Width: 32, Height: 22}}, TailWidth: 32, TailHeight: 22,
+				}},
+			})
+		})
+		host.AttachServices(actionSearchHostServices{})
+		host.Frame(&woxui.DisplayList{}, woxui.FrameInfo{Size: woxui.Size{Width: 320, Height: 50}, PixelSize: woxui.PixelSize{Width: int(320 * scale), Height: int(50 * scale)}, Scale: scale})
+		var button woxui.AccessibilityNode
+		for _, node := range host.Snapshot().Tree.Nodes {
+			if node.AutomationID == "result-preview-preview" {
+				button = node
+			}
+		}
+		if button.Label != "Open preview (Ctrl+P)" || button.Bounds.Width != 28 || button.Bounds.X+button.Bounds.Width > 320 {
+			t.Fatalf("scale %v: invalid preview button: %#v", scale, button)
+		}
+		point := woxui.Point{X: button.Bounds.X + 14, Y: button.Bounds.Y + 14}
+		host.Pointer(woxui.PointerEvent{Kind: woxui.PointerMove, Position: point})
+		host.Pointer(woxui.PointerEvent{Kind: woxui.PointerDown, Position: point, Button: woxui.PointerButtonPrimary})
+		host.Pointer(woxui.PointerEvent{Kind: woxui.PointerUp, Position: point, Button: woxui.PointerButtonPrimary})
+		if opened != 1 || activated != 0 || tooltip != button.Label {
+			t.Fatalf("scale %v: opened=%d activated=%d tooltip=%q", scale, opened, activated, tooltip)
+		}
+	}
+}
+
+func TestLauncherResultGroupUsesFlutterTitleTypography(t *testing.T) {
+	titleColor := woxui.Color{R: 240, G: 242, B: 244, A: 255}
+	result := LauncherResultsView(LauncherResultsProps{
+		Width:         320,
+		Height:        50,
+		ContentHeight: 50,
+		RowHeight:     50,
+		Theme: woxcomponent.Theme{
+			ResultTitle:    titleColor,
+			ResultSubtitle: woxui.Color{R: 120, G: 125, B: 130, A: 255},
+		},
+		Items: []LauncherResultItem{{Title: "Today", Group: true}},
+	}).(woxwidget.Semantics)
+	scrollGesture := result.Child.(woxwidget.Container).Child.(woxwidget.Semantics).Child.(woxwidget.Gesture)
+	stack := scrollGesture.Child.(woxwidget.Stack)
+	scroll := stack.Children[0].Child.(woxwidget.ScrollView)
+	content := scroll.Child.(woxwidget.Container)
+	row := content.Child.(woxwidget.Flex).Children[0].(woxwidget.Container)
+	if row.Height != 50 {
+		t.Fatalf("group row height = %.0f, want the supplied row height when GroupRowHeight is unset", row.Height)
+	}
+	titleBoundary := row.Child.(woxwidget.Align).Child.(woxwidget.Boundary[launcherResultTextProps])
+	label := titleBoundary.Build(titleBoundary.Props).(woxwidget.Text)
+
+	if label.Color != titleColor {
+		t.Fatalf("group title color = %#v, want Flutter result title color %#v", label.Color, titleColor)
+	}
+	if label.Style.Size != 15 || label.Style.Weight != woxui.FontWeightRegular {
+		t.Fatalf("group title style = %#v, want Flutter 15px normal result title typography", label.Style)
+	}
+}
+
+func TestLauncherResultGroupUsesCompactHeaderHeight(t *testing.T) {
+	result := LauncherResultsView(LauncherResultsProps{
+		Width: 320, Height: 28, ContentHeight: 28, RowHeight: 56, GroupRowHeight: 28,
+		Items: []LauncherResultItem{{Title: "Files", Group: true}},
+	}).(woxwidget.Semantics)
+	scrollGesture := result.Child.(woxwidget.Container).Child.(woxwidget.Semantics).Child.(woxwidget.Gesture)
+	stack := scrollGesture.Child.(woxwidget.Stack)
+	scroll := stack.Children[0].Child.(woxwidget.ScrollView)
+	content := scroll.Child.(woxwidget.Container)
+	row := content.Child.(woxwidget.Flex).Children[0].(woxwidget.Container)
+	if row.Height != 28 {
+		t.Fatalf("group row height = %.0f, want compact header height 28", row.Height)
+	}
+}
+
+func TestLauncherResultsScrollbarUsesValueText(t *testing.T) {
+	title := woxui.Color{R: 240, G: 242, B: 244, A: 255}
+	result := LauncherResultsView(LauncherResultsProps{
+		Width: 320, Height: 50, ContentHeight: 150, RowHeight: 50,
+		Theme: woxcomponent.Theme{ResultTitle: title, ResultSubtitle: woxui.Color{R: 255, A: 255}},
+		Items: []LauncherResultItem{{Title: "Result"}},
+	}).(woxwidget.Semantics)
+	scroll := result.Child.(woxwidget.Container).Child.(woxwidget.Semantics).Child.(woxwidget.Stateful).Widget.(woxcomponent.ScrollViewProps)
+	if scroll.ThumbColor != title {
+		t.Fatalf("launcher scrollbar = %#v, want ResultTitle so ResultSubtitle cannot restyle it", scroll.ThumbColor)
+	}
+}
+
+func TestLauncherResultsExposeCompletionState(t *testing.T) {
+	result := LauncherResultsView(LauncherResultsProps{Width: 320, Height: 50, ContentHeight: 50, RowHeight: 50, Complete: true}).(woxwidget.Semantics)
+	if result.Value != "complete" || !result.ReadOnly {
+		t.Fatalf("result completion semantics = value %q readonly %v", result.Value, result.ReadOnly)
+	}
+}
+
+func TestLauncherResultExposesHoveredSemantics(t *testing.T) {
+	host := woxwidget.NewHost(func(woxui.FrameInfo) woxwidget.Widget {
+		return LauncherResultsView(LauncherResultsProps{
+			Width: 320, Height: 50, ContentHeight: 50, RowHeight: 50,
+			Items: []LauncherResultItem{{ID: "hovered", Title: "Hovered", Hovered: true}},
+		})
+	})
+	host.AttachServices(actionSearchHostServices{})
+	frame := woxui.FrameInfo{Size: woxui.Size{Width: 320, Height: 50}, PixelSize: woxui.PixelSize{Width: 320, Height: 50}, Scale: 1}
+	host.Frame(&woxui.DisplayList{}, frame)
+	var row woxui.AccessibilityNode
+	for _, node := range host.Snapshot().Tree.Nodes {
+		if node.AutomationID == "launcher.result.hovered" {
+			row = node
+			break
+		}
+	}
+	if row.AutomationID == "" {
+		t.Fatal("hovered result was missing from the host snapshot")
+	}
+	if !row.Hovered || row.Selected {
+		t.Fatalf("hovered result snapshot = hovered %v selected %v, want hover without selection", row.Hovered, row.Selected)
+	}
+}
+
+func TestLauncherResultWiresSecondaryTap(t *testing.T) {
+	tapped := false
+	result := LauncherResultsView(LauncherResultsProps{
+		Width: 320, Height: 50, ContentHeight: 50, RowHeight: 50,
+		Items: []LauncherResultItem{{ID: "result", Title: "Result", OnSecondaryTapDown: func() { tapped = true }}},
+	}).(woxwidget.Semantics)
+	listScroll := result.Child.(woxwidget.Container).Child.(woxwidget.Semantics).Child.(woxwidget.Gesture).Child.(woxwidget.Stack).Children[0].Child.(woxwidget.ScrollView)
+	row := listScroll.Child.(woxwidget.Container).Child.(woxwidget.Flex).Children[0].(woxwidget.Semantics)
+	gesture := row.Child.(woxwidget.Gesture)
+
+	gesture.OnSecondaryTapDown(woxui.Point{})
+	if !tapped {
+		t.Fatal("secondary tap callback was not wired to the result row")
+	}
+}
+
+func TestLauncherResultStillPointerDoesNotHoverUntilMove(t *testing.T) {
+	phase := 0
+	hovered := ""
+	host := woxwidget.NewHost(func(woxui.FrameInfo) woxwidget.Widget {
+		if phase == 0 {
+			return woxwidget.Gesture{ID: "placeholder", Child: woxwidget.Container{Width: 320, Height: 120}}
+		}
+		return LauncherResultsView(LauncherResultsProps{
+			Width: 320, Height: 120, ContentHeight: 100, RowHeight: 50, Complete: true,
+			Theme: woxcomponent.Theme{ResultTitle: woxui.Color{A: 255}},
+			Items: []LauncherResultItem{
+				{ID: "first", Title: "Open Wox Settings", OnHover: func(inside bool) {
+					if inside {
+						hovered = "first"
+					} else if hovered == "first" {
+						hovered = ""
+					}
+				}},
+				{ID: "second", Title: "QQ Music", OnHover: func(inside bool) {
+					if inside {
+						hovered = "second"
+					} else if hovered == "second" {
+						hovered = ""
+					}
+				}},
+			},
+		})
+	})
+	host.AttachServices(actionSearchHostServices{})
+	frame := woxui.FrameInfo{Size: woxui.Size{Width: 320, Height: 120}, PixelSize: woxui.PixelSize{Width: 320, Height: 120}, Scale: 1}
+	host.Frame(&woxui.DisplayList{}, frame)
+	host.Pointer(woxui.PointerEvent{Kind: woxui.PointerMove, Position: woxui.Point{X: 160, Y: 75}})
+	phase = 1
+	host.Frame(&woxui.DisplayList{}, frame)
+	if hovered != "" {
+		t.Fatalf("opening results under a still pointer hovered %q, want no hover", hovered)
+	}
+	host.Pointer(woxui.PointerEvent{Kind: woxui.PointerMove, Position: woxui.Point{X: 162, Y: 77}})
+	if hovered != "second" {
+		t.Fatalf("pointer move hovered %q, want the row under the cursor", hovered)
+	}
+}
+
+func TestLauncherResultWithoutSubtitleCentersTitleVertically(t *testing.T) {
+	result := LauncherResultsView(LauncherResultsProps{
+		Width: 320, Height: 50, ContentHeight: 50, RowHeight: 50,
+		Items: []LauncherResultItem{{ID: "no-subtitle", Title: "Everything"}},
+	}).(woxwidget.Semantics)
+	listScroll := result.Child.(woxwidget.Container).Child.(woxwidget.Semantics).Child.(woxwidget.Gesture).Child.(woxwidget.Stack).Children[0].Child.(woxwidget.ScrollView)
+	row := listScroll.Child.(woxwidget.Container).Child.(woxwidget.Flex).Children[0].(woxwidget.Semantics)
+	content := launcherResultRowContent(row)
+	if len(content.Children) != 2 {
+		t.Fatalf("row children = %d, want icon and label without a zero-width tail slot", len(content.Children))
+	}
+	labelViewport := content.Children[1].(woxwidget.Clip)
+	label := labelViewport.Child.(woxwidget.Container).Child.(woxwidget.Align)
+
+	if label.Vertical != 0.5 || label.Height != 50 {
+		t.Fatalf("title alignment = vertical %.1f height %.0f, want 0.5/50", label.Vertical, label.Height)
+	}
+}
+
+func TestLauncherResultMultilineSubtitleUsesSingleLineCenteredGroup(t *testing.T) {
+	result := LauncherResultsView(LauncherResultsProps{
+		Width: 320, Height: 50, ContentHeight: 50, RowHeight: 50,
+		Items: []LauncherResultItem{{ID: "multiline-subtitle", Title: "Reinstall plugin", Subtitle: "Version: 1.0\nDescription: details"}},
+	}).(woxwidget.Semantics)
+	listScroll := result.Child.(woxwidget.Container).Child.(woxwidget.Semantics).Child.(woxwidget.Gesture).Child.(woxwidget.Stack).Children[0].Child.(woxwidget.ScrollView)
+	row := listScroll.Child.(woxwidget.Container).Child.(woxwidget.Flex).Children[0].(woxwidget.Semantics)
+	labelContainer := launcherResultRowContent(row).Children[1].(woxwidget.Clip).Child.(woxwidget.Container)
+	label := labelContainer.Child.(woxwidget.Align)
+	labels := label.Child.(woxwidget.Flex)
+	subtitle := labels.Children[1].(woxwidget.Boundary[launcherResultTextProps])
+
+	if label.Vertical != 0.5 || subtitle.Props.Value != "Version: 1.0 Description: details" {
+		t.Fatalf("multiline subtitle layout = vertical %.1f value %q, want 0.5/single-line flattened text", label.Vertical, subtitle.Props.Value)
+	}
+}
+
+func TestLauncherResultMultilineTitleUsesSingleLine(t *testing.T) {
+	result := LauncherResultsView(LauncherResultsProps{
+		Width: 320, Height: 50, ContentHeight: 50, RowHeight: 50,
+		Items: []LauncherResultItem{{ID: "multiline-title", Title: "你说得对，是我把战略\r\n真正的问题不是“Wox"}},
+	}).(woxwidget.Semantics)
+	listScroll := result.Child.(woxwidget.Container).Child.(woxwidget.Semantics).Child.(woxwidget.Gesture).Child.(woxwidget.Stack).Children[0].Child.(woxwidget.ScrollView)
+	row := listScroll.Child.(woxwidget.Container).Child.(woxwidget.Flex).Children[0].(woxwidget.Semantics)
+	labels := launcherResultRowContent(row).Children[1].(woxwidget.Clip).Child.(woxwidget.Container).Child.(woxwidget.Align).Child.(woxwidget.Flex)
+	title := labels.Children[0].(woxwidget.Boundary[launcherResultTextProps])
+
+	if title.Props.Value != "你说得对，是我把战略 真正的问题不是“Wox" {
+		t.Fatalf("multiline title = %q, want a single flattened line", title.Props.Value)
+	}
+	if row.Label != title.Props.Value {
+		t.Fatalf("result accessibility label = %q, want the flattened title", row.Label)
+	}
+}
+
+func TestLauncherResultTailsScrollHorizontallyWhenClipped(t *testing.T) {
+	result := LauncherResultsView(LauncherResultsProps{
+		Width: 300, Height: 50, ContentHeight: 50, RowHeight: 50,
+		Theme: woxcomponent.Theme{ResultTitle: woxui.Color{A: 255}},
+		Items: []LauncherResultItem{{
+			ID: "many-tags", Title: "Result", TailWidth: 80, TailHeight: 22,
+			Tails: []LauncherResultTail{{Text: "first", Width: 50, Height: 22}, {Text: "second", Width: 50, Height: 22}},
+		}},
+	}).(woxwidget.Semantics)
+	listScroll := result.Child.(woxwidget.Container).Child.(woxwidget.Semantics).Child.(woxwidget.Gesture).Child.(woxwidget.Stack).Children[0].Child.(woxwidget.ScrollView)
+	row := listScroll.Child.(woxwidget.Container).Child.(woxwidget.Flex).Children[0].(woxwidget.Semantics)
+	tailAlignment := launcherResultRowContent(row).Children[2].(woxwidget.Align)
+	tailBoundary := tailAlignment.Child.(woxwidget.Boundary[launcherResultTailsProps])
+	if tailAlignment.Vertical != 0.5 || tailAlignment.Height != 50 {
+		t.Fatalf("tail alignment = %#v, want full-height vertical center", tailAlignment)
+	}
+	tails := tailBoundary.Build(tailBoundary.Props).(woxwidget.ScrollView)
+
+	if !tails.Horizontal || tails.Key != "launcher-result-tails-many-tags" {
+		t.Fatalf("tail scroll = horizontal %v key %q, want true/stable result key", tails.Horizontal, tails.Key)
+	}
+	if tails.Width != 80 || tails.ContentWidth != 120 || tails.InitialOffset != 40 {
+		t.Fatalf("tail scroll geometry = viewport %.0f content %.0f offset %.0f, want 80/120 starting at the right edge", tails.Width, tails.ContentWidth, tails.InitialOffset)
+	}
+	if tails.KeepVisible == nil || tails.KeepVisible.Start != 40 || tails.KeepVisible.End != 120 {
+		t.Fatalf("tail keep-visible = %#v, want the overflowing right edge", tails.KeepVisible)
+	}
+}
+
+func TestLauncherResultTailsAlignToTheRightWhenTheyFit(t *testing.T) {
+	result := LauncherResultsView(LauncherResultsProps{
+		Width: 300, Height: 50, ContentHeight: 50, RowHeight: 50,
+		Theme: woxcomponent.Theme{ResultTitle: woxui.Color{A: 255}},
+		Items: []LauncherResultItem{{
+			ID: "short-tags", Title: "Result", TailWidth: 120, TailHeight: 22,
+			Tails: []LauncherResultTail{{Text: "cpu", Width: 40, Height: 22}},
+		}},
+	}).(woxwidget.Semantics)
+	listScroll := result.Child.(woxwidget.Container).Child.(woxwidget.Semantics).Child.(woxwidget.Gesture).Child.(woxwidget.Stack).Children[0].Child.(woxwidget.ScrollView)
+	row := listScroll.Child.(woxwidget.Container).Child.(woxwidget.Flex).Children[0].(woxwidget.Semantics)
+	tailBoundary := launcherResultRowContent(row).Children[2].(woxwidget.Align).Child.(woxwidget.Boundary[launcherResultTailsProps])
+	aligned := tailBoundary.Build(tailBoundary.Props).(woxwidget.Align)
+	pinned := aligned.Child.(woxwidget.Container)
+	if aligned.Width != 120 || aligned.Horizontal != 1 || pinned.Width != 50 {
+		t.Fatalf("fitting tails = slot %.0f horizontal %.1f content %.0f, want a right-aligned 50-wide tag in a 120 slot", aligned.Width, aligned.Horizontal, pinned.Width)
+	}
+}
+
+func TestLauncherResultLoadingIconAnimatesSpinner(t *testing.T) {
+	result := LauncherResultsView(LauncherResultsProps{
+		Width: 300, Height: 50, ContentHeight: 50, RowHeight: 50,
+		Theme: woxcomponent.Theme{Cursor: woxui.Color{R: 10, G: 20, B: 30, A: 255}},
+		Items: []LauncherResultItem{{ID: "ai-match", Title: "AI matching...", Loading: true}},
+	}).(woxwidget.Semantics)
+	listScroll := result.Child.(woxwidget.Container).Child.(woxwidget.Semantics).Child.(woxwidget.Gesture).Child.(woxwidget.Stack).Children[0].Child.(woxwidget.ScrollView)
+	row := listScroll.Child.(woxwidget.Container).Child.(woxwidget.Flex).Children[0].(woxwidget.Semantics)
+	icon := launcherResultRowContent(row).Children[0].(woxwidget.Align).Child.(woxwidget.Boundary[launcherResultIconProps])
+	if _, ok := icon.Build(icon.Props).(woxwidget.LoopAnimation); !ok {
+		t.Fatal("loading list result does not animate the shared loading indicator")
+	}
+}
+
+func TestLauncherResultBoundaryEqualCoversAllFields(t *testing.T) {
+	woxwidget.AssertEqualCoversAllFields(t, launcherResultBackgroundProps{})
+	woxwidget.AssertEqualCoversAllFields(t, launcherResultIconProps{})
+	woxwidget.AssertEqualCoversAllFields(t, launcherResultTextProps{})
+	woxwidget.AssertEqualCoversAllFields(t, launcherResultTailsProps{})
+}
+
+// TestLauncherResultActiveLeftBorder keeps marker state separate from content geometry.
+func TestLauncherResultActiveLeftBorder(t *testing.T) {
+	color := woxui.Color{R: 20, G: 180, B: 100, A: 255}
+	for _, selected := range []bool{false, true} {
+		for _, width := range []float32{-4, 0, 4} {
+			for _, density := range []float32{1, 1.5, 2} {
+				props := launcherResultRowProps{
+					Item:     LauncherResultItem{ID: "border", Title: "Title", Selected: selected, Hovered: true},
+					RowWidth: 300, RowHeight: 54, InnerRowWidth: 284, BaseHeight: 50,
+					ItemPadding: woxwidget.Insets{Left: 8, Right: 8}, DensityScale: density,
+					Theme: woxcomponent.Theme{SelectedBorderLeftWidth: width, SelectedBorderLeftColor: color, Cursor: woxui.Color{A: 255}},
+				}
+				row := launcherResultRow(props).(woxwidget.Semantics)
+				stack := row.Child.(woxwidget.Gesture).Child.(woxwidget.Stack)
+				boundary := stack.Children[0].Child.(woxwidget.Boundary[launcherResultBackgroundProps])
+				background := boundary.Build(boundary.Props).(woxwidget.Container)
+				want := float32(0)
+				if selected {
+					want = max(float32(0), width)
+				}
+				if background.LeftBorderWidth != want || (selected && background.LeftBorderColor != color) {
+					t.Fatalf("selected=%t width=%v density=%v: unexpected border %#v", selected, width, density, background)
+				}
+				content := stack.Children[1].Child.(woxwidget.Container)
+				if content.Width != props.RowWidth || content.Padding != props.ItemPadding {
+					t.Fatalf("marker changed content geometry: %#v", content)
+				}
+				props.Item.Group = true
+				group := launcherResultRow(props).(woxwidget.Container)
+				if group.LeftBorderWidth != 0 {
+					t.Fatal("group heading must not have a selection marker")
+				}
+			}
+		}
+	}
+}
+
+func TestLauncherResultUsesIndependentUpdateBoundaries(t *testing.T) {
+	result := LauncherResultsView(LauncherResultsProps{
+		Width: 300, Height: 50, ContentHeight: 50, RowHeight: 50,
+		Theme: woxcomponent.Theme{ResultTitle: woxui.Color{A: 255}},
+		Items: []LauncherResultItem{{
+			ID: "live", Title: "Title", Subtitle: "Subtitle", Icon: &woxui.Image{Width: 28, Height: 28}, TailWidth: 60, TailHeight: 22,
+			Tails: []LauncherResultTail{{Text: "1%", Width: 60, Height: 22}},
+		}},
+	}).(woxwidget.Semantics)
+	listScroll := result.Child.(woxwidget.Container).Child.(woxwidget.Semantics).Child.(woxwidget.Gesture).Child.(woxwidget.Stack).Children[0].Child.(woxwidget.ScrollView)
+	row := listScroll.Child.(woxwidget.Container).Child.(woxwidget.Flex).Children[0].(woxwidget.Semantics)
+	rowStack := row.Child.(woxwidget.Gesture).Child.(woxwidget.Stack)
+	background := rowStack.Children[0].Child.(woxwidget.Boundary[launcherResultBackgroundProps])
+	content := launcherResultRowContent(row)
+	icon := content.Children[0].(woxwidget.Align).Child.(woxwidget.Boundary[launcherResultIconProps])
+	labelViewport := content.Children[1].(woxwidget.Clip)
+	labels := labelViewport.Child.(woxwidget.Container).Child.(woxwidget.Align).Child.(woxwidget.Flex)
+	title := labels.Children[0].(woxwidget.Boundary[launcherResultTextProps])
+	subtitle := labels.Children[1].(woxwidget.Boundary[launcherResultTextProps])
+	tails := content.Children[2].(woxwidget.Align).Child.(woxwidget.Boundary[launcherResultTailsProps])
+
+	want := []woxwidget.Key{
+		LauncherResultBackgroundBoundaryKey("live"), LauncherResultIconBoundaryKey("live"), LauncherResultTitleBoundaryKey("live"),
+		LauncherResultSubtitleBoundaryKey("live"), LauncherResultTailsBoundaryKey("live"),
+	}
+	got := []woxwidget.Key{background.Key, icon.Key, title.Key, subtitle.Key, tails.Key}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("result boundary keys = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestLauncherResultTitleTagsStayVisibleWhenTitleIsLong(t *testing.T) {
+	result := LauncherResultsView(LauncherResultsProps{
+		Width: 260, Height: 50, ContentHeight: 50, RowHeight: 50,
+		Theme: woxcomponent.Theme{ResultTitle: woxui.Color{A: 255}},
+		Items: []LauncherResultItem{{
+			ID: "bound", Title: "Open a very long settings result title that would otherwise hide trailing chips",
+			TitleTags: []LauncherResultTitleTag{
+				{Text: "sz", Kind: LauncherResultTitleTagKindAlias, Tooltip: "Result alias"},
+				{Text: "ctrl+alt+s", Kind: LauncherResultTitleTagKindHotkey, Labels: []string{"Ctrl", "Alt", "S"}, Tooltip: "Result hotkey"},
+			},
+			TailWidth: 40, Tails: []LauncherResultTail{{Text: "tail", Width: 40, Height: 22}},
+		}},
+	}).(woxwidget.Semantics)
+	listScroll := result.Child.(woxwidget.Container).Child.(woxwidget.Semantics).Child.(woxwidget.Gesture).Child.(woxwidget.Stack).Children[0].Child.(woxwidget.ScrollView)
+	row := listScroll.Child.(woxwidget.Container).Child.(woxwidget.Flex).Children[0].(woxwidget.Semantics)
+	if row.Description != "sz ctrl+alt+s" {
+		t.Fatalf("row description = %q, want title tags to stay readable", row.Description)
+	}
+	content := launcherResultRowContent(row)
+	viewport := content.Children[1].(woxwidget.Clip)
+	label := viewport.Child.(woxwidget.Container)
+	if viewport.Width != label.Width {
+		t.Fatalf("tagged label widths = viewport %.0f content %.0f, want the title clip to reserve the same width as the visible label", viewport.Width, label.Width)
+	}
+	labels := label.Child.(woxwidget.Align).Child.(woxwidget.Flex)
+	titleRow := labels.Children[0].(woxwidget.Flex)
+	if len(titleRow.Children) != 3 {
+		t.Fatalf("title row children = %d, want clipped title plus alias and hotkey chips", len(titleRow.Children))
+	}
+	flexible, ok := titleRow.Children[0].(woxwidget.Flexible)
+	if !ok {
+		t.Fatal("long titles must shrink before title tags")
+	}
+	built := flexible.Child.(woxwidget.LayoutBuilder).Build(woxui.Size{Width: 180, Height: 50})
+	constrained, ok := built.(woxwidget.Constrained)
+	if !ok || constrained.MaxWidth != 180 || constrained.FillWidth {
+		t.Fatalf("title constraint = %#v, want a shrink-wrapped max width so tags follow the text", built)
+	}
+	aliasCaps := titleRow.Children[1].(woxwidget.Container).Child.(woxwidget.Align).Child.(woxwidget.Flex).Children
+	if len(aliasCaps) != 1 || launcherResultHotkeyKeycapLabel(aliasCaps[0]) != "SZ" {
+		t.Fatalf("alias keycaps = %v, want one SZ chip matching hotkey glyph case", aliasCaps)
+	}
+	hotkeyCaps := titleRow.Children[2].(woxwidget.Container).Child.(woxwidget.Align).Child.(woxwidget.Flex).Children
+	if len(hotkeyCaps) != 3 {
+		t.Fatalf("hotkey keycaps = %d, want Ctrl, Alt, and S", len(hotkeyCaps))
+	}
+	if got := launcherResultHotkeyKeycapLabel(hotkeyCaps[0]); got != "Ctrl" {
+		t.Fatalf("first hotkey keycap = %q, want Ctrl", got)
+	}
+	if got := launcherResultHotkeyKeycapLabel(hotkeyCaps[2]); got != "S" {
+		t.Fatalf("last hotkey keycap = %q, want S", got)
+	}
+	aliasStyle := launcherResultHotkeyKeycapText(aliasCaps[0]).Style
+	hotkeyStyle := launcherResultHotkeyKeycapText(hotkeyCaps[0]).Style
+	if aliasStyle != hotkeyStyle || aliasStyle.Size != woxcomponent.ResultTitleTagFontSize {
+		t.Fatalf("title tag text style = alias %+v hotkey %+v, want the same keycap type", aliasStyle, hotkeyStyle)
+	}
+	if aliasStyle.Size != woxcomponent.TailFontSize {
+		t.Fatalf("title tag font = %v, want tail size %v", aliasStyle.Size, woxcomponent.TailFontSize)
+	}
+	if aliasCaps[0].(woxwidget.Stack).Height != 16 || hotkeyCaps[0].(woxwidget.Stack).Height != 16 {
+		t.Fatalf("title tag keycap height = alias %.0f hotkey %.0f, want dense 16", aliasCaps[0].(woxwidget.Stack).Height, hotkeyCaps[0].(woxwidget.Stack).Height)
+	}
+
+	host := woxwidget.NewHost(func(woxui.FrameInfo) woxwidget.Widget {
+		return LauncherResultsView(LauncherResultsProps{
+			Width: 320, Height: 50, ContentHeight: 50, RowHeight: 50,
+			Theme: woxcomponent.Theme{ResultTitle: woxui.Color{A: 255}},
+			Items: []LauncherResultItem{{
+				ID: "bound", Title: "Open Wox Settings",
+				TitleTags: []LauncherResultTitleTag{{
+					Text: "ctrl+shift+s", Kind: LauncherResultTitleTagKindHotkey, Labels: []string{"Ctrl", "Shift", "S"}, Tooltip: "Result hotkey",
+				}},
+				OnTooltip: func(bool, string, woxui.Rect) {},
+			}},
+		})
+	})
+	host.AttachServices(actionSearchHostServices{})
+	host.Frame(&woxui.DisplayList{}, woxui.FrameInfo{Size: woxui.Size{Width: 320, Height: 50}, PixelSize: woxui.PixelSize{Width: 320, Height: 50}, Scale: 1})
+	var laidOutRow, tag woxui.AccessibilityNode
+	for _, node := range host.Snapshot().Tree.Nodes {
+		switch node.AutomationID {
+		case "launcher.result.bound":
+			laidOutRow = node
+		case "result-title-tag-bound-ctrl+shift+s":
+			tag = node
+		}
+	}
+	if laidOutRow.AutomationID == "" || tag.AutomationID == "" {
+		t.Fatal("laid-out result and title tag were missing from the host snapshot")
+	}
+	if tag.Bounds.X < laidOutRow.Bounds.X+80 || tag.Bounds.X > laidOutRow.Bounds.X+laidOutRow.Bounds.Width*0.7 {
+		t.Fatalf("title tag bounds = %#v in row %#v, want the chip immediately after the title", tag.Bounds, laidOutRow.Bounds)
+	}
+	if tag.Bounds.Height > 16 {
+		t.Fatalf("title tag height = %.0f, want dense keycaps that sit on the title line", tag.Bounds.Height)
+	}
+}
+
+func launcherResultHotkeyKeycapLabel(child woxwidget.Widget) string {
+	return launcherResultHotkeyKeycapText(child).Value
+}
+
+func launcherResultHotkeyKeycapText(child woxwidget.Widget) woxwidget.Text {
+	return child.(woxwidget.Stack).Children[2].Child.(woxwidget.Align).Child.(woxwidget.Text)
+}
+
+func TestLauncherResultTailWidthDoesNotChangeLabelBoundaryConstraints(t *testing.T) {
+	labelGeometry := func(tailWidth float32) (float32, float32) {
+		result := LauncherResultsView(LauncherResultsProps{
+			Width: 300, Height: 50, ContentHeight: 50, RowHeight: 50,
+			Items: []LauncherResultItem{{ID: "live", Title: "Title", TailWidth: tailWidth}},
+		}).(woxwidget.Semantics)
+		listScroll := result.Child.(woxwidget.Container).Child.(woxwidget.Semantics).Child.(woxwidget.Gesture).Child.(woxwidget.Stack).Children[0].Child.(woxwidget.ScrollView)
+		row := listScroll.Child.(woxwidget.Container).Child.(woxwidget.Flex).Children[0].(woxwidget.Semantics)
+		viewport := launcherResultRowContent(row).Children[1].(woxwidget.Clip)
+		content := viewport.Child.(woxwidget.Container)
+		return viewport.Width, content.Width
+	}
+
+	firstViewport, firstContent := labelGeometry(40)
+	secondViewport, secondContent := labelGeometry(80)
+	if firstViewport == secondViewport || firstContent != secondContent {
+		t.Fatalf("label widths = viewport %.0f/%.0f content %.0f/%.0f, want changing viewport and stable content", firstViewport, secondViewport, firstContent, secondContent)
+	}
+}
+
+func TestLauncherResultShowsQuickSelectBadge(t *testing.T) {
+	fill := woxui.Color{R: 180, G: 180, B: 190, A: 255}
+	text := woxui.Color{R: 24, G: 29, B: 38, A: 255}
+	result := LauncherResultsView(LauncherResultsProps{
+		Width: 320, Height: 50, ContentHeight: 50, RowHeight: 50,
+		TailColor: fill, Theme: woxcomponent.Theme{Background: text, ResultTitle: woxui.Color{A: 255}},
+		Items: []LauncherResultItem{{ID: "one", Title: "One", QuickSelectNumber: "1"}},
+	}).(woxwidget.Semantics)
+	listScroll := result.Child.(woxwidget.Container).Child.(woxwidget.Semantics).Child.(woxwidget.Gesture).Child.(woxwidget.Stack).Children[0].Child.(woxwidget.ScrollView)
+	row := listScroll.Child.(woxwidget.Container).Child.(woxwidget.Flex).Children[0].(woxwidget.Semantics)
+	content := launcherResultRowContent(row)
+	if len(content.Children) != 3 {
+		t.Fatalf("row children = %d, want icon, label, and quick select badge", len(content.Children))
+	}
+	badgeSlot := content.Children[2].(woxwidget.Align).Child.(woxwidget.Container)
+	chip := badgeSlot.Child.(woxwidget.Container)
+	label := chip.Child.(woxwidget.Align).Child.(woxwidget.Text)
+	if badgeSlot.Width != 35 || chip.Width != 20 || chip.Height != 20 || chip.Radius != 4 {
+		t.Fatalf("quick select badge geometry = slot %.0f chip %.0fx%.0f radius %.0f, want Flutter 35/20/4", badgeSlot.Width, chip.Width, chip.Height, chip.Radius)
+	}
+	if chip.Color != fill || label.Value != "1" || label.Color != text || label.Style.Size != 11 || label.Style.Weight != woxui.FontWeightSemibold {
+		t.Fatalf("quick select badge style = fill %#v text %q color %#v style %#v", chip.Color, label.Value, label.Color, label.Style)
+	}
+	if row.Value != "1" {
+		t.Fatalf("quick select result value = %q, want the visible number", row.Value)
+	}
+}
+
+func TestLauncherQuickSelectTextContrastsTransparentFrame(t *testing.T) {
+	light := woxui.Color{R: 245, G: 245, B: 245, A: 255}
+	dark := woxui.Color{R: 24, G: 29, B: 38, A: 255}
+	if got := launcherQuickSelectText(light, woxui.Color{}); got != (woxui.Color{A: 255}) {
+		t.Fatalf("light chip digit = %#v, want black", got)
+	}
+	if got := launcherQuickSelectText(dark, woxui.Color{}); got != (woxui.Color{R: 255, G: 255, B: 255, A: 255}) {
+		t.Fatalf("dark chip digit = %#v, want white", got)
+	}
+	if got := launcherQuickSelectText(light, dark); got != dark {
+		t.Fatalf("opaque window digit = %#v, want the window fill", got)
+	}
+}
+
+func TestLauncherResultSelectedQuickSelectKeepsReadableDigit(t *testing.T) {
+	background := woxui.Color{R: 24, G: 29, B: 38, A: 255}
+	selectedFill := woxui.Color{R: 245, G: 245, B: 245, A: 255}
+	result := LauncherResultsView(LauncherResultsProps{
+		Width: 320, Height: 50, ContentHeight: 50, RowHeight: 50,
+		SelectedTailColor: selectedFill,
+		Theme:             woxcomponent.Theme{Background: background, SelectedBackground: selectedFill, ResultTitle: woxui.Color{A: 255}},
+		Items:             []LauncherResultItem{{ID: "one", Title: "One", Selected: true, QuickSelectNumber: "1"}},
+	}).(woxwidget.Semantics)
+	listScroll := result.Child.(woxwidget.Container).Child.(woxwidget.Semantics).Child.(woxwidget.Gesture).Child.(woxwidget.Stack).Children[0].Child.(woxwidget.ScrollView)
+	row := listScroll.Child.(woxwidget.Container).Child.(woxwidget.Flex).Children[0].(woxwidget.Semantics)
+	badgeSlot := launcherResultRowContent(row).Children[2].(woxwidget.Align).Child.(woxwidget.Container)
+	label := badgeSlot.Child.(woxwidget.Container).Child.(woxwidget.Align).Child.(woxwidget.Text)
+	if label.Color != background {
+		t.Fatalf("selected quick select digit = %#v, want the window background so it stays readable on a light chip", label.Color)
+	}
+}
+
+func TestLauncherResultTrailingClusterKeepsBadgeOnTheRightEdge(t *testing.T) {
+	result := LauncherResultsView(LauncherResultsProps{
+		Width: 320, Height: 50, ContentHeight: 50, RowHeight: 50, ItemPadding: woxwidget.Insets{Left: 8, Right: 8},
+		Theme: woxcomponent.Theme{ResultTitle: woxui.Color{A: 255}, Background: woxui.Color{A: 255}},
+		Items: []LauncherResultItem{{
+			ID: "tagged", Title: "QQ Music", TailWidth: 80, TailHeight: 22, QuickSelectNumber: "2",
+			Tails: []LauncherResultTail{{Text: "CPU", Width: 40, Height: 22}, {Text: "MEM", Width: 40, Height: 22}},
+		}},
+	}).(woxwidget.Semantics)
+	listScroll := result.Child.(woxwidget.Container).Child.(woxwidget.Semantics).Child.(woxwidget.Gesture).Child.(woxwidget.Stack).Children[0].Child.(woxwidget.ScrollView)
+	row := listScroll.Child.(woxwidget.Container).Child.(woxwidget.Flex).Children[0].(woxwidget.Semantics)
+	content := launcherResultRowContent(row)
+	if len(content.Children) != 3 {
+		t.Fatalf("row children = %d, want icon, label, and one trailing cluster", len(content.Children))
+	}
+	cluster := content.Children[2].(woxwidget.Container)
+	if cluster.Width != 115 {
+		t.Fatalf("trailing cluster width = %.0f, want tails plus badge without an extra flex gap", cluster.Width)
+	}
+	children := cluster.Child.(woxwidget.Flex).Children
+	if len(children) != 2 {
+		t.Fatalf("trailing children = %d, want tails then badge", len(children))
+	}
+	badge := children[1].(woxwidget.Align)
+	if badge.Width != 35 {
+		t.Fatalf("trailing badge width = %.0f, want the 35-wide quick select slot", badge.Width)
+	}
+}
+
+func launcherResultRowContent(row woxwidget.Semantics) woxwidget.Flex {
+	stack := row.Child.(woxwidget.Gesture).Child.(woxwidget.Stack)
+	return stack.Children[1].Child.(woxwidget.Container).Child.(woxwidget.Flex)
+}
+
+func TestLauncherResultTailHoverUsesTooltipAndKeepsRowActions(t *testing.T) {
+	var hovered bool
+	var tooltip string
+	var anchor woxui.Rect
+	tapped := false
+	result := LauncherResultsView(LauncherResultsProps{
+		Width: 320, Height: 50, ContentHeight: 50, RowHeight: 50,
+		Theme: woxcomponent.Theme{ResultTitle: woxui.Color{A: 255}},
+		Items: []LauncherResultItem{{
+			ID: "perf", Title: "Result", TailWidth: 160, TailHeight: 22,
+			Tails:     []LauncherResultTail{{Text: "B1", Width: 40, Height: 22, Tooltip: "First batch flush tick: 5.0ms"}, {Text: "1ms", Width: 40, Height: 22}},
+			OnSelect:  func() { tapped = true },
+			OnTooltip: func(inside bool, text string, bounds woxui.Rect) { hovered, tooltip, anchor = inside, text, bounds },
+		}},
+	}).(woxwidget.Semantics)
+	listScroll := result.Child.(woxwidget.Container).Child.(woxwidget.Semantics).Child.(woxwidget.Gesture).Child.(woxwidget.Stack).Children[0].Child.(woxwidget.ScrollView)
+	row := listScroll.Child.(woxwidget.Container).Child.(woxwidget.Flex).Children[0].(woxwidget.Semantics)
+	tailBoundary := launcherResultRowContent(row).Children[2].(woxwidget.Align).Child.(woxwidget.Boundary[launcherResultTailsProps])
+	aligned := tailBoundary.Build(tailBoundary.Props).(woxwidget.Align)
+	rowFlex := aligned.Child.(woxwidget.Container).Child.(woxwidget.Flex)
+	batch := rowFlex.Children[0].(woxwidget.Container).Child.(woxwidget.Align).Child.(woxwidget.Semantics)
+	if batch.AutomationID != "result-tail-perf-0" || batch.Label != "B1" || batch.Description != "First batch flush tick: 5.0ms" {
+		t.Fatalf("batch tail semantics = %+v, want a hoverable performance tooltip target", batch)
+	}
+	wantAnchor := woxui.Rect{X: 4, Y: 6, Width: 40, Height: 22}
+	batch.Child.(woxwidget.Gesture).OnHoverAt(true, wantAnchor)
+	if !hovered || tooltip != "First batch flush tick: 5.0ms" || anchor != wantAnchor {
+		t.Fatalf("hover = %v, %q, %#v; want tooltip and anchor", hovered, tooltip, anchor)
+	}
+	batch.Child.(woxwidget.Gesture).OnTap()
+	if !tapped {
+		t.Fatal("tooltip tail should still activate the result row")
+	}
+	plain := rowFlex.Children[1].(woxwidget.Container).Child.(woxwidget.Align).Child.(woxwidget.Container)
+	if plain.Child == nil {
+		t.Fatal("tails without tooltip should stay unwrapped")
+	}
+}
+
+func TestLauncherResultImageTailOverlaysCenteredSVGText(t *testing.T) {
+	tails := launcherResultTails([]LauncherResultTail{{
+		Image: &woxui.Image{Width: 192, Height: 36}, Width: 96, Height: 18,
+		ImageText: "5H 100%", ImageTextColor: woxui.Color{R: 31, G: 41, B: 55, A: 255}, ImageTextSize: 9.5,
+	}}, 106, 18, woxui.Color{}, false).(woxwidget.Align)
+	row := tails.Child.(woxwidget.Container).Child.(woxwidget.Flex)
+	item := row.Children[0].(woxwidget.Container)
+	stack := item.Child.(woxwidget.Align).Child.(woxwidget.Stack)
+	label := stack.Children[1].Child.(woxwidget.Align).Child.(woxwidget.Text)
+
+	if label.Value != "5H 100%" || label.Style.Size != 9.5 || label.Color != (woxui.Color{R: 31, G: 41, B: 55, A: 255}) {
+		t.Fatalf("image tail label = %#v", label)
+	}
+}
+
+// TestResultUnderlayPaintsBeyondPaddedViewport checks pixels available to the footer blur.
+func TestResultUnderlayPaintsBeyondPaddedViewport(t *testing.T) {
+	for _, bottom := range []float32{0, 8} {
+		host := woxwidget.NewHost(func(woxui.FrameInfo) woxwidget.Widget {
+			return LauncherResultsView(LauncherResultsProps{
+				Width: 320, Height: 200, UnderlayHeight: 40, ContentHeight: 300, RowHeight: 50,
+				ContainerPadding: woxwidget.Insets{Top: 8, Bottom: bottom},
+				Theme:            woxcomponent.Theme{ToolbarBorderWidth: 1, SelectedBackground: woxui.Color{R: 255, A: 255}},
+				Items:            []LauncherResultItem{{ID: "1"}, {ID: "2"}, {ID: "3"}, {ID: "4"}, {ID: "5", Selected: true}, {ID: "6"}},
+			})
+		})
+		host.AttachServices(actionSearchHostServices{})
+		list := &woxui.DisplayList{}
+		host.Frame(list, woxui.FrameInfo{Size: woxui.Size{Width: 320, Height: 256}, PixelSize: woxui.PixelSize{Width: 320, Height: 256}, Scale: 1})
+		renderer, err := woxui.NewSoftwareRenderer(320, 256)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = renderer.Render(list); err != nil {
+			t.Fatal(err)
+		}
+		if pixel := renderer.RGBA().RGBAAt(160, 230); pixel.R != 255 || pixel.A != 255 {
+			t.Fatalf("bottom=%v footer backdrop was clipped: %v", bottom, pixel)
+		}
+	}
+}
+
+// TestResultBottomGutterTransparency paints list content through padding while retaining the footer sample.
+func TestResultBottomGutterTransparency(t *testing.T) {
+	for _, underlay := range []float32{0, 40} {
+		for _, scale := range []float32{1, 1.5, 2} {
+			host := woxwidget.NewHost(func(woxui.FrameInfo) woxwidget.Widget {
+				return LauncherResultsView(LauncherResultsProps{
+					Width: 320, Height: 200, UnderlayHeight: underlay, ContentHeight: 300, RowHeight: 50,
+					ContainerPadding: woxwidget.Insets{Top: 8, Bottom: 8},
+					Theme:            woxcomponent.Theme{SelectedBackground: woxui.Color{R: 255, A: 255}},
+					Items:            []LauncherResultItem{{ID: "1"}, {ID: "2"}, {ID: "3"}, {ID: "4", Selected: true}, {ID: "5", Selected: true}, {ID: "6"}},
+				})
+			})
+			host.AttachServices(actionSearchHostServices{})
+			list := &woxui.DisplayList{}
+			host.Frame(list, woxui.FrameInfo{Size: woxui.Size{Width: 320, Height: 256}, PixelSize: woxui.PixelSize{Width: int(320 * scale), Height: int(256 * scale)}, Scale: scale})
+			renderer, err := woxui.NewSoftwareRenderer(320, 256)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = renderer.Render(list); err != nil {
+				t.Fatal(err)
+			}
+			img := renderer.RGBA()
+			before, start, end, after := img.RGBAAt(160, 207).A, img.RGBAAt(160, 209).A, img.RGBAAt(160, 214).A, img.RGBAAt(160, 216+int(underlay)).A
+			if underlay > 0 && img.RGBAAt(160, 230).A != 255 {
+				t.Fatalf("footer sample was faded or clipped: %v", img.RGBAAt(160, 230))
+			}
+			if before != 255 || start != 255 || end != 255 || after != 0 {
+				t.Fatalf("scale=%v alpha before/start/end/after=%v/%v/%v/%v", scale, before, start, end, after)
+			}
+		}
+
+	}
+
+}

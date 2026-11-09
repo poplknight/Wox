@@ -1,0 +1,281 @@
+# Wox Go UI
+
+`wox.core/ui` is Wox's cross-platform Go UI. Core and UI run in one executable and process. Lifecycle, queries, actions, terminal subscriptions, and every core-to-UI update use typed Go `Services`/`View` contracts.
+
+`wox.core` always starts the embedded Go UI; there is no standalone Wox UI module or runner.
+
+Shared controls consume `component.ControlTheme` directly; launcher-only appearance stays in `component.Theme`. Settings defines the control colors directly without an adapter to launcher tokens.
+
+Settings uses the fixed Glass-derived dark palette in `launcher/settings_theme.go`, with a translucent window tint, system blur where supported, and translucent popup tints over floating blur materials. Onboarding management uses the same fixed colors and system material, with a separate launcher theme for its demos. Launcher themes and system appearance do not restyle Settings or onboarding management; theme previews continue to show their own theme colors.
+
+macOS caption controls use AppKit's standard window buttons through `WindowOptions.TitleBarControls` and `Window.SetTitleBarControls`. They retain the running OS's appearance, including macOS 27 glass, while Go title bars reserve their layout space. Close and maximize requests flow through the host callbacks; Settings keeps zoom disabled. Ordinary launcher, onboarding, and screenshot windows leave captions hidden. Caption coordinates are AppKit points and do not use the display's backing pixel scale.
+
+## Architecture contract
+
+`runtime` keeps the stable UI API as a small facade. Implementations, native bridges and tests are grouped under its `internal/input`, `internal/graphics`, `internal/capture`, `internal/window` and `internal/webview` directories. See [runtime layout](runtime/README.md) for responsibilities and dependency direction.
+
+The portable Go layer owns widget layout, focus routing, text editing state, scrolling, Wox protocol DTOs, query behavior, previews, actions, and settings pages. Platform files are deliberately thin and own only the native window/event loop, renderer submission, font measurement, clipboard thread dispatch, file dialogs, external-link thread dispatch, and IME integration:
+
+- Windows: Win32 + Direct2D/DirectWrite.
+- macOS: AppKit + CoreGraphics/CoreText.
+- Linux: GTK3 + GtkGLArea/OpenGL/Pango, with layer-shell and WebKitGTK used when available.
+
+`util/clipboard` owns clipboard formats, native bridges, prepared image resources, promised-format providers, and exit persistence. Runtime window methods are thin adapters: they prepare through that package and dispatch publication to the window's UI thread with a Windows HWND or Linux display capability. Runtime native headers and implementations contain no clipboard-specific symbols or includes. Windows prepares detached DIB and PNG handles before queuing the short commit; prepared resources serialize publication and teardown. The UI manager supplies generic thread dispatch to `clipboard.Flush` before normal exit. See [clipboard ownership](../util/clipboard/README.md).
+
+`util/hotkey` owns shared shortcut parsing and modifier aliases, with canonical key names in `util/keyboard`; runtime only maps normal combinations to UI key events. Global registration keeps its native key support and special trigger policies. `util/browser` owns external-link validation, launch policy, and native bridges; runtime supplies owner handles and GUI-thread dispatch. `util/shell` owns Windows owner-aware shell execution. `util/window` owns the shared Windows input-queue attachment primitive, while runtime retains Wox window activation, visibility, and editor focus policy. These utility packages have no UI imports or native runtime-header dependencies.
+
+Windows desktop capture exposes immutable packed BGRX pixels. Cropped RGBA copies clip physical coordinates and row lengths in Go, then convert channels with the native packed-row primitive, including forced opaque alpha for the capture's padding byte. This keeps full-desktop scene detachment from becoming a per-pixel Go loop when debugging disables compiler optimization.
+
+Display-list and widget changes must compile unchanged on all three platforms. A platform-specific feature should first expose a small capability on `Window`; business widgets must not import Win32, AppKit, GTK, or renderer APIs.
+
+Screenshot-specific native sessions and object selection belong to [`screenshot`](screenshot/README.md), alongside the portable editor and capture workflow. That package owns AX/UIA/AT-SPI traversal, query scheduling, selection hierarchy, inspector chrome, and selection overlays. Its platform adapters depend on runtime's general window, capture, main-thread, and coordinate primitives. Runtime must not import the screenshot package or include its native headers; native feature state and tests stay with the feature.
+
+System WebView previews keep their public facade on `runtime.Window`, while `runtime/internal/webview` owns validation, visibility, navigation, pointer forwarding, and reset/close lifecycle. Platform host adapters only translate that driver contract to WebView2, WKWebView, or WebKitGTK and must not leak native engine types into launcher or widget packages.
+
+Launcher presentation is split into three layers. `launcher/component/wox_*.go` owns theme-aware Wox controls and their shared interaction/accessibility behavior, with one component per file. `launcher/view/` owns pure page composition through immutable props and callbacks; cohesive domains such as preview rendering live in a dedicated subpackage (`launcher/view/preview`). The `launcher` package root retains controller state, core requests, native-window lifecycle, and adapters that prepare typed view props; adapters do not construct primitive widget trees. Widget slots are reserved for composing an already separate view or shared form control. View and component packages must not depend on `launcher.App`.
+
+### Launcher state ownership
+
+`launcher.App` composes per-instance controllers through `bindControllers` in
+`launcher/controllers.go`. It owns instance identity, the launcher window, shared
+window registration, and cross-feature commands such as applying a query response
+or changing the selected surface. Controllers remain in the launcher feature
+package; they receive narrow service interfaces, explicit peer controllers, and
+semantic callbacks. They must not store `*App` or accept the entire `Services`
+contract merely to reach another feature.
+
+| Owner | Responsibility |
+| --- | --- |
+| `queryController`, `resultController` | Query editing, hints, history, generation timers; published rows, selection, refinements and scrolling |
+| `actionPanelController`, `formActionController` | Action filtering and selection; submitted action forms and their editor state |
+| `formTableController` | The shared table editor overlay: the Settings-hosted and launcher-hosted editor sessions, row editing, pickers and the emoji catalog. `App` decides which form currently owns a table; feature-specific rows (window-manager groups, AI providers, MCP servers, skills, plugin trigger keywords) are reached through callbacks to their owners |
+| `hotkeyRecordingController` | The single active hotkey recording shared by Settings, onboarding, plugin settings, action and requirement forms and table rows: core's native recorder, local fallback candidates, availability checks and persisting main, selection and action-panel hotkeys. `App` decides whether the target form is still on screen and which window receives recorder input |
+| `windowGroupEditorController` | The Window Manager plugin's workspace group editor shown inside the shared table editor: displays, layouts, app and URL assignments, and saving the group row. Its per-edit state lives on the table editor session |
+| `previewController` | Selected-preview visibility and resource transitions; Markdown and text-layout caches; the generic preview bodies (text, Markdown, images, lists, files, folders) and their tags. `App` keeps the preview router that dispatches each preview type to its owning feature |
+| `webViewPreviewController`, `dictationPreviewController` | The WebView preview's native document, focus handoff, fullscreen mode and page commands (close, hide, open in browser); the dictation history preview with playback and model comparison |
+| Remote, file, native-file, WebView, terminal and dictation controllers | Each preview's requests, caches, native/session state and cleanup |
+| `chatController`, `chatWindowController` | One chat session, attachment imports, the shared AI catalog prefetch and entering/leaving launcher chat mode; the dedicated window presenting that session |
+| `generalSettingsController` | The full settings payload and the built-in setting rows used by the General, Appearance, Hotkey, Runtime, Debug, Updates and Privacy pages: row selection and activation, the shared inline text editor, the shared choice picker, row rendering and localization, and starting a save. `App`'s `saveSetting` persists the value and applies cross-feature effects |
+| `settingsWindowController` | Settings window lifecycle and session state shared by all pages: route, saving and restart status, hover overlays and the search highlight. Session begin, tab switch and close go through its methods; settings-domain controllers retain page editing and persistence policies |
+| `pluginSettingsController` | The Plugins settings page: installed and store catalogs, search and filters, selection and detail tabs, install/upgrade/enable operations, the plugin settings form with its auto-save, and the page's view props. It reaches the Settings window, the shared choice picker, settings search and the AI model catalog through injected collaborators; it also owns the dictation/OCR model manager overlay those fields open. The table editor and hotkey recorder it opens stay with their owners |
+| `cloudSettingsController` | The Cloud settings page: account, sync status and progress, billing plan, devices, plugin exclusions, the account form, action menu and bootstrap flow, and the page's view props. The plan tooltip stays with `settingsWindowController` with the other hover overlays |
+| `themeSettingsController` | The Theme settings page and theme editor: catalog, search and selection, install/apply operations, auto-theme editing, demo wallpaper, the editor draft with its color dialog and AI assistant, and their view props. Applying a theme to every window stays with `App` through `applyTheme` |
+| `settingsSearchController` | The Settings search panel: query editor, results built from every page's snapshot, keyboard selection, and opening the chosen page, plugin or field |
+| `aiSettingsController` | The AI page: the provider/MCP/skill/built-in tool form and its table persistence, the provider catalog, and the shared AI model, skill and plugin-mention catalogs used by chat and plugin forms. Tables open in the shared form table editor; the generic settings-table save hook stays on `App` because it dispatches across the AI, hotkey and query forms |
+| `hotkeySettingsController` | The Hotkey page and the general tab's query hotkey fields: the hotkey form, focus movement, ignored-app candidates, and opening its tables. Field recording goes through `hotkeyRecordingController` |
+| `dataSettingsController`, `runtimeSettingsController` | The Data page (backups, storage location, logs) and the Runtime page (host statuses, restarts, executable paths), with their view props. Text and choice fields reuse the shared built-in setting editor and choice picker through callbacks |
+| `onboardingController` | The first-run guide: its window, pages, setup actions and launcher migration. Settings-domain controllers are read through getters. `App` keeps the cross-window transitions: switching between the guide and Settings, hotkey-recorder routing and the macOS permission flow |
+| `notesController` | Note-window registry and the capabilities used by individual note editors |
+| Glance, Attention, toolbar, quick-select and result-drag controllers | Accessory refresh and inbox visibility, message expiry, modifier-hold selection and drag lifecycle |
+| `imageStore`, `languageCatalog`, `formTableEmojiCatalog`, `tooltipController`, `appearanceController` | Decoded-image budget and request deduplication, published translations, table-editor emoji search/recent choices, tooltip lifecycle and launcher appearance |
+
+Mutable controller state is confined to the UI thread, except for explicitly
+synchronized image bookkeeping, terminal subscription reconciliation, and atomic
+revisions. Background work publishes through UI dispatch and retains its existing
+query IDs, session keys or generation checks. Result refresh still holds shrinking
+partial snapshots for 1.2 seconds using actual list/grid geometry; typed-query grace
+and final-response handling remain separate policies.
+
+`snapshot()` only reads state. Its collection references are borrowed for the
+current synchronous launcher build, not retained for asynchronous use. Retained
+`widget.Boundary.Build` callbacks consume their supplied props and stable
+callbacks only. Action-panel invalidation compares the result and toolbar
+revisions directly instead of advancing a revision during snapshot creation.
+
+`launcher/component/wox_sidebar.go` owns the shared sidebar panel, split layout,
+toggle control and minimum-width calculation used by Chat and Notes. Their window
+controllers use `sidebar_window.go` for native minimum-size and resize handling;
+feature controllers retain their own open state, persistence and content actions.
+
+Notes uses a document-local `notesEditingSession` for text and structural edits,
+selection, Markdown projection, and bounded undo/redo history. It has no native
+window, persistence service, or timer dependency; change notifications schedule
+autosave through its host. `notesAutosave` owns debounce generations and rejects
+queued callbacks after cancellation, record switches, or shutdown. The window
+controller coordinates save results, conflict-copy registry changes, search,
+clipboard and native actions. `notes_window_geometry.go` owns logical bounds and
+frame transitions. Geometry acknowledgement and one-shot focus requests happen
+at the frame entry point, outside widget composition. `notes_presentation.go`
+prepares display data and callbacks; `view/notes_chrome_view.go` owns toolbar,
+format bar, search, menus, link editor, status and overlay layout. Editor-session
+tests run without constructing an App, native window, or persistence service.
+
+Notes organization is separate from document revisions. The Notes repository stores
+`group:<id>` and `placement:<note-id>` records through atomic settings/oplog batches.
+Deleted groups retain their parent so late remote children resolve to a surviving
+ancestor; missing parents and cycles are displayed at the root without read-time
+writes. Existing notes without placement records stay at the root until organized.
+`notes_sidebar.go` owns each window's tree interaction, menus, drag lifecycle and
+local presentation preferences; `view/notes_sidebar_view.go` owns its responsive
+layout. The tree stays beside the editor; opening it raises the native minimum width
+and expands an undersized window to preserve the editor's minimum width. Note switching still flushes the document
+first and reuses an existing window for the target note.
+
+
+Final destruction cancels the instance context, stops query/Glance/quick-select,
+file-preview (including native occlusion) and settings-highlight timers, cancels
+dictation and attachment imports, and releases terminal subscriptions. Notes get
+a final save attempt on the UI thread; stopping autosave also invalidates already
+queued timer callbacks. Native tooltips are dismissed on that same UI thread.
+Image and remote preview service calls inherit the instance context. Image/file/remote
+loaders reject new work and late completions after destruction, and disposal clears
+their request records without changing normal cache or retry behavior. In-progress
+local file inspection may finish, but cannot publish into the destroyed instance.
+WebView controllers clear presentation state; native WebView destruction remains
+owned by the runtime window. Hiding the launcher is a different transition:
+dedicated chat windows keep their shared session, and existing hidden-window
+resource retention policies still apply. Native focus, IME, geometry and DPI
+conversion remain owned by the existing runtime window capabilities.
+
+Test fixtures use `bindTestApp` to supply missing General/Appearance settings
+controllers and wire the same capabilities while preserving explicit fixture state,
+without starting native windows or subscribing to process services. Production wiring
+must remain centralized in `bindControllers` so test and application ownership
+do not diverge.
+
+The widget Host supports incremental retained `Stateful` elements alongside legacy stateless descriptions. Stateful identity is scoped by widget type and stable key; the Host owns mount, update, build, post-frame work, and disposal ordering, while `StateContext` schedules frames without moving native work into rendering. `FocusNode` attachments remain window-specific, `TextEditingController` retains portable editor state across immutable rebuilds, and keyed `ScrollView` widgets retain offsets through `ScrollController` and consume declarative `KeepVisible` ranges when the target or viewport changes. `WoxTextField` always mounts retained State and exposes only its committed business value by default; caret, selection, and IME composition stay inside the field unless an advanced stateful owner explicitly supplies a controller. Shared choice overlays own query editing, keyboard highlight, and list scrolling while adapters receive only the committed option. Settings pages, navigation and search, plugin/theme catalogs, runtime row following, title-bar hover, shared forms, form-table pickers/editors, and model-manager lists keep transient interaction state below `launcher.App`. Modal focus trapping and restoration stay Host-owned, while `WoxDialog` State can request a specific descendant after its first layout. New stateful controls should use this lifecycle instead of storing interaction state in `launcher.App`; legacy controls can migrate independently without replacing the complete widget tree at once.
+
+List result gutters are fixed outside the scrolling rows. Window sizing and list composition share the same resolved padding: `ResultContainerPaddingTop/Bottom` frame the viewport, and `AppPaddingBottom` is added below results only when neither a toolbar nor a bottom query box owns that edge. The result-count budget applies to row content; group headers add their own height without consuming a result slot. Selection following and quick selection use the inner viewport without padding. Lists with a bottom gutter stop painting at that viewport; edge-to-edge lists can extend behind the toolbar.
+
+Explicit query refreshes retain the visible result snapshot for up to 400 ms while buffering only the newest partial response. A final response or a partial response whose logical result-area height reaches the retained height commits immediately. The deadline commits the buffered response, including its layout, refinements, and context; if none arrived, it enters the normal waiting state. Refresh and window sizing share the same list/grid geometry calculation. New query generations cancel the refresh buffer; ordinary typed queries keep their existing short transition and display their first response immediately.
+
+## Incremental rendering scope
+
+Fine-grained layout invalidation, `Boundary` decomposition, and repaint-region tuning target the Launcher window. Launcher interactions are continuous and latency-sensitive, so query editing, list and grid result fields, Glance, previews, and action surfaces should invalidate the smallest stable visual owner that actually changed.
+
+Settings and other secondary pages are low-frequency surfaces and do not require per-field incremental rendering. Full-page or full-window refreshes are acceptable there; do not add fine-grained boundaries solely for those pages unless profiling demonstrates a user-visible performance problem. Shared widgets must remain correct in every window, but Launcher is the optimization target.
+
+Plugin form save state protects only editable setting values. Setting actions keep their progress and errors in the plugin controller independently of the form, so a catalog refresh or form replacement cannot discard an operation. When edits or a value save retain the form, display-only definitions still refresh using the shared form editability classification; editable definitions and editor state remain stable until the save completes.
+
+Settings, account, theme, resource catalogs, and other UI domains use typed services directly. The only production loopback HTTP surface is `appcontrol`; automation has a separate authenticated endpoint that exists only in `wox_automation` builds. Production builds register no UI business routes.
+
+## Current migration surface
+
+The Go process currently supports the Wox query protocol, list and grid results, refinements, completion hints, toolbar messages, actions and action forms, live Glance items and actions, GPU raster/SVG images, text/image/file/list/structured previews, system WebView previews, streaming terminal output with cursor-based history loading and local find, media controls, and a native-GPU chat surface with multiline IME input, streamed snapshots, stop, history, model and skill catalogs, message copy/edit/retry actions, a copyable debug trace, tool-call cards, and `ask_user` answers. Query rows render multiple plugin and development tails, including the Go UI receive-time marker backed by core's shared query timestamp. Response-local action icon references are restored before shared widgets render them. List and grid result viewports preserve the complete result set, keep keyboard selection visible, expose a portable scrollbar, and leave pointer scrolling independent from selection. Launcher rows, action surfaces, query rounding, and toolbar gutters consume platform-resolved theme geometry. The action panel reuses the shared IME editor for translated filtering and has its own bounded scroll surface. Windows applies native Mica/Acrylic policy and snaps image destinations to physical pixels before high-quality Direct2D sampling. WebView previews share one portable URL/HTML/CSS/User-Agent/cache contract and use WebView2, WKWebView, or runtime-detected WebKitGTK without exposing those engines to query widgets. Query-owned requirement settings and trigger-keyword conflict editing reuse the same portable form engine. Theme color editing is one shared live-preview component mounted by both query previews and the settings route. The core-backed settings window includes general, appearance, hotkeys, network, live runtime-host diagnostics, theme, updates, privacy with a copyable telemetry sample, development diagnostics, plugin management, AI provider/MCP/skill management, local data and backup management, Cloud Sync, a real local usage dashboard, and an About page backed by the running core version; text settings reuse the common IME editor, executable paths use the cross-platform native file picker, and searchable choice overlays handle system font and Glance catalogs. Settings, the shared macOS/Windows/Linux X11 screenshot editor with scrolling capture, and named `wox.instance.<session>` launchers use the process-local window manager, which tracks create/show/hide/close transitions, gives each launcher an independent session/client/widget host, and broadcasts shared setting changes. Its scrollable rail includes keyboard-first fuzzy search across built-in settings, sections, installed plugins, and plugin-defined settings. Runtime diagnostics expose version, executable, loaded-plugin, install/upgrade, and host-restart state through the existing core protocol. Cloud Sync covers login, registration and legal consent, email verification, password reset/change, encrypted bootstrap/restore, live progress, enable/disable/manual sync, subscription links, device management, and plugin exclusions without platform-specific page code. The configured application font is applied by DirectWrite, CoreText, or Pango through one window-level API. Hotkey recording continues to use core's native cross-platform recorder, while the Go layer provides shared query/tray editors, emoji or structured image values, a core-backed ignored-application picker, and shared dictation/OCR model managers. Plugin and theme pages share installed/store catalogs with install, upgrade, apply, enable, disable, and uninstall actions as appropriate, while the theme page reuses the live GPU preview editor. AI settings reuse the JSON table editor, load provider choices from core, validate transport-specific fields, and support both local skill directories and remote repository cloning. The Data page uses core-owned cross-platform routes for storage migration, backup/restore, shell opening, and logs, while the Go layer owns responsive progress and confirmation state. The plugin editor consumes the translated, platform-filtered `SettingDefinitions` DTO from core. Shared form components include JSON table add/edit/delete flows with cross-platform directory picking; unsupported specialized table columns are preserved without mutation.
+
+The settings domain is split into per-domain settings controllers (general, about, privacy, usage, update, runtime, data, network, appearance, ai, hotkey, theme, plugin, cloud) plus a `settingsSearchController`. Each controller owns its slice of settings state and its page behavior and exposes a `Snapshot()` for the view layer; `settingsSnapshot` nests the per-domain snapshots. Controllers never hold `App`: `bindX` functions inject narrow services, getters for sibling controllers, and callbacks. Window-level state (route, row, saving and restart status, hover overlays) lives on `settingsWindowController`. `generalSettingsController` holds the full `settingsData` payload and drives the built-in setting rows shared by several pages: row selection and activation, the shared inline editor, the choice picker, and starting a save. `App` keeps the cross-page coordination: opening and reloading the window, tab activation, key routing, the page router and page composition, and `saveSetting`, which persists a built-in value and applies its effects on other features. The settings search controller aggregates matches from each controller via a `Searchable` interface.
+
+Windows builds embed the checked-in `resource/others/webview/WebView2Loader.dll`, extract it under the Wox data directory, and set `WOX_WEBVIEW2_LOADER_PATH` before the first WebView opens. Linux builds do not require WebKitGTK headers, but WebView previews need a WebKitGTK 4.1 or 4.0 runtime installed.
+
+## macOS memory baseline and renderer invariants
+
+The July 2026 M3 Max investigation established a release-build reference for the complete Wox process, not an isolated renderer demo. The original approximately 300 MB report motivated replacing the `CAMetalLayer` renderer with CoreGraphics drawing into a bounded IOSurface pool. After that renderer replacement, a controlled follow-up used the same real Wox data and process lifecycle for both sides:
+
+| Release checkpoint | Before the follow-up | After the follow-up |
+| --- | ---: | ---: |
+| Hidden physical footprint | 102.9 MB | 80-84 MB |
+| Settled visible query | 123.1-130 MB | 90.9 MB |
+| Visible peak during the final run | Not recorded | 94 MB |
+| Visible IOSurface memory | Approximately 21 MB | 14 MB |
+
+These numbers are comparison points rather than a CI budget because macOS, display scale, installed applications, and user data affect the absolute footprint.
+
+The memory reduction depends on four decisions:
+
+- The [native renderer](runtime/internal/window/native_darwin.m) uses AppKit, CoreGraphics, CoreText, and IOSurface without creating a Metal device, command queue, shader library, drawable pool, or texture caches for the launcher.
+- [Rendering](runtime/internal/window/window_darwin.go) keeps active triple-buffer behavior, then trims only unused surfaces after 250 ms of visible inactivity. The visible idle pool retains the presented surface and one reusable current-size back buffer. Hiding releases the complete pool, including the native hide-on-blur path, and queued frames cannot recreate surfaces until the window is visible again. A surface is removable only when its presentation reference count is zero and `IOSurfaceIsInUse` is false; stale-size surfaces are removed first, and retries are bounded.
+- [`system_profiler` discovery](../plugin/system/app/app_darwin.go) contributes application paths to the shared application cache instead of reparsing every returned bundle. Localized names are read from `Info.plist`, `InfoPlist.loctable`, root `InfoPlist.strings`, and `.lproj` strings without constructing one `NSBundle` per application. Cache freshness includes those files, the resolved icon source, and the preferred macOS languages. On the reference machine this reduced the post-index native heap from approximately 256 `NSBundle` and 258 `CFBundle` instances to 8 and 12.
+- [Process startup](../main.go) uses `GOGC=50` when the environment does not provide `GOGC`; this heap-growth policy is shared across platforms, while the reference measurements in this section are macOS-only. The override remains available for diagnosis. In the final interleaved macOS release comparison, the default settled at 90.9 MB versus 96.8 MB with `GOGC=100`; query p95 was 6 ms versus 7 ms, and GC pause p95 remained approximately 0.5 ms.
+
+Do not replace the idle trim with a hard two-surface allocation cap. Both existing surfaces can still be owned by Core Animation while the next frame is encoded; refusing a third surface can drop the final frame. Trimming to one visible surface also saves only about 7 MB at the cost of allocating another full-size surface on the next refresh, which turns a stable footprint into allocation churn and input-visible stalls.
+
+For later comparisons, stop every other Wox instance and sample the same release-process PID throughout the run. Use real Wox data, warm up application and image caches, replay deterministic query blocks, wait for the same visible or hidden lifecycle checkpoint, and record at least three samples. `PhysicalFootprintMB` or `footprint --pid <PID> --noCategories` is the primary macOS process metric; pair it with `vmmap <PID> -summary`, `heap -s -H <PID>`, and Go heap profiles when attribution is needed. The retained [workload and sampler](../../.agents/skills/wox-memory-debug/scripts/) should be reused. Do not compare an Activity Monitor spike, a debug build, an isolated layer demo, or a different PID directly with this release baseline.
+
+## Windows hidden memory lifecycle
+
+For memory measurements under Delve, set `_NO_DEBUG_HEAP=1` before starting the
+debugger. Windows' debug heap changes allocation and fragmentation behavior;
+its growth must not be attributed to release builds. Keep compilation settings,
+heap sampling, workload and debugger mode identical across comparisons.
+Automation builds expose `perf.memory_snapshot` to read Go statistics and native
+resident-page ownership without showing the launcher. Its optional `profilePath`
+writes a heap profile without forcing GC; use the existing hidden cleanup and
+wait at least 45 seconds before collecting comparable checkpoints. The native
+free-heap counter intersects free blocks with resident pages, so nonresident
+committed free space is not subtracted from the resident heap.
+
+The September 2026 Windows investigation (Intel integrated GPU, release-style build, private working set as the metric) measured a hidden idle footprint of 63-70 MB. Roughly 29 MB of that was the NT process heap, of which only about 12 MB was still allocated: a show/hide cycle allocates and frees around 25 MB of Direct2D, DirectWrite, and user-mode driver blocks, and the freed pages stay committed and resident because roughly 30,000 small long-lived blocks fragment them. `HeapCompact` does not return them. Hiding runs two staged releases in [`manager.go`](manager.go) and [`window_windows.go`](runtime/internal/window/window_windows.go): `debug.FreeOSMemory` plus cache drops after 10 seconds, and `IDXGIDevice3::Trim` after 30 seconds. Both lower committed memory, so the Task Manager number they produce is real.
+
+Do not add `SetProcessWorkingSetSize(-1, -1)` / `EmptyWorkingSet` to this sequence. It was tried and drops the private working set to a few MB, but commit charge does not move: the pages only migrate to the standby list and fault back in on the next show, or turn into page-file hard faults under memory pressure. It changes the reported number without reducing memory use, so it is not an acceptable optimization for Wox.
+
+File search persists its query arrays in read-only index mappings rather than
+retaining heap copies. Its long-hide release targets only those clean file pages,
+under the store lease lock; it never trims the process-wide private working set.
+Report the reduced private commit separately from file-page residency: dropping
+mapped pages can leave them in the OS file cache, and the next query pays for
+faulting them back. Include first-after-idle latency in comparisons.
+
+Settings > Interface offers **Use software rendering (CPU)** (`UseSoftwareRendering`), a local-only preference applied after settings/privacy restoration and before the first window opens. Changes take effect after restarting Wox; the supervisor does not choose the rendering backend. Windows uses WARP; Linux requests Mesa software OpenGL (Mesa software drivers must be installed); macOS already rasterizes its IOSurfaces on the CPU, so both settings use that backend. This controls Wox UI drawing, not the desktop compositor or embedded web pages.
+
+In earlier measurements, using WARP was 10 MB lower when hidden and about 40 MB lower while visible because the hardware user-mode driver keeps heap and anonymous allocations the trim cannot reach; it is not used by default because it moves rendering to the CPU.
+
+On Windows, a final hidden check at 35 seconds requests `HeapOptimizeResources`
+after the independently scheduled renderer teardown. This asks the heap manager
+to decommit unused LFH caches without invalidating live allocations or evicting
+the process working set. It cannot reclaim pages still shared with live blocks.
+Before this request, SQLite is trimmed again because background indexing and
+screenshot persistence can refill its page caches after the 10-second trim.
+The automation-only `perf.native_heap_optimize` method allows a before/after
+measurement independent of the hidden lifecycle.
+
+Native thread pressure also survives hiding: spare Go OS threads retain stacks
+and loaded DLLs' thread-local storage. Application indexing limits concurrent
+path groups, and Windows emoji rendering queues before acquiring an OS thread.
+Emoji COM initialization, rendering, object release, and apartment teardown stay
+on that thread. Do not terminate runtime, plugin pipe, input method, or window
+threads as an idle-memory trim; their owners must control their lifetime.
+The automation-only `perf.thread_snapshot` writes goroutine and thread creation
+profiles and returns SQLite allocation/pool statistics. `perf.sqlite_release`
+measures the effect of the existing SQLite cache trim without closing pools.
+
+### Hidden-state ownership rules (September 22, 2026)
+
+A follow-up on the same Windows machine (dev build with `sqlite_fts5,wox_automation`, two 20-query warm-up blocks, samples 45 seconds after hide) moved the hidden private working set from 64.1 MB to 55.4 MB and the live Go heap from 17.2 MB to 11.0 MB. The 30-second stage already released most renderer memory; the remaining gains came from process-wide ownership fixes rather than more cache trimming:
+
+| Change | Hidden footprint |
+| --- | ---: |
+| Baseline: staged trims, prepared search text and pinyin table released at 30 s | 64.1 MB |
+| One shared Wox log for plugins; one process-wide fsnotify watcher | 60.7 MB |
+| Live-object reductions below | 55.4 MB |
+
+Rules that follow from it:
+
+- Plugins log through the shared Wox logger with their name as the component. Do not create a `util.Log` per plugin: each one cost a goroutine, an `io.Pipe`, an open file, and a zap/Lumberjack pair, and `CreateLogger` used to redirect the standard library `log` output every time it ran.
+- Watch directories through [`util.WatchDirectory`](../util/file_watcher.go). Every `fsnotify.NewWatcher` owns a completion port and a goroutine blocked in a native wait, which pins an OS thread; the shared watcher multiplexes all directories onto one and uses a 16 KB per-directory buffer instead of the 64 KB default.
+- `Metadata.translate` memoizes only strings it actually translated. Glance values and notification titles pass through it too, and caching every distinct untranslated string made the per-plugin map grow without bound.
+- Decode rasters at the size they are drawn and when they are first needed. Title bars draw the app icon at 20 logical px, so `newApp` decodes it at 64 px; the notes and chat taskbar glyphs are decoded on first window open.
+- `Manager.themes` stores themes without `AssetFiles`. Packages are still validated on load, but wallpaper bytes are reloaded through `Manager.ThemeWithAssets` only for the theme being applied, previewed in the installed catalog, or saved.
+- Settings-only state is built while a settings or onboarding window is open. `reloadSettings` skips the AI, hotkey, and query forms otherwise; a background cloud sync that finishes with the window closed marks the cloud snapshot stale instead of reloading the installed plugin catalog, and the catalog is released on close.
+- The launcher shares the i18n manager's language table through `LanguageBundle` instead of parsing a second copy, and `translationSnapshot` returns the published map rather than copying it per action-panel keystroke.
+- Result actions capture identifiers, not domain values. The theme plugin used to capture whole `common.Theme` values (and, for MRU restore, a pointer into the entire installed catalog) in action closures that live in the query and MRU caches.
+- Many-record plugin data is one plugin setting per record (`note:{id}`, `chat:{id}`), loaded on demand with only summaries resident. The AI Chat history moved from one `ai_chats` array to `chat:{id}` keys in the `20260922_split_ai_chats` migration; per-key settings also let Cloud Sync merge records edited on different devices.
+
+What is left after these changes is mostly native: about 10 MB of committed-but-free NT heap fragmentation from show/hide churn, private DLL pages, and Go runtime metadata that scales with the heap.
+
+The 30-second stage destroys the whole Windows renderer: swap chains, Direct2D targets and device, and this window's reference to the shared D3D device, which is released when no other window holds it. The native WebView host keeps a raw pointer to the renderer's composition visuals, so the renderer can only be released after the WebView. Pages opened with caching enabled, such as sites with "keep in background" turned on, intentionally survive hiding; while one exists, the stage is skipped and the renderer stays resident. Every other page is already discarded on hide, so the stage closes the idle WebView controller and then releases the renderer. The stage used to be skipped whenever a controller existed, and the controller outlives every hide, so a single ordinary web preview kept the renderer resident for the rest of the hidden period.
+
+On the same Windows machine (October 10, 2026; `sqlite_fts5,wox_automation` build, isolated data directory, one embedded website preview, then hidden), the private working set 45 seconds after hide was:
+
+| Build | Hidden + 5 s | Hidden + 45 s | Commit at 45 s |
+| --- | ---: | ---: | ---: |
+| Any WebView controller skips the stage | 100.7 MB | 94.6 MB | 162 MB |
+| Stage closes a controller without background pages | 101.8 MB | 60.4 MB | 122 MB |
+
+Without any web preview, both builds settle at about 59 MB.
+
+## SVG theme colors
+
+SVG icons can use `fill="var(--wox-theme-icon-color)"` or `stroke="var(--wox-theme-icon-color)"` to follow Wox appearance: white in dark themes and black in light themes. Fixed colors remain unchanged, including in SVGs that mix brand colors with this variable. This applies to inline, file, and Base64 SVGs in the shared launcher image pipeline. Controls that explicitly tint an entire icon retain that behavior.
+
+Standard SVG `currentColor` keeps its normal meaning and defaults to black; it is not the Wox theme variable.
+
+
+## Embedding chat
+
+Use `preview.ChatConversation` for launcher, dedicated-window, and business-specific chat surfaces. It owns message/composer layout, empty-state alignment, floating catalog sizing, and the common composer keyboard behavior. `ChatInput` owns the model selector and the entire composer toolbar, including Send/Stop; add general toolbar controls there once so every host receives them. Hosts must not build alternate input toolbars or calculate composer/model-chip sizes.
+
+Supply conversation data, model/catalog entries, the native host window, theme, localized labels, and request callbacks through `ChatConversationProps`. Optional header, history, tool questions, and a business footer are extension points. `PrepareMessages` allows AI Chat to reuse its cached rich-message/tool-round preparation at the size chosen by the component. Simple hosts can supply message data directly. Use `ChatScrollState`, `ChatCatalogKey`, and `ChatComposerKey` for retained scroll and keyboard handling, including host-level keyboard dispatch outside the text field.
+
+Message preparation and text-layout caches must use the presenting host window, including Markdown, reasoning, quoted attachments, and tool details. The hidden launcher can release its Windows renderer while Chat or Settings remains open, so measuring through the launcher can fail even though the conversation's own window can still draw.
+
+Provider requests, persistence, skill context, and applying generated theme patches stay in their business controllers. These intentionally differ; the shared component does not send requests or save drafts by itself.

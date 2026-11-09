@@ -1,0 +1,989 @@
+package emoji
+
+import (
+	"context"
+	"embed"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
+	"wox/common"
+	"wox/common/icons"
+	"wox/internal/assetfs"
+	"wox/plugin"
+	"wox/plugin/system"
+	"wox/setting"
+	"wox/setting/definition"
+	"wox/util"
+	"wox/util/clipboard"
+	"wox/util/emojiimage"
+	"wox/util/emojisearch"
+
+	"github.com/google/uuid"
+	"github.com/tidwall/gjson"
+)
+
+var emojiIcon = icons.Get(icons.PluginEmoji)
+
+var (
+	primaryActionSettingKey = "primary_action"
+	primaryActionValueCopy  = "copy"
+	primaryActionValuePaste = "paste"
+)
+
+//go:embed emoji-data.json
+var rawEmojiFS embed.FS
+
+var emojiFS = assetfs.New(rawEmojiFS)
+
+func init() {
+	// plugin.AllSystemPlugin = append(plugin.AllSystemPlugin, &EmojiPlugin{})
+}
+
+type EmojiData struct {
+	Emoji       string
+	Categories  map[string]string // language code -> category name
+	Names       map[string]string // language code -> emoji name
+	SearchTerms []string
+}
+
+var (
+	emojiCatalogOnce sync.Once
+	emojiCatalog     []EmojiData
+	emojiCatalogErr  error
+)
+
+// LoadCatalog returns the immutable embedded emoji catalog shared by plugin and UI search.
+func LoadCatalog() ([]EmojiData, error) {
+	emojiCatalogOnce.Do(func() {
+		emojiCatalog, emojiCatalogErr = loadEmojiCatalog()
+	})
+	return emojiCatalog, emojiCatalogErr
+}
+
+// loadEmojiCatalog parses the embedded catalog once without plugin-specific user state.
+func loadEmojiCatalog() ([]EmojiData, error) {
+	data, err := emojiFS.ReadFile("emoji-data.json")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read emoji data: %w", err)
+	}
+
+	jsonResult := gjson.ParseBytes(data)
+	if !jsonResult.IsArray() {
+		return nil, fmt.Errorf("failed to parse emoji data: root is not array")
+	}
+
+	entries := make([]EmojiData, 0, 5000)
+	seen := make(map[string]bool)
+	jsonResult.ForEach(func(_, category gjson.Result) bool {
+		categoryNames := resultToStringMap(category.Get("name_i18n"))
+		if base := strings.TrimSpace(category.Get("name").String()); base != "" && categoryNames["en"] == "" {
+			categoryNames["en"] = base
+		}
+		category.Get("list").ForEach(func(_, subCategory gjson.Result) bool {
+			subCategory.Get("list").ForEach(func(_, emoji gjson.Result) bool {
+				char := emoji.Get("char").String()
+				if char == "" || seen[char] {
+					return true
+				}
+
+				names := make(map[string]string)
+				if base := strings.TrimSpace(emoji.Get("name").String()); base != "" {
+					names["en"] = base
+				}
+				for lang, name := range resultToStringMap(emoji.Get("name_i18n")) {
+					if strings.TrimSpace(name) != "" {
+						names[lang] = name
+					}
+				}
+
+				entries = append(entries, EmojiData{
+					Emoji:       char,
+					Categories:  categoryNames,
+					Names:       names,
+					SearchTerms: emojisearch.BuildTerms(names, categoryNames),
+				})
+				seen[char] = true
+				return true
+			})
+			return true
+		})
+		return true
+	})
+	return entries, nil
+}
+
+type emojiUsage struct {
+	Emoji    string `json:"emoji"`
+	UseCount int    `json:"useCount"`
+}
+
+type EmojiPlugin struct {
+	api           plugin.API
+	emojis        []EmojiData
+	emojiLoadOnce sync.Once
+	emojiLoadErr  error
+
+	// emoji -> custom descriptions added by user
+	customDescriptions map[string][]string
+}
+
+func (e *EmojiPlugin) GetMetadata() plugin.Metadata {
+	return plugin.Metadata{
+		Id:            common.EmojiPluginID,
+		Name:          "i18n:plugin_emoji_plugin_name",
+		Author:        "Wox Launcher",
+		Website:       "https://github.com/Wox-launcher/Wox",
+		Version:       "1.0.0",
+		MinWoxVersion: "2.0.0",
+		Runtime:       "Go",
+		Description:   "i18n:plugin_emoji_plugin_description",
+		Icon:          emojiIcon.String(),
+		Entry:         "",
+		TriggerKeywords: []string{
+			"emoji",
+		},
+		Commands: []plugin.MetadataCommand{},
+		SettingDefinitions: definition.PluginSettingDefinitions{
+			{
+				Type: definition.PluginSettingDefinitionTypeSelect,
+				Value: &definition.PluginSettingValueSelect{
+					Key:          primaryActionSettingKey,
+					Label:        "i18n:plugin_emoji_primary_action",
+					Tooltip:      "i18n:plugin_emoji_primary_action_tooltip",
+					DefaultValue: primaryActionValuePaste,
+					Options: []definition.PluginSettingValueSelectOption{
+						{Label: "i18n:plugin_emoji_primary_action_copy_to_clipboard", Value: primaryActionValueCopy},
+						{Label: "i18n:plugin_emoji_primary_action_paste_to_active_app", Value: primaryActionValuePaste},
+					},
+				},
+			},
+			{
+				Type: definition.PluginSettingDefinitionTypeCheckBox,
+				Value: &definition.PluginSettingValueCheckBox{
+					Key:          "aiMatchEnabled",
+					Label:        "i18n:plugin_emoji_setting_ai_enable_label",
+					Tooltip:      "i18n:plugin_emoji_setting_ai_enable_tooltip",
+					DefaultValue: "false",
+				},
+			},
+			{
+				Type: definition.PluginSettingDefinitionTypeSelectAIModel,
+				Value: &definition.PluginSettingValueSelectAIModel{
+					Key:     "aiModel",
+					Label:   "i18n:plugin_emoji_setting_ai_model_label",
+					Tooltip: "i18n:plugin_emoji_setting_ai_model_tooltip",
+				},
+			},
+		},
+		SupportedOS: []string{
+			"Windows",
+			"Macos",
+			"Linux",
+		},
+		Features: []plugin.MetadataFeature{
+			{
+				Name: plugin.MetadataFeatureAI,
+			},
+			{
+				Name: plugin.MetadataFeatureQueryEnv,
+				Params: map[string]any{
+					"requireActiveWindowName": true,
+					"requireActiveWindowPid":  true,
+					"requireActiveWindowIcon": true,
+				},
+			},
+			{
+				Name: plugin.MetadataFeatureMRU,
+				Params: map[string]any{
+					"HashBy": "identityKey",
+				},
+			},
+		},
+	}
+}
+
+func (e *EmojiPlugin) Init(ctx context.Context, initParams plugin.InitParams) {
+	e.api = initParams.API
+	e.emojis = nil
+	e.emojiLoadOnce = sync.Once{}
+	e.emojiLoadErr = nil
+	e.customDescriptions = make(map[string][]string)
+	e.loadCustomDescriptions(ctx)
+	e.api.OnMRURestore(ctx, e.handleMRURestore)
+	// Emoji data is intentionally lazy-loaded on the first emoji query. The old
+	// startup path parsed the full embedded emoji catalog for every launch, which
+	// kept several megabytes of emoji search data live even when the user never
+	// opened the emoji plugin. Resetting the lazy state here preserves plugin
+	// reload behavior while moving that cost to the feature that actually uses it.
+}
+
+func (e *EmojiPlugin) ensureEmojisLoaded(ctx context.Context) bool {
+	e.emojiLoadOnce.Do(func() {
+		e.emojiLoadErr = e.loadEmojis(ctx)
+	})
+	if e.emojiLoadErr != nil {
+		e.api.Log(ctx, plugin.LogLevelError, e.emojiLoadErr.Error())
+		return false
+	}
+	return true
+}
+
+func (e *EmojiPlugin) loadEmojis(ctx context.Context) error {
+	catalog, err := LoadCatalog()
+	if err != nil {
+		return err
+	}
+	e.emojis = make([]EmojiData, len(catalog))
+	for index, entry := range catalog {
+		e.emojis[index] = entry
+		e.emojis[index].SearchTerms = append([]string(nil), entry.SearchTerms...)
+	}
+	e.applyCustomDescriptions(ctx)
+	e.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("Loaded %d emojis", len(e.emojis)))
+	return nil
+}
+
+func (e *EmojiPlugin) Query(ctx context.Context, query plugin.Query) plugin.QueryResponse {
+	if !e.ensureEmojisLoaded(ctx) {
+		return e.newEmojiQueryResponse(nil)
+	}
+
+	var results []plugin.QueryResult
+	search := strings.ToLower(strings.TrimSpace(query.Search))
+
+	// Get frequently used emojis
+	frequentlyUsed := e.getFrequentlyUsed(ctx)
+	frequentlyUsedSet := make(map[string]bool)
+	for _, usage := range frequentlyUsed {
+		frequentlyUsedSet[usage.Emoji] = true
+	}
+
+	// Add frequently used emojis first (as a group)
+	for _, usage := range frequentlyUsed {
+		entry := e.findEmoji(usage.Emoji)
+		if entry == nil {
+			continue
+		}
+		if !e.matchEmoji(*entry, search) {
+			continue
+		}
+
+		result := e.createEmojiResult(ctx, query, *entry, true)
+		result.Group = "i18n:plugin_emoji_frequently_used"
+		result.GroupScore = 100
+		results = append(results, result)
+	}
+
+	existingEmojiSet := make(map[string]bool)
+	for _, r := range results {
+		if r.Icon.ImageType == common.WoxImageTypeEmoji {
+			existingEmojiSet[r.Icon.ImageData] = true
+		}
+	}
+
+	if search == "" {
+		// Empty query: sample every category so browsing is not stuck in Smileys.
+		browseItems := selectBrowseEmojis(e.emojis, usageCountMap(e.loadUsages(ctx)), frequentlyUsedSet, func(entry EmojiData) string {
+			return e.getCategoryName(ctx, entry)
+		}, browsePerCategory)
+		for index, item := range browseItems {
+			result := e.createEmojiResult(ctx, query, item.Entry, false)
+			result.Group = item.Category
+			result.GroupScore = 50
+			// The manager sorts by score, so slice order alone cannot preserve the browse ranking.
+			result.Score = int64(len(browseItems) - index)
+			results = append(results, result)
+			existingEmojiSet[item.Entry.Emoji] = true
+		}
+	} else {
+		count := 0
+		for _, entry := range e.emojis {
+			if frequentlyUsedSet[entry.Emoji] {
+				continue
+			}
+
+			if e.matchEmoji(entry, search) {
+				result := e.createEmojiResult(ctx, query, entry, false)
+				result.Group = e.getCategoryName(ctx, entry)
+				result.GroupScore = 50
+				results = append(results, result)
+				existingEmojiSet[entry.Emoji] = true
+				count++
+			}
+
+			if count >= 100 {
+				break
+			}
+		}
+	}
+
+	e.maybeStartAIMatch(ctx, query, search, existingEmojiSet, &results)
+
+	return e.newEmojiQueryResponse(results)
+}
+
+func (e *EmojiPlugin) newEmojiQueryResponse(results []plugin.QueryResult) plugin.QueryResponse {
+	response := plugin.NewQueryResponse(results)
+	gridLayout := plugin.MetadataFeatureParamsGridLayout{
+		Columns:     10,
+		ItemPadding: 12,
+		ItemMargin:  6,
+		ShowTitle:   false,
+	}
+	response.Layout = plugin.QueryLayout{GridLayout: &gridLayout}
+	return response
+}
+
+func (e *EmojiPlugin) maybeStartAIMatch(ctx context.Context, query plugin.Query, search string, existingEmojiSet map[string]bool, results *[]plugin.QueryResult) {
+	if query.Id == "" {
+		return
+	}
+	if !e.isAIMatchEnabled(ctx) {
+		return
+	}
+	if len(search) < 2 {
+		return
+	}
+
+	model, ok := e.getAIModel(ctx)
+	if !ok {
+		return
+	}
+
+	aiGeneratingResult := e.createAIPlaceholderResult()
+	*results = append(*results, aiGeneratingResult)
+
+	util.Go(ctx, "emoji ai match", func() {
+		systemPrompt := "You are an emoji matcher. Return JSON only."
+		userPrompt := fmt.Sprintf("Query: %s\nReturn JSON: {\"emojis\": [\"😀\", \"😄\"]}. Return up to 12 emojis.", search)
+		conversations := []common.Conversation{
+			{Role: common.ConversationRoleSystem, Text: systemPrompt},
+			{Role: common.ConversationRoleUser, Text: userPrompt},
+		}
+
+		var finalData string
+		err := e.api.AIChatStream(ctx, model, conversations, common.ChatOptions{
+			ThinkingMode: common.ChatThinkingModeNonThinking,
+		}, func(streamResult common.ChatStreamData) {
+			if streamResult.Status == common.ChatStreamStatusStreaming || streamResult.Status == common.ChatStreamStatusStreamed || streamResult.Status == common.ChatStreamStatusFinished {
+				finalData = streamResult.Data
+			}
+
+			if streamResult.Status == common.ChatStreamStatusFinished {
+				e.handleAIMatchResult(ctx, query, finalData, existingEmojiSet, aiGeneratingResult.Id)
+			}
+			if streamResult.Status == common.ChatStreamStatusError {
+				e.updateAIPlaceholder(ctx, aiGeneratingResult.Id, "i18n:plugin_emoji_ai_failed", common.NewWoxImageEmoji("⚠️"))
+			}
+		})
+		if err != nil {
+			e.updateAIPlaceholder(ctx, aiGeneratingResult.Id, "i18n:plugin_emoji_ai_failed", common.NewWoxImageEmoji("⚠️"))
+			return
+		}
+	})
+}
+
+func (e *EmojiPlugin) handleAIMatchResult(ctx context.Context, query plugin.Query, data string, existingEmojiSet map[string]bool, aiGeneratingResultId string) {
+	entries := e.parseAIEmojis(data)
+	if len(entries) == 0 {
+		e.updateAIPlaceholder(ctx, aiGeneratingResultId, "i18n:plugin_emoji_ai_no_result", common.NewWoxImageEmoji("😕"))
+		return
+	}
+
+	var results []plugin.QueryResult
+	for _, entry := range entries {
+		if existingEmojiSet[entry.Emoji] {
+			continue
+		}
+		result := e.createEmojiResult(ctx, query, entry, false)
+		result.Group = "i18n:plugin_emoji_ai_group"
+		result.GroupScore = 90
+		result.Score = 90
+		results = append(results, result)
+		if len(results) >= 12 {
+			break
+		}
+	}
+
+	if len(results) == 0 {
+		e.updateAIPlaceholder(ctx, aiGeneratingResultId, "i18n:plugin_emoji_ai_no_result", common.NewWoxImageEmoji("😕"))
+		return
+	}
+	e.updateAIPlaceholderWithResult(ctx, aiGeneratingResultId, results[0])
+	if len(results) > 1 {
+		e.api.PushResults(ctx, query, results[1:])
+	}
+}
+
+func (e *EmojiPlugin) parseAIEmojis(data string) []EmojiData {
+	var results []EmojiData
+	seen := make(map[string]bool)
+
+	if gjson.Valid(data) {
+		emojiArray := gjson.Get(data, "emojis")
+		if emojiArray.IsArray() {
+			emojiArray.ForEach(func(_, value gjson.Result) bool {
+				emoji := strings.TrimSpace(value.String())
+				if emoji == "" || seen[emoji] {
+					return true
+				}
+				entry := e.findEmoji(emoji)
+				if entry != nil {
+					results = append(results, *entry)
+					seen[emoji] = true
+				}
+				return true
+			})
+		}
+	}
+
+	if len(results) > 0 {
+		return results
+	}
+
+	for _, entry := range e.emojis {
+		if seen[entry.Emoji] {
+			continue
+		}
+		if strings.Contains(data, entry.Emoji) {
+			results = append(results, entry)
+			seen[entry.Emoji] = true
+		}
+	}
+
+	return results
+}
+
+func (e *EmojiPlugin) createAIPlaceholderResult() plugin.QueryResult {
+	return plugin.QueryResult{
+		Id:         uuid.New().String(),
+		Title:      "i18n:plugin_emoji_ai_matching",
+		SubTitle:   "i18n:plugin_emoji_ai_matching_subtitle",
+		Icon:       icons.Get(icons.StatusLoading),
+		Group:      "i18n:plugin_emoji_ai_group",
+		GroupScore: 90,
+		Score:      90,
+	}
+}
+
+func (e *EmojiPlugin) updateAIPlaceholder(ctx context.Context, resultId string, subtitle string, icon common.WoxImage) {
+	updatable := e.api.GetUpdatableResult(ctx, resultId)
+	if updatable == nil {
+		return
+	}
+
+	updatable.SubTitle = &subtitle
+	updatable.Icon = &icon
+	e.api.UpdateResult(ctx, *updatable)
+}
+
+func (e *EmojiPlugin) updateAIPlaceholderWithResult(ctx context.Context, resultId string, result plugin.QueryResult) {
+	updatable := e.api.GetUpdatableResult(ctx, resultId)
+	if updatable == nil {
+		return
+	}
+
+	title := result.Title
+	subTitle := result.SubTitle
+	icon := result.Icon
+	actions := result.Actions
+
+	updatable.Title = &title
+	updatable.SubTitle = &subTitle
+	updatable.Icon = &icon
+	updatable.Actions = &actions
+	e.api.UpdateResult(ctx, *updatable)
+}
+
+func (e *EmojiPlugin) getAIModel(ctx context.Context) (common.Model, bool) {
+	modelRaw := strings.TrimSpace(e.api.GetSetting(ctx, "aiModel"))
+	if modelRaw == "" {
+		return common.Model{}, false
+	}
+	var model common.Model
+	if err := json.Unmarshal([]byte(modelRaw), &model); err != nil {
+		e.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to parse AI model: %v", err))
+		return common.Model{}, false
+	}
+	if model.Name == "" || model.Provider == "" {
+		return common.Model{}, false
+	}
+	return model, true
+}
+
+func (e *EmojiPlugin) isAIMatchEnabled(ctx context.Context) bool {
+	return strings.EqualFold(strings.TrimSpace(e.api.GetSetting(ctx, "aiMatchEnabled")), "true")
+}
+
+func (e *EmojiPlugin) createEmojiResult(ctx context.Context, query plugin.Query, entry EmojiData, isFrequentlyUsed bool) plugin.QueryResult {
+	emoji := entry.Emoji
+	title := e.getDisplayName(ctx, entry)
+	subTitle := e.getSecondaryName(title, entry)
+
+	return plugin.QueryResult{
+		Title:       title,
+		SubTitle:    subTitle,
+		Icon:        common.NewWoxImageEmoji(emoji),
+		IdentityKey: emoji,
+		Actions:     attachEmojiMRUContext(e.buildEmojiActions(ctx, query, emoji, isFrequentlyUsed), emoji),
+	}
+}
+
+func emojiMRUContext(emoji string) common.ContextData {
+	return common.ContextData{"emoji": emoji}
+}
+
+func attachEmojiMRUContext(actions []plugin.QueryResultAction, emoji string) []plugin.QueryResultAction {
+	data := emojiMRUContext(emoji)
+	for i := range actions {
+		if actions[i].ContextData == nil {
+			actions[i].ContextData = data
+			continue
+		}
+		actions[i].ContextData["emoji"] = emoji
+	}
+	return actions
+}
+
+// handleMRURestore rebuilds an emoji result from the stored character.
+func (e *EmojiPlugin) handleMRURestore(ctx context.Context, mruData plugin.MRUData) (*plugin.QueryResult, error) {
+	emoji := strings.TrimSpace(mruData.ContextData["emoji"])
+	if emoji == "" {
+		return nil, fmt.Errorf("empty emoji in context data")
+	}
+	if !e.ensureEmojisLoaded(ctx) {
+		return nil, fmt.Errorf("emoji catalog is not available")
+	}
+	entry := e.findEmoji(emoji)
+	if entry == nil {
+		return nil, fmt.Errorf("emoji no longer exists: %s", emoji)
+	}
+	result := e.createEmojiResult(ctx, plugin.Query{}, *entry, false)
+	return &result, nil
+}
+
+// buildEmojiActions wires copy/paste defaults from the primary action setting.
+func (e *EmojiPlugin) buildEmojiActions(ctx context.Context, query plugin.Query, emoji string, isFrequentlyUsed bool) []plugin.QueryResultAction {
+	primaryActionCode := e.primaryActionCode(ctx)
+	copyIsDefault := primaryActionCode == primaryActionValueCopy
+	alternateHotkey := util.PrimaryHotkey("enter")
+	actions := []plugin.QueryResultAction{
+		{
+			Name:      "i18n:plugin_emoji_copy",
+			Icon:      icons.Get(icons.ActionCopy),
+			IsDefault: copyIsDefault,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				if err := clipboard.WriteText(emoji); err != nil {
+					util.GetLogger().Error(ctx, fmt.Sprintf("Failed to copy emoji: %v", err))
+					return
+				}
+				e.recordUsage(ctx, emoji)
+			},
+		},
+	}
+
+	pasteAction, pasteErr := system.GetPasteToActiveWindowAction(ctx, e.api, query.Env.ActiveWindowTitle, query.Env.ActiveWindowPid, query.Env.ActiveWindowIcon, func(actionCtx context.Context) error {
+		if err := clipboard.WriteText(emoji); err != nil {
+			return fmt.Errorf("failed to copy emoji before paste: %w", err)
+		}
+		e.recordUsage(actionCtx, emoji)
+		return nil
+	})
+	if pasteErr == nil {
+		// The helper always marks paste as default; honor the plugin setting instead.
+		pasteAction.IsDefault = !copyIsDefault
+		if copyIsDefault {
+			pasteAction.Hotkey = alternateHotkey
+		} else {
+			actions[0].Hotkey = alternateHotkey
+		}
+		actions = append(actions, pasteAction)
+	}
+
+	actions = append(actions, plugin.QueryResultAction{
+		Name: "i18n:plugin_emoji_copy_large",
+		Icon: icons.Get(icons.ActionCopy),
+		Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+			img, err := emojiimage.Render(emoji, 200)
+			if err != nil {
+				e.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to build emoji image: %v", err))
+				e.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("Failed to build emoji image: %v", err)})
+				return
+			}
+
+			if err := clipboard.Write(&clipboard.ImageData{Image: img}); err != nil {
+				e.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to copy emoji image: %v", err))
+				return
+			}
+
+			e.recordUsage(ctx, emoji)
+		},
+	})
+
+	existingDescriptions := strings.Join(e.customDescriptions[emoji], ", ")
+	actions = append(actions, plugin.QueryResultAction{
+		Name:                   "i18n:plugin_emoji_add_keyword",
+		Icon:                   icons.Get(icons.ActionEdit),
+		Type:                   plugin.QueryResultActionTypeForm,
+		PreventHideAfterAction: true,
+		Form: definition.PluginSettingDefinitions{
+			{
+				Type: definition.PluginSettingDefinitionTypeTextBox,
+				Value: &definition.PluginSettingValueTextBox{
+					Key:          "keyword",
+					Label:        "i18n:plugin_emoji_add_keyword_label",
+					DefaultValue: existingDescriptions,
+					Tooltip:      "i18n:plugin_emoji_add_keyword_hint",
+				},
+			},
+		},
+		OnSubmit: func(ctx context.Context, actionContext plugin.FormActionContext) {
+			raw := strings.TrimSpace(actionContext.Values["keyword"])
+			if raw == "" {
+				return
+			}
+			parts := strings.Split(raw, ",")
+			var descriptions []string
+			for _, p := range parts {
+				if trimmed := strings.TrimSpace(p); trimmed != "" {
+					descriptions = append(descriptions, trimmed)
+				}
+			}
+			if len(descriptions) == 0 {
+				return
+			}
+			e.addCustomDescriptions(ctx, emoji, descriptions)
+			e.api.RefreshQuery(ctx, plugin.RefreshQueryParam{PreserveSelectedIndex: true})
+		},
+	})
+
+	if isFrequentlyUsed {
+		actions = append(actions, plugin.QueryResultAction{
+			Name:                   "i18n:plugin_emoji_remove_frequently_used",
+			Icon:                   icons.Get(icons.ActionDelete),
+			PreventHideAfterAction: true,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				e.removeUsage(ctx, emoji)
+				e.api.RefreshQuery(ctx, plugin.RefreshQueryParam{PreserveSelectedIndex: true})
+			},
+		})
+	}
+
+	return actions
+}
+
+// primaryActionCode returns the configured Enter action, defaulting to paste.
+func (e *EmojiPlugin) primaryActionCode(ctx context.Context) string {
+	code := strings.TrimSpace(e.api.GetSetting(ctx, primaryActionSettingKey))
+	if code == "" {
+		return primaryActionValuePaste
+	}
+	return code
+}
+
+func (e *EmojiPlugin) findEmoji(emoji string) *EmojiData {
+	for _, entry := range e.emojis {
+		if entry.Emoji == emoji {
+			return &entry
+		}
+	}
+	return nil
+}
+
+// loadUsages returns the full persisted usage list without the display cap.
+func (e *EmojiPlugin) loadUsages(ctx context.Context) []emojiUsage {
+	data := e.api.GetSetting(ctx, "frequentlyUsed")
+	if data == "" {
+		return nil
+	}
+
+	var usages []emojiUsage
+	if err := json.Unmarshal([]byte(data), &usages); err != nil {
+		e.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to parse frequently used data: %v", err))
+		return nil
+	}
+	return usages
+}
+
+func (e *EmojiPlugin) getFrequentlyUsed(ctx context.Context) []emojiUsage {
+	usages := e.loadUsages(ctx)
+	sort.Slice(usages, func(i, j int) bool {
+		return usages[i].UseCount > usages[j].UseCount
+	})
+
+	// Limit to top 16 (2 rows in grid)
+	if len(usages) > frequentlyUsedLimit {
+		usages = usages[:frequentlyUsedLimit]
+	}
+
+	return usages
+}
+
+func (e *EmojiPlugin) recordUsage(ctx context.Context, emoji string) {
+	usages := e.loadUsages(ctx)
+	if usages == nil {
+		usages = []emojiUsage{}
+	}
+
+	// Find existing or add new
+	found := false
+	for i := range usages {
+		if usages[i].Emoji == emoji {
+			usages[i].UseCount++
+			found = true
+			break
+		}
+	}
+	if !found {
+		usages = append(usages, emojiUsage{Emoji: emoji, UseCount: 1})
+	}
+
+	// Keep only top 50 to limit storage
+	sort.Slice(usages, func(i, j int) bool {
+		return usages[i].UseCount > usages[j].UseCount
+	})
+	if len(usages) > frequentlyUsedStoreCap {
+		usages = usages[:frequentlyUsedStoreCap]
+	}
+
+	data, err := json.Marshal(usages)
+	if err != nil {
+		e.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to serialize frequently used data: %v", err))
+		return
+	}
+	e.api.SaveSetting(ctx, "frequentlyUsed", string(data), false)
+}
+
+func (e *EmojiPlugin) removeUsage(ctx context.Context, emoji string) {
+	usages := e.loadUsages(ctx)
+	if len(usages) == 0 {
+		return
+	}
+
+	filtered := usages[:0]
+	for _, usage := range usages {
+		if usage.Emoji != emoji {
+			filtered = append(filtered, usage)
+		}
+	}
+
+	data, err := json.Marshal(filtered)
+	if err != nil {
+		e.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to serialize frequently used data: %v", err))
+		return
+	}
+	e.api.SaveSetting(ctx, "frequentlyUsed", string(data), false)
+}
+
+func (e *EmojiPlugin) matchEmoji(entry EmojiData, search string) bool {
+	if emojisearch.Match(emojisearch.Entry{Emoji: entry.Emoji, SearchTerms: entry.SearchTerms}, search) {
+		return true
+	}
+
+	if extras, ok := e.customDescriptions[entry.Emoji]; ok {
+		for _, desc := range extras {
+			if strings.Contains(strings.ToLower(desc), search) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func (e *EmojiPlugin) loadCustomDescriptions(ctx context.Context) {
+	data := e.api.GetSetting(ctx, "customDescriptions")
+	if strings.TrimSpace(data) == "" {
+		return
+	}
+	var saved map[string][]string
+	if err := json.Unmarshal([]byte(data), &saved); err != nil {
+		e.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to parse custom descriptions: %v", err))
+		return
+	}
+	e.customDescriptions = saved
+}
+
+func (e *EmojiPlugin) addCustomDescriptions(ctx context.Context, emoji string, descriptions []string) {
+	var cleaned []string
+	for _, desc := range descriptions {
+		trimmed := strings.TrimSpace(desc)
+		if trimmed == "" {
+			continue
+		}
+		cleaned = append(cleaned, trimmed)
+	}
+	if len(cleaned) == 0 {
+		return
+	}
+
+	values := e.customDescriptions[emoji]
+	for _, v := range cleaned {
+		duplicate := false
+		for _, exist := range values {
+			if strings.EqualFold(strings.TrimSpace(exist), v) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			values = append(values, v)
+		}
+	}
+	e.customDescriptions[emoji] = values
+
+	e.applyCustomDescriptions(ctx)
+
+	data, err := json.Marshal(e.customDescriptions)
+	if err != nil {
+		e.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to serialize custom descriptions: %v", err))
+		return
+	}
+	e.api.SaveSetting(ctx, "customDescriptions", string(data), false)
+}
+
+func (e *EmojiPlugin) applyCustomDescriptions(ctx context.Context) {
+	if len(e.customDescriptions) == 0 {
+		return
+	}
+
+	custom := make(map[string][]string)
+	for k, v := range e.customDescriptions {
+		for _, item := range v {
+			trimmed := strings.ToLower(strings.TrimSpace(item))
+			if trimmed == "" {
+				continue
+			}
+			custom[k] = append(custom[k], trimmed)
+		}
+	}
+
+	for i := range e.emojis {
+		terms := e.emojis[i].SearchTerms
+		if extra, ok := custom[e.emojis[i].Emoji]; ok {
+			terms = append(terms, extra...)
+		}
+		e.emojis[i].SearchTerms = emojisearch.NormalizeTerms(terms)
+	}
+}
+
+func resultToStringMap(result gjson.Result) map[string]string {
+	values := make(map[string]string)
+	if !result.IsObject() {
+		return values
+	}
+
+	result.ForEach(func(key, value gjson.Result) bool {
+		values[key.String()] = value.String()
+		return true
+	})
+	return values
+}
+
+func pickLangValue(i18n map[string]string, fallback string) string {
+	if v, ok := i18n["en"]; ok && strings.TrimSpace(v) != "" {
+		return strings.TrimSpace(v)
+	}
+
+	for _, v := range i18n {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+
+	return strings.TrimSpace(fallback)
+}
+
+func (e *EmojiPlugin) getDisplayName(ctx context.Context, entry EmojiData) string {
+	langCode := setting.GetSettingManager().GetWoxSetting(ctx).LangCode.Get()
+	preferred := e.getPreferredLangKeys(string(langCode))
+
+	for _, key := range preferred {
+		if name, ok := entry.Names[key]; ok {
+			if trimmed := strings.TrimSpace(name); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+
+	for _, name := range entry.Names {
+		if trimmed := strings.TrimSpace(name); trimmed != "" {
+			return trimmed
+		}
+	}
+
+	return entry.Emoji
+}
+
+func (e *EmojiPlugin) getCategoryName(ctx context.Context, entry EmojiData) string {
+	langCode := setting.GetSettingManager().GetWoxSetting(ctx).LangCode.Get()
+	preferred := e.getPreferredLangKeys(string(langCode))
+
+	for _, key := range preferred {
+		if name, ok := entry.Categories[key]; ok {
+			if trimmed := strings.TrimSpace(name); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+
+	for _, name := range entry.Categories {
+		if trimmed := strings.TrimSpace(name); trimmed != "" {
+			return trimmed
+		}
+	}
+
+	// use en as fallback
+	if name, ok := entry.Categories["en"]; ok {
+		if trimmed := strings.TrimSpace(name); trimmed != "" {
+			return trimmed
+		}
+	}
+
+	return ""
+}
+
+func (e *EmojiPlugin) getSecondaryName(primary string, entry EmojiData) string {
+	primaryLower := strings.ToLower(strings.TrimSpace(primary))
+
+	if name, ok := entry.Names["en"]; ok {
+		trimmed := strings.TrimSpace(name)
+		if trimmed != "" && strings.ToLower(trimmed) != primaryLower {
+			return trimmed
+		}
+	}
+
+	for _, name := range entry.Names {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			continue
+		}
+		if strings.ToLower(trimmed) == primaryLower {
+			continue
+		}
+		return trimmed
+	}
+
+	return ""
+}
+
+func (e *EmojiPlugin) getPreferredLangKeys(langCode string) []string {
+	var preferred []string
+	if langCode != "" {
+		preferred = append(preferred, langCode)
+		if strings.Contains(langCode, "_") {
+			parts := strings.SplitN(langCode, "_", 2)
+			if len(parts) == 2 {
+				base := parts[0]
+				if base != "" && base != langCode {
+					preferred = append(preferred, base)
+				}
+			}
+		}
+	}
+
+	preferred = append(preferred, "en")
+	return preferred
+}

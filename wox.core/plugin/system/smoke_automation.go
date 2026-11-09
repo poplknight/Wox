@@ -1,0 +1,481 @@
+//go:build wox_automation
+
+package system
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"wox/common"
+	"wox/common/icons"
+	"wox/plugin"
+	"wox/util"
+
+	"github.com/google/uuid"
+)
+
+const (
+	smokeAutomationTrigger                 = "wox-smoke"
+	smokeAutomationSlowCommand             = "slow"
+	smokeAutomationStreamingCommand        = "streaming-preview"
+	smokeAutomationToolbarCommand          = "toolbar"
+	smokeAutomationToolbarLongCommand      = "toolbar-long"
+	smokeAutomationToastCommand            = "toast"
+	smokeAutomationToastResultCommand      = "toast-result"
+	smokeAutomationAttentionCommand        = "attention"
+	smokeAutomationQuickSelectCommand      = "quick-select"
+	smokeAutomationPinRankingCommand       = "pin-ranking"
+	smokeAutomationGroupJumpCommand        = "group-jump"
+	smokeAutomationTooltipCommand          = "tooltip"
+	smokeAutomationToolbarMessageID        = "wox-smoke-toolbar-message"
+	smokeAutomationKeepOpenAction          = "keep-open"
+	smokeAutomationClearAction             = "clear"
+	smokeAutomationResultAction            = "hide-launcher"
+	smokeAutomationSecondaryAction         = "open-folder"
+	smokeAutomationLongToolbarTitle        = "Indexing file contents across every configured search root: 18365 files are already processed and the catalog is still updating with additional paths that must remain visible in the launcher status"
+	smokeAutomationAttentionKey            = "attention-smoke-item"
+	smokeAutomationAttentionTitle          = "Attention smoke item"
+	smokeAutomationAttentionQuery          = "1+1"
+	smokeAutomationResultBindingCommand    = "result-binding"
+	smokeAutomationResultBindingID         = "result-binding-fixture"
+	smokeAutomationResultBindingTitle      = "Result binding fixture"
+	smokeAutomationResultBindingAction     = "run-result-binding"
+	smokeAutomationResultBindingContextKey = "fixture"
+	smokeAutomationResultBindingMarker     = "result-binding"
+	smokeAutomationResultBindingLog        = "result binding fixture executed"
+)
+
+func init() {
+	plugin.AllSystemPlugin = append(plugin.AllSystemPlugin, &smokeAutomationPlugin{})
+}
+
+type smokeAutomationPlugin struct {
+	api                  plugin.API
+	attentionMu          sync.Mutex
+	attentionDescription string
+}
+
+// GetMetadata exposes command-scoped fixtures and an exact-match global preview probe.
+func (*smokeAutomationPlugin) GetMetadata() plugin.Metadata {
+	return plugin.Metadata{
+		Id: "0cb0d21c-45ce-4fe0-987e-24d645eca58c", Name: "Smoke Test Fixture", Runtime: "Go", Version: "1.0.0",
+		TriggerKeywords: []string{smokeAutomationTrigger, "*"}, HiddenFromPluginList: true,
+		Features: []plugin.MetadataFeature{
+			{Name: plugin.MetadataFeatureQuerySelection},
+			{Name: plugin.MetadataFeatureMRU},
+		},
+		Commands: []plugin.MetadataCommand{
+			{Command: "preview-scope", Description: "Global and plugin preview boundary fixture"},
+			{Command: "query-hint", QueryHint: &common.QueryHint{Elements: []common.QueryElement{
+				{Id: "filter", Kind: common.QueryElementArgument, Suggestions: []string{"created", "assigned", "search"}},
+			}}},
+			{Command: smokeAutomationSlowCommand, Description: "Delayed query loading fixture"},
+			{Command: smokeAutomationStreamingCommand, Description: "Streaming preview fixture"},
+			{Command: smokeAutomationToolbarCommand, Description: "Toolbar message fixture"},
+			{Command: smokeAutomationToolbarLongCommand, Description: "Long toolbar message fixture"},
+			{Command: smokeAutomationToastCommand, Description: "Toast notification fixture"},
+			{Command: smokeAutomationToastResultCommand, Description: "Toast action result fixture"},
+			{Command: smokeAutomationAttentionCommand, Description: "Persistent attention fixture"},
+			{Command: smokeAutomationQuickSelectCommand, Description: "Two numbered results for Quick Select"},
+			{Command: smokeAutomationPinRankingCommand, Description: "Two deterministic results for pin ranking"},
+			{Command: smokeAutomationGroupJumpCommand, Description: "Two named groups for Option/Ctrl-arrow group jumps"},
+			{Command: smokeAutomationTooltipCommand, Description: "Preview tag tooltip fixture"},
+			{Command: smokeAutomationResultBindingCommand, Description: "Result hotkey and alias fixture"},
+			{Command: smokeAutomationListCommand, Description: "500 list results"},
+			{Command: smokeAutomationGridCommand, Description: "500 grid results with group headers"},
+			{Command: smokeAutomationChatCommand, Description: "200 chat messages with streaming updates"},
+			{Command: smokeAutomationWarmCacheCommand, Description: "Repeated text and image warm-cache fixture"},
+		},
+		SupportedOS: []string{util.PlatformMacOS, util.PlatformWindows, util.PlatformLinux},
+	}
+}
+
+func (p *smokeAutomationPlugin) Init(ctx context.Context, initParams plugin.InitParams) {
+	p.api = initParams.API
+	p.api.OnMRURestore(ctx, p.restoreResultBindingFixture)
+}
+
+// Query dispatches the deterministic native smoke behaviors by metadata command.
+func (p *smokeAutomationPlugin) Query(ctx context.Context, query plugin.Query) plugin.QueryResponse {
+	if query.IsGlobalQuery() {
+		if strings.TrimSpace(query.Search) == "wox-preview-scope-smoke" {
+			return p.queryPreviewScope()
+		}
+		return plugin.QueryResponse{}
+	}
+	switch query.Command {
+	case "preview-scope":
+		return p.queryPreviewScope()
+	case smokeAutomationSlowCommand:
+		return p.querySlow(ctx)
+	case smokeAutomationStreamingCommand:
+		return p.queryStreamingPreview()
+	case smokeAutomationToolbarCommand:
+		return p.queryToolbar(ctx)
+	case smokeAutomationToolbarLongCommand:
+		return p.queryToolbarLong(ctx)
+	case smokeAutomationToastResultCommand:
+		return plugin.NewQueryResponse([]plugin.QueryResult{{Title: "Toast action completed", Icon: icons.Get(icons.PluginApp)}})
+	case smokeAutomationToastCommand:
+		return plugin.NewQueryResponse([]plugin.QueryResult{{Title: "Show toast fixture", Icon: icons.Get(icons.PluginApp), Actions: []plugin.QueryResultAction{{
+			Name: "Show toast", IsDefault: true, PreventHideAfterAction: true,
+			Action: func(actionCtx context.Context, _ plugin.ActionContext) {
+				title := "Toast fixture"
+				message := "Toast fixture message"
+				actionLabel := "Open fixture"
+				if query.Search == "hidden" {
+					p.api.HideApp(actionCtx)
+					title = ""
+					message = "A longer toast message that wraps across multiple lines while its action remains available and the launcher is hidden."
+				}
+				if query.Search == "long" {
+					title = "File received"
+					message = `Received file: C:\Users\Example\Downloads\LocalSend\2026-11-01_18-35-41 - Phone - ff1ffea7-f0cd-44cc-a9aa-5b194e435317\IMG_2829.jpeg`
+					actionLabel = "View receive history"
+				}
+				p.api.ShowToastMsg(actionCtx, plugin.ShowToastMsgOption{Message: message, Title: title, Action: &plugin.ToastMsgAction{
+					Name: actionLabel, ContextData: common.ContextData{"marker": "toast"},
+					Action: func(callbackCtx context.Context, action plugin.ToastMsgActionContext) {
+						if action.ContextData["marker"] != "toast" {
+							return
+						}
+						p.api.ShowApp(callbackCtx)
+						p.api.ChangeQuery(callbackCtx, common.PlainQuery{QueryType: plugin.QueryTypeInput, QueryText: "wox-smoke toast-result "})
+					},
+				}})
+			},
+		}}}})
+	case smokeAutomationAttentionCommand:
+		return p.queryAttentionFixture()
+	case smokeAutomationQuickSelectCommand:
+		return p.queryQuickSelect()
+	case smokeAutomationPinRankingCommand:
+		return queryPinRanking()
+	case smokeAutomationGroupJumpCommand:
+		return queryGroupJump()
+	case smokeAutomationTooltipCommand:
+		return queryTooltipPreview()
+	case smokeAutomationResultBindingCommand:
+		return p.queryResultBinding()
+	case smokeAutomationListCommand:
+		response := queryListFixture()
+		if query.Search == "preview" {
+			// Keep the right pane fixed while the result viewport scrolls independently.
+			for index := range response.Results {
+				response.Results[index].Preview = plugin.WoxPreview{PreviewType: plugin.WoxPreviewTypeText, PreviewData: "Stable repaint smoke preview"}
+			}
+		}
+		return response
+	case smokeAutomationGridCommand:
+		return queryGridFixture()
+	case smokeAutomationChatCommand:
+		return p.queryChatFixture()
+	case smokeAutomationWarmCacheCommand:
+		return queryWarmCacheFixture()
+	default:
+		return plugin.QueryResponse{}
+	}
+}
+
+// queryPreviewScope sends identical preview payloads through global and plugin queries, including live updates.
+func (p *smokeAutomationPlugin) queryPreviewScope() plugin.QueryResponse {
+	return plugin.NewQueryResponse([]plugin.QueryResult{{
+		Id: uuid.NewString(), Title: "Preview scope initial", Icon: icons.Get(icons.PluginApp),
+		Preview: plugin.WoxPreview{PreviewType: plugin.WoxPreviewTypeText, PreviewData: "Preview scope initial body"},
+		Actions: []plugin.QueryResultAction{{
+			Id: "update-preview-scope", Name: "Update preview", Icon: icons.Get(icons.ActionUpdate), IsDefault: true, PreventHideAfterAction: true,
+			Action: func(ctx context.Context, action plugin.ActionContext) {
+				title := "Preview scope updated"
+				preview := plugin.WoxPreview{PreviewType: plugin.WoxPreviewTypeText, PreviewData: "Preview scope updated body"}
+				p.api.UpdateResult(ctx, plugin.UpdatableResult{Id: action.ResultId, Title: &title, Preview: &preview})
+			},
+		}},
+	}})
+}
+
+// queryResultBinding returns one restorable executable result for alias and hotkey bindings.
+func (p *smokeAutomationPlugin) queryResultBinding() plugin.QueryResponse {
+	return plugin.NewQueryResponse([]plugin.QueryResult{p.resultBindingFixture()})
+}
+
+// restoreResultBindingFixture rebuilds only the result-binding fixture from saved MRU identity.
+func (p *smokeAutomationPlugin) restoreResultBindingFixture(_ context.Context, mruData plugin.MRUData) (*plugin.QueryResult, error) {
+	if mruData.Title != smokeAutomationResultBindingTitle || mruData.ContextData[smokeAutomationResultBindingContextKey] != smokeAutomationResultBindingMarker {
+		return nil, fmt.Errorf("unsupported smoke MRU restore")
+	}
+	result := p.resultBindingFixture()
+	return &result, nil
+}
+
+// resultBindingFixture is the stable executable row stored by result alias and hotkey bindings.
+func (p *smokeAutomationPlugin) resultBindingFixture() plugin.QueryResult {
+	return plugin.QueryResult{
+		Id:    smokeAutomationResultBindingID,
+		Title: smokeAutomationResultBindingTitle,
+		Icon:  icons.Get(icons.PluginApp),
+		Actions: []plugin.QueryResultAction{{
+			Id:        smokeAutomationResultBindingAction,
+			Name:      "Run binding fixture",
+			Icon:      icons.Get(icons.ActionRun),
+			IsDefault: true,
+			ContextData: common.ContextData{
+				smokeAutomationResultBindingContextKey: smokeAutomationResultBindingMarker,
+			},
+			Action: func(ctx context.Context, _ plugin.ActionContext) {
+				p.api.Log(ctx, plugin.LogLevelInfo, smokeAutomationResultBindingLog)
+			},
+		}},
+	}
+}
+
+// queryGroupJump returns leading ungrouped rows plus two named groups, matching
+// queries that show links above a Files-style group.
+func queryGroupJump() plugin.QueryResponse {
+	return plugin.NewQueryResponse([]plugin.QueryResult{
+		groupJumpResult("group-jump-url", "Group jump URL", "", 30, 300),
+		groupJumpResult("group-jump-open", "Group jump open", "", 20, 300),
+		groupJumpResult("group-jump-a-first", "Group jump A first", "Group jump A", 20, 200),
+		groupJumpResult("group-jump-a-last", "Group jump A last", "Group jump A", 10, 200),
+		groupJumpResult("group-jump-b-first", "Group jump B first", "Group jump B", 20, 100),
+		groupJumpResult("group-jump-b-last", "Group jump B last", "Group jump B", 10, 100),
+	})
+}
+
+func groupJumpResult(id, title, group string, score, groupScore int64) plugin.QueryResult {
+	return plugin.QueryResult{
+		Id: id, Title: title, Icon: icons.Get(icons.PluginApp), Score: score, Group: group, GroupScore: groupScore,
+		Actions: []plugin.QueryResultAction{{
+			Id: smokeAutomationKeepOpenAction, Name: "Keep open", Icon: icons.Get(icons.ActionRun), IsDefault: true, PreventHideAfterAction: true,
+		}},
+	}
+}
+
+// queryPinRanking returns stable ordering without mutating persisted plugin settings.
+func queryPinRanking() plugin.QueryResponse {
+	return plugin.NewQueryResponse([]plugin.QueryResult{
+		{Id: "pin-ranking-first-fixture", Title: "Pin ranking first fixture", Icon: icons.Get(icons.PluginApp)},
+		{Id: "pin-ranking-second-fixture", Title: "Pin ranking second fixture", Icon: icons.Get(icons.PluginApp)},
+	})
+}
+
+// queryAttentionFixture exposes fresh and repeated pushes through the real plugin API boundary.
+func (p *smokeAutomationPlugin) queryAttentionFixture() plugin.QueryResponse {
+	return plugin.NewQueryResponse([]plugin.QueryResult{{
+		Id:    "attention-smoke-fixture",
+		Title: "Attention smoke fixture",
+		Icon:  icons.Get(icons.PluginApp),
+		Actions: []plugin.QueryResultAction{
+			{
+				Id:                     "push-fresh-attention",
+				Name:                   "Push fresh attention",
+				Icon:                   icons.Get(icons.ActionAdd),
+				IsDefault:              true,
+				PreventHideAfterAction: true,
+				Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+					p.pushAttentionFixture(ctx, true)
+					p.completeAttentionFixtureAction(ctx, actionContext.ResultId, "Attention smoke fixture: fresh pushed")
+				},
+			},
+			{
+				Id:                     "repeat-attention",
+				Name:                   "Repeat attention",
+				Icon:                   icons.Get(icons.ActionUpdate),
+				PreventHideAfterAction: true,
+				Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+					p.pushAttentionFixture(ctx, false)
+					p.completeAttentionFixtureAction(ctx, actionContext.ResultId, "Attention smoke fixture: repeat pushed")
+				},
+			},
+		},
+	}})
+}
+
+func (p *smokeAutomationPlugin) completeAttentionFixtureAction(ctx context.Context, resultID string, title string) {
+	p.api.UpdateResult(ctx, plugin.UpdatableResult{Id: resultID, Title: &title})
+}
+
+// pushAttentionFixture keeps repeated pushes byte-identical until a fresh generation is requested.
+func (p *smokeAutomationPlugin) pushAttentionFixture(ctx context.Context, fresh bool) {
+	p.attentionMu.Lock()
+	if fresh || p.attentionDescription == "" {
+		p.attentionDescription = fmt.Sprintf("Attention smoke generation %d", time.Now().UnixNano())
+	}
+	description := p.attentionDescription
+	p.attentionMu.Unlock()
+
+	p.api.PushAttention(ctx, plugin.PushAttentionRequest{
+		Key:         smokeAutomationAttentionKey,
+		Title:       smokeAutomationAttentionTitle,
+		Description: description,
+		Action: &plugin.AttentionAction{
+			Type:  plugin.AttentionActionTypeChangeQuery,
+			Query: smokeAutomationAttentionQuery,
+		},
+	})
+}
+
+// querySlow delays a real plugin response long enough for smoke tests to observe query loading.
+func (*smokeAutomationPlugin) querySlow(ctx context.Context) plugin.QueryResponse {
+	timer := time.NewTimer(1500 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return plugin.QueryResponse{}
+	case <-timer.C:
+		return plugin.NewQueryResponse([]plugin.QueryResult{{Title: "Slow query completed", Icon: icons.Get(icons.PluginApp)}})
+	}
+}
+
+// queryStreamingPreview returns a compact result whose smoke-only action publishes its first preview chunk.
+func (p *smokeAutomationPlugin) queryStreamingPreview() plugin.QueryResponse {
+	resultID := uuid.NewString()
+	return plugin.NewQueryResponse([]plugin.QueryResult{{
+		Id: resultID, Title: "Streaming preview pending", Icon: icons.Get(icons.PluginApp),
+		Actions: []plugin.QueryResultAction{{
+			Id: "publish-preview", Name: "Publish preview", Icon: icons.Get(icons.ActionPreview), PreventHideAfterAction: true,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				title := "Streaming preview received"
+				p.api.UpdateResult(ctx, plugin.UpdatableResult{
+					Id: actionContext.ResultId, Title: &title,
+					Preview: &plugin.WoxPreview{PreviewType: plugin.WoxPreviewTypeMarkdown, PreviewData: "# Streaming preview\n\nFirst preview chunk"},
+				})
+			},
+		}},
+	}})
+}
+
+// queryTooltipPreview exposes one selected result whose preview tag opens a native tooltip.
+func queryTooltipPreview() plugin.QueryResponse {
+	return plugin.NewQueryResponse([]plugin.QueryResult{{
+		Id:    "tooltip-smoke-fixture",
+		Title: "Tooltip smoke fixture",
+		Icon:  icons.Get(icons.PluginApp),
+		Preview: plugin.WoxPreview{
+			PreviewType: plugin.WoxPreviewTypeText,
+			PreviewData: "Hover the preview tag to show a native tooltip.",
+			PreviewTags: []plugin.WoxPreviewTag{{
+				Label:   "Tooltip",
+				Tooltip: "Native tooltip must not hide the launcher",
+			}},
+		},
+		Actions: []plugin.QueryResultAction{{
+			Id:                     smokeAutomationKeepOpenAction,
+			Name:                   "Keep open",
+			Icon:                   icons.Get(icons.ActionRun),
+			IsDefault:              true,
+			PreventHideAfterAction: true,
+		}},
+	}})
+}
+
+// queryQuickSelect returns two named results so a hold-to-number activation can target the second row.
+func (p *smokeAutomationPlugin) queryQuickSelect() plugin.QueryResponse {
+	return plugin.NewQueryResponse([]plugin.QueryResult{
+		{
+			Id:    "quick-select-first-fixture",
+			Title: "Quick select first fixture",
+			Icon:  icons.Get(icons.PluginApp),
+			Actions: []plugin.QueryResultAction{{
+				Id:                     "keep-open",
+				Name:                   "Keep open",
+				Icon:                   icons.Get(icons.ActionRun),
+				IsDefault:              true,
+				PreventHideAfterAction: true,
+				Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+					p.completeAttentionFixtureAction(ctx, actionContext.ResultId, "Quick select first activated")
+				},
+			}},
+		},
+		{
+			Id:    "quick-select-second-fixture",
+			Title: "Quick select second fixture",
+			Icon:  icons.Get(icons.PluginApp),
+			Actions: []plugin.QueryResultAction{{
+				Id:                     smokeAutomationResultAction,
+				Name:                   "Hide launcher",
+				Icon:                   icons.Get(icons.ActionHide),
+				IsDefault:              true,
+				PreventHideAfterAction: false,
+				Action: func(ctx context.Context, _ plugin.ActionContext) {
+					p.api.Log(ctx, plugin.LogLevelInfo, "Quick select second fixture activated")
+				},
+			}},
+		},
+	})
+}
+
+// queryToolbar publishes a persistent toolbar message through the real plugin API boundary.
+func (p *smokeAutomationPlugin) queryToolbar(ctx context.Context) plugin.QueryResponse {
+	return p.queryToolbarWithStatus(ctx, "Toolbar fixture ready")
+}
+
+// queryToolbarLong uses a status long enough to consume leftover footer width.
+func (p *smokeAutomationPlugin) queryToolbarLong(ctx context.Context) plugin.QueryResponse {
+	return p.queryToolbarWithStatus(ctx, smokeAutomationLongToolbarTitle)
+}
+
+// queryToolbarWithStatus publishes one toolbar status plus the shared Enter and extra result actions.
+func (p *smokeAutomationPlugin) queryToolbarWithStatus(ctx context.Context, title string) plugin.QueryResponse {
+	p.showToolbarMessage(ctx, title)
+	return plugin.NewQueryResponse([]plugin.QueryResult{{
+		Title: "Toolbar smoke fixture", Icon: icons.Get(icons.PluginApp),
+		Actions: []plugin.QueryResultAction{
+			{
+				Id:                     smokeAutomationResultAction,
+				Name:                   "Hide launcher",
+				Icon:                   icons.Get(icons.ActionHide),
+				IsDefault:              true,
+				Hotkey:                 "enter",
+				PreventHideAfterAction: false,
+				Action: func(callbackCtx context.Context, _ plugin.ActionContext) {
+					p.api.Log(callbackCtx, plugin.LogLevelInfo, "Toolbar fixture result action executed")
+				},
+			},
+			{
+				Id:                     smokeAutomationSecondaryAction,
+				Name:                   "Open folder",
+				ShowInToolbar:          true,
+				Icon:                   icons.Get(icons.ActionOpenContainingFolder),
+				Hotkey:                 util.PrimaryHotkey("enter"),
+				PreventHideAfterAction: true,
+				Action: func(callbackCtx context.Context, _ plugin.ActionContext) {
+					p.api.Log(callbackCtx, plugin.LogLevelInfo, "Toolbar fixture secondary action executed")
+				},
+			},
+		},
+	}})
+}
+
+// showToolbarMessage publishes the current toolbar state and keeps its callbacks deterministic.
+func (p *smokeAutomationPlugin) showToolbarMessage(ctx context.Context, title string) {
+	p.api.ShowToolbarMsg(ctx, plugin.ToolbarMsg{
+		Id:            smokeAutomationToolbarMessageID,
+		Title:         title,
+		Icon:          icons.Get(icons.PluginApp),
+		Indeterminate: true,
+		Actions: []plugin.ToolbarMsgAction{
+			{
+				Id:                     smokeAutomationKeepOpenAction,
+				Name:                   "Keep open",
+				Hotkey:                 util.PrimaryHotkey("k"),
+				PreventHideAfterAction: true,
+				ContextData:            common.ContextData{"marker": "context-round-trip"},
+				Action: func(callbackCtx context.Context, actionContext plugin.ToolbarMsgActionContext) {
+					p.showToolbarMessage(callbackCtx, fmt.Sprintf("Toolbar fixture keep-open: %s", actionContext.ContextData["marker"]))
+				},
+			},
+			{
+				Id:                     smokeAutomationClearAction,
+				Name:                   "Clear",
+				Hotkey:                 util.PrimaryHotkey("l"),
+				PreventHideAfterAction: true,
+				Action: func(callbackCtx context.Context, _ plugin.ToolbarMsgActionContext) {
+					p.api.ClearToolbarMsg(callbackCtx, smokeAutomationToolbarMessageID)
+				},
+			},
+		},
+	})
+}

@@ -1,0 +1,162 @@
+package plugin
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"testing"
+	"wox/common"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestGetFeatureParamsForGridLayoutParsesJSONNumbers(t *testing.T) {
+	metadata := Metadata{
+		Features: []MetadataFeature{
+			{
+				Name: MetadataFeatureGridLayout,
+				Params: map[string]any{
+					"Columns":     12.0,
+					"ShowTitle":   false,
+					"ItemPadding": 12.0,
+					"ItemMargin":  6.0,
+					"AspectRatio": 1.7777778,
+				},
+			},
+		},
+	}
+
+	params, err := metadata.GetFeatureParamsForGridLayout()
+
+	require.NoError(t, err)
+	assert.Equal(t, 12, params.Columns)
+	assert.False(t, params.ShowTitle)
+	assert.Equal(t, 12, params.ItemPadding)
+	assert.Equal(t, 6, params.ItemMargin)
+	assert.Equal(t, 1.7777778, params.AspectRatio)
+}
+
+func TestGetFeatureParamsForGridLayoutUsesOutlineFriendlyDefaults(t *testing.T) {
+	metadata := Metadata{
+		Features: []MetadataFeature{
+			{
+				Name:   MetadataFeatureGridLayout,
+				Params: map[string]any{},
+			},
+		},
+	}
+
+	params, err := metadata.GetFeatureParamsForGridLayout()
+
+	require.NoError(t, err)
+	assert.Equal(t, 8, params.Columns)
+	// Behavior change: the default grid highlight is now an outline, so missing
+	// ItemPadding should not preserve the old filled-background spacing.
+	assert.Equal(t, 0, params.ItemPadding)
+	assert.Equal(t, 6, params.ItemMargin)
+	assert.Equal(t, 1.0, params.AspectRatio)
+}
+
+func TestGetFeatureParamsForDebounceParsesJSONNumbers(t *testing.T) {
+	metadata := Metadata{
+		Features: []MetadataFeature{
+			{
+				Name: MetadataFeatureDebounce,
+				Params: map[string]any{
+					"IntervalMs": 200.0,
+				},
+			},
+		},
+	}
+
+	params, err := metadata.GetFeatureParamsForDebounce()
+
+	require.NoError(t, err)
+	assert.Equal(t, 200, params.IntervalMs)
+}
+
+// TestValidateDebounce rejects malformed scoped settings without requiring the plugin-wide feature.
+func TestValidateDebounce(t *testing.T) {
+	for _, test := range []struct {
+		payload string
+		valid   bool
+	}{
+		{`{}`, true},
+		{`{"TriggerDebounceMs":{"web":500,"fast":0},"Commands":[{"Command":"run","DebounceMs":0}]}`, true},
+		{`{"Commands":[{"Command":"run","DebounceMs":null}]}`, true},
+		{`{"TriggerDebounceMs":{"web":-1}}`, false},
+		{`{"TriggerDebounceMs":{"*":100}}`, false},
+		{`{"TriggerDebounceMs":{"two words":100}}`, false},
+		{`{"TriggerDebounceMs":{"web":1.5}}`, false},
+		{`{"Commands":[{"Command":"run","DebounceMs":-1}]}`, false},
+		{`{"Commands":[{"Command":"run","DebounceMs":1.5}]}`, false},
+	} {
+		var metadata Metadata
+		err := json.Unmarshal([]byte(test.payload), &metadata)
+		if err == nil {
+			err = metadata.ValidateDebounce()
+		}
+		if (err == nil) != test.valid {
+			t.Fatalf("%s: err=%v", test.payload, err)
+		}
+	}
+}
+
+func TestGetFeatureParamsForQueryEnvParsesFolderOnlyRequirement(t *testing.T) {
+	metadata := Metadata{
+		Features: []MetadataFeature{
+			{
+				Name: MetadataFeatureQueryEnv,
+				Params: map[string]any{
+					"requireActiveWindowIsOpenSaveDialogSelectFolder": true,
+				},
+			},
+		},
+	}
+
+	params, err := metadata.GetFeatureParamsForQueryEnv()
+
+	require.NoError(t, err)
+	assert.True(t, params.RequireActiveWindowIsOpenSaveDialogSelectFolder)
+}
+
+func TestValidateGlancesRejectsDuplicateIds(t *testing.T) {
+	metadata := Metadata{
+		Glances: []MetadataGlance{
+			{Id: "time", Name: "Time"},
+			{Id: "time", Name: "Duplicate Time"},
+		},
+	}
+
+	err := metadata.ValidateGlances()
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "duplicate glance id")
+}
+
+func TestMetadataTranslateCachesOnlyTranslatedText(t *testing.T) {
+	metadata := Metadata{I18n: map[string]map[string]string{"en_US": {"plugin_name": "Notes"}}}
+	ctx := context.Background()
+
+	assert.Equal(t, "Notes", metadata.translate(ctx, "i18n:plugin_name"))
+	for index := 0; index < 50; index++ {
+		dynamic := fmt.Sprintf("%d MB", index)
+		assert.Equal(t, dynamic, metadata.translate(ctx, common.I18nString(dynamic)))
+	}
+
+	assert.Equal(t, 1, metadata.translateCache.Len(), "dynamic untranslated text must not accumulate in the cache")
+}
+
+func TestValidateGlancesAcceptsPluginLocalIds(t *testing.T) {
+	metadata := Metadata{
+		Glances: []MetadataGlance{
+			{Id: "time", Name: "Time", RefreshIntervalMs: 60000},
+			{Id: "battery", Name: "Battery", RefreshIntervalMs: 60000},
+		},
+	}
+
+	err := metadata.ValidateGlances()
+
+	require.NoError(t, err)
+}

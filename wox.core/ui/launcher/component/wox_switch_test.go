@@ -1,0 +1,82 @@
+package component
+
+import (
+	"testing"
+	"time"
+
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+)
+
+func TestWoxSwitchUsesIntegerGeometry(t *testing.T) {
+	animation := WoxSwitch(SwitchProps{}).(woxwidget.AnimatedFloat)
+	off := animation.Builder(0).(woxwidget.Stack)
+	on := animation.Builder(1).(woxwidget.Stack)
+	offThumb := off.Children[1].Child.(woxwidget.Container)
+	onThumb := on.Children[1].Child.(woxwidget.Container)
+
+	if off.Width != 36 || off.Height != 24 {
+		t.Fatalf("switch size = %vx%v, want 36x24", off.Width, off.Height)
+	}
+	if track := off.Children[0].Child.(woxwidget.Container); track.Width != 32 || track.Height != 20 || track.Radius != 10 {
+		t.Fatalf("switch track = %vx%v r%v, want 32x20 r10", track.Width, track.Height, track.Radius)
+	}
+	if offThumb.Width != 10 || onThumb.Width != 14 {
+		t.Fatalf("switch thumb sizes = %v/%v, want 10/14", offThumb.Width, onThumb.Width)
+	}
+}
+
+func TestWoxSwitchOffTrackStaysVisible(t *testing.T) {
+	text := woxui.Color{R: 245, G: 245, B: 247, A: 255}
+	animation := WoxSwitch(SwitchProps{Theme: ControlTheme{Text: text, Accent: text}}).(woxwidget.AnimatedFloat)
+	track := animation.Builder(0).(woxwidget.Stack).Children[0].Child.(woxwidget.Container)
+	if track.Color.A != SettingsSwitchOffTrackAlpha {
+		t.Fatalf("off switch track alpha = %d, want %d", track.Color.A, SettingsSwitchOffTrackAlpha)
+	}
+}
+
+func TestWoxSwitchAnimatesThumbSizeOnHover(t *testing.T) {
+	theme := ControlTheme{
+		Text:       woxui.Color{R: 80, G: 90, B: 100, A: 255},
+		Accent:     woxui.Color{R: 20, G: 80, B: 160, A: 255},
+		AccentText: woxui.Color{R: 255, G: 255, B: 255, A: 255},
+	}
+	switchControl := WoxSwitch(SwitchProps{ID: "enabled", Label: "Enabled", Value: true, OnChange: func(bool) {}, Theme: theme}).(woxwidget.Semantics)
+	stateful := switchControl.Child.(woxwidget.Focusable).Child
+	normalAnimation := buildHoverable(stateful, false).(woxwidget.Gesture).Child.(woxwidget.AnimatedFloat)
+	hoverAnimation := buildHoverable(stateful, true).(woxwidget.Gesture).Child.(woxwidget.AnimatedFloat)
+	normal := normalAnimation.Builder(0).(woxwidget.AnimatedFloat).Builder(1).(woxwidget.Stack)
+	hovered := hoverAnimation.Builder(1).(woxwidget.AnimatedFloat).Builder(1).(woxwidget.Stack)
+
+	if hoverAnimation.Target != 1 || hoverAnimation.Duration != 120*time.Millisecond {
+		t.Fatalf("switch hover animation = target %v duration %v", hoverAnimation.Target, hoverAnimation.Duration)
+	}
+	if normal.Children[0].Child.(woxwidget.Container).Color == hovered.Children[0].Child.(woxwidget.Container).Color {
+		t.Fatal("switch track did not change color on hover")
+	}
+	normalThumb := normal.Children[1].Child.(woxwidget.Container)
+	hoveredThumb := hovered.Children[1].Child.(woxwidget.Container)
+	if hoveredThumb.Width-normalThumb.Width != 2 {
+		t.Fatalf("switch hover thumb growth = %v, want 2", hoveredThumb.Width-normalThumb.Width)
+	}
+}
+
+// TestWoxSwitchThumbUsesAccentForeground covers both color schemes and animation overshoot.
+func TestWoxSwitchThumbUsesAccentForeground(t *testing.T) {
+	white := woxui.Color{R: 255, G: 255, B: 255, A: 255}
+	dark := woxui.Color{R: 22, G: 22, B: 26, A: 255}
+	for _, foreground := range []woxui.Color{dark, white} {
+		animation := WoxSwitch(SwitchProps{Value: true, Theme: ControlTheme{AccentText: foreground}}).(woxwidget.AnimatedFloat)
+		for _, position := range []float32{0, 1, 1.1} {
+			visual := animation.Builder(position).(woxwidget.Stack)
+			thumb := visual.Children[1].Child.(woxwidget.Container)
+			want := foreground
+			if position == 0 {
+				want = white
+			}
+			if thumb.Color != want {
+				t.Fatalf("thumb at %v = %v, want %v", position, thumb.Color, want)
+			}
+		}
+	}
+}

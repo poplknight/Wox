@@ -1,0 +1,961 @@
+package launcher
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	woxcomponent "wox/ui/launcher/component"
+
+	"wox/ai"
+	"wox/cloudsync"
+	"wox/common"
+	"wox/plugin"
+	"wox/plugin/system/shell/terminal"
+	"wox/ui/contract"
+	launcherview "wox/ui/launcher/view"
+	woxui "wox/ui/runtime"
+	woxscreenshot "wox/ui/screenshot"
+	woxwidget "wox/ui/widget"
+	"wox/util"
+	"wox/util/overlay/confettioverlay"
+)
+
+// SessionID identifies the launcher instance receiving core push updates.
+func (a *App) SessionID() string {
+	return a.sessionID
+}
+
+// MemoryDiagnostics reports caches owned by this launcher instance without forcing allocation or cleanup.
+func (a *App) MemoryDiagnostics() (decodedImageBytes, rendererBytes uint64) {
+	return a.imageStore.decodedBytes(), a.windows.RendererResidentBytes()
+}
+
+// Show presents the launcher without changing any independent management window.
+func (a *App) Show(_ context.Context, options contract.ShowOptions) error {
+	return a.showWindow(fromCoreShowOptions(options))
+}
+
+// Hide closes the visible launcher surface and reports the lifecycle transition.
+func (a *App) Hide(_ context.Context) error {
+	return a.hideWindow(true)
+}
+
+// Toggle changes launcher visibility using core-owned placement policy.
+func (a *App) Toggle(_ context.Context, options contract.ShowOptions) error {
+	visible := false
+	if err := a.runOnUI("read launcher visibility", func() {
+		visible = a.visible
+	}); err != nil {
+		return err
+	}
+	if visible {
+		return a.hideWindow(true)
+	}
+	return a.showWindow(fromCoreShowOptions(options))
+}
+
+func fromCoreShowOptions(options contract.ShowOptions) showAppParams {
+	queryHistories := make([]plainQuery, 0, len(options.QueryHistories))
+	for _, query := range options.QueryHistories {
+		queryHistories = append(queryHistories, fromCorePlainQuery(query))
+	}
+	return showAppParams{
+		SelectAll: options.SelectAll,
+		Position: position{
+			Type:      options.Position.Type,
+			DisplayID: options.Position.DisplayID,
+			X:         options.Position.X,
+			Y:         options.Position.Y,
+		},
+		PositionHeight: options.PositionHeight,
+		WindowWidth:    options.WindowWidth, MaxResultCount: options.MaxResultCount, QueryHistories: queryHistories,
+		LaunchMode: options.LaunchMode, StartPage: options.StartPage,
+		HideQueryBox: options.HideQueryBox, HideToolbar: options.HideToolbar, HideResults: options.HideResults, ShowPreviewTitleBar: options.ShowPreviewTitleBar,
+		QueryBoxAtBottom: options.QueryBoxAtBottom, HideOnBlur: options.HideOnBlur,
+		RememberPosition: options.RememberPosition,
+		RestoreWindow:    options.RestoreWindow,
+		ShowSource:       options.ShowSource,
+	}
+}
+
+// ChangeQuery replaces the launcher query and enters the normal typed query pipeline.
+func (a *App) ChangeQuery(_ context.Context, query common.PlainQuery) error {
+	query.QueryHint = query.QueryHint.NormalizeForQuery(query.QueryType, query.QueryText)
+	converted := fromCorePlainQuery(query)
+	if err := a.runOnUI("change query", func() {
+		a.setQuery(converted)
+	}); err != nil {
+		return err
+	}
+	return a.sendCurrentQuery()
+}
+
+func fromCorePlainQuery(query common.PlainQuery) plainQuery {
+	return plainQuery{
+		QueryID:   query.QueryId,
+		QueryType: query.QueryType,
+		QueryText: query.QueryText,
+		QueryHint: query.QueryHint.Clone(),
+		QuerySelection: selection{
+			Type:      string(query.QuerySelection.Type),
+			Text:      query.QuerySelection.Text,
+			FilePaths: append([]string(nil), query.QuerySelection.FilePaths...),
+		},
+		QueryScope:       fromCoreQueryScope(query.QueryScope),
+		QueryRefinements: cloneStringMap(query.QueryRefinements),
+		ContextData:      cloneStringMap(map[string]string(query.ContextData)),
+	}
+}
+
+// RefreshQuery starts a new query identity while optionally retaining the visible selection.
+func (a *App) RefreshQuery(_ context.Context, options common.RefreshQueryOptions) error {
+	if err := a.runOnUI("refresh query", func() {
+		selected := a.resultList.selected
+		a.beginQueryGenerationLocked()
+		a.querySession.completionHint = nil
+		// Keep the visible glance through the refresh. Clearing it blanks the query accessory until results return.
+		a.glance.stopGlanceLocked(false)
+		if options.SelectedResultId == "" && !options.PreserveSelectedIndex {
+			a.resultList.selected = -1
+			a.resultList.resultScrollDetached = false
+		} else {
+			a.resultList.pendingSelection = &pendingResultSelection{
+				queryID:       a.querySession.query.QueryID,
+				index:         selected,
+				resultID:      options.SelectedResultId,
+				preserveIndex: options.PreserveSelectedIndex,
+			}
+			a.resultList.selected = selected
+		}
+		a.previews.reconcileSelectedPreview()
+		a.querySession.beginRefreshResultHoldLocked()
+	}); err != nil {
+		return err
+	}
+	return a.sendCurrentQuery()
+}
+
+// RefreshGlance schedules a stale-query-guarded accessory refresh.
+func (a *App) RefreshGlance(_ context.Context, pluginID string, ids []string) error {
+	util.Go(a.lifecycleCtx, "refresh glance manually", func() {
+		a.glance.refreshGlance("manualRefresh", pluginID, append([]string(nil), ids...))
+	})
+	return nil
+}
+
+// RecordHotkey applies a raw core recorder result to the active settings field.
+func (a *App) RecordHotkey(_ context.Context, hotkey string, kind string) error {
+	var applyErr error
+	if err := a.runOnUI("record hotkey", func() {
+		applyErr = a.hotkeyRecording.applyRecordedHotkey(recordedHotkeyPayload{Hotkey: hotkey, Kind: kind})
+	}); err != nil {
+		return err
+	}
+	return applyErr
+}
+
+// ChangeTheme applies a platform-resolved core theme without transport serialization.
+func (a *App) ChangeTheme(_ context.Context, theme common.Theme) error {
+	converted := fromCoreTheme(theme)
+	if err := a.runOnUI("change launcher theme", func() {
+		a.applyTheme(converted)
+	}); err != nil {
+		return err
+	}
+	a.publishSettingsChanged("theme")
+	return nil
+}
+
+// OpenSetting opens the independent management window at one explicit path.
+func (a *App) OpenSetting(_ context.Context, windowContext common.SettingWindowContext) error {
+	if !a.isPrimary && a.primary != nil {
+		return a.primary.OpenSetting(context.Background(), windowContext)
+	}
+	return a.openSettings(settingWindowContext{Path: windowContext.Path, Param: windowContext.Param, Source: string(windowContext.Source)})
+}
+
+// FocusSetting raises the current settings window without changing its management state.
+func (a *App) FocusSetting(_ context.Context) error {
+	if !a.isPrimary && a.primary != nil {
+		return a.primary.FocusSetting(context.Background())
+	}
+	var settingsView *woxui.ManagedWindow
+	if err := a.runOnUI("resolve settings window for focus", func() {
+		settingsView = a.settingsWindow.view
+	}); err != nil {
+		return err
+	}
+	if settingsView == nil {
+		return nil
+	}
+	_, err := settingsView.Show()
+	return err
+}
+
+// OpenNotes opens, creates, or toggles the native Notes utility window.
+func (a *App) OpenNotes(_ context.Context, request common.NotesWindowRequest) error {
+	if !a.isPrimary && a.primary != nil {
+		return a.primary.OpenNotes(context.Background(), request)
+	}
+	var openErr error
+	if err := a.runOnUI("open Notes window", func() { openErr = a.notes.openNoteRequest(request) }); err != nil {
+		return err
+	}
+	return openErr
+}
+
+// RefreshNotes reloads externally changed Notes data without replacing dirty local edits.
+func (a *App) RefreshNotes(_ context.Context, noteID string) error {
+	if !a.isPrimary && a.primary != nil {
+		return a.primary.RefreshNotes(context.Background(), noteID)
+	}
+	return a.runOnUI("refresh Notes windows", func() {
+		for _, controller := range a.notes.noteWindows {
+			controller.refresh(noteID)
+		}
+	})
+}
+
+// OpenOnboarding opens the first-run guide in its dedicated window.
+func (a *App) OpenOnboarding(_ context.Context) error {
+	if !a.isPrimary && a.primary != nil {
+		return a.primary.OpenOnboarding(context.Background())
+	}
+	return a.openOnboarding()
+}
+
+// OpenMacOSPermissionFlow presents the native drag-to-authorize panel after a user action.
+func (a *App) OpenMacOSPermissionFlow(_ context.Context, permissionType string) error {
+	if !a.isPrimary && a.primary != nil {
+		return a.primary.OpenMacOSPermissionFlow(context.Background(), permissionType)
+	}
+	return a.openMacOSPermissionFlow(permissionType)
+}
+
+// ShowToolbarMessage displays a plugin-owned persistent toolbar snapshot.
+func (a *App) ShowToolbarMessage(_ context.Context, message plugin.ToolbarMsgUI) error {
+	converted := fromCoreToolbarMessage(message)
+	return a.runOnUI("show toolbar message", func() {
+		if message.Fallback {
+			a.toolbar.applyToolbarFallbackMessage(converted)
+			return
+		}
+		a.toolbar.applyToolbarMessage(converted)
+	})
+}
+
+// ShowNotificationMessage displays one transient notification in the launcher toolbar.
+func (a *App) ShowNotificationMessage(ctx context.Context, message common.NotifyMsg) error {
+	converted := toolbarMessage{Text: message.Text, Icon: imageFromString(message.Icon), DisplaySeconds: message.DisplaySeconds}
+	return a.runOnUI("show notification message", func() {
+		a.toolbar.applyToolbarMessage(converted)
+		if message.Confetti {
+			if err := confettioverlay.Show(); err != nil {
+				util.GetLogger().Warn(ctx, "show notification confetti: "+err.Error())
+			}
+		}
+	})
+}
+
+// ClearToolbarMessage removes the matching plugin-owned toolbar snapshot.
+func (a *App) ClearToolbarMessage(_ context.Context, toolbarMessageID string) error {
+	return a.runOnUI("clear toolbar message", func() {
+		a.toolbar.clearToolbarMessageByID(toolbarMessageID)
+	})
+}
+
+// UpdateAttentionUnreadCount shows or hides the query-box unread decoration beside Glance.
+func (a *App) UpdateAttentionUnreadCount(_ context.Context, unreadCount int) error {
+	if unreadCount < 0 {
+		unreadCount = 0
+	}
+	return a.runOnUI("update attention unread count", func() {
+		if a.attention.attentionUnreadCount == unreadCount {
+			return
+		}
+		a.attention.attentionUnreadCount = unreadCount
+		if a.window != nil {
+			_ = a.window.Invalidate()
+		}
+	})
+}
+
+// SendChatResponse reconciles a core chat snapshot with the active preview.
+func (a *App) SendChatResponse(_ context.Context, chat common.AIChatData) error {
+	converted := fromCoreChatData(chat)
+	return a.runOnUI("apply chat response", func() {
+		a.chat.applyChatResponse(converted)
+	})
+}
+
+// RemoveChat drops a chat deleted outside this UI, for example by Cloud Sync from another device.
+func (a *App) RemoveChat(_ context.Context, chatID string) error {
+	return a.runOnUI("remove chat", func() {
+		a.chat.applyDeletedChat(chatID)
+	})
+}
+
+// ReloadChatResources invalidates the requested AI catalogs.
+func (a *App) ReloadChatResources(_ context.Context, resourceName string) error {
+	return a.runOnUI("reload chat resources", func() {
+		a.chat.reloadChatResourceName(resourceName)
+	})
+}
+
+// SendAIQuestion opens the typed ask-user overlay for the active chat preview.
+func (a *App) SendAIQuestion(_ context.Context, questionID string, question string, options []common.AIQuestionOption) error {
+	converted := make([]aiQuestionOption, len(options))
+	for index, option := range options {
+		converted[index] = aiQuestionOption{Value: option.Value, Title: option.Title, SubTitle: option.SubTitle, Recommended: option.Recommended, Extra: cloneStringMap(option.Extra)}
+	}
+	var applyErr error
+	if err := a.runOnUI("apply AI question", func() {
+		applyErr = a.chat.applyTypedAIQuestion(aiQuestion{QuestionID: questionID, Question: question, Options: converted})
+	}); err != nil {
+		return err
+	}
+	return applyErr
+}
+
+// ReloadSettingPlugins refreshes plugin-backed settings and glance catalogs.
+func (a *App) ReloadSettingPlugins(_ context.Context) error {
+	if err := a.runOnUI("invalidate chat plugin mentions", func() {
+		a.chat.reloadChatResourceName("mentions")
+	}); err != nil {
+		return err
+	}
+	util.Go(a.lifecycleCtx, "reload settings plugins", a.reloadGlanceCatalogFromCore)
+	a.publishSettingsChanged("plugins")
+	return nil
+}
+
+// ReloadSetting refreshes settings, translations, and any eligible glance item.
+func (a *App) ReloadSetting(_ context.Context) error {
+	if err := a.reloadSettings(); err != nil {
+		return err
+	}
+	if err := a.reloadTranslations(); err != nil {
+		return err
+	}
+	a.glance.stopGlanceLocked(true)
+	refreshGlance := a.glanceEligibleLocked()
+	if refreshGlance {
+		util.Go(a.lifecycleCtx, "refresh glance after settings change", func() {
+			a.glance.refreshGlance("settingsChanged", "", nil)
+		})
+	}
+	a.publishSettingsChanged("settings")
+	return nil
+}
+
+// ReloadSettingThemes is reserved until the Go settings theme catalog becomes push-driven.
+func (a *App) ReloadSettingThemes(_ context.Context) error {
+	return nil
+}
+
+// CloudSyncProgressChanged applies transient sync progress immediately.
+func (a *App) CloudSyncProgressChanged(_ context.Context, progress cloudsync.CloudSyncProgress) error {
+	return a.runOnUI("apply cloud sync progress", func() {
+		a.applyTypedCloudSyncProgress(progress)
+	})
+}
+
+// RefreshAccountStatus reloads the authoritative account and sync snapshot.
+func (a *App) RefreshAccountStatus(_ context.Context) error {
+	util.Go(a.lifecycleCtx, "refresh account status", a.cloudSettings.reloadCloudSync)
+	return nil
+}
+
+// UpdateResult patches the visible result with one already-polished core snapshot.
+func (a *App) UpdateResult(ctx context.Context, result plugin.UpdatableResult) (bool, error) {
+	updated := false
+	previewBecameVisible := false
+	err := a.runOnUI("apply result update", func() {
+		// Check on the UI thread, after any intervening query transition. Result
+		// ids alone cannot distinguish retained rows from the next query's rows.
+		if sessionID := util.GetContextSessionId(ctx); sessionID != "" && sessionID != a.sessionID {
+			return
+		}
+		if queryID := util.GetContextQueryId(ctx); queryID != "" && (queryID != a.querySession.query.QueryID || queryID != a.resultList.resultsQueryID) {
+			return
+		}
+		for index := range a.resultList.results {
+			if a.resultList.results[index].ID == result.Id {
+				previewBecameVisible = index == a.resultList.selected && resultPreviewBecameVisible(a.resultList.results[index].Preview, result.Preview)
+				break
+			}
+		}
+		if script, command, scriptErr := plugin.WebViewScriptUpdate(result.Preview); command {
+			if scriptErr != nil || a.resultList.selected < 0 || a.resultList.selected >= len(a.resultList.results) || a.resultList.results[a.resultList.selected].ID != result.Id {
+				return
+			}
+			if !a.window.UpdateWebViewScript(a.webView.webViewDocumentKey(), script) {
+				return
+			}
+			result.Preview = nil
+		}
+		updated = a.applyTypedResultUpdate(result)
+	})
+	if err == nil && updated && previewBecameVisible {
+		err = a.applyWindowBounds()
+	}
+	return updated, err
+}
+
+// PushResults appends a typed result batch only when its query is still visible.
+func (a *App) PushResults(_ context.Context, payload plugin.PushResultsPayload) (bool, error) {
+	results := make([]queryResult, len(payload.Results))
+	for index := range payload.Results {
+		results[index] = fromCoreQueryResult(payload.Results[index])
+	}
+	appended := false
+	var appendErr error
+	if err := a.runOnUI("append pushed results", func() {
+		appended, appendErr = a.appendTypedResults(payload.QueryId, results)
+	}); err != nil {
+		return false, err
+	}
+	return appended, appendErr
+}
+
+// ToggleRecordingMode reports the missing native window-level implementation.
+func (a *App) ToggleRecordingMode(_ context.Context) (bool, error) {
+	return false, errors.New("Go UI recording mode is not implemented")
+}
+
+// PickFiles runs the native picker and normalizes cancellation to an empty list.
+func (a *App) PickFiles(_ context.Context, params common.PickFilesParams) ([]string, error) {
+	path, err := a.window.PickFile(woxui.FileDialogOptions{Directory: params.IsDirectory})
+	if err != nil {
+		return nil, err
+	}
+	if path == "" {
+		return []string{}, nil
+	}
+	return []string{path}, nil
+}
+
+// screenshotControlTheme keeps the size dialog on the same Interface size as the rest of Wox.
+func (a *App) screenshotControlTheme() woxcomponent.ControlTheme {
+	theme := a.appearance.palette.componentTheme().Controls
+	theme.DensityScale = a.appearance.densityMetrics.normalized().scale
+	return theme
+}
+
+// CaptureScreenshot starts the native capture session without changing launcher visibility.
+func (a *App) CaptureScreenshot(_ context.Context, request common.CaptureScreenshotRequest) (common.CaptureScreenshotResult, error) {
+	result, err := woxscreenshot.CaptureScreenshot(woxscreenshot.ScreenshotOptions{
+		OnClipboardReady:  request.OnClipboardReady,
+		SaveEditableScene: request.SaveEditableScene, EditScreenshotPath: request.EditScreenshotPath,
+		ExportFilePath: request.ExportFilePath, ExportDirectory: request.ExportDirectory, CopyToClipboard: request.Output == "" || strings.EqualFold(request.Output, "clipboard"),
+		HideAnnotationToolbar: request.HideAnnotationToolbar, AutoConfirm: request.AutoConfirm, AllowVideoRecording: request.AllowVideoRecording,
+		ExtraActions:      request.ExtraActions,
+		RecordingDefaults: woxscreenshot.RecordingDefaults{FPS: 60, ShowPointer: true}, WindowManager: a.windows,
+		Theme: a.screenshotControlTheme(), FontFamily: a.generalSettings.Data().AppFontFamily,
+		SizeLabels: woxscreenshot.ScreenshotSizeLabels{
+			Title: a.language.translate("i18n:plugin_screenshot_size_title"),
+			Width: a.language.translate("i18n:plugin_screenshot_size_width"), Height: a.language.translate("i18n:plugin_screenshot_size_height"),
+			Apply: a.language.translate("i18n:plugin_screenshot_size_apply"), Cancel: a.language.translate("i18n:ui_screenshot_tool_cancel"),
+			InvalidSize:     a.language.translate("i18n:plugin_screenshot_size_invalid"),
+			LockAspectRatio: a.language.translate("i18n:plugin_screenshot_size_lock_ratio"), Swap: a.language.translate("i18n:plugin_screenshot_size_swap"),
+			RatioPresets: a.language.translate("i18n:plugin_screenshot_size_ratio_presets"),
+			RatioFree:    a.language.translate("i18n:plugin_screenshot_size_ratio_free"), RatioCustom: a.language.translate("i18n:plugin_screenshot_size_ratio_custom"),
+		},
+		AnnotationTooltips: woxscreenshot.ScreenshotAnnotationTooltips{
+			FontSize:  a.language.translate("i18n:ui_screenshot_font_size"),
+			Rectangle: a.language.translate("i18n:ui_screenshot_tool_rectangle"),
+			Ellipse:   a.language.translate("i18n:ui_screenshot_tool_ellipse"),
+			Text:      a.language.translate("i18n:ui_screenshot_tool_text"),
+			Arrow:     a.language.translate("i18n:ui_screenshot_tool_arrow"),
+			Number:    a.language.translate("i18n:ui_screenshot_tool_number"),
+			Mosaic:    a.language.translate("i18n:ui_screenshot_tool_mosaic"),
+			Brush:     a.language.translate("i18n:ui_screenshot_tool_brush"),
+			Eraser:    a.language.translate("i18n:ui_screenshot_tool_eraser"),
+		},
+		ActionTooltips: woxscreenshot.ScreenshotActionTooltips{
+			Undo:              a.language.translate("i18n:ui_screenshot_tool_undo"),
+			ScrollingCapture:  a.language.translate("i18n:ui_screenshot_tool_scrolling_capture"),
+			Cursor:            a.language.translate("i18n:ui_screenshot_tool_cursor"),
+			Background:        a.language.translate("i18n:ui_screenshot_tool_background"),
+			BackgroundLoading: a.language.translate("i18n:ui_screenshot_background_loading"),
+			BackgroundFailed:  a.language.translate("i18n:ui_screenshot_background_failed"),
+			Pin:               a.language.translate("i18n:ui_screenshot_tool_pin"),
+			Record:            a.language.translate("i18n:ui_screenshot_record_enter"),
+			Cancel:            a.language.translate("i18n:ui_screenshot_tool_cancel"),
+			Save:              a.language.translate("i18n:ui_screenshot_tool_save"),
+			SaveTitle:         a.language.translate("i18n:ui_screenshot_save_title"),
+			Confirm:           a.language.translate("i18n:ui_screenshot_tool_confirm"),
+		},
+		RecordingRuntime: woxscreenshot.RecordingRuntimeLabels{
+			Title:       a.language.translate("i18n:ui_screenshot_record_runtime_title"),
+			Description: a.language.translate("i18n:ui_screenshot_record_runtime_description"),
+			Install:     a.language.translate("i18n:ui_screenshot_record_runtime_install"),
+			Cancel:      a.language.translate("i18n:ui_screenshot_record_runtime_cancel"),
+			Retry:       a.language.translate("i18n:ui_screenshot_record_runtime_retry"),
+			Downloading: a.language.translate("i18n:ui_screenshot_record_runtime_downloading"),
+			Installing:  a.language.translate("i18n:ui_screenshot_record_runtime_installing"),
+			Failed:      a.language.translate("i18n:ui_screenshot_record_runtime_failed"),
+			Unsupported: a.language.translate("i18n:ui_screenshot_record_runtime_unsupported"),
+		},
+		RecordingTooltips: woxscreenshot.RecordingTooltips{
+			Enter: a.language.translate("i18n:ui_screenshot_record_enter"), Start: a.language.translate("i18n:ui_screenshot_record_start"),
+			Pause: a.language.translate("i18n:ui_screenshot_record_pause"), Resume: a.language.translate("i18n:ui_screenshot_record_resume"),
+			Restart: a.language.translate("i18n:ui_screenshot_record_restart"), ShowPointer: a.language.translate("i18n:ui_screenshot_record_pointer"),
+			ShowKeypress: a.language.translate("i18n:ui_screenshot_record_keypress"), Finish: a.language.translate("i18n:ui_screenshot_record_finish"),
+			Save: a.language.translate("i18n:ui_screenshot_record_save"), Play: a.language.translate("i18n:ui_screenshot_record_play"),
+			Cancel: a.language.translate("i18n:ui_screenshot_record_cancel"), PrivacyWarning: a.language.translate("i18n:ui_screenshot_record_privacy"),
+			Format: a.language.translate("i18n:ui_screenshot_record_format"), FormatMP4: a.language.translate("i18n:ui_screenshot_record_format_mp4"),
+			FormatGIF: a.language.translate("i18n:ui_screenshot_record_format_gif"), FormatWebP: a.language.translate("i18n:ui_screenshot_record_format_webp"),
+			ExportFailed: a.language.translate("i18n:ui_screenshot_record_export_failed"),
+			Exporting:    a.language.translate("i18n:ui_screenshot_record_exporting"), ExportProgress: a.language.translate("i18n:ui_screenshot_record_export_progress"),
+		},
+	})
+	if err != nil {
+		errorCode := "capture_failed"
+		if errors.Is(err, woxscreenshot.ErrScreenshotDisplayLayoutChanged) {
+			errorCode = "display_layout_changed"
+		}
+		if strings.Contains(strings.ToLower(err.Error()), "screen recording permission") {
+			errorCode = "permission_denied"
+		}
+		return common.CaptureScreenshotResult{Status: common.CaptureScreenshotStatusFailed, ErrorCode: errorCode, ErrorMessage: err.Error()}, nil
+	}
+	if result.CopiedColor != "" {
+		return common.CaptureScreenshotResult{Status: common.CaptureScreenshotStatusCancelled, CopiedColor: result.CopiedColor}, nil
+	}
+	if result.Cancelled {
+		return common.CaptureScreenshotResult{Status: common.CaptureScreenshotStatusCancelled}, nil
+	}
+	selection := common.ScreenshotRect{X: float64(result.LogicalSelection.X), Y: float64(result.LogicalSelection.Y), Width: float64(result.LogicalSelection.Width), Height: float64(result.LogicalSelection.Height)}
+	artifactKind := common.CaptureArtifactKind(result.ArtifactKind)
+	if artifactKind == "" {
+		artifactKind = common.CaptureArtifactKindImage
+	}
+	artifactPath := result.ArtifactPath
+	if artifactPath == "" {
+		artifactPath = result.ScreenshotPath
+	}
+	return common.CaptureScreenshotResult{
+		SaveEditableScene:    result.SaveEditableScene,
+		EditableSceneWarning: result.EditableSceneWarning,
+		Status:               common.CaptureScreenshotStatusCompleted, ArtifactKind: artifactKind, ArtifactPath: artifactPath,
+		ScreenshotPath: result.ScreenshotPath, LogicalSelectionRect: &selection,
+		PinToScreen: result.PinToScreen, PinOverlayShown: result.PinOverlayShown, ClipboardWriteSucceeded: result.ClipboardWriteSucceeded, ClipboardWarningMessage: result.ClipboardWarningMessage,
+		ExtraActionID: result.ExtraActionID,
+	}, nil
+}
+
+// WriteClipboardImageFile gives native clipboard ownership to the embedded window.
+func (a *App) WriteClipboardImageFile(_ context.Context, filePath string) error {
+	return a.window.WriteClipboardImageFile(filePath)
+}
+
+// ApplyTerminalChunk merges one core ring-buffer update into the matching launcher session.
+func (a *App) ApplyTerminalChunk(_ context.Context, sessionID string, chunk terminal.TerminalChunk) error {
+	if sessionID != "" && sessionID != a.sessionID {
+		return nil
+	}
+	converted := terminalChunk{SessionID: chunk.SessionID, CursorStart: chunk.CursorStart, CursorEnd: chunk.CursorEnd, Content: chunk.Content, Truncated: chunk.Truncated}
+	return a.runOnUI("apply terminal chunk", func() {
+		a.terminal.applyTerminalChunk(converted)
+	})
+}
+
+// ApplyTerminalState updates one visible terminal preview state.
+func (a *App) ApplyTerminalState(_ context.Context, sessionID string, state terminal.SessionState) error {
+	if sessionID != "" && sessionID != a.sessionID {
+		return nil
+	}
+	converted := terminalSessionState{
+		SessionID: state.SessionID, Command: state.Command, Interpreter: state.Interpreter,
+		WorkingDirectory: state.WorkingDirectory, Status: string(state.Status), ExitCode: state.ExitCode, Error: state.Error,
+	}
+	return a.runOnUI("apply terminal state", func() {
+		a.terminal.applyTerminalState(converted)
+	})
+}
+
+func fromCoreTheme(theme common.Theme) themeData {
+	colors := theme.ResolvedColors()
+	return themeData{
+		Surfaces:                                   woxcomponent.LoadThemeSurfaces(theme.Surfaces, theme.AssetFiles),
+		ActionContainerDividerColor:                colors["ActionContainerDividerColor"],
+		PreviewBackgroundColor:                     colors["PreviewBackgroundColor"],
+		PreviewBorderColor:                         colors["PreviewBorderColor"],
+		PreviewBorderRadius:                        theme.PreviewBorderRadius,
+		ResultItemActiveIndicatorWidth:             theme.ResultItemActiveIndicatorWidth,
+		ResultItemActiveIndicatorInsetLeft:         theme.ResultItemActiveIndicatorInsetLeft,
+		ResultItemActiveIndicatorInsetTop:          theme.ResultItemActiveIndicatorInsetTop,
+		ResultItemActiveIndicatorInsetBottom:       theme.ResultItemActiveIndicatorInsetBottom,
+		ResultItemActiveIndicatorBorderRadius:      theme.ResultItemActiveIndicatorBorderRadius,
+		QuerySeparatorThickness:                    theme.QuerySeparatorThickness,
+		QuerySeparatorPaddingLeft:                  theme.QuerySeparatorPaddingLeft,
+		QuerySeparatorPaddingRight:                 theme.QuerySeparatorPaddingRight,
+		QueryBoxPaddingLeft:                        theme.QueryBoxPaddingLeft,
+		ResultItemActiveIndicatorColor:             theme.ResultItemActiveIndicatorColor,
+		QuerySeparatorColor:                        theme.QuerySeparatorColor,
+		PreviewTagBorderRadius:                     theme.PreviewTagBorderRadius,
+		PreviewTagFontColor:                        colors["PreviewTagFontColor"],
+		PreviewTagBackgroundColor:                  colors["PreviewTagBackgroundColor"],
+		PreviewTagBorderColor:                      colors["PreviewTagBorderColor"],
+		GlanceFontColor:                            colors["GlanceFontColor"],
+		GlanceIconColor:                            colors["GlanceIconColor"],
+		GlanceBackgroundColor:                      colors["GlanceBackgroundColor"],
+		AttentionFontColor:                         colors["AttentionFontColor"],
+		AttentionIconColor:                         colors["AttentionIconColor"],
+		AttentionBackgroundColor:                   colors["AttentionBackgroundColor"],
+		AttentionBorderColor:                       colors["AttentionBorderColor"],
+		RefinementButtonFontColor:                  colors["RefinementButtonFontColor"],
+		RefinementButtonIconColor:                  colors["RefinementButtonIconColor"],
+		RefinementButtonBackgroundColor:            colors["RefinementButtonBackgroundColor"],
+		RefinementButtonBorderColor:                colors["RefinementButtonBorderColor"],
+		RefinementButtonHoverBackgroundColor:       colors["RefinementButtonHoverBackgroundColor"],
+		RefinementButtonActiveFontColor:            colors["RefinementButtonActiveFontColor"],
+		RefinementButtonActiveIconColor:            colors["RefinementButtonActiveIconColor"],
+		RefinementButtonActiveBackgroundColor:      colors["RefinementButtonActiveBackgroundColor"],
+		RefinementButtonActiveBorderColor:          colors["RefinementButtonActiveBorderColor"],
+		RefinementButtonActiveHoverBackgroundColor: colors["RefinementButtonActiveHoverBackgroundColor"],
+		RefinementBackgroundColor:                  colors["RefinementBackgroundColor"],
+		RefinementBorderColor:                      colors["RefinementBorderColor"],
+		RefinementTitleColor:                       colors["RefinementTitleColor"],
+		RefinementDividerColor:                     colors["RefinementDividerColor"],
+		RefinementHotkeyColor:                      colors["RefinementHotkeyColor"],
+		RefinementItemFontColor:                    colors["RefinementItemFontColor"],
+		RefinementItemBackgroundColor:              colors["RefinementItemBackgroundColor"],
+		RefinementItemHoverBackgroundColor:         colors["RefinementItemHoverBackgroundColor"],
+		RefinementItemActiveFontColor:              colors["RefinementItemActiveFontColor"],
+		RefinementItemActiveBackgroundColor:        colors["RefinementItemActiveBackgroundColor"],
+		RefinementItemActiveHoverBackgroundColor:   colors["RefinementItemActiveHoverBackgroundColor"],
+		ScrollbarThumbColor:                        colors["ScrollbarThumbColor"],
+		ScrollbarThumbHoverColor:                   colors["ScrollbarThumbHoverColor"],
+		ScrollbarThumbActiveColor:                  colors["ScrollbarThumbActiveColor"],
+		ScrollbarWidth:                             theme.ScrollbarWidth,
+		ScrollbarHoverWidth:                        theme.ScrollbarHoverWidth,
+		ScrollbarBorderRadius:                      theme.ScrollbarBorderRadius,
+		AppWindowChrome:                            theme.UsesCustomWindowChrome(),
+		AppContentInset:                            theme.AppContentInset,
+		AppContentBackgroundColor:                  colors["AppContentBackgroundColor"],
+		AppContentBorderRadius:                     theme.AppContentBorderRadius,
+		OverlayBackgroundColor:                     theme.OverlayBackgroundColor,
+		OverlayFontColor:                           theme.OverlayFontColor,
+		AppBorderColor:                             colors["AppBorderColor"],
+		AppBorderWidth:                             theme.AppBorderWidth,
+		AppBorderRadius:                            theme.AppBorderRadius,
+		GlanceHoverBackgroundColor:                 colors["GlanceHoverBackgroundColor"],
+		AttentionHoverBackgroundColor:              colors["AttentionHoverBackgroundColor"],
+		AttentionHoverBorderColor:                  colors["AttentionHoverBorderColor"],
+
+		ToolbarPrimaryFontColor:               colors["ToolbarPrimaryFontColor"],
+		ToolbarPrimaryHotkeyFontColor:         colors["ToolbarPrimaryHotkeyFontColor"],
+		ToolbarPrimaryHotkeyBackgroundColor:   colors["ToolbarPrimaryHotkeyBackgroundColor"],
+		ToolbarPrimaryHotkeyBorderColor:       colors["ToolbarPrimaryHotkeyBorderColor"],
+		ToolbarHotkeyFontColor:                colors["ToolbarHotkeyFontColor"],
+		ActionItemHotkeyFontColor:             colors["ActionItemHotkeyFontColor"],
+		ActionItemActiveHotkeyFontColor:       colors["ActionItemActiveHotkeyFontColor"],
+		ToolbarHotkeyBackgroundColor:          colors["ToolbarHotkeyBackgroundColor"],
+		ActionItemHotkeyBackgroundColor:       colors["ActionItemHotkeyBackgroundColor"],
+		ActionItemActiveHotkeyBackgroundColor: colors["ActionItemActiveHotkeyBackgroundColor"],
+		ToolbarHotkeyBorderColor:              colors["ToolbarHotkeyBorderColor"],
+		ActionItemHotkeyBorderColor:           colors["ActionItemHotkeyBorderColor"],
+		ActionItemActiveHotkeyBorderColor:     colors["ActionItemActiveHotkeyBorderColor"],
+		ResultItemHoverBackgroundColor:        colors["ResultItemHoverBackgroundColor"],
+
+		ResultItemActiveBorderLeftWidth: theme.ResultItemActiveBorderLeftWidth,
+		ResultItemActiveBorderLeftColor: theme.ResultItemActiveBorderLeftColor,
+		ActionContainerBorderRadius:     theme.ActionContainerBorderRadius, ActionItemBorderRadius: theme.ActionItemBorderRadius,
+		ToolbarBorderColor: theme.ToolbarBorderColor, ToolbarBorderWidth: theme.ToolbarBorderWidth,
+		AppBackgroundColor: theme.AppBackgroundColor, AppPaddingLeft: theme.AppPaddingLeft, AppPaddingTop: theme.AppPaddingTop, AppPaddingRight: theme.AppPaddingRight, AppPaddingBottom: theme.AppPaddingBottom,
+		ResultContainerPaddingLeft: theme.ResultContainerPaddingLeft, ResultContainerPaddingTop: theme.ResultContainerPaddingTop, ResultContainerPaddingRight: theme.ResultContainerPaddingRight, ResultContainerPaddingBottom: theme.ResultContainerPaddingBottom,
+		ResultItemBorderRadius: theme.ResultItemBorderRadius, ResultItemPaddingLeft: theme.ResultItemPaddingLeft, ResultItemPaddingTop: theme.ResultItemPaddingTop, ResultItemPaddingRight: theme.ResultItemPaddingRight, ResultItemPaddingBottom: theme.ResultItemPaddingBottom,
+		ResultItemTitleColor: theme.ResultItemTitleColor, ResultItemSubTitleColor: theme.ResultItemSubTitleColor, ResultItemTailTextColor: theme.ResultItemTailTextColor,
+		ResultItemActiveBackgroundColor: theme.ResultItemActiveBackgroundColor, ResultItemActiveTitleColor: theme.ResultItemActiveTitleColor, ResultItemActiveSubTitleColor: theme.ResultItemActiveSubTitleColor, ResultItemActiveTailTextColor: theme.ResultItemActiveTailTextColor,
+		QueryBoxFontColor: theme.QueryBoxFontColor, QueryBoxBackgroundColor: theme.QueryBoxBackgroundColor, QueryBoxBorderRadius: theme.QueryBoxBorderRadius, QueryBoxCursorColor: theme.QueryBoxCursorColor,
+		QueryBoxTextSelectionBackgroundColor: theme.QueryBoxTextSelectionBackgroundColor, QueryBoxTextSelectionColor: theme.QueryBoxTextSelectionColor,
+		ActionContainerBackgroundColor: theme.ActionContainerBackgroundColor, ActionContainerHeaderFontColor: theme.ActionContainerHeaderFontColor,
+		ActionContainerBorderColor: theme.ActionContainerBorderColor, ActionContainerBorderWidth: theme.ActionContainerBorderWidth,
+		ActionContainerPaddingLeft: theme.ActionContainerPaddingLeft, ActionContainerPaddingTop: theme.ActionContainerPaddingTop, ActionContainerPaddingRight: theme.ActionContainerPaddingRight, ActionContainerPaddingBottom: theme.ActionContainerPaddingBottom,
+		ActionItemActiveBackgroundColor: theme.ActionItemActiveBackgroundColor, ActionItemActiveFontColor: theme.ActionItemActiveFontColor, ActionItemFontColor: theme.ActionItemFontColor,
+		ActionQueryBoxFontColor: theme.ActionQueryBoxFontColor, ActionQueryBoxBackgroundColor: theme.ActionQueryBoxBackgroundColor, ActionQueryBoxBorderRadius: theme.ActionQueryBoxBorderRadius,
+		PreviewFontColor: theme.PreviewFontColor, PreviewSplitLineColor: theme.PreviewSplitLineColor, PreviewPropertyTitleColor: theme.PreviewPropertyTitleColor, PreviewPropertyContentColor: theme.PreviewPropertyContentColor,
+		ToolbarFontColor: theme.ToolbarFontColor, ToolbarBackgroundColor: theme.ToolbarBackgroundColor, ToolbarBlurSigma: theme.ToolbarBlurSigma, ToolbarBlurBrightness: theme.ToolbarBlurBrightness, ToolbarBlurSaturation: theme.ToolbarBlurSaturation, ToolbarPaddingLeft: theme.ToolbarPaddingLeft, ToolbarPaddingRight: theme.ToolbarPaddingRight,
+	}
+}
+
+func fromCoreToolbarMessage(message plugin.ToolbarMsgUI) toolbarMessage {
+	actions := make([]toolbarMessageAction, len(message.Actions))
+	for index, action := range message.Actions {
+		actions[index] = toolbarMessageAction{
+			ID: action.Id, Name: action.Name, Icon: fromCoreImage(action.Icon), Hotkey: action.Hotkey,
+			IsDefault: action.IsDefault, PreventHideAfterAction: action.PreventHideAfterAction, ContextData: cloneStringMap(map[string]string(action.ContextData)),
+		}
+	}
+	return toolbarMessage{ID: message.Id, Title: message.Title, Icon: fromCoreImage(message.Icon), Progress: message.Progress, Indeterminate: message.Indeterminate, Actions: actions}
+}
+
+func imageFromString(value string) woxImage {
+	if value == "" {
+		return woxImage{}
+	}
+	imageType, imageData, ok := strings.Cut(value, ":")
+	if !ok {
+		return woxImage{}
+	}
+	return woxImage{ImageType: imageType, ImageData: imageData}
+}
+
+func fromCoreChatData(chat common.AIChatData) chatData {
+	conversations := make([]chatConversation, len(chat.Conversations))
+	for index, conversation := range chat.Conversations {
+		images := make([]woxImage, len(conversation.Images))
+		for imageIndex := range conversation.Images {
+			images[imageIndex] = fromCoreImage(conversation.Images[imageIndex])
+		}
+		skillRefs := make([]chatSkillRef, len(conversation.SkillRefs))
+		for skillIndex, skill := range conversation.SkillRefs {
+			skillRefs[skillIndex] = chatSkillRef{ID: skill.Id, Name: skill.Name, Path: skill.Path, Source: skill.Source}
+		}
+		mentions := make([]chatMentionRef, len(conversation.Mentions))
+		for mentionIndex, mention := range conversation.Mentions {
+			mentions[mentionIndex] = chatMentionRef{Kind: string(mention.Kind), ID: mention.Id, Name: mention.Name}
+		}
+		conversations[index] = chatConversation{
+			ID: conversation.Id, Role: string(conversation.Role), Text: conversation.Text, Reasoning: conversation.Reasoning,
+			Images: images, SkillRefs: skillRefs, Mentions: mentions, Attachments: append([]common.AIChatAttachment(nil), conversation.Attachments...),
+			ToolCallInfo: chatToolCallFromContract(conversation.ToolCallInfo),
+			Timestamp:    conversation.Timestamp,
+		}
+	}
+	compactions := make([]json.RawMessage, len(chat.CompactionEntries))
+	for index := range chat.CompactionEntries {
+		compactions[index], _ = json.Marshal(chat.CompactionEntries[index])
+	}
+	var debugTrace json.RawMessage
+	if chat.DebugTrace != nil {
+		snapshot := chat.DebugTrace.Snapshot()
+		debugTrace, _ = json.Marshal(snapshot)
+	}
+	return chatData{
+		ProjectID: chat.ProjectId, ID: chat.Id, Title: chat.Title, Conversations: conversations, CompactionEntries: compactions,
+		Model: aiModel{Name: chat.Model.Name, Provider: string(chat.Model.Provider), ProviderAlias: chat.Model.ProviderAlias}, DebugTrace: debugTrace,
+		CreatedAt: chat.CreatedAt, UpdatedAt: chat.UpdatedAt, IsStreaming: chat.IsStreaming, IsSummary: chat.IsSummary,
+	}
+}
+
+// chatToolCallFromContract copies persisted tool metadata and fills origin from
+// the live registry when older chats predate Source/Server fields.
+func chatToolCallFromContract(info common.ToolCallInfo) chatToolCallInfo {
+	source := string(info.Source)
+	server := info.Server
+	if source == "" && strings.TrimSpace(info.Name) != "" {
+		if tool, ok := ai.GetToolRegistry().Get(info.Name); ok {
+			source = string(tool.Source)
+			if tool.ServerConfig != nil {
+				server = tool.ServerConfig.Name
+			}
+		}
+	}
+	return chatToolCallInfo{
+		ID: info.Id, Name: info.Name, Source: source, Server: server, Arguments: cloneAnyMap(info.Arguments),
+		Status: string(info.Status), Delta: info.Delta, Response: info.Response,
+		StartTimestamp: info.StartTimestamp, EndTimestamp: info.EndTimestamp,
+	}
+}
+
+func cloneAnyMap(values map[string]any) map[string]any {
+	if values == nil {
+		return nil
+	}
+	copy := make(map[string]any, len(values))
+	for key, value := range values {
+		copy[key] = value
+	}
+	return copy
+}
+
+// updatedResultBoundaryKeys maps independently updatable result fields to their cached layout boundaries.
+func updatedResultBoundaryKeys(result plugin.UpdatableResult, grid bool) []woxwidget.Key {
+	keys := make([]woxwidget.Key, 0, 4)
+	if result.Icon != nil {
+		keys = append(keys, launcherview.LauncherResultIconBoundaryKey(result.Id))
+	}
+	if result.Title != nil {
+		keys = append(keys, launcherview.LauncherResultTitleBoundaryKey(result.Id))
+	}
+	if !grid && result.SubTitle != nil {
+		keys = append(keys, launcherview.LauncherResultSubtitleBoundaryKey(result.Id))
+	}
+	if !grid && result.Tails != nil {
+		keys = append(keys, launcherview.LauncherResultTailsBoundaryKey(result.Id))
+	}
+	return keys
+}
+
+func (a *App) applyTypedCloudSyncProgress(progress cloudsync.CloudSyncProgress) {
+	if progress.Active {
+		copy := cloudSyncProgress{Active: true, Operation: progress.Operation, EntityType: progress.EntityType, PluginID: progress.PluginID, Key: progress.Key, Current: progress.Current, Total: progress.Total}
+		a.cloudSettings.SetSyncProgress(&copy)
+	} else {
+		a.cloudSettings.SetSyncProgress(nil)
+	}
+	_ = a.window.Invalidate()
+	if !progress.Active {
+		// Background syncs finish while the settings window is closed most of the time.
+		// Reloading then would fetch and keep the whole installed plugin catalog for a
+		// page nobody is looking at, so mark the snapshot stale and let the cloud tab
+		// reload it on its next open.
+		if !a.settingsWindow.open {
+			a.cloudSettings.SetLoaded(false)
+			return
+		}
+		util.Go(a.lifecycleCtx, "reload cloud sync after progress", a.cloudSettings.reloadCloudSyncSilently)
+	}
+}
+
+// resultPreviewBecameVisible identifies the one layout-affecting transition in a streaming preview.
+func resultPreviewBecameVisible(previous queryPreview, update *plugin.WoxPreview) bool {
+	return update != nil && previous.PreviewData == "" && update.PreviewData != ""
+}
+
+func (a *App) applyTypedResultUpdate(result plugin.UpdatableResult) bool {
+	updated := false
+	updatedIndex := -1
+	for index := range a.resultList.results {
+		if a.resultList.results[index].ID != result.Id {
+			continue
+		}
+		if result.Title != nil {
+			a.resultList.results[index].Title = *result.Title
+		}
+		if result.SubTitle != nil {
+			a.resultList.results[index].SubTitle = *result.SubTitle
+		}
+		if result.Icon != nil {
+			a.resultList.results[index].Icon = fromCoreImage(*result.Icon)
+		}
+		if result.Preview != nil {
+			a.resultList.results[index].Preview = fromCorePreview(*result.Preview)
+		}
+		if result.Tails != nil {
+			a.resultList.results[index].Tails = fromCoreTails(*result.Tails)
+		}
+		if result.TitleTags != nil {
+			a.resultList.results[index].TitleTags = fromCoreTitleTags(*result.TitleTags)
+		}
+		if result.Actions != nil {
+			queryResult := plugin.QueryResult{Actions: *result.Actions}
+			uiActions := queryResult.ToUI().Actions
+			actions := make([]resultAction, len(uiActions))
+			for actionIndex := range uiActions {
+				actions[actionIndex] = fromCoreResultAction(uiActions[actionIndex])
+			}
+			a.resultList.results[index].Actions = actions
+		}
+		if result.DragData != nil {
+			a.resultList.results[index].DragData = &queryResultDragData{Type: result.DragData.Type, Files: append([]string(nil), result.DragData.Files...), PreventHideAfterDrag: result.DragData.PreventHideAfterDrag}
+		}
+		updated = true
+		updatedIndex = index
+		break
+	}
+	if updated {
+		a.resultList.resultRevision++
+		a.resultList.results[updatedIndex].Revision = a.resultList.resultRevision
+		a.resultList.resultsSectionRevision++
+		a.previews.reconcileSelectedPreview()
+		keys := updatedResultBoundaryKeys(result, a.resultList.layout.GridLayout != nil)
+		if result.Preview == nil && result.Actions == nil && a.host != nil {
+			if len(keys) == 0 {
+				return updated
+			}
+			allFound := true
+			for _, key := range keys {
+				allFound = a.host.InvalidateBoundary(key) && allFound
+			}
+			if allFound || a.host.InvalidateBoundary(launcherview.LauncherResultBackgroundBoundaryKey(result.Id)) {
+				return updated
+			}
+		}
+		_ = a.window.Invalidate()
+	}
+	return updated
+}
+
+func (a *App) appendTypedResults(queryID string, results []queryResult) (bool, error) {
+	if queryID != a.querySession.query.QueryID {
+		return false, nil
+	}
+	for index := range results {
+		if results[index].QueryID == "" {
+			results[index].QueryID = queryID
+		}
+	}
+	a.querySession.resetQueryLoadingLocked()
+	a.querySession.resetQueryTransitionLocked()
+	a.querySession.releaseRefreshResultHoldLocked()
+	if a.resultList.resultsQueryID != queryID {
+		a.resultList.clearRows()
+	}
+	a.resultList.resultsQueryID = queryID
+	for index := range results {
+		a.resultList.resultRevision++
+		results[index].Revision = a.resultList.resultRevision
+	}
+	a.resultList.results = append(a.resultList.results, results...)
+	a.resultList.resultsSectionRevision++
+	if a.resultList.pendingSelection != nil && a.resultList.pendingSelection.queryID == queryID && a.resultList.pendingSelection.querySnapshot != nil {
+		selected, _, keep := restoreRefreshSelection(a.resultList.results, a.resultList.pendingSelection, queryID, a.querySession.queryComplete)
+		a.resultList.selected = selected
+		if !keep {
+			a.resultList.pendingSelection = nil
+		}
+	} else if a.resultList.selected < 0 {
+		a.resultList.selected = selectableIndex(a.resultList.results)
+	}
+	a.previews.reconcileSelectedPreview()
+	if err := a.applyWindowBounds(); err != nil {
+		return false, err
+	}
+	_ = a.window.Invalidate()
+	return true, nil
+}
+
+func fromCorePreview(preview plugin.WoxPreview) queryPreview {
+	tags := make([]previewTag, len(preview.PreviewTags))
+	for index, tag := range preview.PreviewTags {
+		tags[index] = previewTag{Label: tag.Label, Tooltip: tag.Tooltip}
+	}
+	return queryPreview{
+		PreviewType: preview.PreviewType, PreviewData: preview.PreviewData, PreviewOverlayData: preview.PreviewOverlayData, DefaultHidden: preview.DefaultHidden,
+		PreviewTags: tags, PreviewProperties: cloneStringMap(preview.PreviewProperties), ScrollPosition: preview.ScrollPosition,
+	}
+}
+
+func fromCoreTitleTag(tag plugin.QueryResultTitleTag) resultTitleTag {
+	converted := resultTitleTag{Text: tag.Text, Kind: tag.Kind, Tooltip: tag.Tooltip}
+	if tag.Kind == plugin.QueryResultTitleTagKindHotkey {
+		converted.Labels = formatHotkeyLabels(tag.Text)
+	}
+	return converted
+}
+
+func fromCoreTitleTags(tags []plugin.QueryResultTitleTag) []resultTitleTag {
+	converted := make([]resultTitleTag, len(tags))
+	for index, tag := range tags {
+		converted[index] = fromCoreTitleTag(tag)
+	}
+	return converted
+}
+
+func fromCoreTails(tails []plugin.QueryResultTail) []resultTail {
+	converted := make([]resultTail, len(tails))
+	for index, tail := range tails {
+		converted[index] = resultTail{
+			Type: tail.Type, Text: tail.Text, TextCategory: tail.TextCategory, Image: fromCoreImage(tail.Image),
+			ImageWidth: tail.ImageWidth, ImageHeight: tail.ImageHeight, Tooltip: tail.Tooltip, ContextData: cloneStringMap(tail.ContextData),
+		}
+	}
+	return converted
+}
+
+var _ contract.View = (*App)(nil)

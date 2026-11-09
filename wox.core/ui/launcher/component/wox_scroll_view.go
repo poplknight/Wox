@@ -1,0 +1,474 @@
+package component
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+)
+
+const (
+	scrollbarMinHitThickness = float32(12)
+	scrollbarEdgeInset       = float32(2)
+)
+
+// ScrollViewProps contains the geometry and optional controlled state for a Wox scroll surface.
+type ScrollViewProps struct {
+	// EdgeFade fades only content at scrollable vertical edges, leaving the thumb clear.
+	EdgeFade float32
+	Theme    ControlTheme
+
+	Key     woxwidget.Key
+	Content woxwidget.Widget
+	Width   float32
+	// FillWidth and FillHeight adopt dimensions resolved by the parent layout.
+	FillWidth  bool
+	FillHeight bool
+	Height     float32
+	// UnderlayHeight extends vertical painting behind a footer without changing
+	// the usable viewport, scrollbar geometry, or controlled scroll range.
+	// Callers supply explicit content height and own selection visibility.
+	UnderlayHeight float32
+	ContentWidth   float32
+	ContentHeight  float32
+	// Horizontal scrolls along X and places the shared fading thumb along the bottom.
+	Horizontal          bool
+	Offset              float32
+	Controller          *woxwidget.ScrollController
+	KeepVisible         *woxwidget.ScrollRange
+	KeepVisibleKey      woxwidget.Key
+	ThumbColor          woxui.Color
+	HideScrollbar       bool
+	AlwaysShowScrollbar bool
+	// RetainState keeps the content subtree stable when overflow changes.
+	RetainState bool
+	// ReserveScrollbarSpace keeps vertical content clear of the thumb and its
+	// hit target, even while faded or not overflowing, so wrapping stays stable.
+	ReserveScrollbarSpace bool
+	AutomationID          string
+	Label                 string
+	OnScroll              func(float32)
+	// OnOffsetChanged reports absolute offset changes made through a retained scroll controller.
+	OnOffsetChanged func(float32)
+	// OnGeometryChanged reports measured geometry when the scroll-axis content extent is omitted.
+	OnGeometryChanged func(viewport, content float32)
+}
+
+// ContentViewportWidth returns logical units available to content. Callers that
+// measure or explicitly size children must use this same width as the scroller.
+func (props ScrollViewProps) ContentViewportWidth() float32 {
+	if !props.ReserveScrollbarSpace || props.HideScrollbar || props.Horizontal {
+		return props.Width
+	}
+	width, hoverWidth := float32(3), float32(7)
+	if props.Theme.ScrollbarWidth != nil {
+		width = float32(*props.Theme.ScrollbarWidth)
+	}
+	if props.Theme.ScrollbarHoverWidth != nil {
+		hoverWidth = float32(*props.Theme.ScrollbarHoverWidth)
+	}
+	return max(float32(0), props.Width-max(scrollbarMinHitThickness, width, hoverWidth)-scrollbarEdgeInset-props.Theme.Scaled(4))
+}
+
+type scrollViewState struct {
+	visible bool
+	// pointerInside keeps an already-visible overlay from fading while the
+	// pointer is over the scroll surface. It does not reveal the thumb; that
+	// waits for a real PointerMove, wheel, or offset change. hovered widens
+	// the thumb only when the pointer is on the scrollbar hit target.
+	pointerInside  bool
+	hovered        bool
+	dragging       bool
+	dragOrigin     float32
+	hideAt         time.Time
+	hideTimer      *time.Timer
+	controller     *woxwidget.ScrollController
+	hasGeometry    bool
+	viewportExtent float32
+	contentExtent  float32
+}
+
+// WoxScrollView builds a scroll surface with the shared fading draggable scrollbar.
+func WoxScrollView(props ScrollViewProps) woxwidget.Widget {
+	if props.Key == "" {
+		props.Key = "wox-scroll"
+	}
+	if props.FillWidth || props.FillHeight {
+		fillWidth := props.FillWidth
+		fillHeight := props.FillHeight
+		props.FillWidth = false
+		props.FillHeight = false
+		return woxwidget.LayoutBuilder{Build: func(size woxui.Size) woxwidget.Widget {
+			if fillWidth {
+				props.Width = size.Width
+			}
+			if fillHeight {
+				props.Height = size.Height
+			}
+			return WoxScrollView(props)
+		}}
+	}
+	if !woxScrollNeedsState(props) {
+		return buildWoxScrollView(woxwidget.StateContext{}, props, nil)
+	}
+	return woxwidget.Stateful{
+		Key: props.Key, Type: (*scrollViewState)(nil), Widget: props,
+		CreateState: func() woxwidget.State { return &scrollViewState{} },
+	}
+}
+
+// InitState creates a controller when the caller does not own scroll state.
+func (s *scrollViewState) InitState(_ woxwidget.StateContext, widget any) {
+	props := widget.(ScrollViewProps)
+	if props.Controller == nil && props.OnScroll == nil {
+		s.controller = woxwidget.NewScrollController(props.Offset)
+	}
+}
+
+// DidUpdateWidget reveals the scrollbar when a controlled offset moves.
+func (s *scrollViewState) DidUpdateWidget(context woxwidget.StateContext, oldWidget, newWidget any) {
+	oldProps := oldWidget.(ScrollViewProps)
+	newProps := newWidget.(ScrollViewProps)
+	if newProps.Height != oldProps.Height || newProps.ContentHeight != oldProps.ContentHeight || newProps.Width != oldProps.Width || newProps.ContentWidth != oldProps.ContentWidth {
+		s.hasGeometry = false
+	}
+	if newProps.HideScrollbar {
+		s.visible = false
+		s.pointerInside = false
+		s.hideAt = time.Time{}
+		if s.hideTimer != nil {
+			s.hideTimer.Stop()
+			s.hideTimer = nil
+		}
+		return
+	}
+	if newProps.Controller == nil && newProps.Offset != oldProps.Offset && newProps.Height == oldProps.Height && newProps.ContentHeight == oldProps.ContentHeight {
+		s.show(context)
+	}
+}
+
+// Build expires inactivity and composes the scroll surface from retained interaction state.
+func (s *scrollViewState) Build(context woxwidget.StateContext, widget any) woxwidget.Widget {
+	props := widget.(ScrollViewProps)
+	if props.Controller == nil && props.OnScroll == nil {
+		if s.controller == nil {
+			s.controller = woxwidget.NewScrollController(props.Offset)
+		}
+		props.Controller = s.controller
+	}
+	if s.visible && !s.pointerInside && !s.hovered && !s.dragging && !s.hideAt.IsZero() && !time.Now().Before(s.hideAt) {
+		s.visible = false
+		s.hideAt = time.Time{}
+		s.hideTimer = nil
+	}
+	return buildWoxScrollView(context, props, s)
+}
+
+// Dispose cancels the pending inactivity frame when the scroll surface leaves the tree.
+func (s *scrollViewState) Dispose() {
+	if s.hideTimer != nil {
+		s.hideTimer.Stop()
+		s.hideTimer = nil
+	}
+}
+
+func (s *scrollViewState) show(context woxwidget.StateContext) {
+	wasVisible := s.visible
+	s.visible = true
+	s.scheduleHide(context)
+	if !wasVisible {
+		context.Invalidate()
+	}
+}
+
+func (s *scrollViewState) scheduleHide(context woxwidget.StateContext) {
+	if s.hideTimer != nil {
+		s.hideTimer.Stop()
+		s.hideTimer = nil
+	}
+	s.hideAt = time.Time{}
+	if s.pointerInside || s.hovered || s.dragging {
+		return
+	}
+	s.hideAt = time.Now().Add(500 * time.Millisecond)
+	s.hideTimer = time.AfterFunc(500*time.Millisecond, func() {
+		// Invalidation reads the retained tree, which is owned by the UI thread.
+		_ = woxui.Call(context.Invalidate)
+	})
+}
+
+// setPointerInside tracks whether the pointer is over the surface without revealing the thumb.
+func (s *scrollViewState) setPointerInside(context woxwidget.StateContext, inside bool) {
+	if s.pointerInside == inside {
+		return
+	}
+	s.pointerInside = inside
+	s.scheduleHide(context)
+	context.Invalidate()
+}
+
+func (s *scrollViewState) setHovered(context woxwidget.StateContext, hovered bool) {
+	if s.hovered == hovered {
+		return
+	}
+	s.hovered = hovered
+	s.scheduleHide(context)
+	context.Invalidate()
+}
+
+func buildWoxScrollView(context woxwidget.StateContext, props ScrollViewProps, state *scrollViewState) woxwidget.Widget {
+	contentHint := scrollAxisContent(props)
+	if state != nil && state.hasGeometry {
+		if props.Horizontal {
+			props.Width = state.viewportExtent
+			props.ContentWidth = state.contentExtent
+		} else {
+			props.Height = state.viewportExtent
+			props.ContentHeight = state.contentExtent
+		}
+	}
+	if props.Horizontal {
+		props.ContentWidth = max(props.Width, props.ContentWidth)
+	} else {
+		props.ContentHeight = max(props.Height, props.ContentHeight)
+	}
+	offset := scrollCurrentOffset(props)
+	viewportKey := props.Key + "-viewport"
+	if viewportKey == "-viewport" {
+		viewportKey = "wox-scroll-viewport"
+	}
+	scroll := woxwidget.ScrollView{
+		EdgeFade: props.EdgeFade,
+		// A Wox strip is never nested inside another scroller, so a horizontal
+		// surface always consumes the ordinary mouse wheel.
+		Width: props.ContentViewportWidth(), Height: props.Height, Horizontal: props.Horizontal, MapVerticalWheel: props.Horizontal,
+		Offset: offset, KeepVisible: props.KeepVisible, KeepVisibleKey: props.KeepVisibleKey, Child: props.Content,
+	}
+	if props.Horizontal {
+		scroll.ContentWidth = contentHint
+	} else {
+		scroll.Height += max(float32(0), props.UnderlayHeight)
+		scroll.ContentHeight = max(props.Height, contentHint) + max(float32(0), props.UnderlayHeight)
+	}
+	if contentHint <= 0 {
+		scroll.OnGeometryChanged = func(viewport, content float32) {
+			geometryChanged := state == nil || !state.hasGeometry || state.viewportExtent != viewport || state.contentExtent != content
+			if !geometryChanged {
+				return
+			}
+			if state != nil {
+				state.hasGeometry = true
+				state.viewportExtent = viewport
+				state.contentExtent = content
+				context.Invalidate()
+			}
+			if props.OnGeometryChanged != nil {
+				props.OnGeometryChanged(viewport, content)
+			}
+		}
+	}
+	if props.Controller != nil {
+		scroll.Key = viewportKey
+		scroll.ID = string(viewportKey)
+		scroll.Controller = props.Controller
+		scroll.OnOffsetChanged = func(offset float32) {
+			if state != nil && !props.HideScrollbar {
+				state.show(context)
+			}
+			if props.OnOffsetChanged != nil {
+				props.OnOffsetChanged(offset)
+			}
+		}
+	}
+	children := []woxwidget.StackChild{{Child: scroll}}
+	viewport := scrollAxisViewport(props)
+	content := scrollAxisContent(props)
+	if !props.HideScrollbar && content > viewport && viewport > 0 {
+		thumbLength := max(float32(24), viewport*viewport/content)
+		thumbOffset := (viewport - thumbLength) * offset / (content - viewport)
+		thumbColor := props.ThumbColor
+		thumbColor.A = min(150, thumbColor.A)
+		if props.Theme.ScrollbarThumbColor != nil {
+			thumbColor = *props.Theme.ScrollbarThumbColor
+		}
+		if state != nil && state.hovered && props.Theme.ScrollbarThumbHoverColor != nil {
+			thumbColor = *props.Theme.ScrollbarThumbHoverColor
+		}
+		if state != nil && state.dragging && props.Theme.ScrollbarThumbActiveColor != nil {
+			thumbColor = *props.Theme.ScrollbarThumbActiveColor
+		}
+		visible := state != nil && (state.visible || props.AlwaysShowScrollbar)
+		targetOpacity := float32(0)
+		if visible {
+			targetOpacity = 1
+		}
+		targetThickness := float32(3)
+		if props.Theme.ScrollbarWidth != nil {
+			targetThickness = float32(*props.Theme.ScrollbarWidth)
+		}
+		if state != nil && (state.hovered || state.dragging) {
+			targetThickness = 7
+			if props.Theme.ScrollbarHoverWidth != nil {
+				targetThickness = float32(*props.Theme.ScrollbarHoverWidth)
+			}
+		}
+		// The drag target stays usable even when the authored thumb is thin.
+		hitThickness := max(scrollbarMinHitThickness, targetThickness)
+		opacityKey := props.Key + "-scrollbar-opacity"
+		widthKey := props.Key + "-scrollbar-width"
+		var thumb woxwidget.Widget = woxwidget.AnimatedFloat{Key: opacityKey, Target: targetOpacity, Duration: 200 * time.Millisecond, Builder: func(opacity float32) woxwidget.Widget {
+			return woxwidget.AnimatedFloat{Key: widthKey, Target: targetThickness, Duration: 120 * time.Millisecond, Builder: func(thickness float32) woxwidget.Widget {
+				radius := thickness / 2
+				if props.Theme.ScrollbarBorderRadius != nil {
+					radius = float32(*props.Theme.ScrollbarBorderRadius)
+				}
+				color := thumbColor
+				color.A = uint8(float32(color.A)*opacity + 0.5)
+				if props.Horizontal {
+					return woxwidget.Align{Width: thumbLength, Height: hitThickness, Vertical: 1, Child: woxwidget.Container{Width: thumbLength, Height: thickness, Radius: radius, Color: color}}
+				}
+				return woxwidget.Align{Width: hitThickness, Height: thumbLength, Horizontal: 1, Child: woxwidget.Container{Width: thickness, Height: thumbLength, Radius: radius, Color: color}}
+			}}
+		}}
+		if visible {
+			thumb = woxwidget.Gesture{ID: string(props.Key) + "-scrollbar", OnHover: func(hovered bool) { state.setHovered(context, hovered) }, OnPanStart: func(point woxui.Point) {
+				state.dragOrigin = thumbOffset + scrollAxisPointer(props, point)
+				state.dragging = true
+				state.setHovered(context, true)
+			}, OnPanUpdate: func(point woxui.Point) {
+				pointer := thumbOffset + scrollAxisPointer(props, point)
+				delta := (pointer - state.dragOrigin) * content / viewport
+				state.dragOrigin = pointer
+				if scrollOffset(props, delta) != scrollCurrentOffset(props) {
+					applyScroll(props, delta)
+				}
+			}, OnPanEnd: func() {
+				state.dragging = false
+				state.scheduleHide(context)
+				context.Invalidate()
+			}, Child: thumb}
+		}
+		if props.Horizontal {
+			children = append(children, woxwidget.StackChild{Left: thumbOffset, Bottom: scrollbarEdgeInset, AnchorBottom: true, Child: thumb})
+		} else {
+			children = append(children, woxwidget.StackChild{Top: thumbOffset, Right: scrollbarEdgeInset, AnchorRight: true, Child: thumb})
+		}
+	}
+	var result woxwidget.Widget = woxwidget.Gesture{ID: string(props.Key), CoverHover: true, OnPointer: func(event woxui.PointerEvent) bool {
+		if state == nil || props.HideScrollbar || event.Kind != woxui.PointerMove {
+			return false
+		}
+		// Host re-hit-tests after a popup or rebuild lands under a still
+		// pointer. That path only fires OnHover; reveal the thumb after a
+		// real move, matching launcher result hover.
+		state.show(context)
+		state.setPointerInside(context, true)
+		return false
+	}, OnHover: func(inside bool) {
+		if state == nil || props.HideScrollbar {
+			return
+		}
+		state.setPointerInside(context, inside)
+	}, OnScrollHandled: func(delta woxui.Point) bool {
+		scrollDelta := woxScrollWheelDelta(props, delta)
+		if scrollDelta == 0 || scrollOffset(props, scrollDelta) == scrollCurrentOffset(props) {
+			return false
+		}
+		if state != nil && !props.HideScrollbar {
+			state.show(context)
+		}
+		applyScroll(props, scrollDelta)
+		return true
+	}, Child: woxwidget.Stack{Width: props.Width, Height: props.Height + max(float32(0), props.UnderlayHeight), Children: children}}
+	if props.AutomationID != "" {
+		var actions []woxui.AccessibilityAction
+		var onAction func(woxui.AccessibilityAction, string) error
+		// A scroll action makes the node interactive, so an unlabeled surface stays non-interactive.
+		if props.Controller != nil && strings.TrimSpace(props.Label) != "" {
+			controller := props.Controller
+			actions = []woxui.AccessibilityAction{woxui.AccessibilityActionScroll}
+			// Automation scrolls by the same absolute offset the wheel and thumb use.
+			onAction = func(action woxui.AccessibilityAction, value string) error {
+				if action != woxui.AccessibilityActionScroll {
+					return nil
+				}
+				target, err := strconv.ParseFloat(strings.TrimSpace(value), 32)
+				if err != nil {
+					return err
+				}
+				controller.JumpTo(float32(target))
+				return nil
+			}
+		}
+		result = woxwidget.Semantics{
+			Key: props.Key + "-semantics", AutomationID: props.AutomationID, Role: woxui.AccessibilityRoleGroup, Label: props.Label,
+			Value: fmt.Sprintf("%.0f/%.0f", offset, max(float32(0), content-viewport)), ReadOnly: true,
+			Actions: actions, OnAction: onAction, Child: result,
+		}
+	}
+	return result
+}
+
+func woxScrollNeedsState(props ScrollViewProps) bool {
+	if props.RetainState {
+		return true
+	}
+	if scrollAxisViewport(props) <= 0 {
+		return false
+	}
+	content := scrollAxisContent(props)
+	return content <= 0 || content > scrollAxisViewport(props)
+}
+
+func scrollAxisViewport(props ScrollViewProps) float32 {
+	if props.Horizontal {
+		return props.Width
+	}
+	return props.Height
+}
+
+func scrollAxisContent(props ScrollViewProps) float32 {
+	if props.Horizontal {
+		return props.ContentWidth
+	}
+	return props.ContentHeight
+}
+
+func scrollAxisPointer(props ScrollViewProps, point woxui.Point) float32 {
+	if props.Horizontal {
+		return point.X
+	}
+	return point.Y
+}
+
+func woxScrollWheelDelta(props ScrollViewProps, delta woxui.Point) float32 {
+	if !props.Horizontal {
+		return -delta.Y
+	}
+	if delta.X != 0 {
+		return -delta.X
+	}
+	return -delta.Y
+}
+
+func scrollOffset(props ScrollViewProps, delta float32) float32 {
+	return min(max(float32(0), scrollCurrentOffset(props)+delta), max(float32(0), scrollAxisContent(props)-scrollAxisViewport(props)))
+}
+
+func scrollCurrentOffset(props ScrollViewProps) float32 {
+	if props.Controller != nil {
+		return props.Controller.Offset()
+	}
+	return props.Offset
+}
+
+func applyScroll(props ScrollViewProps, delta float32) {
+	if props.Controller != nil {
+		props.Controller.ScrollBy(delta)
+	} else if props.OnScroll != nil {
+		props.OnScroll(delta)
+	}
+}

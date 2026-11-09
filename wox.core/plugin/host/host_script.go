@@ -1,0 +1,1133 @@
+package host
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+	"wox/common"
+	"wox/common/icons"
+	"wox/i18n"
+	"wox/network"
+	"wox/plugin"
+	"wox/util"
+	"wox/util/clipboard"
+	"wox/util/shell"
+)
+
+const (
+	defaultScriptExecutionTimeout = 10 * time.Second
+	scriptExecutionTimeoutEnv     = "WOX_SCRIPT_EXECUTION_TIMEOUT"
+)
+
+func init() {
+	host := &ScriptHost{}
+	plugin.AllHosts = append(plugin.AllHosts, host)
+}
+
+// scriptExecutionTimeout is the interactive 10s cap, or WOX_SCRIPT_EXECUTION_TIMEOUT
+// when health checks need enough time for slow network fallbacks.
+func scriptExecutionTimeout() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(scriptExecutionTimeoutEnv))
+	if raw == "" {
+		return defaultScriptExecutionTimeout
+	}
+	timeout, err := time.ParseDuration(raw)
+	if err != nil || timeout <= 0 {
+		return defaultScriptExecutionTimeout
+	}
+	return timeout
+}
+
+type ScriptHost struct {
+	// Script host doesn't need persistent connections like websocket hosts
+}
+
+func (s *ScriptHost) GetRuntime(ctx context.Context) plugin.Runtime {
+	return plugin.PLUGIN_RUNTIME_SCRIPT
+}
+
+func (s *ScriptHost) Start(ctx context.Context) error {
+	// Script host doesn't need to start any background processes
+	util.GetLogger().Info(ctx, "Script host started")
+	return nil
+}
+
+func (s *ScriptHost) Stop(ctx context.Context) {
+	// Script host doesn't need to stop any background processes
+	util.GetLogger().Info(ctx, "Script host stopped")
+}
+
+func (s *ScriptHost) IsStarted(ctx context.Context) bool {
+	// Script host is always "started" since it doesn't maintain persistent connections
+	return true
+}
+
+func (s *ScriptHost) RuntimeStatus(ctx context.Context) plugin.RuntimeHostStatus {
+	// Script plugins are run directly per invocation, so exposing a running
+	// status preserves the shared host contract without adding fake restart UI.
+	return plugin.RuntimeHostStatus{
+		StatusCode:    plugin.RuntimeHostStatusRunning,
+		StatusMessage: "Script runtime does not use a persistent host process.",
+		CanRestart:    false,
+	}
+}
+
+func (s *ScriptHost) LoadPlugin(ctx context.Context, metadata plugin.Metadata, pluginDirectory string) (plugin.Plugin, error) {
+	// For script plugins, the actual script file is in the user script plugins directory
+	userScriptPluginDirectory := util.GetLocation().GetUserScriptPluginsDirectory()
+	scriptPath := filepath.Join(userScriptPluginDirectory, metadata.Entry)
+
+	// Check if script file exists
+	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("script file not found: %s", scriptPath)
+	}
+
+	// Make sure script is executable
+	if err := os.Chmod(scriptPath, 0755); err != nil {
+		util.GetLogger().Warn(ctx, fmt.Sprintf("Failed to make script executable: %s", err.Error()))
+	}
+
+	util.GetLogger().Info(ctx, fmt.Sprintf("Loaded script plugin: %s", metadata.GetName(ctx)))
+	return NewScriptPlugin(metadata, scriptPath), nil
+}
+
+func (s *ScriptHost) UnloadPlugin(ctx context.Context, metadata plugin.Metadata) {
+	// Script plugins don't need explicit unloading since they're not persistent
+	util.GetLogger().Info(ctx, fmt.Sprintf("Unloaded script plugin: %s", metadata.GetName(ctx)))
+}
+
+// ScriptPlugin represents a script-based plugin
+type ScriptPlugin struct {
+	metadata   plugin.Metadata
+	scriptPath string
+	api        plugin.API // API for accessing plugin settings
+}
+
+func NewScriptPlugin(metadata plugin.Metadata, scriptPath string) *ScriptPlugin {
+	return &ScriptPlugin{
+		metadata:   metadata,
+		scriptPath: scriptPath,
+	}
+}
+
+func (s *ScriptPlugin) Init(ctx context.Context, initParams plugin.InitParams) {
+	// Save API reference for accessing settings
+	s.api = initParams.API
+	util.GetLogger().Debug(ctx, fmt.Sprintf("Script plugin %s initialized", s.metadata.GetName(ctx)))
+}
+
+func (s *ScriptPlugin) Query(ctx context.Context, query plugin.Query) plugin.QueryResponse {
+	response, err := s.query(ctx, query)
+	if err != nil {
+		requestJSON, _ := json.Marshal(scriptQueryRequest(ctx, query))
+		util.GetLogger().Error(ctx, fmt.Sprintf("script plugin query failed for %s: %s, raw request: %s", s.metadata.GetName(ctx), err.Error(), requestJSON))
+
+		if issueResponse, handled := s.runtimeIssueResponse(ctx, err); handled {
+			return issueResponse
+		}
+
+		s.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: err.Error()})
+		return plugin.QueryResponse{}
+	}
+
+	return response
+}
+
+// QueryWithError executes the script query and returns interpreter or protocol errors.
+func (s *ScriptPlugin) QueryWithError(ctx context.Context, query plugin.Query) (plugin.QueryResponse, error) {
+	return s.query(ctx, query)
+}
+
+func (s *ScriptPlugin) query(ctx context.Context, query plugin.Query) (plugin.QueryResponse, error) {
+	results, err := s.executeScript(ctx, scriptQueryRequest(ctx, query))
+	if err != nil {
+		return plugin.QueryResponse{}, err
+	}
+	return plugin.NewQueryResponse(results), nil
+}
+
+func scriptQueryRequest(ctx context.Context, query plugin.Query) map[string]interface{} {
+	return map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "query",
+		"params": map[string]interface{}{
+			"search":          query.Search,
+			"trigger_keyword": query.TriggerKeyword,
+			"command":         query.Command,
+			"raw_query":       query.RawQuery,
+		},
+		"id": util.GetContextTraceId(ctx),
+	}
+}
+
+// executeScript executes the script with the given JSON-RPC request and returns the results
+func (s *ScriptPlugin) executeScript(ctx context.Context, request map[string]interface{}) ([]plugin.QueryResult, error) {
+	// Execute script and get raw response
+	response, err := s.executeScriptRaw(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+
+	// Extract results
+	result, exists := response["result"]
+	if !exists {
+		return []plugin.QueryResult{}, nil
+	}
+
+	resultMap, ok := result.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid result format")
+	}
+
+	items, exists := resultMap["items"]
+	if !exists {
+		return []plugin.QueryResult{}, nil
+	}
+
+	itemsArray, ok := items.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid items format")
+	}
+
+	// Convert items to QueryResult
+	var queryResults []plugin.QueryResult
+	for _, item := range itemsArray {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		queryResult := plugin.QueryResult{
+			IconShowContainer: getFirstBoolFromMap(itemMap, []string{"iconShowContainer", "icon_show_container", "IconShowContainer"}),
+			Title:             getStringFromMap(itemMap, "title"),
+			SubTitle:          getStringFromMap(itemMap, "subtitle"),
+			Score:             int64(getFloatFromMap(itemMap, "score")),
+			Group:             getFirstStringFromMap(itemMap, []string{"group", "Group"}),
+			IdentityKey:       getFirstStringFromMap(itemMap, []string{"identityKey", "identity_key", "IdentityKey", "scoreKey", "score_key", "ScoreKey"}),
+		}
+		if groupScore := getFirstFloatPtrFromMap(itemMap, []string{"groupScore", "group_score", "GroupScore"}); groupScore != nil {
+			queryResult.GroupScore = int64(*groupScore)
+		}
+
+		// Icon: WoxImage.String() format, e.g. "base64:data:image/png;base64,xxx" or "emoji:🧮"
+		if iconStr := getStringFromMap(itemMap, "icon"); iconStr != "" {
+			if img, err := common.ParseWoxImage(iconStr); err != nil {
+				util.GetLogger().Warn(ctx, fmt.Sprintf("script plugin %s returned invalid icon: %s, err: %s", s.metadata.GetName(ctx), iconStr, err.Error()))
+			} else {
+				// Normalize base64 without data URI header to png
+				if img.ImageType == common.WoxImageTypeBase64 && !strings.Contains(img.ImageData, ",") {
+					img.ImageData = fmt.Sprintf("data:image/png;base64,%s", img.ImageData)
+				}
+				queryResult.Icon = img
+			}
+		}
+
+		if preview, ok := parseScriptPreview(itemMap); ok {
+			queryResult.Preview = preview
+		}
+
+		if dragData := parseScriptDragData(itemMap); dragData != nil {
+			queryResult.DragData = dragData
+		}
+
+		if tails := parseScriptTails(ctx, s.metadata, itemMap); len(tails) > 0 {
+			queryResult.Tails = tails
+		}
+
+		// Handle actions - must be an array
+		if actionsData, exists := itemMap["actions"]; exists {
+			if actionsArray, ok := actionsData.([]interface{}); ok {
+				for _, actionItem := range actionsArray {
+					if actionMap, ok := actionItem.(map[string]interface{}); ok {
+						actionName := getStringFromMap(actionMap, "name")
+						if actionName == "" {
+							actionName = "Execute"
+						}
+
+						var actionIcon common.WoxImage
+						if iconStr := getFirstStringFromMap(actionMap, []string{"icon", "Icon"}); iconStr != "" {
+							if img, err := common.ParseWoxImage(iconStr); err != nil {
+								util.GetLogger().Warn(ctx, fmt.Sprintf("script plugin %s returned invalid action icon: %s, err: %s", s.metadata.GetName(ctx), iconStr, err.Error()))
+							} else {
+								if img.ImageType == common.WoxImageTypeBase64 && !strings.Contains(img.ImageData, ",") {
+									img.ImageData = fmt.Sprintf("data:image/png;base64,%s", img.ImageData)
+								}
+								actionIcon = img
+							}
+						}
+
+						// Capture actionMap in closure
+						actionMapCopy := actionMap
+						queryResult.Actions = append(queryResult.Actions, plugin.QueryResultAction{
+							Name:      actionName,
+							Icon:      actionIcon,
+							IsDefault: getFirstBoolFromMap(actionMapCopy, []string{"isDefault", "is_default", "IsDefault"}),
+							Hotkey: getFirstStringFromMap(actionMapCopy, []string{
+								"hotkey",
+								"Hotkey",
+							}),
+							PreventHideAfterAction: getFirstBoolFromMap(actionMapCopy, []string{
+								"preventHideAfterAction",
+								"prevent_hide_after_action",
+								"PreventHideAfterAction",
+							}),
+							ShowInToolbar: getFirstBoolFromMap(actionMapCopy, []string{
+								"showInToolbar",
+								"show_in_toolbar",
+								"ShowInToolbar",
+							}),
+							Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+								s.executeAction(ctx, actionMapCopy)
+							},
+						})
+					}
+				}
+			}
+		}
+
+		queryResults = append(queryResults, queryResult)
+	}
+
+	return queryResults, nil
+}
+
+// executeAction executes an action from a script plugin result
+func (s *ScriptPlugin) executeAction(ctx context.Context, actionData map[string]interface{}) {
+	actionId := getStringFromMap(actionData, "id")
+	actionDataValue, hasActionData := actionData["data"]
+	actionDataMap := getStringMapFromValue(actionDataValue)
+	actionDataString := ""
+	if !hasActionData {
+		actionDataValue = nil
+	} else if actionDataMap == nil {
+		actionDataString = getStringFromMap(actionData, "data")
+	}
+
+	// Check if this is a built-in action that can be handled directly
+	if s.handleBuiltInAction(ctx, actionId, actionData) {
+		// Built-in action was handled, still call script action as a hook (optional for script to handle)
+		actionParams := map[string]interface{}{
+			"id": actionId,
+		}
+		if actionDataMap != nil {
+			actionParams["data"] = actionDataMap
+		} else if actionDataString != "" {
+			actionParams["data"] = actionDataString
+		}
+		request := map[string]interface{}{
+			"jsonrpc": "2.0",
+			"method":  "action",
+			"params":  actionParams,
+			"id":      util.GetContextTraceId(ctx),
+		}
+
+		// Call script action as a hook, but ignore errors since it's optional
+		_ = s.executeScriptAction(ctx, request)
+		return
+	}
+
+	// Custom action - must be handled by script
+	actionParams := map[string]interface{}{
+		"id": actionId,
+	}
+	if actionDataMap != nil {
+		actionParams["data"] = actionDataMap
+	} else if actionDataString != "" {
+		actionParams["data"] = actionDataString
+	}
+	request := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "action",
+		"params":  actionParams,
+		"id":      util.GetContextTraceId(ctx),
+	}
+
+	// Execute script for custom action
+	err := s.executeScriptAction(ctx, request)
+	if err != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("Script plugin %s action failed: %s", s.metadata.GetName(ctx), err.Error()))
+	}
+}
+
+// executeScriptRaw executes the script with the given JSON-RPC request and returns the raw response
+func (s *ScriptPlugin) executeScriptRaw(ctx context.Context, request map[string]interface{}) (map[string]interface{}, error) {
+	ctx, release, offlineErr := network.Default.Begin(ctx)
+	if offlineErr != nil {
+		return nil, offlineErr
+	}
+	defer release()
+	// Convert request to JSON
+	requestJSON, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// Determine the interpreter based on file extension
+	interpreter, err := s.getInterpreter(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	util.GetLogger().Debug(ctx, fmt.Sprintf("Using interpreter: '%s' for script: %s", interpreter, s.scriptPath))
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, scriptExecutionTimeout())
+	defer cancel()
+
+	// Prepare command
+	var cmd *exec.Cmd
+	if interpreter != "" {
+		cmd = shell.BuildCommandContext(timeoutCtx, interpreter, nil, s.scriptPath)
+		util.GetLogger().Debug(ctx, fmt.Sprintf("Executing command: %s %s", interpreter, s.scriptPath))
+	} else {
+		cmd = shell.BuildCommandContext(timeoutCtx, s.scriptPath, nil)
+		util.GetLogger().Debug(ctx, fmt.Sprintf("Executing command: %s", s.scriptPath))
+	}
+
+	cmd.Cancel = func() error {
+		if cmd.Process != nil {
+			shell.TerminateProcessTree(cmd.Process.Pid)
+		}
+		return nil
+	}
+	pluginCacheDirectory := ""
+	if cacheDir, cacheErr := util.GetLocation().EnsurePluginCacheDirectory(s.metadata.Id); cacheErr != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("failed to create script plugin cache folder: %s", cacheErr.Error()))
+	} else {
+		pluginCacheDirectory = cacheDir
+	}
+
+	// Set up environment variables for script plugins
+	envVars := []string{
+		"WOX_DIRECTORY_USER_SCRIPT_PLUGINS=" + util.GetLocation().GetUserScriptPluginsDirectory(),
+		"WOX_DIRECTORY_USER_DATA=" + util.GetLocation().GetUserDataDirectory(),
+		"WOX_DIRECTORY_WOX_DATA=" + util.GetLocation().GetWoxDataDirectory(),
+		"WOX_DIRECTORY_PLUGINS=" + util.GetLocation().GetPluginDirectory(),
+		"WOX_DIRECTORY_THEMES=" + util.GetLocation().GetThemeDirectory(),
+		"WOX_DIRECTORY_PLUGIN_CACHE=" + pluginCacheDirectory,
+		"WOX_PLUGIN_ID=" + s.metadata.Id,
+		"WOX_PLUGIN_NAME=" + s.metadata.GetName(ctx),
+		"WOX_LANG=" + string(i18n.GetI18nManager().GetCurrentLangCode()),
+		"PYTHONIOENCODING=utf-8",
+	}
+
+	// Add plugin settings as environment variables
+	// Settings are prefixed with WOX_SETTING_ to avoid conflicts
+	if s.api != nil {
+		// Iterate through setting definitions to get all setting values
+		for _, settingDef := range s.metadata.SettingDefinitions {
+			if settingDef.Value != nil {
+				key := settingDef.Value.GetKey()
+				value := s.api.GetSetting(ctx, key)
+
+				// Convert setting key to uppercase and replace special characters for env var name
+				// e.g., "api_key" -> "WOX_SETTING_API_KEY"
+				envKey := "WOX_SETTING_" + strings.ToUpper(strings.ReplaceAll(key, ".", "_"))
+				envVars = append(envVars, envKey+"="+value)
+			}
+		}
+	}
+
+	cmd.Env = append(os.Environ(), envVars...)
+
+	// Set up stdin with the JSON-RPC request
+	cmd.Stdin = strings.NewReader(string(requestJSON))
+
+	// Execute script
+	output, err := cmd.Output()
+	if err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("script execution failed: %s, stderr: %s", exitError.Error(), string(exitError.Stderr))
+		}
+
+		return nil, fmt.Errorf("script execution failed: %w", err)
+	}
+
+	// Parse JSON-RPC response
+	var response map[string]interface{}
+	if err := json.Unmarshal(output, &response); err != nil {
+		return nil, fmt.Errorf("failed to parse script response: %w", err)
+	}
+
+	// Check for JSON-RPC error
+	if errorData, exists := response["error"]; exists {
+		return nil, fmt.Errorf("script returned error: %v", errorData)
+	}
+
+	return response, nil
+}
+
+// executeScriptAction executes the script for action requests
+func (s *ScriptPlugin) executeScriptAction(ctx context.Context, request map[string]interface{}) error {
+	// Execute script and get raw response
+	response, err := s.executeScriptRaw(ctx, request)
+	if err != nil {
+		return err
+	}
+
+	// Handle action result if present
+	if result, exists := response["result"]; exists {
+		if resultMap, ok := result.(map[string]interface{}); ok {
+			s.handleActionResult(ctx, resultMap)
+		}
+	}
+
+	return nil
+}
+
+// handleBuiltInAction handles built-in actions directly without calling script
+// Returns true if the action was a built-in action (handled or not), false if it's a custom action
+func (s *ScriptPlugin) handleBuiltInAction(ctx context.Context, actionId string, actionData map[string]interface{}) bool {
+	switch actionId {
+	case "copy-to-clipboard":
+		// Support both "text" and "data" fields
+		text := getStringFromMap(actionData, "text")
+		if text == "" {
+			text = getStringFromMap(actionData, "data")
+		}
+		if text != "" {
+			if err := clipboard.WriteText(text); err != nil {
+				util.GetLogger().Error(ctx, fmt.Sprintf("Script plugin %s failed to copy to clipboard: %s", s.metadata.GetName(ctx), err.Error()))
+			} else {
+				util.GetLogger().Info(ctx, fmt.Sprintf("Script plugin %s copied to clipboard: %s", s.metadata.GetName(ctx), text))
+			}
+		}
+		return true
+
+	case "open-url":
+		url := getStringFromMap(actionData, "url")
+		if url != "" {
+			if err := shell.Open(url); err != nil {
+				util.GetLogger().Error(ctx, fmt.Sprintf("Script plugin %s failed to open URL %s: %s", s.metadata.GetName(ctx), url, err.Error()))
+			}
+		}
+		return true
+
+	case "open-directory":
+		path := getStringFromMap(actionData, "path")
+		if path != "" {
+			// Open directory using shell.Open
+			if err := shell.Open(path); err != nil {
+				util.GetLogger().Error(ctx, fmt.Sprintf("Script plugin %s failed to open directory %s: %s", s.metadata.GetName(ctx), path, err.Error()))
+			} else {
+				util.GetLogger().Info(ctx, fmt.Sprintf("Script plugin %s opened directory: %s", s.metadata.GetName(ctx), path))
+			}
+		}
+		return true
+
+	case "notify":
+		message := getStringFromMap(actionData, "message")
+		if message != "" {
+			if instance := plugin.GetPluginManager().GetPluginInstanceById(s.metadata.Id); instance != nil {
+				plugin.GetPluginManager().GetUI().Notify(ctx, legacyNotifyMessage(ctx, instance, message))
+			} else {
+				s.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: message})
+			}
+		}
+		return true
+
+	case "change-query":
+		queryText := getFirstStringFromMap(actionData, []string{"query", "text", "queryText"})
+		if queryText != "" && s.api != nil {
+			s.api.ChangeQuery(ctx, common.PlainQuery{
+				QueryType: plugin.QueryTypeInput,
+				QueryText: queryText,
+			})
+		}
+		return true
+
+	default:
+		// Not a built-in action
+		return false
+	}
+}
+
+// handleActionResult handles the result from an action execution (for custom actions that return results)
+func (s *ScriptPlugin) handleActionResult(ctx context.Context, result map[string]interface{}) {
+	actionType := getStringFromMap(result, "action")
+
+	// This is for backward compatibility - if script returns an action result, handle it
+	if actionType != "" {
+		util.GetLogger().Warn(ctx, fmt.Sprintf("Script plugin %s returned action result (deprecated): %s", s.metadata.GetName(ctx), actionType))
+	}
+}
+
+// getInterpreter determines the appropriate interpreter for the script based on file extension or shebang
+func (s *ScriptPlugin) getInterpreter(ctx context.Context) (string, error) {
+	ext := strings.ToLower(filepath.Ext(s.scriptPath))
+
+	// Try to determine interpreter from file extension first
+	interpreter, err := s.getInterpreterFromExtension(ctx, ext)
+	if err == nil {
+		return interpreter, nil
+	}
+	if isScriptRuntimeError(err) {
+		return "", err
+	}
+
+	// If extension is unknown or missing, try to read shebang from file
+	shebangInterpreter, shebangErr := s.getInterpreterFromShebang(ctx)
+	if shebangErr == nil && shebangInterpreter != "" {
+		return shebangInterpreter, nil
+	}
+	if isScriptRuntimeError(shebangErr) {
+		return "", shebangErr
+	}
+
+	// If no extension and no valid shebang, assume it's executable
+	if ext == "" {
+		return "", nil
+	}
+
+	return "", fmt.Errorf("unsupported script type: %s", ext)
+}
+
+// getInterpreterFromExtension determines interpreter based on file extension
+func (s *ScriptPlugin) getInterpreterFromExtension(ctx context.Context, ext string) (string, error) {
+	switch ext {
+	case ".py":
+		return resolveScriptPythonPath(ctx)
+	case ".js":
+		return resolveScriptNodejsPath(ctx)
+	case ".rb":
+		return "ruby", nil
+	case ".pl":
+		return "perl", nil
+	case "":
+		return "", nil
+	default:
+		return "", fmt.Errorf("unsupported extension: %s", ext)
+	}
+}
+
+// getInterpreterFromShebang reads the first line of the script to determine the interpreter
+func (s *ScriptPlugin) getInterpreterFromShebang(ctx context.Context) (string, error) {
+	file, err := os.Open(s.scriptPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to open script file: %w", err)
+	}
+	defer file.Close()
+
+	// Read first line using scanner
+	scanner := bufio.NewScanner(file)
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return "", fmt.Errorf("failed to read script file: %w", err)
+		}
+		return "", fmt.Errorf("script file is empty")
+	}
+
+	shebangLine := strings.TrimSpace(scanner.Text())
+
+	// Check if it starts with shebang
+	if !strings.HasPrefix(shebangLine, "#!") {
+		return "", fmt.Errorf("no shebang found")
+	}
+
+	// Extract interpreter path from shebang
+	interpreterPath := strings.TrimSpace(shebangLine[2:])
+	util.GetLogger().Debug(ctx, fmt.Sprintf("Raw shebang line: %s", shebangLine))
+	util.GetLogger().Debug(ctx, fmt.Sprintf("Extracted interpreter path: %s", interpreterPath))
+
+	// Handle common shebang patterns
+	// e.g., "#!/usr/bin/env python3" -> "python3"
+	// e.g., "#!/usr/bin/python3" -> "python3"
+	// e.g., "#!/bin/bash" -> "bash"
+	parts := strings.Fields(interpreterPath)
+	util.GetLogger().Debug(ctx, fmt.Sprintf("Shebang parts: %v (count: %d)", parts, len(parts)))
+
+	if len(parts) == 0 {
+		return "", fmt.Errorf("empty shebang interpreter")
+	}
+
+	// Check if using env
+	if len(parts) >= 2 && (filepath.Base(parts[0]) == "env") {
+		// Format: /usr/bin/env python3
+		interpreterPath = parts[1]
+		util.GetLogger().Debug(ctx, fmt.Sprintf("Detected env-based shebang, using: %s", interpreterPath))
+	} else {
+		// Format: /usr/bin/python3 or /bin/bash
+		// Extract just the interpreter name from full path
+		interpreterPath = filepath.Base(parts[0])
+		util.GetLogger().Debug(ctx, fmt.Sprintf("Detected direct path shebang, using: %s", interpreterPath))
+	}
+
+	interpreterPath, mapErr := s.mapInterpreterWithCustomPath(ctx, interpreterPath)
+	if mapErr != nil {
+		return "", mapErr
+	}
+
+	util.GetLogger().Debug(ctx, fmt.Sprintf("Final interpreter after mapping: %s", interpreterPath))
+	if interpreterPath == "bash" || interpreterPath == "sh" {
+		return "", fmt.Errorf("unsupported interpreter: %s", interpreterPath)
+	}
+	return interpreterPath, nil
+}
+
+func (s *ScriptPlugin) mapInterpreterWithCustomPath(ctx context.Context, interpreter string) (string, error) {
+	interpreter = strings.ToLower(interpreter)
+
+	if strings.HasPrefix(interpreter, "python") {
+		return resolveScriptPythonPath(ctx)
+	}
+	if interpreter == "node" || interpreter == "nodejs" {
+		return resolveScriptNodejsPath(ctx)
+	}
+	return interpreter, nil
+}
+
+func resolveScriptPythonPath(ctx context.Context) (string, error) {
+	return (&PythonHost{}).resolvePythonPath(ctx)
+}
+
+func resolveScriptNodejsPath(ctx context.Context) (string, error) {
+	return (&NodejsHost{}).resolveNodejsPath(ctx)
+}
+
+func isScriptRuntimeError(err error) bool {
+	var executableErr *runtimeExecutableError
+	return errors.As(err, &executableErr)
+}
+
+func (s *ScriptPlugin) runtimeIssueResponse(ctx context.Context, err error) (plugin.QueryResponse, bool) {
+	runtimeName := s.getScriptRuntimeName()
+	statusCode := plugin.RuntimeHostStatusExecutableMissing
+	var executableErr *runtimeExecutableError
+	if errors.As(err, &executableErr) {
+		statusCode = executableErr.statusCode
+	} else if runtimeName = s.detectMissingRuntime(ctx, err); runtimeName == "" {
+		return plugin.QueryResponse{}, false
+	}
+
+	displayRuntimeName, installURL := s.getRuntimeDisplayName(runtimeName)
+	subtitleKey := "plugin_script_runtime_missing_subtitle"
+	if statusCode == plugin.RuntimeHostStatusUnsupportedVersion {
+		subtitleKey = "plugin_script_runtime_unsupported_subtitle"
+	}
+
+	var actions []plugin.QueryResultAction
+	if installURL != "" {
+		actions = append(actions, plugin.QueryResultAction{
+			Name: "i18n:plugin_script_runtime_install_action",
+			Icon: icons.Get(icons.ActionInstall),
+			Action: func(actionCtx context.Context, _ plugin.ActionContext) {
+				if openErr := shell.Open(installURL); openErr != nil {
+					util.GetLogger().Error(actionCtx, fmt.Sprintf("script plugin %s failed to open runtime install url %s: %s", s.metadata.GetName(actionCtx), installURL, openErr.Error()))
+				}
+			},
+		})
+	}
+
+	util.GetLogger().Info(ctx, fmt.Sprintf("script plugin %s runtime issue: %s (%s)", s.metadata.GetName(ctx), runtimeName, statusCode))
+	return plugin.NewQueryResponse([]plugin.QueryResult{
+		{
+			Title:    s.metadata.GetName(ctx),
+			SubTitle: fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, subtitleKey), displayRuntimeName),
+			Icon:     s.metadata.GetIconOrDefault(s.metadata.Directory, common.NewWoxImageEmoji("⚠️")),
+			Preview: plugin.WoxPreview{
+				PreviewType: plugin.WoxPreviewTypeMarkdown,
+				PreviewData: s.buildRuntimeIssueMarkdown(ctx, runtimeName, statusCode),
+			},
+			Actions: actions,
+		},
+	}), true
+}
+
+// detectMissingRuntime checks if a script execution error is caused by a missing runtime.
+// Returns the runtime name (e.g., "python", "nodejs") if a missing runtime is detected, or empty string otherwise.
+func (s *ScriptPlugin) detectMissingRuntime(ctx context.Context, err error) string {
+	if err == nil {
+		return ""
+	}
+
+	errMsg := err.Error()
+
+	// On Windows, exit status 9009 means "command not found"
+	// Also check for common "executable file not found" error messages
+	isMissingRuntime := strings.Contains(errMsg, "exit status 9009") ||
+		strings.Contains(errMsg, "executable file not found") ||
+		strings.Contains(errMsg, "no such file or directory") ||
+		strings.Contains(errMsg, "not found in %PATH%") ||
+		strings.Contains(errMsg, "not found in $PATH")
+
+	if !isMissingRuntime {
+		return ""
+	}
+
+	return s.getScriptRuntimeName()
+}
+
+// getScriptRuntimeName returns the runtime name based on the script file extension
+func (s *ScriptPlugin) getScriptRuntimeName() string {
+	ext := strings.ToLower(filepath.Ext(s.scriptPath))
+	switch ext {
+	case ".py":
+		return "python"
+	case ".js":
+		return "nodejs"
+	default:
+		if ext != "" {
+			return strings.TrimPrefix(ext, ".")
+		}
+		return "unknown"
+	}
+}
+
+func (s *ScriptPlugin) getRuntimeDisplayName(runtimeName string) (string, string) {
+	switch strings.ToLower(runtimeName) {
+	case "python":
+		return "Python", "https://www.python.org/downloads/"
+	case "nodejs", "node":
+		return "Node.js", "https://nodejs.org/"
+	default:
+		return runtimeName, ""
+	}
+}
+
+func (s *ScriptPlugin) buildRuntimeIssueMarkdown(ctx context.Context, runtimeName string, statusCode plugin.RuntimeHostStatusCode) string {
+	if statusCode == plugin.RuntimeHostStatusUnsupportedVersion {
+		switch strings.ToLower(runtimeName) {
+		case "python":
+			return i18n.GetI18nManager().TranslateWox(ctx, "plugin_script_runtime_python_unsupported_markdown")
+		case "nodejs", "node":
+			return i18n.GetI18nManager().TranslateWox(ctx, "plugin_script_runtime_nodejs_unsupported_markdown")
+		default:
+			displayRuntimeName, _ := s.getRuntimeDisplayName(runtimeName)
+			return fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "plugin_script_runtime_unsupported_markdown"), displayRuntimeName, displayRuntimeName)
+		}
+	}
+
+	switch strings.ToLower(runtimeName) {
+	case "python":
+		return i18n.GetI18nManager().TranslateWox(ctx, "plugin_script_runtime_python_missing_markdown")
+	case "nodejs", "node":
+		return i18n.GetI18nManager().TranslateWox(ctx, "plugin_script_runtime_nodejs_missing_markdown")
+	default:
+		displayRuntimeName, _ := s.getRuntimeDisplayName(runtimeName)
+		return fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "plugin_script_runtime_missing_markdown"), displayRuntimeName, displayRuntimeName, displayRuntimeName)
+	}
+}
+
+func getBoolFromMap(m map[string]interface{}, key string) (bool, bool) {
+	value, exists := m[key]
+	if !exists {
+		return false, false
+	}
+	switch typed := value.(type) {
+	case bool:
+		return typed, true
+	case string:
+		return strings.EqualFold(typed, "true"), true
+	default:
+		return false, true
+	}
+}
+
+func getFirstBoolFromMap(m map[string]interface{}, keys []string) bool {
+	for _, key := range keys {
+		if value, exists := getBoolFromMap(m, key); exists {
+			return value
+		}
+	}
+	return false
+}
+
+// Helper functions to safely extract values from maps
+func getStringFromMap(m map[string]interface{}, key string) string {
+	if value, exists := m[key]; exists {
+		if str, ok := value.(string); ok {
+			return str
+		}
+	}
+	return ""
+}
+
+func getFloatFromMap(m map[string]interface{}, key string) float64 {
+	if value, exists := m[key]; exists {
+		if num, ok := value.(float64); ok {
+			return num
+		}
+		if num, ok := value.(int); ok {
+			return float64(num)
+		}
+	}
+	return 0
+}
+
+func getFirstFloatPtrFromMap(m map[string]interface{}, keys []string) *float64 {
+	for _, key := range keys {
+		if _, exists := m[key]; !exists {
+			continue
+		}
+
+		value := getFloatFromMap(m, key)
+		return &value
+	}
+
+	return nil
+}
+
+func getSliceFromMap(m map[string]interface{}, key string) []interface{} {
+	if value, exists := m[key]; exists {
+		if result, ok := value.([]interface{}); ok {
+			return result
+		}
+	}
+	return nil
+}
+
+func getMapFromMap(m map[string]interface{}, key string) map[string]interface{} {
+	if value, exists := m[key]; exists {
+		if result, ok := value.(map[string]interface{}); ok {
+			return result
+		}
+	}
+	return nil
+}
+
+func getStringMapFromValue(value interface{}) map[string]string {
+	switch typed := value.(type) {
+	case map[string]string:
+		return typed
+	case map[string]interface{}:
+		result := make(map[string]string, len(typed))
+		for key, value := range typed {
+			switch inner := value.(type) {
+			case string:
+				result[key] = inner
+			default:
+				result[key] = fmt.Sprint(value)
+			}
+		}
+		return result
+	default:
+		return nil
+	}
+}
+
+func getFirstStringFromMap(m map[string]interface{}, keys []string) string {
+	for _, key := range keys {
+		if value := getStringFromMap(m, key); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func parseScriptPreview(itemMap map[string]interface{}) (plugin.WoxPreview, bool) {
+	previewMap := getMapFromMap(itemMap, "preview")
+	if previewMap == nil {
+		previewMap = getMapFromMap(itemMap, "Preview")
+	}
+	if previewMap == nil {
+		return plugin.WoxPreview{}, false
+	}
+
+	previewData := getFirstStringFromMap(previewMap, []string{
+		"data",
+		"preview_data",
+		"previewData",
+		"PreviewData",
+	})
+	if previewData == "" {
+		return plugin.WoxPreview{}, false
+	}
+
+	previewType := getFirstStringFromMap(previewMap, []string{
+		"type",
+		"preview_type",
+		"previewType",
+		"PreviewType",
+	})
+	if previewType == "" {
+		previewType = plugin.WoxPreviewTypeText
+	}
+
+	scrollPosition := getFirstStringFromMap(previewMap, []string{
+		"scroll_position",
+		"scrollPosition",
+		"ScrollPosition",
+	})
+
+	propertiesMap := getMapFromMap(previewMap, "properties")
+	if propertiesMap == nil {
+		propertiesMap = getMapFromMap(previewMap, "preview_properties")
+	}
+	if propertiesMap == nil {
+		propertiesMap = getMapFromMap(previewMap, "previewProperties")
+	}
+	if propertiesMap == nil {
+		propertiesMap = getMapFromMap(previewMap, "PreviewProperties")
+	}
+	tagsArray := getSliceFromMap(previewMap, "tags")
+	if tagsArray == nil {
+		tagsArray = getSliceFromMap(previewMap, "preview_tags")
+	}
+	if tagsArray == nil {
+		tagsArray = getSliceFromMap(previewMap, "previewTags")
+	}
+	if tagsArray == nil {
+		tagsArray = getSliceFromMap(previewMap, "PreviewTags")
+	}
+
+	preview := plugin.WoxPreview{
+		PreviewType:    previewType,
+		PreviewData:    previewData,
+		ScrollPosition: scrollPosition,
+	}
+	if len(tagsArray) > 0 {
+		// Script previews now accept explicit tags because the launcher metadata
+		// UI is tag-based. Keep the parser permissive across naming styles so
+		// shell scripts do not need a Go-specific payload shape.
+		preview.PreviewTags = make([]plugin.WoxPreviewTag, 0, len(tagsArray))
+		for _, item := range tagsArray {
+			tagMap, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			preview.PreviewTags = append(preview.PreviewTags, plugin.WoxPreviewTag{
+				Label: getFirstStringFromMap(tagMap, []string{"label", "Label"}),
+				Tooltip: getFirstStringFromMap(tagMap, []string{
+					"tooltip",
+					"Tooltip",
+				}),
+			})
+		}
+	}
+	if len(propertiesMap) > 0 {
+		preview.PreviewProperties = make(map[string]string, len(propertiesMap))
+		for key, value := range propertiesMap {
+			switch typed := value.(type) {
+			case string:
+				preview.PreviewProperties[key] = typed
+			default:
+				preview.PreviewProperties[key] = fmt.Sprint(value)
+			}
+		}
+	}
+
+	return preview, true
+}
+
+func parseScriptDragData(itemMap map[string]interface{}) *plugin.QueryResultDragData {
+	dragMap := getMapFromMap(itemMap, "dragData")
+	if dragMap == nil {
+		dragMap = getMapFromMap(itemMap, "DragData")
+	}
+	if dragMap == nil {
+		return nil
+	}
+
+	dragType := getFirstStringFromMap(dragMap, []string{"type", "Type"})
+	if dragType != plugin.QueryResultDragDataTypeFiles {
+		return nil
+	}
+
+	filesArray := getSliceFromMap(dragMap, "files")
+	if filesArray == nil {
+		filesArray = getSliceFromMap(dragMap, "Files")
+	}
+	files := make([]string, 0, len(filesArray))
+	for _, item := range filesArray {
+		if filePath, ok := item.(string); ok && strings.TrimSpace(filePath) != "" {
+			files = append(files, filePath)
+		}
+	}
+	if len(files) == 0 {
+		return nil
+	}
+
+	return &plugin.QueryResultDragData{
+		Type:  plugin.QueryResultDragDataTypeFiles,
+		Files: files,
+		PreventHideAfterDrag: getFirstBoolFromMap(dragMap, []string{
+			"preventHideAfterDrag",
+			"prevent_hide_after_drag",
+			"PreventHideAfterDrag",
+		}),
+	}
+}
+
+func parseScriptTails(ctx context.Context, metadata plugin.Metadata, itemMap map[string]interface{}) []plugin.QueryResultTail {
+	tailsArray := getSliceFromMap(itemMap, "tails")
+	if tailsArray == nil {
+		tailsArray = getSliceFromMap(itemMap, "Tails")
+	}
+	if tailsArray == nil {
+		return nil
+	}
+
+	var tails []plugin.QueryResultTail
+	for _, tailItem := range tailsArray {
+		tailMap, ok := tailItem.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		tailType := getFirstStringFromMap(tailMap, []string{"type", "Type"})
+		switch tailType {
+		case plugin.QueryResultTailTypeImage:
+			imageStr := getFirstStringFromMap(tailMap, []string{"image", "Image"})
+			if imageStr == "" {
+				continue
+			}
+			img, err := common.ParseWoxImage(imageStr)
+			if err != nil {
+				util.GetLogger().Warn(ctx, fmt.Sprintf("script plugin %s returned invalid tail image: %s, err: %s", metadata.GetName(ctx), imageStr, err.Error()))
+				continue
+			}
+			tails = append(tails, plugin.QueryResultTail{
+				Id:          getFirstStringFromMap(tailMap, []string{"id", "Id"}),
+				Type:        plugin.QueryResultTailTypeImage,
+				Image:       img,
+				ImageWidth:  getFirstFloatPtrFromMap(tailMap, []string{"imageWidth", "ImageWidth", "width", "Width"}),
+				ImageHeight: getFirstFloatPtrFromMap(tailMap, []string{"imageHeight", "ImageHeight", "height", "Height"}),
+				Tooltip:     getFirstStringFromMap(tailMap, []string{"tooltip", "Tooltip"}),
+			})
+		default:
+			text := getFirstStringFromMap(tailMap, []string{"text", "Text"})
+			if text == "" {
+				continue
+			}
+			textCategory := getFirstStringFromMap(tailMap, []string{"textCategory", "TextCategory", "category", "Category"})
+			tails = append(tails, plugin.QueryResultTail{
+				Id:           getFirstStringFromMap(tailMap, []string{"id", "Id"}),
+				Type:         plugin.QueryResultTailTypeText,
+				Text:         text,
+				TextCategory: plugin.QueryResultTailTextCategory(textCategory),
+				Tooltip:      getFirstStringFromMap(tailMap, []string{"tooltip", "Tooltip"}),
+			})
+		}
+
+		if len(tails) == 0 {
+			continue
+		}
+
+		contextData := getMapFromMap(tailMap, "contextData")
+		if contextData == nil {
+			contextData = getMapFromMap(tailMap, "ContextData")
+		}
+		if len(contextData) == 0 {
+			continue
+		}
+
+		lastIndex := len(tails) - 1
+		tails[lastIndex].ContextData = make(map[string]string, len(contextData))
+		for key, value := range contextData {
+			switch typed := value.(type) {
+			case string:
+				tails[lastIndex].ContextData[key] = typed
+			default:
+				tails[lastIndex].ContextData[key] = fmt.Sprint(value)
+			}
+		}
+	}
+
+	return tails
+}

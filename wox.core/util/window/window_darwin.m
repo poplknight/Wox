@@ -1,0 +1,2389 @@
+#include <ApplicationServices/ApplicationServices.h>
+#include <Cocoa/Cocoa.h>
+#include <ScriptingBridge/ScriptingBridge.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+typedef struct {
+    int x;
+    int y;
+    int width;
+    int height;
+} WoxWindowRectC;
+
+typedef struct {
+    char id[64];
+    WoxWindowRectC bounds;
+    WoxWindowRectC workArea;
+    int isPrimary;
+} WoxDisplayInfoC;
+
+typedef struct {
+    char id[64];
+    int pid;
+    char title[1024];
+    WoxWindowRectC bounds;
+    WoxDisplayInfoC display;
+    int isMinimized;
+} WoxManagedWindowC;
+
+extern AXError _AXUIElementGetWindow(AXUIElementRef element, CGWindowID *identifier);
+
+static char* copyPathFromAXValue(CFTypeRef value);
+char* getFinderWindowPathByPid(int pid);
+int isOpenSaveDialogByPid(int pid);
+int isOpenSaveDialogSelectFolderByPid(int pid);
+
+static CFStringRef const woxAXFullScreenAttribute = CFSTR("AXFullScreen");
+
+static void activateRunningApplication(NSRunningApplication *application) {
+    if (application == nil) {
+        return;
+    }
+
+    if (@available(macOS 14.0, *)) {
+        [application activateWithOptions:0];
+        return;
+    }
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    [application activateWithOptions:NSApplicationActivateIgnoringOtherApps];
+#pragma clang diagnostic pop
+}
+
+static int copyApplicationIconPng(NSRunningApplication *application, unsigned char **iconData) {
+    if (!application) {
+        return 0;
+    }
+
+    NSImage *icon = [application icon];
+    if (!icon) {
+        return 0;
+    }
+
+    CGImageRef cgRef = [icon CGImageForProposedRect:NULL context:nil hints:nil];
+    NSBitmapImageRep *newRep = [[NSBitmapImageRep alloc] initWithCGImage:cgRef];
+    [newRep setSize:[icon size]];
+    NSData *pngData = [newRep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+    if (!pngData) {
+        return 0;
+    }
+
+    NSUInteger length = [pngData length];
+    void *buffer = malloc(length);
+    if (!buffer) {
+        return 0;
+    }
+    memcpy(buffer, [pngData bytes], length);
+
+    *iconData = buffer;
+    return (int)length;
+}
+
+int getActiveWindowIcon(unsigned char **iconData) {
+    @autoreleasepool {
+        NSRunningApplication *activeApp = [[NSWorkspace sharedWorkspace] frontmostApplication];
+        return copyApplicationIconPng(activeApp, iconData);
+    }
+}
+
+int getWindowIconByPid(int pid, unsigned char **iconData) {
+    @autoreleasepool {
+        if (pid <= 0) {
+            return 0;
+        }
+
+        NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:(pid_t)pid];
+        return copyApplicationIconPng(app, iconData);
+    }
+}
+
+static char* copyApplicationName(NSRunningApplication *application) {
+    if (!application) {
+        return strdup("");
+    }
+
+    NSString *name = [application localizedName];
+    if (!name || [name length] == 0) {
+        return strdup("");
+    }
+
+    return strdup([name UTF8String]);
+}
+
+char* getActiveWindowName() {
+    @autoreleasepool {
+        NSRunningApplication *activeApp = [[NSWorkspace sharedWorkspace] frontmostApplication];
+        return copyApplicationName(activeApp);
+    }
+}
+
+char* getWindowNameByPid(int pid) {
+    @autoreleasepool {
+        if (pid <= 0) {
+            return strdup("");
+        }
+
+        NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:(pid_t)pid];
+        return copyApplicationName(app);
+    }
+}
+
+char* getProcessBundleIdentifier(int pid) {
+    @autoreleasepool {
+        if (pid <= 0) {
+            return strdup("");
+        }
+
+        NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+        if (!app) {
+            return strdup("");
+        }
+
+        NSString *identifier = [app bundleIdentifier];
+        if (identifier && [identifier length] > 0) {
+            return strdup([identifier UTF8String]);
+        }
+
+        NSString *name = [app localizedName];
+        if (name && [name length] > 0) {
+            return strdup([name UTF8String]);
+        }
+
+        return strdup("");
+    }
+}
+
+int isProcessIdentityRunning(const char *identity) {
+    @autoreleasepool {
+        if (!identity || identity[0] == '\0') {
+            return 0;
+        }
+
+        NSString *target = [NSString stringWithUTF8String:identity];
+        if (!target || [target length] == 0) {
+            return 0;
+        }
+
+        for (NSRunningApplication *app in [[NSWorkspace sharedWorkspace] runningApplications]) {
+            NSString *identifier = [app bundleIdentifier];
+            if (identifier && [identifier caseInsensitiveCompare:target] == NSOrderedSame) {
+                return 1;
+            }
+
+            NSString *name = [app localizedName];
+            if (name && [name caseInsensitiveCompare:target] == NSOrderedSame) {
+                return 1;
+            }
+        }
+
+        return 0;
+    }
+}
+
+int getActiveWindowPid() {
+    @autoreleasepool {
+        NSRunningApplication *activeApp = [[NSWorkspace sharedWorkspace] frontmostApplication];
+        if (!activeApp) {
+            return -1;
+        }
+
+        return [activeApp processIdentifier];
+    }
+}
+
+static void copyCString(char *dest, size_t destSize, const char *value) {
+    if (destSize == 0) {
+        return;
+    }
+    if (!value) {
+        dest[0] = '\0';
+        return;
+    }
+    strncpy(dest, value, destSize - 1);
+    dest[destSize - 1] = '\0';
+}
+
+static CGFloat desktopTopForScreens(NSArray<NSScreen *> *screens) {
+    CGFloat desktopTop = 0;
+    for (NSScreen *screen in screens) {
+        desktopTop = MAX(desktopTop, NSMaxY([screen frame]));
+    }
+    return desktopTop;
+}
+
+// accessibilityToDesktopYOffset maps AX's primary-display top origin into
+// Wox's virtual-desktop top origin when another display extends above it.
+static CGFloat accessibilityToDesktopYOffset(NSArray<NSScreen *> *screens) {
+    NSScreen *primary = [screens firstObject];
+    if (!primary) {
+        return 0;
+    }
+    return desktopTopForScreens(screens) - NSMaxY([primary frame]);
+}
+
+static WoxWindowRectC rectFromAppKitRect(NSRect rect, CGFloat desktopTop) {
+    WoxWindowRectC result;
+    result.x = (int)llround(rect.origin.x);
+    result.y = (int)llround(desktopTop - NSMaxY(rect));
+    result.width = (int)llround(rect.size.width);
+    result.height = (int)llround(rect.size.height);
+    return result;
+}
+
+static WoxWindowRectC rectFromCGPointAndCGSize(CGPoint point, CGSize size) {
+    NSArray<NSScreen *> *screens = [NSScreen screens];
+    WoxWindowRectC result;
+    result.x = (int)llround(point.x);
+    result.y = (int)llround(point.y + accessibilityToDesktopYOffset(screens));
+    result.width = (int)llround(size.width);
+    result.height = (int)llround(size.height);
+    return result;
+}
+
+static BOOL pointInRect(CGPoint point, WoxWindowRectC rect) {
+    return point.x >= rect.x && point.x < rect.x + rect.width && point.y >= rect.y && point.y < rect.y + rect.height;
+}
+
+static void fillDisplayInfoFromScreen(NSScreen *screen, BOOL isPrimary, CGFloat desktopTop, WoxDisplayInfoC *outDisplay) {
+    NSNumber *screenNumber = [[screen deviceDescription] objectForKey:@"NSScreenNumber"];
+    NSString *screenId = [screenNumber stringValue];
+    copyCString(outDisplay->id, sizeof(outDisplay->id), [screenId UTF8String]);
+    outDisplay->bounds = rectFromAppKitRect([screen frame], desktopTop);
+    outDisplay->workArea = rectFromAppKitRect([screen visibleFrame], desktopTop);
+    outDisplay->isPrimary = isPrimary ? 1 : 0;
+}
+
+static BOOL fillDisplayInfoForRect(WoxWindowRectC windowRect, WoxDisplayInfoC *outDisplay) {
+    NSArray<NSScreen *> *screens = [NSScreen screens];
+    if ([screens count] == 0) {
+        return NO;
+    }
+
+    CGFloat desktopTop = desktopTopForScreens(screens);
+    CGPoint center = CGPointMake(windowRect.x + windowRect.width / 2.0, windowRect.y + windowRect.height / 2.0);
+    NSScreen *primary = [screens firstObject];
+
+    NSScreen *fallback = [screens objectAtIndex:0];
+    for (NSScreen *screen in screens) {
+        WoxWindowRectC bounds = rectFromAppKitRect([screen frame], desktopTop);
+        if (pointInRect(center, bounds)) {
+            fillDisplayInfoFromScreen(screen, screen == primary, desktopTop, outDisplay);
+            return YES;
+        }
+    }
+
+    fillDisplayInfoFromScreen(fallback, fallback == primary, desktopTop, outDisplay);
+    return YES;
+}
+
+static CGWindowID parseWindowId(const char *windowId) {
+    if (!windowId || strlen(windowId) == 0) {
+        return 0;
+    }
+    return (CGWindowID)strtoul(windowId, NULL, 10);
+}
+
+static BOOL getAXWindowId(AXUIElementRef window, CGWindowID *outWindowId) {
+    if (!window || !outWindowId) {
+        return NO;
+    }
+    return _AXUIElementGetWindow(window, outWindowId) == kAXErrorSuccess && *outWindowId != 0;
+}
+
+static AXUIElementRef copyWindowForId(pid_t pid, CGWindowID targetWindowId) {
+    if (pid <= 0) {
+        return NULL;
+    }
+
+    AXUIElementRef app = AXUIElementCreateApplication(pid);
+    if (!app) {
+        return NULL;
+    }
+
+    AXUIElementRef matchedWindow = NULL;
+    CFTypeRef windowsValue = NULL;
+    CFIndex windowCount = 0;
+    if (AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, &windowsValue) == kAXErrorSuccess && windowsValue && CFGetTypeID(windowsValue) == CFArrayGetTypeID()) {
+        CFArrayRef windows = (CFArrayRef)windowsValue;
+        windowCount = CFArrayGetCount(windows);
+        if (targetWindowId != 0) {
+            for (CFIndex i = 0; i < windowCount; i++) {
+                AXUIElementRef candidate = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
+                CGWindowID candidateId = 0;
+                if (getAXWindowId(candidate, &candidateId) && candidateId == targetWindowId) {
+                    matchedWindow = (AXUIElementRef)CFRetain(candidate);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!matchedWindow && targetWindowId == 0) {
+        CFTypeRef focusedValue = NULL;
+        if (AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute, &focusedValue) == kAXErrorSuccess && focusedValue) {
+            matchedWindow = (AXUIElementRef)focusedValue;
+        } else if (windowsValue && windowCount > 0) {
+            AXUIElementRef firstWindow = (AXUIElementRef)CFArrayGetValueAtIndex((CFArrayRef)windowsValue, 0);
+            matchedWindow = (AXUIElementRef)CFRetain(firstWindow);
+        }
+    }
+    if (windowsValue) {
+        CFRelease(windowsValue);
+    }
+
+    CFRelease(app);
+    return matchedWindow;
+}
+
+static BOOL getAXWindowRect(AXUIElementRef window, WoxWindowRectC *outRect) {
+    if (!window || !outRect) {
+        return NO;
+    }
+
+    CFTypeRef positionValue = NULL;
+    CFTypeRef sizeValue = NULL;
+    CGPoint position = CGPointZero;
+    CGSize size = CGSizeZero;
+
+    if (AXUIElementCopyAttributeValue(window, kAXPositionAttribute, &positionValue) != kAXErrorSuccess || !positionValue) {
+        return NO;
+    }
+    if (AXUIElementCopyAttributeValue(window, kAXSizeAttribute, &sizeValue) != kAXErrorSuccess || !sizeValue) {
+        CFRelease(positionValue);
+        return NO;
+    }
+
+    BOOL ok = AXValueGetValue((AXValueRef)positionValue, kAXValueCGPointType, &position) && AXValueGetValue((AXValueRef)sizeValue, kAXValueCGSizeType, &size);
+    CFRelease(positionValue);
+    CFRelease(sizeValue);
+
+    if (!ok) {
+        return NO;
+    }
+
+    *outRect = rectFromCGPointAndCGSize(position, size);
+    return YES;
+}
+
+static void copyAXWindowTitle(AXUIElementRef window, char *dest, size_t destSize) {
+    if (!dest || destSize == 0) {
+        return;
+    }
+    dest[0] = '\0';
+
+    if (!window) {
+        return;
+    }
+
+    CFTypeRef titleValue = NULL;
+    if (AXUIElementCopyAttributeValue(window, kAXTitleAttribute, &titleValue) != kAXErrorSuccess || !titleValue) {
+        return;
+    }
+
+    if (CFGetTypeID(titleValue) == CFStringGetTypeID()) {
+        CFStringGetCString((CFStringRef)titleValue, dest, destSize, kCFStringEncodingUTF8);
+        dest[destSize - 1] = '\0';
+    }
+    CFRelease(titleValue);
+}
+
+static BOOL readAXWindowMinimized(AXUIElementRef window) {
+    if (!window) {
+        return NO;
+    }
+
+    CFTypeRef minimizedValue = NULL;
+    if (AXUIElementCopyAttributeValue(window, kAXMinimizedAttribute, &minimizedValue) != kAXErrorSuccess || !minimizedValue) {
+        return NO;
+    }
+
+    BOOL minimized = NO;
+    if (CFGetTypeID(minimizedValue) == CFBooleanGetTypeID()) {
+        minimized = CFBooleanGetValue((CFBooleanRef)minimizedValue);
+    }
+    CFRelease(minimizedValue);
+    return minimized;
+}
+
+static int fillManagedWindowFromAXWindow(pid_t pid, AXUIElementRef window, WoxManagedWindowC *outWindow) {
+    if (pid <= 0 || !window || !outWindow) {
+        return -1;
+    }
+
+    CGWindowID windowId = 0;
+    if (!getAXWindowId(window, &windowId)) {
+        return 0;
+    }
+
+    WoxWindowRectC rect;
+    if (!getAXWindowRect(window, &rect) || rect.width <= 0 || rect.height <= 0) {
+        return 0;
+    }
+
+    memset(outWindow, 0, sizeof(WoxManagedWindowC));
+    NSString *windowIdString = [NSString stringWithFormat:@"%u", windowId];
+    copyCString(outWindow->id, sizeof(outWindow->id), [windowIdString UTF8String]);
+    copyAXWindowTitle(window, outWindow->title, sizeof(outWindow->title));
+    outWindow->pid = (int)pid;
+    outWindow->bounds = rect;
+    outWindow->isMinimized = readAXWindowMinimized(window) ? 1 : 0;
+    if (!fillDisplayInfoForRect(rect, &outWindow->display)) {
+        return -3;
+    }
+    return 1;
+}
+
+static int appendManagedWindowFromAXWindow(pid_t pid, AXUIElementRef window, WoxManagedWindowC **windows, int *count, int *capacity, NSMutableSet<NSNumber *> *seenWindowIds) {
+    CGWindowID windowId = 0;
+    if (!getAXWindowId(window, &windowId)) {
+        return 1;
+    }
+
+    NSNumber *windowIdNumber = [NSNumber numberWithUnsignedInt:windowId];
+    if ([seenWindowIds containsObject:windowIdNumber]) {
+        return 1;
+    }
+
+    if (*count >= *capacity) {
+        int newCapacity = *capacity == 0 ? 16 : *capacity * 2;
+        WoxManagedWindowC *newWindows = (WoxManagedWindowC *)realloc(*windows, sizeof(WoxManagedWindowC) * (size_t)newCapacity);
+        if (!newWindows) {
+            return -1;
+        }
+        *windows = newWindows;
+        *capacity = newCapacity;
+    }
+
+    int result = fillManagedWindowFromAXWindow(pid, window, &(*windows)[*count]);
+    if (result == 1) {
+        [seenWindowIds addObject:windowIdNumber];
+        (*count)++;
+    }
+    return 1;
+}
+
+static BOOL windowRectApproximatelyMatchesTarget(WoxWindowRectC rect, int x, int y, int width, int height) {
+    const int tolerance = 2;
+    return abs(rect.x - x) <= tolerance &&
+           abs(rect.y - y) <= tolerance &&
+           abs(rect.width - width) <= tolerance &&
+           abs(rect.height - height) <= tolerance;
+}
+
+static BOOL setAXWindowPosition(AXUIElementRef window, CGPoint position) {
+    AXValueRef positionValue = AXValueCreate(kAXValueCGPointType, &position);
+    if (!positionValue) {
+        return NO;
+    }
+
+    AXError err = AXUIElementSetAttributeValue(window, kAXPositionAttribute, positionValue);
+    CFRelease(positionValue);
+    return err == kAXErrorSuccess;
+}
+
+static BOOL setAXWindowSize(AXUIElementRef window, CGSize size) {
+    AXValueRef sizeValue = AXValueCreate(kAXValueCGSizeType, &size);
+    if (!sizeValue) {
+        return NO;
+    }
+
+    AXError err = AXUIElementSetAttributeValue(window, kAXSizeAttribute, sizeValue);
+    CFRelease(sizeValue);
+    return err == kAXErrorSuccess;
+}
+
+static BOOL axWindowMatchesTargetFrame(AXUIElementRef window, int x, int y, int width, int height) {
+    WoxWindowRectC rect;
+    return getAXWindowRect(window, &rect) && windowRectApproximatelyMatchesTarget(rect, x, y, width, height);
+}
+
+// Some apps, notably Finder, adjust AXPosition while applying AXSize. Keep the
+// position write last on each attempt so a successful resize does not leave the
+// window anchored at an intermediate location.
+static BOOL applyAXWindowFrame(AXUIElementRef window, int x, int y, int width, int height) {
+    const int maxAttempts = 8;
+    const useconds_t settleInterval = 50000;
+    NSArray<NSScreen *> *screens = [NSScreen screens];
+    CGPoint position = CGPointMake(x, y - accessibilityToDesktopYOffset(screens));
+    CGSize size = CGSizeMake(MAX(1, width), MAX(1, height));
+
+    if (axWindowMatchesTargetFrame(window, x, y, width, height)) {
+        return YES;
+    }
+
+    for (int attempt = 0; attempt < maxAttempts; attempt++) {
+        if (!setAXWindowSize(window, size)) {
+            return NO;
+        }
+
+        if (!setAXWindowPosition(window, position)) {
+            return NO;
+        }
+
+        if (axWindowMatchesTargetFrame(window, x, y, width, height)) {
+            return YES;
+        }
+        if (attempt + 1 < maxAttempts) {
+            usleep(settleInterval);
+            if (axWindowMatchesTargetFrame(window, x, y, width, height)) {
+                return YES;
+            }
+        }
+    }
+
+    return YES;
+}
+
+// readAXWindowFullScreenState reads the undocumented-but-standard Accessibility fullscreen flag.
+static BOOL readAXWindowFullScreenState(AXUIElementRef window, BOOL *outFullScreen) {
+    if (!window || !outFullScreen) {
+        return NO;
+    }
+
+    CFTypeRef fullScreenValue = NULL;
+    if (AXUIElementCopyAttributeValue(window, woxAXFullScreenAttribute, &fullScreenValue) != kAXErrorSuccess || !fullScreenValue) {
+        return NO;
+    }
+
+    BOOL ok = NO;
+    if (CFGetTypeID(fullScreenValue) == CFBooleanGetTypeID()) {
+        *outFullScreen = CFBooleanGetValue((CFBooleanRef)fullScreenValue);
+        ok = YES;
+    }
+    CFRelease(fullScreenValue);
+    return ok;
+}
+
+// waitForAXWindowFullScreenState gives macOS time to leave the fullscreen Space before resizing.
+static BOOL waitForAXWindowFullScreenState(AXUIElementRef window, BOOL expectedFullScreen) {
+    const int maxAttempts = 20;
+    const useconds_t interval = 50000;
+
+    for (int attempt = 0; attempt < maxAttempts; attempt++) {
+        BOOL isFullScreen = NO;
+        if (readAXWindowFullScreenState(window, &isFullScreen) && isFullScreen == expectedFullScreen) {
+            return YES;
+        }
+        usleep(interval);
+    }
+    return NO;
+}
+
+// exitAXWindowFullScreenIfNeeded restores fullscreen windows so AX position/size changes can apply.
+static BOOL exitAXWindowFullScreenIfNeeded(AXUIElementRef window, BOOL *outExitedFullScreen) {
+    if (outExitedFullScreen) {
+        *outExitedFullScreen = NO;
+    }
+
+    BOOL isFullScreen = NO;
+    if (!readAXWindowFullScreenState(window, &isFullScreen) || !isFullScreen) {
+        return YES;
+    }
+    if (outExitedFullScreen) {
+        *outExitedFullScreen = YES;
+    }
+
+    if (AXUIElementSetAttributeValue(window, woxAXFullScreenAttribute, kCFBooleanFalse) == kAXErrorSuccess && waitForAXWindowFullScreenState(window, NO)) {
+        return YES;
+    }
+
+    if (readAXWindowFullScreenState(window, &isFullScreen) && !isFullScreen) {
+        return YES;
+    }
+
+    CFTypeRef fullScreenButtonValue = NULL;
+    AXError buttonErr = AXUIElementCopyAttributeValue(window, kAXFullScreenButtonAttribute, &fullScreenButtonValue);
+    if (buttonErr != kAXErrorSuccess || !fullScreenButtonValue) {
+        if (fullScreenButtonValue) {
+            CFRelease(fullScreenButtonValue);
+        }
+        return NO;
+    }
+
+    AXError pressErr = AXUIElementPerformAction((AXUIElementRef)fullScreenButtonValue, kAXPressAction);
+    CFRelease(fullScreenButtonValue);
+    return pressErr == kAXErrorSuccess && waitForAXWindowFullScreenState(window, NO);
+}
+
+// copyWindowAfterFullScreenExit handles macOS recreating the AX window with a new CGWindowID.
+static AXUIElementRef copyWindowAfterFullScreenExit(pid_t pid, CGWindowID targetWindowId) {
+    const int maxAttempts = 30;
+    const useconds_t interval = 50000;
+
+    for (int attempt = 0; attempt < maxAttempts; attempt++) {
+        AXUIElementRef window = copyWindowForId(pid, targetWindowId);
+        if (window) {
+            return window;
+        }
+        usleep(interval);
+    }
+
+    if (targetWindowId == 0) {
+        return NULL;
+    }
+
+    for (int attempt = 0; attempt < maxAttempts; attempt++) {
+        AXUIElementRef window = copyWindowForId(pid, 0);
+        if (window) {
+            return window;
+        }
+        usleep(interval);
+    }
+    return NULL;
+}
+
+char *getActiveWindowIdForManagement() {
+    @autoreleasepool {
+        AXUIElementRef systemWide = AXUIElementCreateSystemWide();
+        if (!systemWide) {
+            return strdup("");
+        }
+
+        AXUIElementRef focusedWindow = NULL;
+        if (AXUIElementCopyAttributeValue(systemWide, kAXFocusedWindowAttribute, (CFTypeRef *)&focusedWindow) != kAXErrorSuccess || !focusedWindow) {
+            CFRelease(systemWide);
+            return strdup("");
+        }
+
+        CGWindowID windowId = 0;
+        BOOL ok = getAXWindowId(focusedWindow, &windowId);
+        CFRelease(focusedWindow);
+        CFRelease(systemWide);
+        if (!ok) {
+            return strdup("");
+        }
+
+        NSString *windowIdString = [NSString stringWithFormat:@"%u", windowId];
+        return strdup([windowIdString UTF8String]);
+    }
+}
+
+int getManagedWindowForManagement(const char *windowId, int pid, WoxManagedWindowC *outWindow) {
+    @autoreleasepool {
+        if (!AXIsProcessTrusted()) {
+            return -2;
+        }
+        if (!outWindow) {
+            return -1;
+        }
+
+        CGWindowID targetWindowId = parseWindowId(windowId);
+        AXUIElementRef window = copyWindowForId((pid_t)pid, targetWindowId);
+        if (!window) {
+            return 0;
+        }
+
+        WoxWindowRectC rect;
+        if (!getAXWindowRect(window, &rect)) {
+            CFRelease(window);
+            return -1;
+        }
+
+        CGWindowID actualWindowId = targetWindowId;
+        if (actualWindowId == 0) {
+            getAXWindowId(window, &actualWindowId);
+        }
+
+        memset(outWindow, 0, sizeof(WoxManagedWindowC));
+        NSString *windowIdString = [NSString stringWithFormat:@"%u", actualWindowId];
+        copyCString(outWindow->id, sizeof(outWindow->id), [windowIdString UTF8String]);
+        copyAXWindowTitle(window, outWindow->title, sizeof(outWindow->title));
+        outWindow->pid = pid;
+        outWindow->bounds = rect;
+        outWindow->isMinimized = 0;
+        if (!fillDisplayInfoForRect(rect, &outWindow->display)) {
+            CFRelease(window);
+            return -3;
+        }
+
+        CFRelease(window);
+        return 1;
+    }
+}
+
+// appendManagedWindowsForPid reads one application's AX window list once and appends every movable window.
+static int appendManagedWindowsForPid(pid_t pid, WoxManagedWindowC **windows, int *count, int *capacity, NSMutableSet<NSNumber *> *seenWindowIds, AXError *outAXError, int *outAXWindowCount) {
+    if (outAXError) {
+        *outAXError = kAXErrorSuccess;
+    }
+    if (outAXWindowCount) {
+        *outAXWindowCount = 0;
+    }
+
+    AXUIElementRef app = AXUIElementCreateApplication(pid);
+    if (!app) {
+        if (outAXError) {
+            *outAXError = kAXErrorFailure;
+        }
+        return 1;
+    }
+
+    CFTypeRef windowsValue = NULL;
+    AXError windowsErr = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, &windowsValue);
+    if (outAXError) {
+        *outAXError = windowsErr;
+    }
+    CFRelease(app);
+    if (windowsErr != kAXErrorSuccess || !windowsValue || CFGetTypeID(windowsValue) != CFArrayGetTypeID()) {
+        if (windowsValue) {
+            CFRelease(windowsValue);
+        }
+        return 1;
+    }
+
+    CFArrayRef appWindows = (CFArrayRef)windowsValue;
+    if (outAXWindowCount) {
+        *outAXWindowCount = (int)CFArrayGetCount(appWindows);
+    }
+    for (CFIndex i = 0; i < CFArrayGetCount(appWindows); i++) {
+        AXUIElementRef window = (AXUIElementRef)CFArrayGetValueAtIndex(appWindows, i);
+        int appendResult = appendManagedWindowFromAXWindow(pid, window, windows, count, capacity, seenWindowIds);
+        if (appendResult < 0) {
+            CFRelease(windowsValue);
+            return appendResult;
+        }
+    }
+    CFRelease(windowsValue);
+    return 1;
+}
+
+int listManagedWindowsForManagement(WoxManagedWindowC **outWindows, int *outCount) {
+    @autoreleasepool {
+        if (!AXIsProcessTrusted()) {
+            return -2;
+        }
+        if (!outWindows || !outCount) {
+            return -1;
+        }
+
+        *outWindows = NULL;
+        *outCount = 0;
+
+        WoxManagedWindowC *windows = NULL;
+        int count = 0;
+        int capacity = 0;
+        NSMutableSet<NSNumber *> *seenWindowIds = [NSMutableSet set];
+        NSMutableOrderedSet<NSNumber *> *ownerPids = [NSMutableOrderedSet orderedSet];
+
+        // Use optionAll instead of optionOnScreenOnly so windows on other macOS Spaces
+        // or dragged offscreen are still discoverable. Skip the CGWindowLayer filter too:
+        // some apps (e.g. Ghostty) place their main window on a non-zero layer, and the
+        // Accessibility kAXWindowsAttribute + zero-size guard below already rejects helper
+        // windows that previously relied on the layer check.
+        CFArrayRef allWindows = CGWindowListCopyWindowInfo(kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
+        if (allWindows) {
+            NSArray *windowInfos = (__bridge NSArray *)allWindows;
+            for (NSDictionary *windowInfo in windowInfos) {
+                NSNumber *ownerPid = [windowInfo objectForKey:(__bridge NSString *)kCGWindowOwnerPID];
+                if (!ownerPid || [ownerPid intValue] <= 0) {
+                    continue;
+                }
+                [ownerPids addObject:ownerPid];
+            }
+
+            for (NSNumber *ownerPid in ownerPids) {
+                int appendResult = appendManagedWindowsForPid((pid_t)[ownerPid intValue], &windows, &count, &capacity, seenWindowIds, NULL, NULL);
+                if (appendResult < 0) {
+                    CFRelease(allWindows);
+                    free(windows);
+                    return appendResult;
+                }
+            }
+            CFRelease(allWindows);
+        }
+
+        *outWindows = windows;
+        *outCount = count;
+        return 1;
+    }
+}
+
+int listManagedWindowsForIdentityForManagement(const char *identity, WoxManagedWindowC **outWindows, int *outCount, char *outDiagnostics, int diagnosticsSize) {
+    @autoreleasepool {
+        copyCString(outDiagnostics, diagnosticsSize > 0 ? (size_t)diagnosticsSize : 0, "");
+        if (!AXIsProcessTrusted()) {
+            return -2;
+        }
+        if (!identity || identity[0] == '\0' || !outWindows || !outCount) {
+            return -1;
+        }
+
+        *outWindows = NULL;
+        *outCount = 0;
+        NSString *target = [NSString stringWithUTF8String:identity];
+        if (!target || [target length] == 0) {
+            return -1;
+        }
+
+        WoxManagedWindowC *windows = NULL;
+        int count = 0;
+        int capacity = 0;
+        NSMutableSet<NSNumber *> *seenWindowIds = [NSMutableSet set];
+        NSMutableArray<NSString *> *diagnostics = [NSMutableArray array];
+        for (NSRunningApplication *app in [[NSWorkspace sharedWorkspace] runningApplications]) {
+            NSString *identifier = [app bundleIdentifier];
+            NSString *name = [app localizedName];
+            BOOL matchesIdentity = identifier && [identifier caseInsensitiveCompare:target] == NSOrderedSame;
+            BOOL matchesName = name && [name caseInsensitiveCompare:target] == NSOrderedSame;
+            if (!matchesIdentity && !matchesName) {
+                continue;
+            }
+
+            int countBefore = count;
+            AXError axError = kAXErrorSuccess;
+            int axWindowCount = 0;
+            int appendResult = appendManagedWindowsForPid([app processIdentifier], &windows, &count, &capacity, seenWindowIds, &axError, &axWindowCount);
+            [diagnostics addObject:[NSString stringWithFormat:@"pid=%d bundle=%@ name=%@ axError=%d axWindows=%d managed=%d",
+                                                              [app processIdentifier],
+                                                              identifier ?: @"",
+                                                              name ?: @"",
+                                                              axError,
+                                                              axWindowCount,
+                                                              count - countBefore]];
+            if (appendResult < 0) {
+                free(windows);
+                return appendResult;
+            }
+        }
+
+        if ([diagnostics count] == 0) {
+            [diagnostics addObject:@"matches=0"];
+        }
+        copyCString(outDiagnostics, diagnosticsSize > 0 ? (size_t)diagnosticsSize : 0, [[diagnostics componentsJoinedByString:@";"] UTF8String]);
+
+        *outWindows = windows;
+        *outCount = count;
+        return 1;
+    }
+}
+
+void freeManagedWindowsForManagement(WoxManagedWindowC *windows) {
+    if (windows) {
+        free(windows);
+    }
+}
+
+int listDisplaysForManagement(WoxDisplayInfoC **outDisplays, int *outCount) {
+    @autoreleasepool {
+        if (!outDisplays || !outCount) {
+            return -1;
+        }
+
+        NSArray<NSScreen *> *screens = [NSScreen screens];
+        NSUInteger count = [screens count];
+        if (count == 0) {
+            return -3;
+        }
+
+        WoxDisplayInfoC *displays = (WoxDisplayInfoC *)calloc(count, sizeof(WoxDisplayInfoC));
+        if (!displays) {
+            return -1;
+        }
+
+        CGFloat desktopTop = desktopTopForScreens(screens);
+        NSScreen *primary = [screens firstObject];
+        for (NSUInteger i = 0; i < count; i++) {
+            NSScreen *screen = [screens objectAtIndex:i];
+            fillDisplayInfoFromScreen(screen, screen == primary, desktopTop, &displays[i]);
+        }
+
+        *outDisplays = displays;
+        *outCount = (int)count;
+        return 1;
+    }
+}
+
+void freeDisplaysForManagement(WoxDisplayInfoC *displays) {
+    if (displays) {
+        free(displays);
+    }
+}
+
+int moveResizeWindowForManagement(const char *windowId, int pid, int x, int y, int width, int height) {
+    @autoreleasepool {
+        if (!AXIsProcessTrusted()) {
+            return -2;
+        }
+
+        CGWindowID targetWindowId = parseWindowId(windowId);
+        AXUIElementRef window = copyWindowForId((pid_t)pid, targetWindowId);
+        if (!window) {
+            return 0;
+        }
+
+        BOOL exitedFullScreen = NO;
+        if (!exitAXWindowFullScreenIfNeeded(window, &exitedFullScreen)) {
+            CFRelease(window);
+            return -1;
+        }
+
+        if (exitedFullScreen) {
+            CFRelease(window);
+            window = copyWindowAfterFullScreenExit((pid_t)pid, targetWindowId);
+            if (!window) {
+                return 0;
+            }
+        }
+
+        NSRunningApplication *application = [NSRunningApplication runningApplicationWithProcessIdentifier:(pid_t)pid];
+        activateRunningApplication(application);
+        AXUIElementSetAttributeValue(window, kAXMinimizedAttribute, kCFBooleanFalse);
+
+        BOOL frameApplied = applyAXWindowFrame(window, x, y, width, height);
+        CFRelease(window);
+
+        if (!frameApplied) {
+            return -1;
+        }
+        return 1;
+    }
+}
+
+// maximizeWindowForManagement uses the native zoom button so macOS tracks the window as zoomed.
+int maximizeWindowForManagement(const char *windowId, int pid) {
+    @autoreleasepool {
+        if (!AXIsProcessTrusted()) {
+            return -2;
+        }
+
+        AXUIElementRef window = copyWindowForId((pid_t)pid, parseWindowId(windowId));
+        if (!window) {
+            return 0;
+        }
+
+        NSRunningApplication *application = [NSRunningApplication runningApplicationWithProcessIdentifier:(pid_t)pid];
+        activateRunningApplication(application);
+        AXUIElementSetAttributeValue(window, kAXMinimizedAttribute, kCFBooleanFalse);
+
+        CFTypeRef zoomButtonValue = NULL;
+        AXError zoomButtonErr = AXUIElementCopyAttributeValue(window, kAXZoomButtonAttribute, &zoomButtonValue);
+        if (zoomButtonErr != kAXErrorSuccess || !zoomButtonValue) {
+            if (zoomButtonValue) {
+                CFRelease(zoomButtonValue);
+            }
+            CFRelease(window);
+            return -4;
+        }
+
+        AXError pressErr = AXUIElementPerformAction((AXUIElementRef)zoomButtonValue, kAXPressAction);
+        CFRelease(zoomButtonValue);
+        CFRelease(window);
+
+        if (pressErr != kAXErrorSuccess) {
+            return -4;
+        }
+        return 1;
+    }
+}
+
+int minimizeWindowForManagement(const char *windowId, int pid) {
+    @autoreleasepool {
+        if (!AXIsProcessTrusted()) {
+            return -2;
+        }
+
+        AXUIElementRef window = copyWindowForId((pid_t)pid, parseWindowId(windowId));
+        if (!window) {
+            return 0;
+        }
+
+        AXError err = AXUIElementSetAttributeValue(window, kAXMinimizedAttribute, kCFBooleanTrue);
+        CFRelease(window);
+        return err == kAXErrorSuccess ? 1 : -1;
+    }
+}
+
+static BOOL elementHasSubrole(AXUIElementRef element, CFStringRef subrole) {
+    CFTypeRef subroleValue = NULL;
+    BOOL matched = NO;
+    if (AXUIElementCopyAttributeValue(element, kAXSubroleAttribute, &subroleValue) == kAXErrorSuccess && subroleValue) {
+        if (CFGetTypeID(subroleValue) == CFStringGetTypeID() && CFStringCompare(subroleValue, subrole, 0) == kCFCompareEqualTo) {
+            matched = YES;
+        }
+        CFRelease(subroleValue);
+    }
+    return matched;
+}
+
+static BOOL elementHasRole(AXUIElementRef element, CFStringRef role) {
+    CFTypeRef roleValue = NULL;
+    BOOL matched = NO;
+    if (AXUIElementCopyAttributeValue(element, kAXRoleAttribute, &roleValue) == kAXErrorSuccess && roleValue) {
+        if (CFGetTypeID(roleValue) == CFStringGetTypeID() && CFStringCompare(roleValue, role, 0) == kCFCompareEqualTo) {
+            matched = YES;
+        }
+        CFRelease(roleValue);
+    }
+    return matched;
+}
+
+static BOOL isOpenSaveDialogWindowElement(AXUIElementRef windowElement) {
+    if (!windowElement) {
+        return NO;
+    }
+
+    if (elementHasRole(windowElement, CFSTR("AXSheet"))) {
+        return YES;
+    }
+    if (elementHasSubrole(windowElement, CFSTR("AXDialog")) ||
+        elementHasSubrole(windowElement, CFSTR("AXSystemDialog")) ||
+        elementHasSubrole(windowElement, CFSTR("AXSheet"))) {
+        return YES;
+    }
+
+    return NO;
+}
+
+static BOOL elementMatchesRole(AXUIElementRef element, CFStringRef expectedRole) {
+    if (!element || !expectedRole) {
+        return NO;
+    }
+
+    CFTypeRef roleValue = NULL;
+    BOOL matched = NO;
+    if (AXUIElementCopyAttributeValue(element, kAXRoleAttribute, &roleValue) == kAXErrorSuccess && roleValue) {
+        if (CFGetTypeID(roleValue) == CFStringGetTypeID() && CFStringCompare((CFStringRef)roleValue, expectedRole, 0) == kCFCompareEqualTo) {
+            matched = YES;
+        }
+        CFRelease(roleValue);
+    }
+    return matched;
+}
+
+static BOOL elementOrDescendantMatchesRole(AXUIElementRef element, CFStringRef expectedRole, int depth) {
+    if (!element || !expectedRole || depth > 8) {
+        return NO;
+    }
+
+    if (elementMatchesRole(element, expectedRole)) {
+        return YES;
+    }
+
+    CFArrayRef children = NULL;
+    AXError childrenErr = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute, (CFTypeRef *)&children);
+    if (childrenErr != kAXErrorSuccess || !children) {
+        if (children) {
+            CFRelease(children);
+        }
+        return NO;
+    }
+
+    BOOL found = NO;
+    CFIndex count = CFArrayGetCount(children);
+    for (CFIndex i = 0; i < count; i++) {
+        AXUIElementRef child = (AXUIElementRef)CFArrayGetValueAtIndex(children, i);
+        if (!child || CFGetTypeID(child) != AXUIElementGetTypeID()) {
+            continue;
+        }
+        if (elementOrDescendantMatchesRole(child, expectedRole, depth + 1)) {
+            found = YES;
+            break;
+        }
+    }
+
+    CFRelease(children);
+    return found;
+}
+
+static BOOL isLikelyOpenSaveDialogWindowElement(AXUIElementRef windowElement) {
+    if (!windowElement) {
+        return NO;
+    }
+
+    if (isOpenSaveDialogWindowElement(windowElement)) {
+        return YES;
+    }
+
+    BOOL hasFileList =
+        elementOrDescendantMatchesRole(windowElement, CFSTR("AXOutline"), 0) ||
+        elementOrDescendantMatchesRole(windowElement, CFSTR("AXBrowser"), 0) ||
+        elementOrDescendantMatchesRole(windowElement, CFSTR("AXTable"), 0);
+
+    BOOL hasFileNameInput =
+        elementOrDescendantMatchesRole(windowElement, CFSTR("AXTextField"), 0) ||
+        elementOrDescendantMatchesRole(windowElement, CFSTR("AXComboBox"), 0);
+
+    return hasFileList && hasFileNameInput;
+}
+
+static AXUIElementRef copyFocusedWindowElement(AXUIElementRef appElement) {
+    if (!appElement) {
+        return NULL;
+    }
+
+    CFTypeRef focusedWindowValue = NULL;
+    AXError err = AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute, &focusedWindowValue);
+    if (err != kAXErrorSuccess || !focusedWindowValue || CFGetTypeID(focusedWindowValue) != AXUIElementGetTypeID()) {
+        if (focusedWindowValue) {
+            CFRelease(focusedWindowValue);
+        }
+        return NULL;
+    }
+
+    return (AXUIElementRef)focusedWindowValue;
+}
+
+static AXUIElementRef copyDialogSheetFromWindow(AXUIElementRef parentWindow) {
+    if (!parentWindow) {
+        return NULL;
+    }
+
+    CFArrayRef sheets = NULL;
+    AXError sheetsErr = AXUIElementCopyAttributeValue(parentWindow, CFSTR("AXSheets"), (CFTypeRef *)&sheets);
+    if (sheetsErr != kAXErrorSuccess || !sheets) {
+        if (sheets) {
+            CFRelease(sheets);
+        }
+        return NULL;
+    }
+
+    AXUIElementRef matchedSheet = NULL;
+    CFIndex count = CFArrayGetCount(sheets);
+    for (CFIndex i = 0; i < count; i++) {
+        AXUIElementRef sheet = (AXUIElementRef)CFArrayGetValueAtIndex(sheets, i);
+        if (!sheet || CFGetTypeID(sheet) != AXUIElementGetTypeID()) {
+            continue;
+        }
+
+        if (isLikelyOpenSaveDialogWindowElement(sheet)) {
+            matchedSheet = (AXUIElementRef)CFRetain(sheet);
+            break;
+        }
+    }
+
+    CFRelease(sheets);
+    return matchedSheet;
+}
+
+static AXUIElementRef copyDialogWindowFromAppWindows(AXUIElementRef appElement) {
+    if (!appElement) {
+        return NULL;
+    }
+
+    CFArrayRef windows = NULL;
+    AXError windowsErr = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute, (CFTypeRef *)&windows);
+    if (windowsErr != kAXErrorSuccess || !windows) {
+        if (windows) {
+            CFRelease(windows);
+        }
+        return NULL;
+    }
+
+    AXUIElementRef matchedWindow = NULL;
+    CFIndex count = CFArrayGetCount(windows);
+    for (CFIndex i = 0; i < count; i++) {
+        AXUIElementRef window = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
+        if (!window || CFGetTypeID(window) != AXUIElementGetTypeID()) {
+            continue;
+        }
+
+        if (isLikelyOpenSaveDialogWindowElement(window)) {
+            matchedWindow = (AXUIElementRef)CFRetain(window);
+            break;
+        }
+
+        AXUIElementRef sheet = copyDialogSheetFromWindow(window);
+        if (sheet) {
+            matchedWindow = sheet;
+            break;
+        }
+    }
+
+    CFRelease(windows);
+    return matchedWindow;
+}
+
+static AXUIElementRef copyOpenSaveDialogWindowForActiveApp(AXUIElementRef appElement) {
+    AXUIElementRef focusedWindow = copyFocusedWindowElement(appElement);
+    if (!focusedWindow) {
+        return copyDialogWindowFromAppWindows(appElement);
+    }
+
+    if (isLikelyOpenSaveDialogWindowElement(focusedWindow)) {
+        return focusedWindow;
+    }
+
+    AXUIElementRef dialogWindow = copyDialogSheetFromWindow(focusedWindow);
+    CFRelease(focusedWindow);
+    if (dialogWindow) {
+        return dialogWindow;
+    }
+
+    return copyDialogWindowFromAppWindows(appElement);
+}
+
+static char* normalizeToDirectoryPathCString(char *pathCString) {
+    if (!pathCString || pathCString[0] == '\0') {
+        if (pathCString) {
+            free(pathCString);
+        }
+        return NULL;
+    }
+
+    NSString *path = [NSString stringWithUTF8String:pathCString];
+    if (!path || [path length] == 0) {
+        free(pathCString);
+        return NULL;
+    }
+
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    if ([fileManager fileExistsAtPath:path isDirectory:&isDir]) {
+        if (isDir) {
+            return pathCString;
+        }
+
+        NSString *parent = [path stringByDeletingLastPathComponent];
+        if (parent && [parent length] > 0) {
+            BOOL parentIsDir = NO;
+            if ([fileManager fileExistsAtPath:parent isDirectory:&parentIsDir] && parentIsDir) {
+                free(pathCString);
+                return strdup([parent UTF8String]);
+            }
+        }
+    }
+
+    free(pathCString);
+    return NULL;
+}
+
+static char* normalizeToParentDirectoryPathCString(char *pathCString) {
+    if (!pathCString || pathCString[0] == '\0') {
+        if (pathCString) {
+            free(pathCString);
+        }
+        return NULL;
+    }
+
+    NSString *path = [NSString stringWithUTF8String:pathCString];
+    if (!path || [path length] == 0) {
+        free(pathCString);
+        return NULL;
+    }
+
+    NSString *parent = [path stringByDeletingLastPathComponent];
+    if (!parent || [parent length] == 0) {
+        free(pathCString);
+        return NULL;
+    }
+
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    if ([fileManager fileExistsAtPath:parent isDirectory:&isDir] && isDir) {
+        free(pathCString);
+        return strdup([parent UTF8String]);
+    }
+
+    free(pathCString);
+    return NULL;
+}
+
+static char* copyNormalizedPathFromAXAttribute(AXUIElementRef element, CFStringRef attr) {
+    if (!element || !attr) {
+        return NULL;
+    }
+
+    CFTypeRef value = NULL;
+    AXError err = AXUIElementCopyAttributeValue(element, attr, &value);
+    if (err != kAXErrorSuccess || !value) {
+        if (value) {
+            CFRelease(value);
+        }
+        return NULL;
+    }
+
+    char *result = normalizeToDirectoryPathCString(copyPathFromAXValue(value));
+    CFRelease(value);
+    return result;
+}
+
+static char* copyParentDirectoryFromAXAttribute(AXUIElementRef element, CFStringRef attr) {
+    if (!element || !attr) {
+        return NULL;
+    }
+
+    CFTypeRef value = NULL;
+    AXError err = AXUIElementCopyAttributeValue(element, attr, &value);
+    if (err != kAXErrorSuccess || !value) {
+        if (value) {
+            CFRelease(value);
+        }
+        return NULL;
+    }
+
+    char *result = normalizeToParentDirectoryPathCString(copyPathFromAXValue(value));
+    CFRelease(value);
+    return result;
+}
+
+static char* findDirectoryPathInElementTree(AXUIElementRef element, int depth) {
+    if (!element || depth > 10) {
+        return NULL;
+    }
+
+    CFStringRef attrsToCheck[] = {
+        kAXDocumentAttribute,
+        kAXValueAttribute,
+        CFSTR("AXURL"),
+        CFSTR("AXFilename"),
+        kAXTitleAttribute
+    };
+    const size_t attrsCount = sizeof(attrsToCheck) / sizeof(attrsToCheck[0]);
+    for (size_t i = 0; i < attrsCount; i++) {
+        CFStringRef attr = attrsToCheck[i];
+        char *result = NULL;
+        if (attr == kAXDocumentAttribute) {
+            result = copyNormalizedPathFromAXAttribute(element, attr);
+        } else {
+            // Non-document values in open/save trees are usually selected item paths.
+            // Use their parent directory as the actual current directory.
+            result = copyParentDirectoryFromAXAttribute(element, attr);
+        }
+        if (result) {
+            return result;
+        }
+    }
+
+    CFArrayRef children = NULL;
+    AXError childrenErr = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute, (CFTypeRef *)&children);
+    if (childrenErr != kAXErrorSuccess || !children) {
+        if (children) {
+            CFRelease(children);
+        }
+        return NULL;
+    }
+
+    char *foundPath = NULL;
+    CFIndex count = CFArrayGetCount(children);
+    for (CFIndex i = 0; i < count; i++) {
+        AXUIElementRef child = (AXUIElementRef)CFArrayGetValueAtIndex(children, i);
+        if (!child || CFGetTypeID(child) != AXUIElementGetTypeID()) {
+            continue;
+        }
+
+        foundPath = findDirectoryPathInElementTree(child, depth + 1);
+        if (foundPath) {
+            break;
+        }
+    }
+
+    CFRelease(children);
+    return foundPath;
+}
+
+static char* copyDirectoryPathFromDialogContext(AXUIElementRef dialogWindow, AXUIElementRef appElement) {
+    if (dialogWindow) {
+        char *result = copyNormalizedPathFromAXAttribute(dialogWindow, kAXDocumentAttribute);
+        if (result) {
+            return result;
+        }
+
+        result = findDirectoryPathInElementTree(dialogWindow, 0);
+        if (result) {
+            return result;
+        }
+    }
+
+    if (appElement) {
+        CFTypeRef focusedElementValue = NULL;
+        if (AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute, &focusedElementValue) == kAXErrorSuccess &&
+            focusedElementValue &&
+            CFGetTypeID(focusedElementValue) == AXUIElementGetTypeID()) {
+            AXUIElementRef focusedElement = (AXUIElementRef)focusedElementValue;
+
+            char *result = copyParentDirectoryFromAXAttribute(focusedElement, kAXValueAttribute);
+            if (result) {
+                CFRelease(focusedElementValue);
+                return result;
+            }
+
+            result = findDirectoryPathInElementTree(focusedElement, 0);
+            CFRelease(focusedElementValue);
+            if (result) {
+                return result;
+            }
+        } else if (focusedElementValue) {
+            CFRelease(focusedElementValue);
+        }
+    }
+
+    return NULL;
+}
+
+
+int isOpenSaveDialog() {
+    @autoreleasepool {
+        NSRunningApplication *activeApp = [[NSWorkspace sharedWorkspace] frontmostApplication];
+        if (!activeApp) {
+            return 0;
+        }
+
+        pid_t pid = [activeApp processIdentifier];
+        return isOpenSaveDialogByPid((int)pid);
+    }
+}
+
+int isOpenSaveDialogByPid(int pid) {
+    @autoreleasepool {
+        if (!AXIsProcessTrusted() || pid <= 0) {
+            return 0;
+        }
+
+        AXUIElementRef appElement = AXUIElementCreateApplication(pid);
+        if (!appElement) {
+            return 0;
+        }
+
+        AXUIElementRef dialogWindow = copyOpenSaveDialogWindowForActiveApp(appElement);
+        BOOL isDialog = dialogWindow != NULL;
+        if (dialogWindow) {
+            CFRelease(dialogWindow);
+        }
+        CFRelease(appElement);
+        return isDialog ? 1 : 0;
+    }
+}
+
+// getAXStringAttribute reads a string attribute used by folder-only heuristics.
+static NSString* getAXStringAttribute(AXUIElementRef element, CFStringRef attr) {
+    if (!element || !attr) {
+        return nil;
+    }
+
+    CFTypeRef value = NULL;
+    if (AXUIElementCopyAttributeValue(element, attr, &value) != kAXErrorSuccess || !value) {
+        if (value) {
+            CFRelease(value);
+        }
+        return nil;
+    }
+
+    NSString *result = nil;
+    if (CFGetTypeID(value) == CFStringGetTypeID()) {
+        // Return an autoreleased Foundation copy because this file is built without ARC.
+        result = [NSString stringWithString:(__bridge NSString *)value];
+    }
+    CFRelease(value);
+    return result;
+}
+
+// axStringLooksLikeSelectFolder matches localized Choose Folder chrome.
+// Prefer multi-word / localized folder-pick phrases so ordinary Open/Save titles
+// that merely mention "folder" are not treated as folder-only.
+static BOOL axStringLooksLikeSelectFolder(NSString *text) {
+    if (!text || [text length] == 0) {
+        return NO;
+    }
+
+    NSString *lower = [text lowercaseString];
+    NSArray<NSString *> *hints = @[
+        @"choose folder",
+        @"select folder",
+        @"pick folder",
+        @"browse for folder",
+        @"选择文件夹",
+        @"选取文件夹",
+        @"选择目录",
+        @"フォルダを選択"
+    ];
+    for (NSString *hint in hints) {
+        if ([lower containsString:[hint lowercaseString]]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+// collectButtonTitlesRecursive gathers default/action button labels for heuristics.
+static void collectButtonTitlesRecursive(AXUIElementRef element, NSMutableArray<NSString *> *titles, int depth) {
+    if (!element || !titles || depth > 8) {
+        return;
+    }
+
+    if (elementMatchesRole(element, kAXButtonRole) || elementMatchesRole(element, CFSTR("AXDefaultButton"))) {
+        NSString *title = getAXStringAttribute(element, kAXTitleAttribute);
+        if (title.length > 0) {
+            [titles addObject:title];
+        }
+    }
+
+    CFArrayRef children = NULL;
+    if (AXUIElementCopyAttributeValue(element, kAXChildrenAttribute, (CFTypeRef *)&children) != kAXErrorSuccess || !children) {
+        if (children) {
+            CFRelease(children);
+        }
+        return;
+    }
+
+    CFIndex count = CFArrayGetCount(children);
+    for (CFIndex i = 0; i < count; i++) {
+        AXUIElementRef child = (AXUIElementRef)CFArrayGetValueAtIndex(children, i);
+        if (!child || CFGetTypeID(child) != AXUIElementGetTypeID()) {
+            continue;
+        }
+        collectButtonTitlesRecursive(child, titles, depth + 1);
+    }
+    CFRelease(children);
+}
+
+// isOpenSaveDialogSelectFolderWindow is true only for confirmed folder-only panels.
+// Uncertain open/save sheets stay false so ordinary Open/Save still show files.
+static int isOpenSaveDialogSelectFolderWindow(AXUIElementRef dialogWindow) {
+    if (!dialogWindow) {
+        return 0;
+    }
+
+    BOOL hasFileList =
+        elementOrDescendantMatchesRole(dialogWindow, CFSTR("AXOutline"), 0) ||
+        elementOrDescendantMatchesRole(dialogWindow, CFSTR("AXBrowser"), 0) ||
+        elementOrDescendantMatchesRole(dialogWindow, CFSTR("AXTable"), 0);
+    if (!hasFileList) {
+        return 0;
+    }
+
+    NSString *title = getAXStringAttribute(dialogWindow, kAXTitleAttribute);
+    BOOL chromeLooksLikeFolder = axStringLooksLikeSelectFolder(title);
+    if (!chromeLooksLikeFolder) {
+        NSMutableArray<NSString *> *buttonTitles = [NSMutableArray array];
+        collectButtonTitlesRecursive(dialogWindow, buttonTitles, 0);
+        for (NSString *buttonTitle in buttonTitles) {
+            if (axStringLooksLikeSelectFolder(buttonTitle)) {
+                chromeLooksLikeFolder = YES;
+                break;
+            }
+        }
+    }
+
+    // AX trees can omit controls while a normal Open/Save panel is loading. Only
+    // explicit folder-picker chrome is strong enough to hide file results.
+    return chromeLooksLikeFolder ? 1 : 0;
+}
+
+int isOpenSaveDialogSelectFolder() {
+    @autoreleasepool {
+        NSRunningApplication *activeApp = [[NSWorkspace sharedWorkspace] frontmostApplication];
+        if (!activeApp) {
+            return 0;
+        }
+        return isOpenSaveDialogSelectFolderByPid((int)[activeApp processIdentifier]);
+    }
+}
+
+int isOpenSaveDialogSelectFolderByPid(int pid) {
+    @autoreleasepool {
+        if (!AXIsProcessTrusted() || pid <= 0) {
+            return 0;
+        }
+
+        AXUIElementRef appElement = AXUIElementCreateApplication(pid);
+        if (!appElement) {
+            return 0;
+        }
+
+        AXUIElementRef dialogWindow = copyOpenSaveDialogWindowForActiveApp(appElement);
+        int result = 0;
+        if (dialogWindow) {
+            result = isOpenSaveDialogSelectFolderWindow(dialogWindow);
+            CFRelease(dialogWindow);
+        }
+        CFRelease(appElement);
+        return result;
+    }
+}
+
+static AXUIElementRef findTextFieldRecursive(AXUIElementRef element, int depth) {
+    if (!element || depth > 6) {
+        return NULL;
+    }
+
+    CFTypeRef role = NULL;
+    if (AXUIElementCopyAttributeValue(element, kAXRoleAttribute, &role) == kAXErrorSuccess && role) {
+        if (CFGetTypeID(role) == CFStringGetTypeID() &&
+            (CFStringCompare(role, kAXTextFieldRole, 0) == kCFCompareEqualTo ||
+             CFStringCompare(role, kAXComboBoxRole, 0) == kCFCompareEqualTo)) {
+            CFRelease(role);
+            return (AXUIElementRef)CFRetain(element);
+        }
+        CFRelease(role);
+    }
+
+    CFArrayRef children = NULL;
+    if (AXUIElementCopyAttributeValue(element, kAXChildrenAttribute, (CFTypeRef *)&children) != kAXErrorSuccess || !children) {
+        return NULL;
+    }
+
+    CFIndex count = CFArrayGetCount(children);
+    for (CFIndex i = 0; i < count; i++) {
+        AXUIElementRef child = (AXUIElementRef)CFArrayGetValueAtIndex(children, i);
+        AXUIElementRef found = findTextFieldRecursive(child, depth + 1);
+        if (found) {
+            CFRelease(children);
+            return found;
+        }
+    }
+
+    CFRelease(children);
+    return NULL;
+}
+
+static BOOL axValueMatchesTargetFileName(CFTypeRef value, NSString *targetName) {
+    if (!value || !targetName || [targetName length] == 0) {
+        return NO;
+    }
+
+    NSString *candidate = nil;
+    if (CFGetTypeID(value) == CFURLGetTypeID()) {
+        candidate = [(__bridge NSURL *)value path];
+    } else if (CFGetTypeID(value) == CFStringGetTypeID()) {
+        NSString *raw = (__bridge NSString *)value;
+        if ([raw hasPrefix:@"file://"]) {
+            NSURL *url = [NSURL URLWithString:raw];
+            if (url) {
+                candidate = [url path];
+            }
+        }
+        if (!candidate) {
+            candidate = raw;
+        }
+    }
+
+    if (!candidate || [candidate length] == 0) {
+        return NO;
+    }
+
+    NSString *trimmed = [candidate stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if ([trimmed length] == 0) {
+        return NO;
+    }
+
+    if ([trimmed compare:targetName options:NSCaseInsensitiveSearch] == NSOrderedSame) {
+        return YES;
+    }
+
+    NSString *basename = [trimmed lastPathComponent];
+    if (basename && [basename length] > 0 &&
+        [basename compare:targetName options:NSCaseInsensitiveSearch] == NSOrderedSame) {
+        return YES;
+    }
+
+    return NO;
+}
+
+static BOOL elementOrDescendantMatchesFileName(AXUIElementRef element, NSString *targetName, int depth) {
+    if (!element || !targetName || depth > 8) {
+        return NO;
+    }
+
+    CFStringRef attrs[] = {
+        kAXTitleAttribute,
+        kAXValueAttribute,
+        CFSTR("AXFilename"),
+        kAXDescriptionAttribute
+    };
+    const size_t attrsCount = sizeof(attrs) / sizeof(attrs[0]);
+    for (size_t i = 0; i < attrsCount; i++) {
+        CFTypeRef value = NULL;
+        AXError err = AXUIElementCopyAttributeValue(element, attrs[i], &value);
+        if (err == kAXErrorSuccess && value) {
+            BOOL matched = axValueMatchesTargetFileName(value, targetName);
+            CFRelease(value);
+            if (matched) {
+                return YES;
+            }
+        } else if (value) {
+            CFRelease(value);
+        }
+    }
+
+    CFArrayRef children = NULL;
+    AXError childrenErr = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute, (CFTypeRef *)&children);
+    if (childrenErr != kAXErrorSuccess || !children) {
+        if (children) {
+            CFRelease(children);
+        }
+        return NO;
+    }
+
+    BOOL matched = NO;
+    CFIndex count = CFArrayGetCount(children);
+    for (CFIndex i = 0; i < count; i++) {
+        AXUIElementRef child = (AXUIElementRef)CFArrayGetValueAtIndex(children, i);
+        if (!child || CFGetTypeID(child) != AXUIElementGetTypeID()) {
+            continue;
+        }
+        if (elementOrDescendantMatchesFileName(child, targetName, depth + 1)) {
+            matched = YES;
+            break;
+        }
+    }
+
+    CFRelease(children);
+    return matched;
+}
+
+static BOOL selectMatchingRowInListElement(AXUIElementRef listElement, NSString *targetName) {
+    if (!listElement || !targetName || [targetName length] == 0) {
+        return NO;
+    }
+
+    CFArrayRef rows = NULL;
+    AXError rowsErr = AXUIElementCopyAttributeValue(listElement, CFSTR("AXRows"), (CFTypeRef *)&rows);
+    if (rowsErr != kAXErrorSuccess || !rows) {
+        if (rows) {
+            CFRelease(rows);
+        }
+        rows = NULL;
+        if (AXUIElementCopyAttributeValue(listElement, kAXChildrenAttribute, (CFTypeRef *)&rows) != kAXErrorSuccess || !rows) {
+            if (rows) {
+                CFRelease(rows);
+            }
+            return NO;
+        }
+    }
+
+    BOOL selected = NO;
+    CFIndex count = CFArrayGetCount(rows);
+    for (CFIndex i = 0; i < count; i++) {
+        AXUIElementRef row = (AXUIElementRef)CFArrayGetValueAtIndex(rows, i);
+        if (!row || CFGetTypeID(row) != AXUIElementGetTypeID()) {
+            continue;
+        }
+        if (!elementOrDescendantMatchesFileName(row, targetName, 0)) {
+            continue;
+        }
+
+        if (AXUIElementSetAttributeValue(row, kAXSelectedAttribute, kCFBooleanTrue) == kAXErrorSuccess) {
+            selected = YES;
+        }
+
+        CFTypeRef selectedRow = (CFTypeRef)row;
+        CFArrayRef selectedRows = CFArrayCreate(kCFAllocatorDefault, &selectedRow, 1, &kCFTypeArrayCallBacks);
+        if (selectedRows) {
+            if (AXUIElementSetAttributeValue(listElement, CFSTR("AXSelectedRows"), selectedRows) == kAXErrorSuccess) {
+                selected = YES;
+            }
+            CFRelease(selectedRows);
+        }
+
+        AXUIElementSetAttributeValue(row, kAXFocusedAttribute, kCFBooleanTrue);
+        break;
+    }
+
+    CFRelease(rows);
+    return selected;
+}
+
+static BOOL selectItemInDialogTreeByName(AXUIElementRef element, NSString *targetName, int depth) {
+    if (!element || !targetName || depth > 10) {
+        return NO;
+    }
+
+    if (elementHasRole(element, CFSTR("AXOutline")) ||
+        elementHasRole(element, CFSTR("AXTable")) ||
+        elementHasRole(element, CFSTR("AXBrowser"))) {
+        if (selectMatchingRowInListElement(element, targetName)) {
+            return YES;
+        }
+    }
+
+    CFArrayRef children = NULL;
+    AXError childrenErr = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute, (CFTypeRef *)&children);
+    if (childrenErr != kAXErrorSuccess || !children) {
+        if (children) {
+            CFRelease(children);
+        }
+        return NO;
+    }
+
+    BOOL selected = NO;
+    CFIndex count = CFArrayGetCount(children);
+    for (CFIndex i = 0; i < count; i++) {
+        AXUIElementRef child = (AXUIElementRef)CFArrayGetValueAtIndex(children, i);
+        if (!child || CFGetTypeID(child) != AXUIElementGetTypeID()) {
+            continue;
+        }
+        if (selectItemInDialogTreeByName(child, targetName, depth + 1)) {
+            selected = YES;
+            break;
+        }
+    }
+
+    CFRelease(children);
+    return selected;
+}
+
+int selectInActiveFileDialog(const char* path) {
+    @autoreleasepool {
+        if (path == NULL) {
+            return 0;
+        }
+        if (!AXIsProcessTrusted()) {
+            return 0;
+        }
+
+        NSString *pathStr = [NSString stringWithUTF8String:path];
+        if (!pathStr || [pathStr length] == 0) {
+            return 0;
+        }
+
+        NSString *targetName = [pathStr lastPathComponent];
+        if (!targetName || [targetName length] == 0) {
+            return 0;
+        }
+
+        NSRunningApplication *activeApp = [[NSWorkspace sharedWorkspace] frontmostApplication];
+        if (!activeApp) {
+            return 0;
+        }
+
+        AXUIElementRef appElement = AXUIElementCreateApplication([activeApp processIdentifier]);
+        if (!appElement) {
+            return 0;
+        }
+
+        AXUIElementRef dialogWindow = copyOpenSaveDialogWindowForActiveApp(appElement);
+        if (!dialogWindow) {
+            CFRelease(appElement);
+            return 0;
+        }
+
+        AXUIElementPerformAction(dialogWindow, kAXRaiseAction);
+        activateRunningApplication(activeApp);
+        usleep(80 * 1000);
+
+        BOOL selected = selectItemInDialogTreeByName(dialogWindow, targetName, 0);
+
+        CFRelease(dialogWindow);
+        CFRelease(appElement);
+        return selected ? 1 : 0;
+    }
+}
+
+int navigateActiveFileDialog(const char* path) {
+    @autoreleasepool {
+        if (path == NULL) {
+            return 0;
+        }
+        if (!AXIsProcessTrusted()) {
+            return 0;
+        }
+
+        NSString *pathStr = [NSString stringWithUTF8String:path];
+        if (!pathStr || [pathStr length] == 0) {
+            return 0;
+        }
+
+        // Cmd+Shift+G to open "Go to the folder" in dialogs
+        CGEventRef gDown = CGEventCreateKeyboardEvent(NULL, (CGKeyCode)5, true);
+        CGEventRef gUp = CGEventCreateKeyboardEvent(NULL, (CGKeyCode)5, false);
+        if (!gDown || !gUp) {
+            if (gDown) CFRelease(gDown);
+            if (gUp) CFRelease(gUp);
+            return 0;
+        }
+        CGEventFlags flags = kCGEventFlagMaskCommand | kCGEventFlagMaskShift;
+        CGEventSetFlags(gDown, flags);
+        CGEventSetFlags(gUp, flags);
+        CGEventPost(kCGHIDEventTap, gDown);
+        CGEventPost(kCGHIDEventTap, gUp);
+        CFRelease(gDown);
+        CFRelease(gUp);
+
+        // Wait briefly for the sheet to appear. 
+        // 50ms might be enough for modern Macs. If it fails, we might need to retry or increase slightly.
+        usleep(150 * 1000);
+
+        NSRunningApplication *activeApp = [[NSWorkspace sharedWorkspace] frontmostApplication];
+        if (!activeApp) {
+            return 0;
+        }
+
+        AXUIElementRef appElement = AXUIElementCreateApplication([activeApp processIdentifier]);
+        if (!appElement) {
+            return 0;
+        }
+
+        AXUIElementRef focusedWindow = NULL;
+        AXError windowErr = AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute, (CFTypeRef *)&focusedWindow);
+        if (windowErr != kAXErrorSuccess || !focusedWindow) {
+            CFRelease(appElement);
+            return 0;
+        }
+
+        AXUIElementRef targetWindow = focusedWindow;
+        CFRetain(targetWindow);
+
+        // If the focused window isn't the dialog, look through all windows
+        if (!elementHasRole(targetWindow, kAXSheetRole) && 
+            !elementHasSubrole(targetWindow, CFSTR("AXDialog")) && 
+            !elementHasSubrole(targetWindow, CFSTR("AXSystemDialog"))) {
+            
+            CFArrayRef windows = NULL;
+            if (AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute, (CFTypeRef *)&windows) == kAXErrorSuccess && windows) {
+                CFIndex count = CFArrayGetCount(windows);
+                for (CFIndex i = 0; i < count; i++) {
+                    AXUIElementRef window = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
+                    if (window && (elementHasRole(window, kAXSheetRole) || 
+                                   elementHasSubrole(window, CFSTR("AXDialog")) || 
+                                   elementHasSubrole(window, CFSTR("AXSystemDialog")))) {
+                        CFRelease(targetWindow);
+                        targetWindow = (AXUIElementRef)CFRetain(window);
+                        break;
+                    }
+                }
+                CFRelease(windows);
+            }
+        }
+
+        AXUIElementPerformAction(targetWindow, kAXRaiseAction);
+        AXUIElementRef textField = findTextFieldRecursive(targetWindow, 0);
+
+        if (textField) {
+            AXUIElementSetAttributeValue(textField, kAXValueAttribute, (CFTypeRef)pathStr);
+            CFRelease(textField);
+        }
+
+        activateRunningApplication(activeApp);
+        usleep(10 * 1000);
+
+        NSAppleScript *appleScript = [[NSAppleScript alloc] initWithSource:@"tell application \"System Events\" to key code 36"];
+        [appleScript executeAndReturnError:nil];
+
+        CFRelease(targetWindow);
+        CFRelease(focusedWindow);
+        CFRelease(appElement);
+        return 1;
+    }
+}
+
+char* getActiveFileDialogPath() {
+    @autoreleasepool {
+        if (!AXIsProcessTrusted()) {
+            return strdup("");
+        }
+
+        NSRunningApplication *activeApp = [[NSWorkspace sharedWorkspace] frontmostApplication];
+        if (!activeApp) {
+            return strdup("");
+        }
+        if ([[activeApp bundleIdentifier] isEqualToString:@"com.apple.finder"]) {
+            return strdup("");
+        }
+
+        AXUIElementRef appElement = AXUIElementCreateApplication([activeApp processIdentifier]);
+        if (!appElement) {
+            return strdup("");
+        }
+
+        AXUIElementRef dialogWindow = copyOpenSaveDialogWindowForActiveApp(appElement);
+        if (!dialogWindow) {
+            CFRelease(appElement);
+            return strdup("");
+        }
+
+        char *resolvedPath = copyDirectoryPathFromDialogContext(dialogWindow, appElement);
+        if (resolvedPath) {
+            CFRelease(dialogWindow);
+            CFRelease(appElement);
+            return resolvedPath;
+        }
+
+        CFRelease(dialogWindow);
+        CFRelease(appElement);
+        return strdup("");
+    }
+}
+
+char* getFileDialogPathByPid(int pid) {
+    @autoreleasepool {
+        if (pid <= 0) {
+            return strdup("");
+        }
+        if (!AXIsProcessTrusted()) {
+            return strdup("");
+        }
+        NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:(pid_t)pid];
+        if (!app) {
+            return strdup("");
+        }
+        if ([[app bundleIdentifier] isEqualToString:@"com.apple.finder"]) {
+            return strdup("");
+        }
+
+        AXUIElementRef appElement = AXUIElementCreateApplication((pid_t)pid);
+        if (!appElement) {
+            return strdup("");
+        }
+
+        AXUIElementRef dialogWindow = copyOpenSaveDialogWindowForActiveApp(appElement);
+        if (!dialogWindow) {
+            CFRelease(appElement);
+            return strdup("");
+        }
+
+        char *resolvedPath = copyDirectoryPathFromDialogContext(dialogWindow, appElement);
+        if (resolvedPath) {
+            CFRelease(dialogWindow);
+            CFRelease(appElement);
+            return resolvedPath;
+        }
+
+        CFRelease(dialogWindow);
+        CFRelease(appElement);
+        return strdup("");
+    }
+}
+
+int activateWindowByPid(int pid) {
+    @autoreleasepool {
+        if (pid <= 0) {
+            return 0;
+        }
+
+        if (!AXIsProcessTrusted()) {
+            return 0;
+        }
+
+        AXUIElementRef appElement = AXUIElementCreateApplication(pid);
+        if (!appElement) {
+            return 0;
+        }
+
+        AXError setFrontmostErr = AXUIElementSetAttributeValue(
+            appElement,
+            kAXFrontmostAttribute,
+            kCFBooleanTrue
+        );
+
+        CFArrayRef windows = NULL;
+        AXError windowsErr = AXUIElementCopyAttributeValue(
+            appElement,
+            kAXWindowsAttribute,
+            (CFTypeRef *)&windows
+        );
+
+        BOOL raised = NO;
+        if (windowsErr == kAXErrorSuccess && windows && CFArrayGetCount(windows) > 0) {
+            AXUIElementRef window = (AXUIElementRef)CFArrayGetValueAtIndex(windows, 0);
+            if (window) {
+                AXUIElementSetAttributeValue(window, kAXMainAttribute, kCFBooleanTrue);
+                AXUIElementSetAttributeValue(appElement, kAXFocusedWindowAttribute, window);
+                AXUIElementPerformAction(window, kAXRaiseAction);
+                raised = YES;
+            }
+        }
+
+        CFIndex windowCount = 0;
+        if (windows) {
+            windowCount = CFArrayGetCount(windows);
+            CFRelease(windows);
+        }
+        CFRelease(appElement);
+
+        if (setFrontmostErr != kAXErrorSuccess) {
+            return 0;
+        }
+        if (raised) {
+            return 1;
+        }
+        return (windowsErr == kAXErrorSuccess && windowCount == 0) ? 1 : 0;
+    }
+}
+
+int isFinder(int pid) {
+    @autoreleasepool {
+        NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+        if (app && [[app bundleIdentifier] isEqualToString:@"com.apple.finder"]) {
+            return 1;
+        }
+        return 0;
+    }
+}
+
+static NSString* getFinderWindowPathValue(id window) {
+    id target = nil;
+    @try {
+        target = [window valueForKey:@"target"];
+    } @catch (NSException *exception) {
+        target = nil;
+    }
+
+    if (!target) {
+        return nil;
+    }
+
+    id urlValue = nil;
+    @try {
+        urlValue = [target valueForKey:@"URL"];
+    } @catch (NSException *exception) {
+        urlValue = nil;
+    }
+
+    NSString *path = nil;
+    if ([urlValue isKindOfClass:[NSURL class]]) {
+        path = [(NSURL *)urlValue path];
+    } else if ([urlValue isKindOfClass:[NSString class]]) {
+        NSString *stringValue = (NSString *)urlValue;
+        if ([stringValue hasPrefix:@"file://"]) {
+            NSURL *url = [NSURL URLWithString:stringValue];
+            path = [url path];
+        } else {
+            path = stringValue;
+        }
+    }
+
+    if (!path || [path length] == 0) {
+        return nil;
+    }
+    return path;
+}
+
+static NSString* getFinderWindowNameValue(id window) {
+    id nameValue = nil;
+    @try {
+        nameValue = [window valueForKey:@"name"];
+    } @catch (NSException *exception) {
+        nameValue = nil;
+    }
+    if (![nameValue isKindOfClass:[NSString class]]) {
+        return nil;
+    }
+    NSString *name = (NSString *)nameValue;
+    if ([name length] == 0) {
+        return nil;
+    }
+    return name;
+}
+
+static BOOL finderPathEquals(NSString *left, NSString *right) {
+    if (!left || !right) {
+        return NO;
+    }
+    return [[left stringByStandardizingPath] caseInsensitiveCompare:[right stringByStandardizingPath]] == NSOrderedSame;
+}
+
+static BOOL finderWindowListContainsPath(NSArray *windowList, NSString *path) {
+    if (!windowList || !path || [path length] == 0) {
+        return NO;
+    }
+
+    for (id window in windowList) {
+        NSString *windowPath = getFinderWindowPathValue(window);
+        if (!windowPath) {
+            continue;
+        }
+        if (finderPathEquals(windowPath, path)) {
+            return YES;
+        }
+    }
+
+    return NO;
+}
+
+char* getActiveFinderWindowPath() {
+    @autoreleasepool {
+        NSRunningApplication *activeApp = [[NSWorkspace sharedWorkspace] frontmostApplication];
+        if (!activeApp || ![[activeApp bundleIdentifier] isEqualToString:@"com.apple.finder"]) {
+            return strdup("");
+        }
+        return getFinderWindowPathByPid((int)[activeApp processIdentifier]);
+    }
+}
+
+static char* copyPathFromAXValue(CFTypeRef value) {
+    if (!value) {
+        return strdup("");
+    }
+
+    if (CFGetTypeID(value) == CFURLGetTypeID()) {
+        CFURLRef url = (CFURLRef)value;
+        CFStringRef path = CFURLCopyFileSystemPath(url, kCFURLPOSIXPathStyle);
+        if (path) {
+            NSString *pathStr = (__bridge NSString *)path;
+            char *result = strdup([pathStr UTF8String]);
+            CFRelease(path);
+            return result;
+        }
+    }
+
+    if (CFGetTypeID(value) == CFStringGetTypeID()) {
+        NSString *stringValue = (__bridge NSString *)value;
+        if ([stringValue hasPrefix:@"file://"]) {
+            NSURL *url = [NSURL URLWithString:stringValue];
+            if (url) {
+                NSString *path = [url path];
+                if (path && [path length] > 0) {
+                    return strdup([path UTF8String]);
+                }
+            }
+        }
+        if ([stringValue length] > 0) {
+            return strdup([stringValue UTF8String]);
+        }
+    }
+
+    return strdup("");
+}
+
+char* getFinderWindowPathByPid(int pid) {
+    @autoreleasepool {
+        if (pid <= 0) {
+            return strdup("");
+        }
+        NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+        if (!app || ![[app bundleIdentifier] isEqualToString:@"com.apple.finder"]) {
+            return strdup("");
+        }
+        id finder = [SBApplication applicationWithBundleIdentifier:@"com.apple.finder"];
+        if (!finder) {
+            return strdup("");
+        }
+
+        id windows = [finder valueForKey:@"windows"];
+        if (![windows isKindOfClass:[NSArray class]]) {
+            return strdup("");
+        }
+
+        NSArray *windowList = (NSArray *)windows;
+        NSString *focusedTitle = nil;
+        NSString *focusedDocumentPath = nil;
+        if (AXIsProcessTrusted()) {
+            AXUIElementRef appElement = AXUIElementCreateApplication(pid);
+            if (appElement) {
+                AXUIElementRef window = NULL;
+                AXError windowErr = AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute, (CFTypeRef *)&window);
+                if (windowErr == kAXErrorSuccess && window) {
+                    CFTypeRef documentValue = NULL;
+                    if (AXUIElementCopyAttributeValue(window, kAXDocumentAttribute, &documentValue) == kAXErrorSuccess && documentValue) {
+                        char *rawPath = copyPathFromAXValue(documentValue);
+                        if (rawPath && rawPath[0] != '\0') {
+                            focusedDocumentPath = [[NSString stringWithUTF8String:rawPath] copy];
+                        }
+                        if (rawPath) {
+                            free(rawPath);
+                        }
+                        CFRelease(documentValue);
+                    }
+
+                    CFTypeRef titleValue = NULL;
+                    if (AXUIElementCopyAttributeValue(window, kAXTitleAttribute, &titleValue) == kAXErrorSuccess && titleValue) {
+                        if (CFGetTypeID(titleValue) == CFStringGetTypeID()) {
+                            focusedTitle = [(__bridge NSString *)titleValue copy];
+                        }
+                        CFRelease(titleValue);
+                    }
+                    CFRelease(window);
+                }
+                CFRelease(appElement);
+            }
+        }
+
+        if (focusedDocumentPath && [focusedDocumentPath length] > 0) {
+            if (finderWindowListContainsPath(windowList, focusedDocumentPath)) {
+                return strdup([focusedDocumentPath UTF8String]);
+            }
+
+            NSString *parent = [focusedDocumentPath stringByDeletingLastPathComponent];
+            if (parent && [parent length] > 0 && finderWindowListContainsPath(windowList, parent)) {
+                return strdup([parent UTF8String]);
+            }
+        }
+
+        if (focusedTitle) {
+            for (id window in windowList) {
+                NSString *name = getFinderWindowNameValue(window);
+                if (!name) {
+                    continue;
+                }
+                if (![name isEqualToString:focusedTitle]) {
+                    continue;
+                }
+                NSString *path = getFinderWindowPathValue(window);
+                if (path) {
+                    return strdup([path UTF8String]);
+                }
+            }
+        }
+
+        return strdup("");
+    }
+}
+
+int selectInFinder(const char* path) {
+    @autoreleasepool {
+        if (path == NULL) {
+            return 0;
+        }
+        NSString *pathStr = [NSString stringWithUTF8String:path];
+        if (!pathStr || [pathStr length] == 0) {
+            return 0;
+        }
+
+        // Check if the file/folder exists
+        BOOL isDir = NO;
+        if (![[NSFileManager defaultManager] fileExistsAtPath:pathStr isDirectory:&isDir]) {
+            return 0;
+        }
+
+        // Use AppleScript to reveal the item in the frontmost Finder window
+        // 'reveal' navigates to the parent folder and selects the item
+        NSString *escapedPath = [pathStr stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
+        NSString *script = [NSString stringWithFormat:
+            @"tell application \"Finder\"\n"
+            @"  activate\n"
+            @"  reveal POSIX file \"%@\"\n"
+            @"end tell", escapedPath];
+        
+        NSAppleScript *appleScript = [[NSAppleScript alloc] initWithSource:script];
+        NSDictionary *errorInfo = nil;
+        [appleScript executeAndReturnError:&errorInfo];
+        
+        if (errorInfo) {
+            return 0;
+        }
+        
+        return 1;
+    }
+}
+
+int navigateInFinder(const char* path) {
+    @autoreleasepool {
+        if (path == NULL) {
+            return 0;
+        }
+
+        NSString *pathStr = [NSString stringWithUTF8String:path];
+        if (!pathStr || [pathStr length] == 0) {
+            return 0;
+        }
+
+        BOOL isDir = NO;
+        if (![[NSFileManager defaultManager] fileExistsAtPath:pathStr isDirectory:&isDir] || !isDir) {
+            return 0;
+        }
+
+        NSString *escapedPath = [pathStr stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
+        NSString *script = [NSString stringWithFormat:
+            @"tell application \"Finder\"\n"
+            @"  activate\n"
+            @"  if (count of Finder windows) > 0 then\n"
+            @"    set target of front Finder window to (POSIX file \"%@\" as alias)\n"
+            @"  else\n"
+            @"    open POSIX file \"%@\"\n"
+            @"  end if\n"
+            @"end tell", escapedPath, escapedPath];
+
+        NSAppleScript *appleScript = [[NSAppleScript alloc] initWithSource:script];
+        NSDictionary *errorInfo = nil;
+        [appleScript executeAndReturnError:&errorInfo];
+        if (errorInfo) {
+            return 0;
+        }
+
+        return 1;
+    }
+}

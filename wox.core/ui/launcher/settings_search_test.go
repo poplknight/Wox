@@ -1,0 +1,213 @@
+package launcher
+
+import (
+	"runtime"
+	"testing"
+
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+)
+
+func TestSettingsSearchPrimaryFSelectsExistingText(t *testing.T) {
+	deps, _ := newSearchControllerDeps()
+	app := bindTestApp(&App{
+		settingsSearch: newSettingsSearchController(deps),
+		pluginSettings: newPluginSettingsController(deps),
+		themeSettings:  newThemeSettingsController(deps),
+	})
+	app.settingsSearch.SetEditor(woxwidget.NewTextEditingController("existing"))
+
+	modifier := woxui.KeyModifierControl
+	if runtime.GOOS == "darwin" {
+		modifier = woxui.KeyModifierMeta
+	}
+	if !app.settingsSearch.onSettingsSearchKey(woxui.KeyEvent{Key: "f", Modifiers: modifier, Down: true}) {
+		t.Fatal("primary+F was not handled")
+	}
+	state := app.settingsSearch.Editor().State()
+	if !app.settingsSearch.Focused() || state.Selection != (woxui.TextSelection{Anchor: 0, Focus: 8}) {
+		t.Fatalf("settings search focus/selection = %v/%+v, want focused with existing text selected", app.settingsSearch.Focused(), state.Selection)
+	}
+}
+
+func TestSettingsSearchKeepsPrintableKeysAfterOCRModelManagerCloses(t *testing.T) {
+	app := newApp(false, nil, woxui.NewWindowManager(), newAppInstanceRegistry(), nil, true, "", launcherWindowID)
+	defer app.cancel()
+	app.settingsWindow.open = true
+	app.settingsWindow.tab = "plugins"
+	app.settingsSearch.SetEditor(woxwidget.NewTextEditingController(""))
+	fields := newFormFieldsState([]formDefinition{{Type: "ocrModel"}}, nil, true)
+	setFormFieldsFocusLocked(&fields, 0)
+	app.pluginSettings.SetForm(&pluginSettingsFormState{formFieldsState: fields})
+	app.settingsSearch.SetFocused(true)
+
+	if app.onSettingsKey(woxui.KeyEvent{Key: "s", Down: true}) {
+		t.Fatal("active OCR field consumed a printable key owned by settings search")
+	}
+}
+
+func TestSettingsSearchPluginResultKeepsPluginIcon(t *testing.T) {
+	icon := woxImage{ImageType: "emoji", ImageData: "P"}
+	app := bindTestApp(&App{})
+	results := app.settingsSearch.settingsSearchResults(settingsSnapshot{
+		search: settingsSearchSnapshot{
+			Query:   woxui.TextEditingState{Text: "UniqueIconPlugin"},
+			Plugins: []pluginSettingsPlugin{{ID: "unique-icon-plugin", Name: "UniqueIconPlugin", Icon: icon}},
+		},
+	})
+
+	if len(results) != 1 || results[0].kind != settingsSearchPlugin {
+		t.Fatalf("plugin search results = %#v, want one plugin result", results)
+	}
+	if results[0].icon != icon {
+		t.Fatalf("plugin search icon = %#v, want %#v", results[0].icon, icon)
+	}
+}
+
+func TestSettingsSearchMatchesPluginEnglishName(t *testing.T) {
+	app := bindTestApp(&App{})
+	results := app.settingsSearch.settingsSearchResults(settingsSnapshot{
+		search: settingsSearchSnapshot{
+			Query:   woxui.TextEditingState{Text: "File Search"},
+			Plugins: []pluginSettingsPlugin{{ID: "file-search", Name: "文件搜索", NameEn: "File Search"}},
+		},
+	})
+
+	for _, result := range results {
+		if result.kind == settingsSearchPlugin && result.pluginID == "file-search" {
+			return
+		}
+	}
+	t.Fatalf("english plugin name missing from results: %#v", results)
+}
+
+func TestSettingsSearchActivatesThemeEditor(t *testing.T) {
+	deps, _ := newSearchControllerDeps()
+	shared := newSharedEditState()
+	app := bindTestApp(&App{
+		settingsSearch:     newSettingsSearchController(deps),
+		pluginSettings:     newPluginSettingsController(deps),
+		themeSettings:      newThemeSettingsController(deps),
+		hotkeySettings:     newHotkeySettingsController(deps),
+		aiSettings:         newAISettingsController(deps),
+		generalSettings:    newGeneralSettingsController(deps, shared),
+		cloudSettings:      newCloudSettingsController(deps),
+		usageSettings:      newUsageSettingsController(deps),
+		aboutSettings:      newAboutSettingsController(deps),
+		appearanceSettings: newAppearanceSettingsController(deps),
+		dataSettings:       newDataSettingsController(deps),
+		runtimeSettings:    newRuntimeSettingsController(deps),
+		updateSettings:     newUpdateSettingsController(deps),
+		sharedEdit:         shared,
+		settingsWindow:     settingsWindowController{tab: "general"},
+	})
+	app.themeSettings.SetThemeEditor(&themeEditorPreviewState{key: "settings-theme|test"})
+	app.themeSettings.SetThemeWallpaperLoading(true)
+
+	app.settingsSearch.activateSettingsSearchResult(settingsSearchResult{
+		kind: settingsSearchSection, title: "Theme Editor", tab: "theme", mode: "editor", navID: "themes.edit",
+	})
+	if app.settingsWindow.tab != "theme" || app.themeSettings.ThemesMode() != "editor" {
+		t.Fatalf("activated destination = %s/%s, want theme/editor", app.settingsWindow.tab, app.themeSettings.ThemesMode())
+	}
+}
+
+func TestSettingsSearchMatchesThemeEditor(t *testing.T) {
+	app := bindTestApp(&App{})
+	for _, query := range []string{"Theme Editor", "themeeditor"} {
+		results := app.settingsSearch.settingsSearchResults(settingsSnapshot{
+			search: settingsSearchSnapshot{Query: woxui.TextEditingState{Text: query}},
+		})
+		found := false
+		for _, result := range results {
+			if result.kind == settingsSearchSection && result.navID == "themes.edit" {
+				if result.title != "Theme Editor" || result.tab != "theme" || result.mode != "editor" {
+					t.Fatalf("query %q theme editor result = %#v, want Theme Editor on the editor route", query, result)
+				}
+				item := settingsSearchNavItem(result)
+				if item.tab != "theme" || item.mode != "editor" {
+					t.Fatalf("query %q theme editor nav = %#v, want theme editor", query, item)
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("query %q missing Theme Editor: %#v", query, results)
+		}
+	}
+}
+
+func TestSettingsSearchMatchesLocalizedBuiltInSetting(t *testing.T) {
+	app := bindTestApp(&App{
+		language: languageCatalog{
+			translations: map[string]string{
+				"ui_ui":   "界面",
+				"ui_lang": "语言",
+			},
+		},
+	})
+	results := app.settingsSearch.settingsSearchResults(settingsSnapshot{
+		search: settingsSearchSnapshot{Query: woxui.TextEditingState{Text: "语言"}},
+	})
+
+	for _, result := range results {
+		if result.kind == settingsSearchSetting && result.settingKey == "LangCode" {
+			if result.title != "语言" || result.subtitle != "界面" {
+				t.Fatalf("localized language result = %#v, want title 语言 and subtitle 界面", result)
+			}
+			return
+		}
+	}
+	t.Fatalf("localized language setting missing from results: %#v", results)
+}
+
+func TestSettingsSearchResultIconSourcesMatchFlutterKinds(t *testing.T) {
+	settingIcon := settingsSearchResultIconSource(settingsSearchSetting)
+	pluginIcon := settingsSearchResultIconSource(settingsSearchPlugin)
+	pluginSettingIcon := settingsSearchResultIconSource(settingsSearchPluginSetting)
+
+	if settingIcon.ImageData == "" || pluginIcon.ImageData == "" || pluginSettingIcon.ImageData == "" {
+		t.Fatalf("search result fallback icons = setting:%v plugin:%v plugin setting:%v", settingIcon.ImageData != "", pluginIcon.ImageData != "", pluginSettingIcon.ImageData != "")
+	}
+	if settingIcon.ImageData == pluginIcon.ImageData || settingIcon.ImageData == pluginSettingIcon.ImageData || pluginIcon.ImageData == pluginSettingIcon.ImageData {
+		t.Fatal("search result kinds unexpectedly share one fallback icon")
+	}
+	for name, icon := range map[string]woxImage{"setting": settingIcon, "plugin": pluginIcon, "plugin setting": pluginSettingIcon} {
+		if _, err := decodeWoxImage(icon); err != nil {
+			t.Fatalf("decode %s search icon: %v", name, err)
+		}
+	}
+}
+
+func TestSettingsSearchHighlightTargetsMatchDestinationKinds(t *testing.T) {
+	tests := []struct {
+		result settingsSearchResult
+		want   string
+	}{
+		{result: settingsSearchResult{kind: settingsSearchSetting, settingKey: "MainHotkey"}, want: "built-in:MainHotkey"},
+		{result: settingsSearchResult{kind: settingsSearchPlugin, pluginID: "clipboard"}, want: "plugin:clipboard"},
+		{result: settingsSearchResult{kind: settingsSearchPluginSetting, pluginID: "clipboard", settingKey: "HistoryLimit"}, want: "plugin-setting:clipboard\x00HistoryLimit"},
+	}
+
+	for _, test := range tests {
+		if got := settingsSearchHighlightTarget(test.result); got != test.want {
+			t.Fatalf("highlight target = %q, want %q", got, test.want)
+		}
+	}
+}
+
+func TestStartSettingsSearchHighlightReplacesPreviousCue(t *testing.T) {
+	app := bindTestApp(&App{})
+	app.settingsWindow.flashLocked("built-in:MainHotkey")
+	defer app.settingsWindow.clearFlashLocked()
+	firstTimer := app.settingsWindow.flashTimer
+
+	app.settingsWindow.flashLocked("plugin:clipboard")
+	if app.settingsWindow.flash != "plugin:clipboard" {
+		t.Fatalf("highlight target = %q, want latest destination", app.settingsWindow.flash)
+	}
+	if app.settingsWindow.flashTimer == nil || app.settingsWindow.flashTimer == firstTimer {
+		t.Fatal("highlight timer was not replaced")
+	}
+}

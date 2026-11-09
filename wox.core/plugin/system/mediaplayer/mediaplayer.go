@@ -1,0 +1,821 @@
+package mediaplayer
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"image"
+	"image/png"
+	"math"
+	"strings"
+	"time"
+	"wox/common"
+	"wox/common/icons"
+	"wox/plugin"
+	"wox/util"
+
+	_ "image/jpeg"
+
+	"github.com/google/uuid"
+	xdraw "golang.org/x/image/draw"
+)
+
+var mediaIcon = icons.Get(icons.PluginMediaPlayer)
+
+const (
+	// PluginID identifies the built-in media player plugin for internal plugin tools.
+	PluginID = common.MediaPlayerPluginID
+
+	ToolGetStatus = "get_status"
+	ToolPlay      = "play"
+	ToolPause     = "pause"
+	ToolToggle    = "toggle"
+	ToolNext      = "next"
+	ToolPrevious  = "previous"
+
+	ToolStatusNone    = "none"
+	ToolStatusPlaying = "playing"
+	ToolStatusPaused  = "paused"
+	ToolStatusStopped = "stopped"
+	ToolStatusUnknown = "unknown"
+
+	mediaControlPlay     = "play"
+	mediaControlPause    = "pause"
+	mediaControlToggle   = "toggle"
+	mediaControlNext     = "next"
+	mediaControlPrevious = "previous"
+
+	mediaControlGlobalResultScore int64 = 200
+	recordArtworkSize                   = 96
+)
+
+type mediaControlAction struct {
+	command string
+	aliases []string
+}
+
+var mediaControlActions = []mediaControlAction{
+	{command: mediaControlPlay},
+	{command: mediaControlPause},
+	{command: mediaControlToggle, aliases: []string{"playpause", "play/pause"}},
+	{command: mediaControlNext},
+	{command: mediaControlPrevious, aliases: []string{"prev", "back"}},
+}
+
+func init() {
+	plugin.AllSystemPlugin = append(plugin.AllSystemPlugin, &MediaPlayerPlugin{})
+}
+
+type MediaPlayerPlugin struct {
+	api             plugin.API
+	pluginDirectory string
+	retriever       MediaRetriever
+
+	// Track results that need periodic refresh
+	trackedResults *util.HashMap[string, mediaTrackedResult]
+}
+
+type mediaContextData struct {
+	Title       string `json:"title"`
+	Artist      string `json:"artist"`
+	Album       string `json:"album"`
+	AppName     string `json:"appName"`
+	AppBundleID string `json:"appBundleId"`
+}
+
+// mediaPreviewData is the internal payload for UI's dedicated now-playing surface.
+type mediaPreviewData struct {
+	Title     string `json:"title"`
+	Artist    string `json:"artist"`
+	Album     string `json:"album"`
+	AppName   string `json:"appName"`
+	Artwork   string `json:"artwork"`
+	Position  int64  `json:"position"`
+	Duration  int64  `json:"duration"`
+	IsPlaying bool   `json:"isPlaying"`
+}
+
+type mediaTrackedResult struct {
+	playbackState          PlaybackState
+	artworkFingerprint     [sha256.Size]byte
+	showOpenMediaAction    bool
+	preferredDefaultAction string
+}
+
+func (m *MediaPlayerPlugin) GetMetadata() plugin.Metadata {
+	return plugin.Metadata{
+		Id:            PluginID,
+		Name:          "i18n:plugin_media_player_plugin_name",
+		Author:        "Wox Launcher",
+		Website:       "https://github.com/Wox-launcher/Wox",
+		Version:       "1.0.0",
+		MinWoxVersion: "2.0.0",
+		Runtime:       "Go",
+		Description:   "i18n:plugin_media_player_plugin_description",
+		Icon:          mediaIcon.String(),
+		Entry:         "",
+		TriggerKeywords: []string{
+			"*",
+			"media",
+		},
+		SupportedOS: []string{
+			"Windows",
+			"Macos",
+			"Linux",
+		},
+		Features: []plugin.MetadataFeature{
+			{
+				Name: plugin.MetadataFeatureMRU,
+				Params: map[string]any{
+					"HashBy": "identityKey",
+				},
+			},
+		},
+	}
+}
+
+func (m *MediaPlayerPlugin) Init(ctx context.Context, initParams plugin.InitParams) {
+	m.api = initParams.API
+	m.pluginDirectory = initParams.PluginDirectory
+	m.retriever = mediaRetriever
+	m.retriever.UpdateAPI(m.api)
+	m.trackedResults = util.NewHashMap[string, mediaTrackedResult]()
+	m.api.OnMRURestore(ctx, m.handleMRURestore)
+
+	// First SMTC/MediaRemote lookup is the expensive one; warm it so entering
+	// the plugin does not pay that cost on the query path.
+	if !mediaRuntimeNeedsInstall() || mediaRuntimeInstalled() {
+		util.Go(ctx, "warm media retriever", func() {
+			_, _ = m.retriever.GetCurrentMedia(util.NewTraceContext())
+		})
+	}
+
+	emptyObject := map[string]any{"type": "object"}
+	registerControl := func(name string, description string, idempotent bool, command string) {
+		m.api.RegisterPluginTool(ctx, plugin.RegisterPluginToolOption{
+			Tool: plugin.PluginToolDescriptor{
+				Name:         name,
+				Description:  description,
+				InputSchema:  emptyObject,
+				OutputSchema: emptyObject,
+				Annotations:  plugin.PluginToolAnnotations{Idempotent: idempotent},
+			},
+			Handler: func(ctx context.Context, _ plugin.InvokePluginToolHandlerOption) plugin.InvokePluginToolHandlerResult {
+				if err := m.retriever.ControlMedia(ctx, command); err != nil {
+					return plugin.InvokePluginToolHandlerResult{Error: &plugin.PluginToolError{Code: plugin.PluginToolErrorExecutionFailed, Message: err.Error()}}
+				}
+				return plugin.InvokePluginToolHandlerResult{Output: map[string]any{}}
+			},
+		})
+	}
+	m.api.RegisterPluginTool(ctx, plugin.RegisterPluginToolOption{
+		Tool: plugin.PluginToolDescriptor{
+			Name:        ToolGetStatus,
+			Description: "i18n:plugin_media_player_tool_get_status",
+			InputSchema: emptyObject,
+			OutputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"status": map[string]any{
+						"type": "string",
+						"enum": []any{ToolStatusNone, ToolStatusPlaying, ToolStatusPaused, ToolStatusStopped, ToolStatusUnknown},
+					},
+				},
+				"required": []any{"status"},
+			},
+			Annotations: plugin.PluginToolAnnotations{ReadOnly: true, Idempotent: true},
+		},
+		Handler: m.getStatusTool,
+	})
+	registerControl(ToolPlay, "i18n:plugin_media_player_tool_play", true, mediaControlPlay)
+	registerControl(ToolPause, "i18n:plugin_media_player_tool_pause", true, mediaControlPause)
+	registerControl(ToolToggle, "i18n:plugin_media_player_tool_toggle", false, mediaControlToggle)
+	registerControl(ToolNext, "i18n:plugin_media_player_tool_next", false, mediaControlNext)
+	registerControl(ToolPrevious, "i18n:plugin_media_player_tool_previous", false, mediaControlPrevious)
+
+	// Start global refresh timer
+	util.Go(ctx, "refresh media player", func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			m.refreshMediaPlayer(util.NewTraceContext())
+		}
+	})
+}
+
+func (m *MediaPlayerPlugin) getStatusTool(ctx context.Context, _ plugin.InvokePluginToolHandlerOption) plugin.InvokePluginToolHandlerResult {
+	mediaInfo, err := m.retriever.GetCurrentMedia(ctx)
+	if err != nil {
+		return plugin.InvokePluginToolHandlerResult{Error: &plugin.PluginToolError{Code: plugin.PluginToolErrorExecutionFailed, Message: err.Error()}}
+	}
+	if mediaInfo == nil {
+		return plugin.InvokePluginToolHandlerResult{Output: map[string]any{"status": ToolStatusNone}}
+	}
+	return plugin.InvokePluginToolHandlerResult{Output: map[string]any{"status": mediaInfo.State.String()}}
+}
+
+func (m *MediaPlayerPlugin) Query(ctx context.Context, query plugin.Query) plugin.QueryResponse {
+	if queryNeedsRuntimeInstallNotice(query, mediaRuntimeNeedsInstall(), mediaRuntimeInstalled()) {
+		return plugin.NewQueryResponse([]plugin.QueryResult{m.buildRuntimeInstallResult()})
+	}
+	if query.IsGlobalQuery() {
+		return plugin.NewQueryResponse(m.queryGlobalControls(ctx, query))
+	}
+
+	var results []plugin.QueryResult
+
+	// Get current media information
+	mediaInfo, err := m.retriever.GetCurrentMedia(ctx)
+	if err != nil {
+		m.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to get media info: %s", err.Error()))
+		return plugin.NewQueryResponse(results)
+	}
+
+	// No media playing
+	if mediaInfo == nil {
+		result := plugin.QueryResult{
+			Title: "i18n:plugin_mediaplayer_no_media",
+			Icon:  mediaIcon,
+		}
+		results = append(results, result)
+		return plugin.NewQueryResponse(results)
+	}
+
+	result := m.buildMediaResult(mediaInfo, false, "")
+
+	results = append(results, result)
+	response := plugin.NewQueryResponse(results)
+	fullPreviewWidthRatio := 0.0
+	response.Layout.ResultPreviewWidthRatio = &fullPreviewWidthRatio
+	return response
+}
+
+// buildRuntimeInstallResult tells the user the now-playing component still needs to be installed.
+func (m *MediaPlayerPlugin) buildRuntimeInstallResult() plugin.QueryResult {
+	return plugin.QueryResult{
+		Title:       "i18n:plugin_mediaplayer_runtime_missing_title",
+		SubTitle:    "i18n:plugin_mediaplayer_runtime_missing_subtitle",
+		Icon:        mediaIcon,
+		IdentityKey: "media-runtime-install",
+		Actions: []plugin.QueryResultAction{{
+			Name:                   "i18n:plugin_mediaplayer_runtime_install",
+			Icon:                   icons.Get(icons.ActionInstall),
+			IsDefault:              true,
+			PreventHideAfterAction: true,
+			Action: func(ctx context.Context, _ plugin.ActionContext) {
+				m.installRuntimeFromQuery(ctx)
+			},
+		}},
+	}
+}
+
+func (m *MediaPlayerPlugin) installRuntimeFromQuery(ctx context.Context) {
+	if m.api != nil {
+		m.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_mediaplayer_runtime_installing"})
+	}
+	installCtx := context.WithoutCancel(ctx)
+	util.Go(installCtx, "install media runtime", func() {
+		err := installMediaRuntime(installCtx)
+		if m.api == nil {
+			return
+		}
+		if err != nil {
+			m.api.Log(installCtx, plugin.LogLevelError, fmt.Sprintf("Failed to install media runtime: %s", err.Error()))
+			message := err.Error()
+			if errors.Is(err, plugin.ErrMediaRuntimeUnavailable) {
+				message = "i18n:plugin_mediaplayer_runtime_unavailable"
+			}
+			m.api.ShowToastMsg(installCtx, plugin.ShowToastMsgOption{Message: message})
+			return
+		}
+		m.api.ChangeQuery(installCtx, common.PlainQuery{QueryType: plugin.QueryTypeInput, QueryText: "media "})
+	})
+}
+
+// queryGlobalControls keeps MediaRemote lookups limited to inputs that look like media commands.
+func (m *MediaPlayerPlugin) queryGlobalControls(ctx context.Context, query plugin.Query) []plugin.QueryResult {
+	actions := m.matchMediaControlActions(query.RawQuery)
+	if len(actions) == 0 {
+		return nil
+	}
+
+	// Play/pause is a command, not one track. Keep it available when nothing is playing
+	// so an alias or hotkey can still toggle the active session later.
+	var results []plugin.QueryResult
+	if exactMediaToggle(query.RawQuery) {
+		results = append(results, m.buildToggleCommandResult())
+	}
+	if m.retriever == nil {
+		return results
+	}
+
+	mediaInfo, err := m.retriever.GetCurrentMedia(ctx)
+	if err != nil || mediaInfo == nil {
+		return results
+	}
+
+	// When the user types a specific command (e.g. "next"/"prev"), the result's
+	// default action should be that command instead of the state-aware play/pause.
+	preferredDefault := resolvePreferredDefaultCommand(query.RawQuery, actions)
+	result := m.buildMediaResult(mediaInfo, true, preferredDefault)
+	result.Score = mediaControlGlobalResultScore
+	return append(results, result)
+}
+
+// exactMediaToggle reports a search that means play/pause rather than a track prefix.
+func exactMediaToggle(search string) bool {
+	switch strings.ToLower(strings.TrimSpace(search)) {
+	case mediaControlToggle, "playpause", "play/pause":
+		return true
+	}
+	return false
+}
+
+// buildToggleCommandResult is the durable play/pause row. Its identity stays the same
+// when the current track changes, and restore does not require media to be active.
+func (m *MediaPlayerPlugin) buildToggleCommandResult() plugin.QueryResult {
+	action := m.buildMediaCommandAction(mediaControlToggle, "i18n:plugin_mediaplayer_toggle", true)
+	action.ContextData = common.ContextData{"command": mediaControlToggle}
+	return plugin.QueryResult{
+		Title:       "i18n:plugin_mediaplayer_toggle",
+		Icon:        mediaIcon,
+		IdentityKey: common.MediaPlayerToggleIdentity,
+		Actions:     []plugin.QueryResultAction{action},
+	}
+}
+
+// resolvePreferredDefaultCommand picks the most specific matched command so a
+// global query's default action mirrors what the user asked for (exact over prefix).
+func resolvePreferredDefaultCommand(search string, actions []mediaControlAction) string {
+	normalized := strings.ToLower(strings.TrimSpace(search))
+	for _, action := range actions {
+		if action.command == normalized {
+			return action.command
+		}
+		for _, alias := range action.aliases {
+			if alias == normalized {
+				return action.command
+			}
+		}
+	}
+	for _, action := range actions {
+		if strings.HasPrefix(action.command, normalized) {
+			return action.command
+		}
+	}
+	return ""
+}
+
+// matchMediaControlActions resolves short command prefixes without making one-letter global input noisy.
+func (m *MediaPlayerPlugin) matchMediaControlActions(search string) []mediaControlAction {
+	normalized := strings.ToLower(strings.TrimSpace(search))
+	if len(normalized) < 2 {
+		return nil
+	}
+
+	matches := make([]mediaControlAction, 0, len(mediaControlActions))
+	for _, action := range mediaControlActions {
+		if action.matches(normalized) {
+			matches = append(matches, action)
+		}
+	}
+	return matches
+}
+
+// matches treats aliases as exact terms so "play" does not also match "playpause".
+func (a mediaControlAction) matches(search string) bool {
+	if a.command == search || strings.HasPrefix(a.command, search) {
+		return true
+	}
+
+	for _, alias := range a.aliases {
+		if alias == search {
+			return true
+		}
+	}
+	return false
+}
+
+// buildMediaResult creates the shared media status result used by both the media keyword and global commands.
+func (m *MediaPlayerPlugin) buildMediaResult(mediaInfo *MediaInfo, showOpenMediaAction bool, preferredDefaultCommand string) plugin.QueryResult {
+	actions := m.buildMediaActions(mediaInfo, preferredDefaultCommand)
+	if showOpenMediaAction {
+		actions = append(actions, m.buildOpenMediaAction())
+	}
+
+	result := plugin.QueryResult{
+		Id:          uuid.NewString(),
+		Title:       mediaInfo.Title,
+		SubTitle:    m.formatSubTitle(mediaInfo),
+		Icon:        m.formatIcon(mediaInfo),
+		IdentityKey: mediaMRUIdentityKey(mediaInfo),
+		Preview:     m.formatPreview(mediaInfo),
+		Tails:       plugin.NewQueryResultTailTexts(m.formatProgress(mediaInfo)),
+		Actions:     attachMediaMRUContext(actions, mediaInfo),
+	}
+	m.trackMediaResult(result.Id, mediaTrackedResult{
+		playbackState:          mediaInfo.State,
+		artworkFingerprint:     sha256.Sum256(mediaInfo.Artwork),
+		showOpenMediaAction:    showOpenMediaAction,
+		preferredDefaultAction: preferredDefaultCommand,
+	})
+	return result
+}
+
+// trackMediaResult is nil-safe so tests and direct plugin construction still get refresh behavior.
+func (m *MediaPlayerPlugin) trackMediaResult(resultId string, tracked mediaTrackedResult) {
+	if m.trackedResults == nil {
+		m.trackedResults = util.NewHashMap[string, mediaTrackedResult]()
+	}
+	m.trackedResults.Store(resultId, tracked)
+}
+
+// buildMediaActions exposes one state-aware default action plus track navigation commands.
+// preferredDefaultCommand overrides the state-aware default when the user typed a
+// specific media command (e.g. "next"/"prev" should default to the matching action).
+func (m *MediaPlayerPlugin) buildMediaActions(mediaInfo *MediaInfo, preferredDefaultCommand string) []plugin.QueryResultAction {
+	defaultCommand := preferredDefaultCommand
+	defaultName := ""
+	switch preferredDefaultCommand {
+	case mediaControlPlay:
+		defaultName = "i18n:plugin_mediaplayer_play"
+	case mediaControlPause:
+		defaultName = "i18n:plugin_mediaplayer_pause"
+	case mediaControlNext:
+		defaultName = "i18n:plugin_mediaplayer_next"
+	case mediaControlPrevious:
+		defaultName = "i18n:plugin_mediaplayer_previous"
+	}
+
+	if defaultCommand == "" {
+		defaultCommand = mediaControlPlay
+		defaultName = "i18n:plugin_mediaplayer_play"
+		if mediaInfo.State == PlaybackStatePlaying {
+			defaultCommand = mediaControlPause
+			defaultName = "i18n:plugin_mediaplayer_pause"
+		}
+	}
+
+	return []plugin.QueryResultAction{
+		m.buildMediaCommandAction(defaultCommand, defaultName, true),
+		m.buildMediaCommandAction(mediaControlNext, "i18n:plugin_mediaplayer_next", false),
+		m.buildMediaCommandAction(mediaControlPrevious, "i18n:plugin_mediaplayer_previous", false),
+	}
+}
+
+func mediaCommandActionIcon(command string) common.WoxImage {
+	switch command {
+	case mediaControlPause:
+		return icons.Get(icons.ActionPause)
+	case mediaControlNext:
+		return icons.Get(icons.ActionSkipNext)
+	case mediaControlPrevious:
+		return icons.Get(icons.ActionSkipPrevious)
+	default:
+		return icons.Get(icons.ActionRun)
+	}
+}
+
+// buildMediaCommandAction captures the command value so every action invokes its own playback operation.
+func (m *MediaPlayerPlugin) buildMediaCommandAction(command string, name string, isDefault bool) plugin.QueryResultAction {
+	return plugin.QueryResultAction{
+		Id:                     "media-control-" + command,
+		Name:                   name,
+		Icon:                   mediaCommandActionIcon(command),
+		IsDefault:              isDefault,
+		PreventHideAfterAction: true,
+		Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+			if err := m.retriever.ControlMedia(ctx, command); err != nil && m.api != nil {
+				m.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to run media control %s: %s", command, err.Error()))
+			}
+		},
+	}
+}
+
+// buildOpenMediaAction enters the dedicated media query without changing playback state.
+func (m *MediaPlayerPlugin) buildOpenMediaAction() plugin.QueryResultAction {
+	return plugin.QueryResultAction{
+		Id:                     "media-open-player",
+		Name:                   "i18n:plugin_mediaplayer_open",
+		Icon:                   icons.Get(icons.ActionOpen),
+		Hotkey:                 util.PrimaryHotkey("enter"),
+		PreventHideAfterAction: true,
+		Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+			if m.api != nil {
+				m.api.ChangeQuery(ctx, common.PlainQuery{QueryType: plugin.QueryTypeInput, QueryText: "media "})
+			}
+		},
+	}
+}
+
+func (m *MediaPlayerPlugin) formatProgress(mediaInfo *MediaInfo) string {
+	durationStr := m.formatDuration(mediaInfo.Duration)
+	positionStr := m.formatDuration(mediaInfo.Position)
+	progressStr := fmt.Sprintf("%s / %s", positionStr, durationStr)
+
+	return progressStr
+}
+
+func (m *MediaPlayerPlugin) formatSubTitle(mediaInfo *MediaInfo) string {
+	newSubtitle := ""
+	if mediaInfo.Artist != "" && mediaInfo.Album != "" {
+		newSubtitle = fmt.Sprintf("%s - %s", mediaInfo.Artist, mediaInfo.Album)
+	} else if mediaInfo.Artist != "" {
+		newSubtitle = mediaInfo.Artist
+	} else if mediaInfo.Album != "" {
+		newSubtitle = mediaInfo.Album
+	}
+
+	return newSubtitle
+}
+
+func (m *MediaPlayerPlugin) formatIcon(mediaInfo *MediaInfo) common.WoxImage {
+	if len(mediaInfo.Artwork) == 0 {
+		if mediaInfo.State == PlaybackStatePlaying {
+			return icons.Get(icons.StatusPlaying)
+		}
+		return mediaIcon
+	}
+
+	coverDataURI, ok := formatRecordArtworkDataURI(mediaInfo.Artwork)
+	if !ok {
+		if mediaInfo.State == PlaybackStatePlaying {
+			return icons.Get(icons.StatusPlaying)
+		}
+		return mediaIcon
+	}
+	return common.NewWoxImageBase64(coverDataURI)
+}
+
+// formatRecordArtworkDataURI keeps the result icon small and gives its artwork a clean circular edge.
+func formatRecordArtworkDataURI(artwork []byte) (string, bool) {
+	decodedArtwork, err := decodeArtworkImageData(artwork)
+	if err != nil {
+		return "", false
+	}
+
+	source, _, err := image.Decode(bytes.NewReader(decodedArtwork))
+	if err != nil {
+		return "", false
+	}
+	scaled := image.NewNRGBA(image.Rect(0, 0, recordArtworkSize, recordArtworkSize))
+	xdraw.CatmullRom.Scale(scaled, scaled.Bounds(), source, centerSquare(source.Bounds()), xdraw.Src, nil)
+	applyCircleAlpha(scaled)
+
+	var output bytes.Buffer
+	if err := png.Encode(&output, scaled); err != nil {
+		return "", false
+	}
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(output.Bytes()), true
+}
+
+// decodeArtworkImageData accepts the macOS base64 payload and Windows raw image bytes.
+func decodeArtworkImageData(artwork []byte) ([]byte, error) {
+	encodedArtwork := strings.TrimSpace(string(artwork))
+	if encodedArtwork != "" {
+		if commaIndex := strings.Index(encodedArtwork, ","); commaIndex >= 0 && strings.HasPrefix(strings.ToLower(encodedArtwork[:commaIndex]), "data:") {
+			encodedArtwork = encodedArtwork[commaIndex+1:]
+		}
+
+		decodedArtwork, err := base64.StdEncoding.DecodeString(encodedArtwork)
+		if err == nil {
+			return decodedArtwork, nil
+		}
+		decodedArtwork, err = base64.RawStdEncoding.DecodeString(encodedArtwork)
+		if err == nil {
+			return decodedArtwork, nil
+		}
+	}
+
+	if len(artwork) == 0 {
+		return nil, fmt.Errorf("empty artwork")
+	}
+	return artwork, nil
+}
+
+// centerSquare returns the largest centered crop inside the source artwork.
+func centerSquare(bounds image.Rectangle) image.Rectangle {
+	width := bounds.Dx()
+	height := bounds.Dy()
+	size := min(width, height)
+	x := bounds.Min.X + (width-size)/2
+	y := bounds.Min.Y + (height-size)/2
+	return image.Rect(x, y, x+size, y+size)
+}
+
+// applyCircleAlpha masks the thumbnail because the artwork sits inside a round record label.
+func applyCircleAlpha(img *image.NRGBA) {
+	center := (float64(recordArtworkSize) - 1) / 2
+	radius := float64(recordArtworkSize) / 2
+	for y := 0; y < recordArtworkSize; y++ {
+		for x := 0; x < recordArtworkSize; x++ {
+			dx := float64(x) - center
+			dy := float64(y) - center
+			distance := math.Sqrt(dx*dx + dy*dy)
+			alphaScale := 1.0
+			if distance >= radius {
+				alphaScale = 0
+			} else if distance > radius-1 {
+				alphaScale = radius - distance
+			}
+
+			pixelOffset := img.PixOffset(x, y)
+			img.Pix[pixelOffset+3] = uint8(float64(img.Pix[pixelOffset+3]) * alphaScale)
+		}
+	}
+}
+
+func (m *MediaPlayerPlugin) formatPreview(mediaInfo *MediaInfo) plugin.WoxPreview {
+	artwork := m.getMediaIcon(mediaInfo)
+	previewData, _ := json.Marshal(mediaPreviewData{
+		Title:     mediaInfo.Title,
+		Artist:    mediaInfo.Artist,
+		Album:     mediaInfo.Album,
+		AppName:   mediaInfo.AppName,
+		Artwork:   artwork.String(),
+		Position:  mediaInfo.Position,
+		Duration:  mediaInfo.Duration,
+		IsPlaying: mediaInfo.State == PlaybackStatePlaying,
+	})
+	return plugin.WoxPreview{
+		PreviewType: plugin.WoxPreviewTypeMedia,
+		PreviewData: string(previewData),
+	}
+}
+
+func (m *MediaPlayerPlugin) formatDuration(seconds int64) string {
+	if seconds <= 0 {
+		return "0:00"
+	}
+
+	minutes := seconds / 60
+	secs := seconds % 60
+
+	if minutes >= 60 {
+		hours := minutes / 60
+		minutes = minutes % 60
+		return fmt.Sprintf("%d:%02d:%02d", hours, minutes, secs)
+	}
+
+	return fmt.Sprintf("%d:%02d", minutes, secs)
+}
+
+func (m *MediaPlayerPlugin) getMediaIcon(mediaInfo *MediaInfo) common.WoxImage {
+	if len(mediaInfo.Artwork) > 0 {
+		if artworkDataURI, ok := formatArtworkDataURI(mediaInfo.Artwork); ok {
+			return common.NewWoxImageBase64(artworkDataURI)
+		}
+	}
+
+	return mediaIcon
+}
+
+// formatArtworkDataURI validates and encodes artwork for the UI image preview contract.
+func formatArtworkDataURI(artwork []byte) (string, bool) {
+	decodedArtwork, err := decodeArtworkImageData(artwork)
+	if err != nil {
+		return "", false
+	}
+
+	_, format, err := image.DecodeConfig(bytes.NewReader(decodedArtwork))
+	if err != nil {
+		return "", false
+	}
+	if format == "jpg" {
+		format = "jpeg"
+	}
+	if format == "" {
+		format = "png"
+	}
+
+	return fmt.Sprintf("data:image/%s;base64,%s", format, base64.StdEncoding.EncodeToString(decodedArtwork)), true
+}
+
+func (m *MediaPlayerPlugin) refreshMediaPlayer(ctx context.Context) {
+	if m.trackedResults == nil {
+		return
+	}
+
+	// Skip refresh unless the primary launcher is visible.
+	if !m.api.IsVisible(context.Background()) {
+		return
+	}
+
+	var toRemove []string
+	trackedUpdates := make(map[string]mediaTrackedResult)
+
+	m.trackedResults.Range(func(resultId string, tracked mediaTrackedResult) bool {
+		// Try to get the result, if it returns nil, the result is no longer visible
+		updatableResult := m.api.GetUpdatableResult(ctx, resultId)
+		if updatableResult == nil {
+			// Mark for removal from tracking queue
+			toRemove = append(toRemove, resultId)
+			return true
+		}
+
+		// Get updated media information
+		mediaInfo, err := m.retriever.GetCurrentMedia(ctx)
+		if err != nil || mediaInfo == nil {
+			// Keep current state if we can't get updated info
+			return true
+		}
+
+		// Update all fields
+		title := mediaInfo.Title
+		subTitle := m.formatSubTitle(mediaInfo)
+		preview := m.formatPreview(mediaInfo)
+		tails := plugin.NewQueryResultTailTexts(m.formatProgress(mediaInfo))
+		actions := m.buildMediaActions(mediaInfo, tracked.preferredDefaultAction)
+		if tracked.showOpenMediaAction {
+			actions = append(actions, m.buildOpenMediaAction())
+		}
+
+		updatableResult.Title = &title
+		updatableResult.SubTitle = &subTitle
+		nextArtworkFingerprint := sha256.Sum256(mediaInfo.Artwork)
+		var nextTracked *mediaTrackedResult
+		if tracked.playbackState != mediaInfo.State || tracked.artworkFingerprint != nextArtworkFingerprint {
+			icon := m.formatIcon(mediaInfo)
+			updatableResult.Icon = &icon
+			updatedTracked := mediaTrackedResult{
+				playbackState:          mediaInfo.State,
+				artworkFingerprint:     nextArtworkFingerprint,
+				showOpenMediaAction:    tracked.showOpenMediaAction,
+				preferredDefaultAction: tracked.preferredDefaultAction,
+			}
+			nextTracked = &updatedTracked
+		}
+		updatableResult.Preview = &preview
+		updatableResult.Tails = &tails
+		updatableResult.Actions = &actions
+
+		// Push update to UI
+		// If UpdateResult returns false, the result is no longer visible in UI
+		if !m.api.UpdateResult(ctx, *updatableResult) {
+			toRemove = append(toRemove, resultId)
+		} else if nextTracked != nil {
+			trackedUpdates[resultId] = *nextTracked
+		}
+		return true
+	})
+
+	// Range holds a read lock, so changed tracking state must be written back after iteration.
+	for resultId, tracked := range trackedUpdates {
+		m.trackedResults.Store(resultId, tracked)
+	}
+
+	// Clean up results that are no longer visible
+	for _, resultId := range toRemove {
+		m.trackedResults.Delete(resultId)
+	}
+}
+
+func mediaMRUIdentityKey(mediaInfo *MediaInfo) string {
+	return strings.Join([]string{mediaInfo.AppName, mediaInfo.Title, mediaInfo.Artist}, "\x1f")
+}
+
+func attachMediaMRUContext(actions []plugin.QueryResultAction, mediaInfo *MediaInfo) []plugin.QueryResultAction {
+	data := common.ContextData{
+		"title":  mediaInfo.Title,
+		"artist": mediaInfo.Artist,
+		"app":    mediaInfo.AppName,
+	}
+	for i := range actions {
+		if actions[i].ContextData == nil {
+			actions[i].ContextData = data
+			continue
+		}
+		actions[i].ContextData["title"] = mediaInfo.Title
+		actions[i].ContextData["artist"] = mediaInfo.Artist
+		actions[i].ContextData["app"] = mediaInfo.AppName
+	}
+	return actions
+}
+
+// handleMRURestore rebuilds the now-playing result only when the same track is still active.
+func (m *MediaPlayerPlugin) handleMRURestore(ctx context.Context, mruData plugin.MRUData) (*plugin.QueryResult, error) {
+	if strings.TrimSpace(mruData.ContextData["command"]) == mediaControlToggle {
+		result := m.buildToggleCommandResult()
+		return &result, nil
+	}
+	title := strings.TrimSpace(mruData.ContextData["title"])
+	if title == "" {
+		return nil, fmt.Errorf("empty media title in context data")
+	}
+	mediaInfo, err := m.retriever.GetCurrentMedia(ctx)
+	if err != nil || mediaInfo == nil {
+		return nil, fmt.Errorf("no active media")
+	}
+	if mediaInfo.Title != title {
+		return nil, fmt.Errorf("media is no longer playing: %s", title)
+	}
+	if artist := strings.TrimSpace(mruData.ContextData["artist"]); artist != "" && mediaInfo.Artist != artist {
+		return nil, fmt.Errorf("media is no longer playing: %s", title)
+	}
+	result := m.buildMediaResult(mediaInfo, false, "")
+	return &result, nil
+}

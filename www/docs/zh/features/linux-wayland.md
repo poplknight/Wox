@@ -1,0 +1,36 @@
+---
+title: "面向 Linux Wayland 的跨平台启动器"
+description: "Wox 是原生 Linux 启动器，支持 Wayland layer-shell。快捷键和 portal 限制见文档。"
+---
+
+# 面向 Linux Wayland 的跨平台启动器
+
+<ReleaseStamp />
+
+Wox 在 Linux 上是原生启动器，不是 Electron。在支持 layer-shell 的 Wayland 桌面上，它以浮层显示，普通全局快捷键使用对应桌面的后端。
+
+![Linux 上带合成器背景模糊的 Wox](/images/linux-wayland.png)
+
+## 是什么
+
+Wox 的 Linux 正式版和 Windows、macOS 一起发。在支持 layer-shell 的桌面上，主窗口使用 Wox 专属的 namespace（`io.github.WoxLauncher.Wox`），位于 top 层，可以盖在普通窗口上，但不是普通的 XDG 顶层窗口。
+
+像 `Ctrl+Space` 这样的常规组合键使用当前桌面的快捷键后端：
+
+- Hyprland：合成器原生绑定。
+- GNOME：Global Shortcuts portal，必要时回退到桌面设置。
+- COSMIC：桌面原生快捷键配置。
+- 其他 Wayland 桌面：在可用时使用 Global Shortcuts portal。
+
+双修饰键和 CapsLock 组合键需要额外输入权限，因为 Wayland 不能像 X11 那样让 Wox 拦截原始按键。
+
+## 限制从哪来
+
+动画、全局快捷键和剪贴板 portal 由合成器管理。Wox 不会用 root 守护进程绕过这些接口。
+
+在 Hyprland 下，Wox 会自动添加 layer 规则来禁用自身的窗口动画，并在合成器配置重载后重新应用，无需手动配置动画规则。此自动处理仅适用于 Hyprland；其他桌面的动画由各自的合成器设置管理。
+
+## 怎么设置
+
+- [Wayland 下的双修饰键和 CapsLock 组合键](/zh/guide/faq.html#wayland-double-modifier-hotkeys)
+- [安装](/zh/guide/installation)

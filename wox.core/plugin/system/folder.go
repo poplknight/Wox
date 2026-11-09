@@ -1,0 +1,1051 @@
+package system
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"wox/common"
+	"wox/common/icons"
+	"wox/i18n"
+	"wox/plugin"
+	"wox/plugin/system/migrateapply"
+	shellplugin "wox/plugin/system/shell"
+	"wox/setting/definition"
+	"wox/setting/validator"
+	"wox/util"
+	"wox/util/pathquery"
+	"wox/util/shell"
+)
+
+const (
+	PluginID                = common.FolderPluginID
+	ToolBrowsePath          = "browse_path"
+	folderResultScore int64 = 1000
+
+	folderOpenActionID                   = "open_folder"
+	folderGoToParentActionID             = "go_to_parent_folder"
+	folderEnterActionID                  = "enter_folder"
+	folderBrowseContainingFolderActionID = "browse_containing_folder"
+	folderOpenContainingFolderActionID   = "open_containing_folder"
+	folderCopyPathActionID               = "copy_path"
+	folderCopyNameActionID               = "copy_name"
+	folderExecuteCommandHereActionID     = "execute_command_here"
+	folderToggleHiddenFilesActionID      = "toggle_hidden_files"
+
+	folderFavoritesSettingKey     = "favorites"
+	folderFavoriteFormNameKey     = "name"
+	folderFavoriteFormPathKey     = "path"
+	folderFavoriteContextNameKey  = "favorite_name"
+	folderFavoriteContextPathKey  = "favorite_path"
+	folderFavoriteContextIndexKey = "favorite_index"
+	folderMRUPathKey              = "path"
+)
+
+func init() {
+	plugin.AllSystemPlugin = append(plugin.AllSystemPlugin, &FolderPlugin{})
+	migrateapply.ImportFavorites = importMigratedFavorites
+}
+
+type FolderPlugin struct {
+	api             plugin.API
+	showHiddenFiles atomic.Bool
+}
+
+type folderFavorite struct {
+	Name string `json:"Name"`
+	Path string `json:"Path"`
+}
+
+type folderFavoriteMatch struct {
+	Name  string
+	Path  string
+	Index int
+}
+
+// GetMetadata returns the system plugin metadata for direct folder browsing.
+func (p *FolderPlugin) GetMetadata() plugin.Metadata {
+	return plugin.Metadata{
+		Id:            PluginID,
+		Name:          "i18n:plugin_folder_plugin_name",
+		Author:        "Wox Launcher",
+		Website:       "https://github.com/Wox-launcher/Wox",
+		Version:       "1.0.0",
+		MinWoxVersion: "2.0.0",
+		Runtime:       "Go",
+		Description:   "i18n:plugin_folder_plugin_description",
+		Icon:          icons.Get(icons.PluginFolder).String(),
+		Entry:         "",
+		TriggerKeywords: []string{
+			"*",
+			"cd",
+		},
+		SupportedOS: []string{
+			"Windows",
+			"Macos",
+			"Linux",
+		},
+		Features: []plugin.MetadataFeature{
+			{
+				Name: plugin.MetadataFeatureMRU,
+				Params: map[string]any{
+					"HashBy": "identityKey",
+				},
+			},
+		},
+		SettingDefinitions: definition.PluginSettingDefinitions{
+			{
+				Type:               definition.PluginSettingDefinitionTypeTable,
+				IsPlatformSpecific: true,
+				Value: &definition.PluginSettingValueTable{
+					Key:     folderFavoritesSettingKey,
+					Title:   "i18n:plugin_folder_favorites",
+					Tooltip: "i18n:plugin_folder_favorites_tooltip",
+					Columns: []definition.PluginSettingValueTableColumn{
+						{
+							Key:   "Name",
+							Label: "i18n:plugin_folder_favorite_name",
+							Type:  definition.PluginSettingValueTableColumnTypeText,
+							Width: 120,
+							Validators: []validator.PluginSettingValidator{
+								{
+									Type:  validator.PluginSettingValidatorTypeNotEmpty,
+									Value: &validator.PluginSettingValidatorNotEmpty{},
+								},
+								{
+									Type:  validator.PluginSettingValidatorTypeUnique,
+									Value: &validator.PluginSettingValidatorUnique{},
+								},
+							},
+						},
+						{
+							Key:   "Path",
+							Label: "i18n:plugin_folder_favorite_path",
+							Type:  definition.PluginSettingValueTableColumnTypeDirPath,
+							Width: 220,
+							Validators: []validator.PluginSettingValidator{
+								{
+									Type:  validator.PluginSettingValidatorTypeNotEmpty,
+									Value: &validator.PluginSettingValidatorNotEmpty{},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func (p *FolderPlugin) Init(ctx context.Context, initParams plugin.InitParams) {
+	p.api = initParams.API
+	p.api.RegisterPluginTool(ctx, plugin.RegisterPluginToolOption{
+		Tool: plugin.PluginToolDescriptor{
+			Name:        ToolBrowsePath,
+			Description: "i18n:plugin_folder_tool_browse_path",
+			InputSchema: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"path": map[string]any{"type": "string"}},
+				"required":   []any{"path"},
+			},
+			OutputSchema: map[string]any{"type": "object"},
+			Annotations:  plugin.PluginToolAnnotations{RequiresUI: true},
+		},
+		Handler: p.browsePathTool,
+	})
+	p.api.OnMRURestore(ctx, p.handleMRURestore)
+}
+
+// browsePathTool opens Folder browsing at a path provided by another plugin.
+func (p *FolderPlugin) browsePathTool(ctx context.Context, option plugin.InvokePluginToolHandlerOption) plugin.InvokePluginToolHandlerResult {
+	path, _ := option.Arguments["path"].(string)
+	browsePath, err := resolveFolderBrowsePath(path)
+	if err != nil {
+		return plugin.InvokePluginToolHandlerResult{Error: &plugin.PluginToolError{Code: plugin.PluginToolErrorExecutionFailed, Message: err.Error()}}
+	}
+	if p.api == nil {
+		return plugin.InvokePluginToolHandlerResult{Error: &plugin.PluginToolError{Code: plugin.PluginToolErrorPluginUnavailable, Message: "folder plugin is not initialized"}}
+	}
+
+	p.api.ChangeQuery(ctx, plugin.FolderBrowseQuery(browsePath))
+	return plugin.InvokePluginToolHandlerResult{Output: map[string]any{}}
+}
+
+// BrowsePathAction hands a filesystem location to Folder without exposing extra query syntax.
+func BrowsePathAction(api plugin.API, path string) plugin.QueryResultAction {
+	return plugin.QueryResultAction{
+		Name:                   "i18n:plugin_folder_browse_here",
+		Icon:                   icons.Get(icons.ActionOpen),
+		PreventHideAfterAction: true,
+		Action: func(ctx context.Context, _ plugin.ActionContext) {
+			plugin.InvokePluginToolAndNotify(ctx, api, plugin.InvokePluginToolOption{
+				PluginId:  PluginID,
+				Name:      ToolBrowsePath,
+				Arguments: map[string]any{"path": path},
+			})
+		},
+	}
+}
+
+// resolveFolderBrowsePath accepts a file or folder and returns the directory Folder should list.
+func resolveFolderBrowsePath(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", errors.New("path is required")
+	}
+
+	expandedPath, expandErr := pathquery.Expand(path)
+	if expandErr != nil {
+		return "", expandErr
+	}
+
+	cleaned, cleanErr := filepath.Abs(expandedPath)
+	if cleanErr != nil {
+		cleaned = filepath.Clean(expandedPath)
+	}
+	info, statErr := os.Stat(cleaned)
+	if statErr != nil {
+		return "", fmt.Errorf("invalid path: %s", path)
+	}
+	if !info.IsDir() {
+		cleaned = filepath.Dir(cleaned)
+	}
+	return cleaned, nil
+}
+
+// Query handles a direct path and the same path after the Folder trigger keyword.
+// "cd /tmp/" is plugin context, so its file preview survives. A bare path stays global.
+func (p *FolderPlugin) Query(ctx context.Context, query plugin.Query) plugin.QueryResponse {
+	if query.Type != plugin.QueryTypeInput {
+		return plugin.QueryResponse{}
+	}
+
+	folderPath, shouldListChildren, ok := pathquery.Parse(query.Search)
+	if !ok {
+		return plugin.NewQueryResponse(p.queryFavorites(ctx, query.Search, query.TriggerKeyword))
+	}
+
+	info, statErr := os.Stat(folderPath)
+	if statErr != nil || !info.IsDir() {
+		parentPath := filepath.Dir(folderPath)
+		namePrefix := filepath.Base(folderPath)
+		if parentInfo, parentStatErr := os.Stat(parentPath); parentStatErr == nil && parentInfo.IsDir() {
+			if results := p.queryChildren(ctx, parentPath, namePrefix, query.TriggerKeyword); len(results) > 0 {
+				return plugin.NewQueryResponse(results)
+			}
+		}
+		return plugin.NewQueryResponse(p.queryFavorites(ctx, query.Search, query.TriggerKeyword))
+	}
+
+	if shouldListChildren {
+		return plugin.NewQueryResponse(p.queryChildren(ctx, folderPath, "", query.TriggerKeyword))
+	}
+
+	favoriteMatch := p.findFavoriteByPath(ctx, folderPath, p.loadFavorites(ctx))
+	result := p.buildPathResult(folderPath, filepath.Base(folderPath), true, folderResultScore, favoriteMatch)
+	result.TabQuery = folderDirectoryTabQuery(query.TriggerKeyword, folderPath)
+	return plugin.NewQueryResponse([]plugin.QueryResult{result})
+}
+
+// folderDirectoryTabQuery is the query Tab installs to list a directory.
+// Global searches leave it blank so Tab keeps ordinary completion.
+func folderDirectoryTabQuery(triggerKeyword string, path string) string {
+	keyword := strings.TrimSpace(triggerKeyword)
+	if keyword == "" || keyword == "*" || strings.TrimSpace(path) == "" {
+		return ""
+	}
+	return keyword + " " + pathquery.EnsureTrailingSeparator(path)
+}
+
+// queryFavorites searches saved file and folder favorites by their name.
+func (p *FolderPlugin) queryFavorites(ctx context.Context, search string, triggerKeyword string) []plugin.QueryResult {
+	search = strings.TrimSpace(search)
+	if search == "" {
+		return nil
+	}
+
+	favorites := p.loadFavorites(ctx)
+	if len(favorites) == 0 {
+		return nil
+	}
+
+	var results []plugin.QueryResult
+	searchLower := strings.ToLower(search)
+	for favoriteIndex, favorite := range favorites {
+		name := strings.TrimSpace(favorite.Name)
+		path := strings.TrimSpace(favorite.Path)
+		if name == "" || path == "" || !strings.HasPrefix(strings.ToLower(name), searchLower) {
+			continue
+		}
+
+		resolvedPath, isDir, ok := p.resolveFavoritePath(ctx, path, false)
+		if !ok {
+			continue
+		}
+
+		result := p.buildFavoriteResult(name, resolvedPath, isDir, favoriteIndex, int64(len(favorites)-favoriteIndex))
+		if isDir {
+			result.TabQuery = folderDirectoryTabQuery(triggerKeyword, resolvedPath)
+		}
+		results = append(results, result)
+	}
+
+	return results
+}
+
+// queryChildren lists one folder level and optionally filters entries for path completion.
+func (p *FolderPlugin) queryChildren(ctx context.Context, folderPath string, namePrefix string, triggerKeyword string) []plugin.QueryResult {
+	entries, readErr := os.ReadDir(folderPath)
+	if readErr != nil {
+		if p.api != nil {
+			p.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to read folder: path=%q err=%s", folderPath, readErr.Error()))
+		}
+		if parent, ok := p.parentDirectoryResult(ctx, folderPath, namePrefix, triggerKeyword, p.loadFavorites(ctx)); ok {
+			return []plugin.QueryResult{parent}
+		}
+		return []plugin.QueryResult{}
+	}
+
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].IsDir() != entries[j].IsDir() {
+			return entries[i].IsDir()
+		}
+
+		leftName := strings.ToLower(entries[i].Name())
+		rightName := strings.ToLower(entries[j].Name())
+		if leftName == rightName {
+			return entries[i].Name() < entries[j].Name()
+		}
+		return leftName < rightName
+	})
+
+	results := make([]plugin.QueryResult, 0, len(entries)+1)
+	showHiddenFiles := p.showHiddenFiles.Load()
+	favorites := p.loadFavorites(ctx)
+	if parent, ok := p.parentDirectoryResult(ctx, folderPath, namePrefix, triggerKeyword, favorites); ok {
+		results = append(results, parent)
+	}
+	for _, entry := range entries {
+		if !showHiddenFiles && isHiddenFolderEntry(entry) {
+			continue
+		}
+		if namePrefix != "" && !plugin.IsStringMatchNoPinYin(ctx, entry.Name(), namePrefix) {
+			continue
+		}
+
+		fullPath := filepath.Join(folderPath, entry.Name())
+		favoriteMatch := p.findFavoriteByPath(ctx, fullPath, favorites)
+		score := int64(0)
+		if namePrefix != "" {
+			score = folderResultScore
+		}
+		result := p.buildPathResult(fullPath, entry.Name(), entry.IsDir(), score, favoriteMatch)
+		if entry.IsDir() {
+			result.TabQuery = folderDirectoryTabQuery(triggerKeyword, fullPath)
+		}
+		results = append(results, result)
+	}
+	return results
+}
+
+// parentDirectoryResult is the ".." row for a full directory listing.
+// Name completion omits it so a typed prefix still resolves to real children.
+func (p *FolderPlugin) parentDirectoryResult(ctx context.Context, folderPath string, namePrefix string, triggerKeyword string, favorites []folderFavorite) (plugin.QueryResult, bool) {
+	if namePrefix != "" {
+		return plugin.QueryResult{}, false
+	}
+	parentPath, ok := folderParentPath(folderPath)
+	if !ok {
+		return plugin.QueryResult{}, false
+	}
+	result := p.buildParentDirectoryResult(parentPath, p.findFavoriteByPath(ctx, parentPath, favorites))
+	result.TabQuery = folderDirectoryTabQuery(triggerKeyword, parentPath)
+	return result, true
+}
+
+// folderParentPath returns the directory above folderPath.
+// Volume roots and filesystem roots have no parent row.
+func folderParentPath(folderPath string) (string, bool) {
+	cleaned := filepath.Clean(folderPath)
+	parent := filepath.Dir(cleaned)
+	if parent == "" || parent == "." || parent == cleaned {
+		return "", false
+	}
+	return parent, true
+}
+
+// folderPathPreview keeps the file preview available without opening the panel on selection.
+// Folder browsing changes the selected path often, so the preview stays collapsed until the user opens it.
+func folderPathPreview(path string) plugin.WoxPreview {
+	return plugin.WoxPreview{
+		PreviewType:   plugin.WoxPreviewTypeFile,
+		PreviewData:   path,
+		DefaultHidden: true,
+	}
+}
+
+// buildParentDirectoryResult is the first browsing row, like ".." in file navigation.
+// Enter returns to the parent listing inside Wox.
+func (p *FolderPlugin) buildParentDirectoryResult(parentPath string, favoriteMatch *folderFavoriteMatch) plugin.QueryResult {
+	return plugin.QueryResult{
+		Title:          "..",
+		SubTitle:       parentPath,
+		Icon:           getFolderPluginPathIcon(parentPath, true),
+		Score:          folderResultScore,
+		RankAboveUsage: true,
+		IdentityKey:    parentPath,
+		Preview:        folderPathPreview(parentPath),
+		Tails:          buildFolderFavoriteTails(favoriteMatch),
+		Actions:        attachFolderMRUContext(p.buildParentDirectoryActions(parentPath, favoriteMatch), parentPath),
+		DragData: &plugin.QueryResultDragData{
+			Type:  plugin.QueryResultDragDataTypeFiles,
+			Files: []string{parentPath},
+		},
+	}
+}
+
+// buildParentDirectoryActions makes Enter browse upward and keeps Open for the file manager.
+func (p *FolderPlugin) buildParentDirectoryActions(parentPath string, favoriteMatch *folderFavoriteMatch) []plugin.QueryResultAction {
+	actions := []plugin.QueryResultAction{
+		{
+			Id:                     folderGoToParentActionID,
+			Name:                   "i18n:plugin_folder_go_to_parent",
+			Icon:                   icons.Get(icons.ActionMoveUp),
+			IsDefault:              true,
+			PreventHideAfterAction: true,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				if p.api != nil {
+					p.api.ChangeQuery(ctx, plugin.FolderBrowseQuery(parentPath))
+				}
+			},
+		},
+		{
+			Id:   folderOpenActionID,
+			Name: "i18n:plugin_folder_open",
+			Icon: icons.Get(icons.ActionOpen),
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				_ = shell.Open(parentPath)
+			},
+		},
+		p.buildCopyPathAction(parentPath),
+		p.buildCopyNameAction("", parentPath),
+		p.buildExecuteCommandAtLocationAction(parentPath, true),
+	}
+	if favoriteMatch != nil {
+		actions = append(actions, p.buildEditFavoriteAction(favoriteMatch.Name, favoriteMatch.Path, favoriteMatch.Index), p.buildDeleteFavoriteAction(favoriteMatch.Name, favoriteMatch.Path, favoriteMatch.Index))
+	} else {
+		actions = append(actions, p.buildAddFavoriteAction(filepath.Base(parentPath), parentPath))
+	}
+	actions = append(actions, p.buildToggleHiddenFilesAction())
+	return actions
+}
+
+// buildPathResult creates a draggable file or folder result with preview support.
+func (p *FolderPlugin) buildPathResult(path string, title string, isDir bool, score int64, favoriteMatch *folderFavoriteMatch) plugin.QueryResult {
+	if title == "" || title == "." || title == string(os.PathSeparator) {
+		title = path
+	}
+
+	return plugin.QueryResult{
+		Title:       title,
+		SubTitle:    path,
+		Icon:        getFolderPluginPathIcon(path, isDir),
+		Score:       score,
+		IdentityKey: path,
+		Preview:     folderPathPreview(path),
+		Tails:       buildFolderFavoriteTails(favoriteMatch),
+		Actions:     attachFolderMRUContext(p.buildPathActions(path, isDir, favoriteMatch), path),
+		DragData: &plugin.QueryResultDragData{
+			Type:  plugin.QueryResultDragDataTypeFiles,
+			Files: []string{path},
+		},
+	}
+}
+
+// buildFavoriteResult creates a saved file or folder result. Enter opens it; Shift+Enter browses its directory.
+func (p *FolderPlugin) buildFavoriteResult(name string, path string, isDir bool, favoriteIndex int, scoreBoost int64) plugin.QueryResult {
+	return plugin.QueryResult{
+		Title:       name,
+		SubTitle:    path,
+		Icon:        getFolderPluginPathIcon(path, isDir),
+		Score:       folderResultScore + scoreBoost,
+		IdentityKey: path,
+		Group:       "i18n:plugin_folder_favorites",
+		Preview:     folderPathPreview(path),
+		Actions:     attachFolderMRUContext(p.buildFavoriteActions(name, path, isDir, favoriteIndex), path),
+		DragData: &plugin.QueryResultDragData{
+			Type:  plugin.QueryResultDragDataTypeFiles,
+			Files: []string{path},
+		},
+	}
+}
+
+// buildPathActions keeps Enter opening the path while Shift+Enter browses its directory in Wox.
+func (p *FolderPlugin) buildPathActions(path string, isDir bool, favoriteMatch *folderFavoriteMatch) []plugin.QueryResultAction {
+	actions := []plugin.QueryResultAction{
+		{
+			Id:        folderOpenActionID,
+			Name:      "i18n:plugin_folder_open",
+			Icon:      icons.Get(icons.ActionOpen),
+			IsDefault: true,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				_ = shell.Open(path)
+			},
+		},
+		p.buildBrowseAction(path, isDir),
+	}
+
+	if isDir {
+		actions = append(actions, p.buildCopyPathAction(path), p.buildCopyNameAction("", path))
+		actions = append(actions, p.buildExecuteCommandAtLocationAction(path, true))
+		if favoriteMatch != nil {
+			actions = append(actions, p.buildEditFavoriteAction(favoriteMatch.Name, favoriteMatch.Path, favoriteMatch.Index), p.buildDeleteFavoriteAction(favoriteMatch.Name, favoriteMatch.Path, favoriteMatch.Index))
+		} else {
+			actions = append(actions, p.buildAddFavoriteAction(filepath.Base(path), path))
+		}
+	} else {
+		actions = append(actions, plugin.QueryResultAction{
+			Id:   folderOpenContainingFolderActionID,
+			Name: "i18n:plugin_folder_open_containing_folder",
+			Icon: icons.Get(icons.ActionOpenContainingFolder),
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				if err := shell.OpenFileInFolder(path); err != nil && p.api != nil {
+					p.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("failed to open containing folder: path=%s err=%s", path, err.Error()))
+				}
+			},
+		})
+		actions = append(actions, p.buildCopyPathAction(path), p.buildCopyNameAction("", path))
+		actions = append(actions, p.buildExecuteCommandAtLocationAction(path, false))
+	}
+
+	actions = append(actions, p.buildToggleHiddenFilesAction())
+	return actions
+}
+
+// buildFavoriteActions adds setting maintenance actions to a saved file or folder.
+func (p *FolderPlugin) buildFavoriteActions(name string, path string, isDir bool, favoriteIndex int) []plugin.QueryResultAction {
+	actions := []plugin.QueryResultAction{
+		{
+			Id:        folderOpenActionID,
+			Name:      "i18n:plugin_folder_open",
+			Icon:      icons.Get(icons.ActionOpen),
+			IsDefault: true,
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				_ = shell.Open(path)
+			},
+		},
+		p.buildBrowseAction(path, isDir),
+	}
+	if !isDir {
+		actions = append(actions, plugin.QueryResultAction{
+			Id:   folderOpenContainingFolderActionID,
+			Name: "i18n:plugin_folder_open_containing_folder",
+			Icon: icons.Get(icons.ActionOpenContainingFolder),
+			Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+				if err := shell.OpenFileInFolder(path); err != nil && p.api != nil {
+					p.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("failed to open containing folder: path=%s err=%s", path, err.Error()))
+				}
+			},
+		})
+	}
+	actions = append(actions,
+		p.buildCopyPathAction(path),
+		p.buildCopyNameAction(name, path),
+		p.buildExecuteCommandAtLocationAction(path, isDir),
+		p.buildEditFavoriteAction(name, path, favoriteIndex),
+		p.buildDeleteFavoriteAction(name, path, favoriteIndex),
+	)
+
+	actions = append(actions, p.buildToggleHiddenFilesAction())
+	return actions
+}
+
+// buildBrowseAction shares directory navigation across path results and saved favorites.
+func (p *FolderPlugin) buildBrowseAction(path string, isDir bool) plugin.QueryResultAction {
+	id := folderEnterActionID
+	name := "i18n:plugin_folder_enter"
+	if !isDir {
+		path = filepath.Dir(path)
+		id = folderBrowseContainingFolderActionID
+		name = "i18n:plugin_folder_browse_containing_folder"
+	}
+	return plugin.QueryResultAction{
+		Id:                     id,
+		Name:                   name,
+		Icon:                   icons.Get(icons.ActionOpen),
+		Hotkey:                 "shift+enter",
+		PreventHideAfterAction: true,
+		Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+			if p.api != nil {
+				p.api.ChangeQuery(ctx, plugin.FolderBrowseQuery(path))
+			}
+		},
+	}
+}
+
+// buildCopyPathAction copies the result path for files, folders, and favorites.
+func (p *FolderPlugin) buildCopyPathAction(path string) plugin.QueryResultAction {
+	return plugin.QueryResultAction{
+		Id:   folderCopyPathActionID,
+		Name: "i18n:plugin_folder_copy_path",
+		Icon: icons.Get(icons.ActionCopy),
+		Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+			if p.api != nil {
+				p.api.Copy(ctx, plugin.CopyParams{Type: plugin.CopyTypePlainText, Text: path})
+			}
+		},
+	}
+}
+
+// buildCopyNameAction copies the visible name, falling back to the leaf path for volume roots.
+func (p *FolderPlugin) buildCopyNameAction(name string, path string) plugin.QueryResultAction {
+	copiedName := folderCopyName(name, path)
+	return plugin.QueryResultAction{
+		Id:   folderCopyNameActionID,
+		Name: "i18n:plugin_folder_copy_name",
+		Icon: icons.Get(icons.ActionCopy),
+		Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+			if p.api != nil {
+				p.api.Copy(ctx, plugin.CopyParams{Type: plugin.CopyTypePlainText, Text: copiedName})
+			}
+		},
+	}
+}
+
+// folderCopyName prefers the result title and keeps volume roots readable.
+func folderCopyName(name string, path string) string {
+	if trimmed := strings.TrimSpace(name); trimmed != "" && trimmed != "." && trimmed != string(os.PathSeparator) {
+		return trimmed
+	}
+	clean := filepath.Clean(strings.TrimSpace(path))
+	base := filepath.Base(clean)
+	if base == "" || base == "." || base == string(os.PathSeparator) {
+		return clean
+	}
+	return base
+}
+
+// buildExecuteCommandAtLocationAction opens Shell with the selected location as its working directory.
+func (p *FolderPlugin) buildExecuteCommandAtLocationAction(path string, isDir bool) plugin.QueryResultAction {
+	action := shellplugin.OpenAtDirectoryAction(p.api, path, isDir)
+	action.Id = folderExecuteCommandHereActionID
+	return action
+}
+
+// buildToggleHiddenFilesAction flips hidden-child visibility and refreshes the current folder query.
+func (p *FolderPlugin) buildToggleHiddenFilesAction() plugin.QueryResultAction {
+	showHiddenFiles := p.showHiddenFiles.Load()
+	actionName := "i18n:plugin_folder_show_hidden_files"
+	if showHiddenFiles {
+		actionName = "i18n:plugin_folder_hide_hidden_files"
+	}
+
+	return plugin.QueryResultAction{
+		Id:                     folderToggleHiddenFilesActionID,
+		Name:                   actionName,
+		Icon:                   icons.Get(icons.ActionHide),
+		PreventHideAfterAction: true,
+		Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+			p.showHiddenFiles.Store(!showHiddenFiles)
+			if p.api != nil {
+				p.api.RefreshQuery(ctx, plugin.RefreshQueryParam{PreserveSelectedIndex: true})
+			}
+		},
+	}
+}
+
+// buildAddFavoriteAction persists the selected folder as a named favorite.
+func (p *FolderPlugin) buildAddFavoriteAction(name string, path string) plugin.QueryResultAction {
+	return plugin.QueryResultAction{
+		Id:                     "add_folder_favorite",
+		Name:                   "i18n:plugin_folder_add_as_favorite",
+		Icon:                   icons.Get(icons.ActionStar),
+		Type:                   plugin.QueryResultActionTypeForm,
+		PreventHideAfterAction: true,
+		ContextData:            p.buildFavoriteActionContextData(name, path, -1),
+		Form:                   buildFolderFavoriteForm(name, path),
+		OnSubmit: func(ctx context.Context, actionContext plugin.FormActionContext) {
+			actionName, actionPath, _ := folderFavoriteDataFromActionContext(actionContext.ActionContext, name, path, -1)
+			favorite := folderFavorite{
+				Name: strings.TrimSpace(actionContext.Values[folderFavoriteFormNameKey]),
+				Path: strings.TrimSpace(actionContext.Values[folderFavoriteFormPathKey]),
+			}
+			if favorite.Name == "" {
+				favorite.Name = actionName
+			}
+			if favorite.Path == "" {
+				favorite.Path = actionPath
+			}
+			if resolvedPath, _, ok := p.resolveFavoritePath(ctx, favorite.Path, true); ok {
+				favorite.Path = resolvedPath
+			} else {
+				return
+			}
+
+			if err := p.addFavorite(ctx, favorite); err != nil {
+				p.notifyFavoriteSettingError(ctx, "plugin_folder_favorite_add_failed", err)
+				return
+			}
+			p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: i18n.GetI18nManager().TranslateWox(ctx, "plugin_folder_favorite_added")})
+			p.api.RefreshQuery(ctx, plugin.RefreshQueryParam{PreserveSelectedIndex: true})
+		},
+	}
+}
+
+// buildEditFavoriteAction updates an existing favorite from the result action panel.
+func (p *FolderPlugin) buildEditFavoriteAction(name string, path string, favoriteIndex int) plugin.QueryResultAction {
+	return plugin.QueryResultAction{
+		Id:                     "edit_folder_favorite",
+		Name:                   "i18n:plugin_folder_edit_favorite",
+		Icon:                   icons.Get(icons.ActionEdit),
+		Type:                   plugin.QueryResultActionTypeForm,
+		PreventHideAfterAction: true,
+		ContextData:            p.buildFavoriteActionContextData(name, path, favoriteIndex),
+		Form:                   buildFolderFavoriteForm(name, path),
+		OnSubmit: func(ctx context.Context, actionContext plugin.FormActionContext) {
+			_, _, currentIndex := folderFavoriteDataFromActionContext(actionContext.ActionContext, name, path, favoriteIndex)
+			favorite := folderFavorite{
+				Name: strings.TrimSpace(actionContext.Values[folderFavoriteFormNameKey]),
+				Path: strings.TrimSpace(actionContext.Values[folderFavoriteFormPathKey]),
+			}
+			if resolvedPath, _, ok := p.resolveFavoritePath(ctx, favorite.Path, true); ok {
+				favorite.Path = resolvedPath
+			} else {
+				return
+			}
+
+			if err := p.updateFavorite(ctx, currentIndex, favorite); err != nil {
+				p.notifyFavoriteSettingError(ctx, "plugin_folder_favorite_update_failed", err)
+				return
+			}
+			p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: i18n.GetI18nManager().TranslateWox(ctx, "plugin_folder_favorite_updated")})
+			p.api.RefreshQuery(ctx, plugin.RefreshQueryParam{PreserveSelectedIndex: true})
+		},
+	}
+}
+
+// buildDeleteFavoriteAction removes a saved folder favorite.
+func (p *FolderPlugin) buildDeleteFavoriteAction(name string, path string, favoriteIndex int) plugin.QueryResultAction {
+	return plugin.QueryResultAction{
+		Id:                     "delete_folder_favorite",
+		Name:                   "i18n:plugin_folder_delete_favorite",
+		Icon:                   icons.Get(icons.ActionUnstar),
+		PreventHideAfterAction: true,
+		ContextData:            p.buildFavoriteActionContextData(name, path, favoriteIndex),
+		Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+			_, _, currentIndex := folderFavoriteDataFromActionContext(actionContext, name, path, favoriteIndex)
+			if err := p.deleteFavorite(ctx, currentIndex); err != nil {
+				p.notifyFavoriteSettingError(ctx, "plugin_folder_favorite_delete_failed", err)
+				return
+			}
+			p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: i18n.GetI18nManager().TranslateWox(ctx, "plugin_folder_favorite_deleted")})
+			p.api.RefreshQuery(ctx, plugin.RefreshQueryParam{PreserveSelectedIndex: false})
+		},
+	}
+}
+
+// buildFolderFavoriteForm builds the action form used for adding and editing favorites.
+func buildFolderFavoriteForm(name string, path string) definition.PluginSettingDefinitions {
+	return definition.PluginSettingDefinitions{
+		{
+			Type: definition.PluginSettingDefinitionTypeTextBox,
+			Value: &definition.PluginSettingValueTextBox{
+				Key:          folderFavoriteFormNameKey,
+				Label:        "i18n:plugin_folder_favorite_name",
+				DefaultValue: strings.TrimSpace(name),
+				Validators: []validator.PluginSettingValidator{
+					{
+						Type:  validator.PluginSettingValidatorTypeNotEmpty,
+						Value: &validator.PluginSettingValidatorNotEmpty{},
+					},
+				},
+			},
+		},
+		{
+			Type: definition.PluginSettingDefinitionTypeTextBox,
+			Value: &definition.PluginSettingValueTextBox{
+				Key:          folderFavoriteFormPathKey,
+				Label:        "i18n:plugin_folder_favorite_path",
+				DefaultValue: strings.TrimSpace(path),
+				Validators: []validator.PluginSettingValidator{
+					{
+						Type:  validator.PluginSettingValidatorTypeNotEmpty,
+						Value: &validator.PluginSettingValidatorNotEmpty{},
+					},
+				},
+			},
+		},
+	}
+}
+
+// loadFavorites loads configured folder favorites from settings.
+func (p *FolderPlugin) loadFavorites(ctx context.Context) []folderFavorite {
+	if p.api == nil {
+		return nil
+	}
+
+	raw := strings.TrimSpace(p.api.GetSetting(ctx, folderFavoritesSettingKey))
+	if raw == "" {
+		return nil
+	}
+
+	var favorites []folderFavorite
+	if err := json.Unmarshal([]byte(raw), &favorites); err != nil {
+		p.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to unmarshal folder favorites: %s", err.Error()))
+		return nil
+	}
+
+	return favorites
+}
+
+// findFavoriteByPath returns the saved favorite that points at this file or folder.
+func (p *FolderPlugin) findFavoriteByPath(ctx context.Context, path string, favorites []folderFavorite) *folderFavoriteMatch {
+	normalizedPath, normalizeErr := normalizeFolderFavoritePath(path)
+	if normalizeErr != nil {
+		return nil
+	}
+
+	for favoriteIndex, favorite := range favorites {
+		name := strings.TrimSpace(favorite.Name)
+		favoritePath := strings.TrimSpace(favorite.Path)
+		if name == "" || favoritePath == "" {
+			continue
+		}
+
+		normalizedFavoritePath, favoriteNormalizeErr := normalizeFolderFavoritePath(favoritePath)
+		if favoriteNormalizeErr != nil {
+			if p.api != nil {
+				p.api.Log(ctx, plugin.LogLevelWarning, fmt.Sprintf("Skipping folder favorite with invalid path syntax: name=%q path=%q err=%s", name, favoritePath, favoriteNormalizeErr.Error()))
+			}
+			continue
+		}
+
+		if !isSameFolderPath(normalizedPath, normalizedFavoritePath) {
+			continue
+		}
+
+		return &folderFavoriteMatch{
+			Name:  name,
+			Path:  normalizedFavoritePath,
+			Index: favoriteIndex,
+		}
+	}
+
+	return nil
+}
+
+func buildFolderFavoriteTails(favoriteMatch *folderFavoriteMatch) []plugin.QueryResultTail {
+	if favoriteMatch == nil || strings.TrimSpace(favoriteMatch.Name) == "" {
+		return nil
+	}
+
+	return []plugin.QueryResultTail{plugin.NewQueryResultTailText(favoriteMatch.Name)}
+}
+
+// addFavorite appends a new folder favorite to the setting table.
+func (p *FolderPlugin) addFavorite(ctx context.Context, favorite folderFavorite) error {
+	favorites := p.loadFavorites(ctx)
+	favorites = append(favorites, favorite)
+	return p.saveFavorites(ctx, favorites)
+}
+
+// updateFavorite updates one saved folder favorite by table index.
+func (p *FolderPlugin) updateFavorite(ctx context.Context, favoriteIndex int, favorite folderFavorite) error {
+	favorites := p.loadFavorites(ctx)
+	if favoriteIndex < 0 || favoriteIndex >= len(favorites) {
+		return fmt.Errorf("favorite index out of range: %d", favoriteIndex)
+	}
+
+	favorites[favoriteIndex] = favorite
+	return p.saveFavorites(ctx, favorites)
+}
+
+// deleteFavorite removes one saved folder favorite by table index.
+func (p *FolderPlugin) deleteFavorite(ctx context.Context, favoriteIndex int) error {
+	favorites := p.loadFavorites(ctx)
+	if favoriteIndex < 0 || favoriteIndex >= len(favorites) {
+		return fmt.Errorf("favorite index out of range: %d", favoriteIndex)
+	}
+
+	favorites = append(favorites[:favoriteIndex], favorites[favoriteIndex+1:]...)
+	return p.saveFavorites(ctx, favorites)
+}
+
+// saveFavorites writes the favorite table while keeping name lookup deterministic.
+func (p *FolderPlugin) saveFavorites(ctx context.Context, favorites []folderFavorite) error {
+	if err := validateFolderFavorites(ctx, favorites); err != nil {
+		return err
+	}
+
+	data, err := json.Marshal(favorites)
+	if err != nil {
+		return err
+	}
+
+	p.api.SaveSetting(ctx, folderFavoritesSettingKey, string(data), true)
+	return nil
+}
+
+// validateFolderFavorites prevents ambiguous case-insensitive name matches.
+func validateFolderFavorites(ctx context.Context, favorites []folderFavorite) error {
+	seen := make(map[string]struct{}, len(favorites))
+	for _, favorite := range favorites {
+		name := strings.TrimSpace(favorite.Name)
+		if name == "" {
+			return errors.New(i18n.GetI18nManager().TranslateWox(ctx, "plugin_folder_favorite_name_required"))
+		}
+		if strings.TrimSpace(favorite.Path) == "" {
+			return errors.New(i18n.GetI18nManager().TranslateWox(ctx, "plugin_folder_favorite_path_required"))
+		}
+
+		key := strings.ToLower(name)
+		if _, exists := seen[key]; exists {
+			return errors.New(i18n.GetI18nManager().TranslateWox(ctx, "ui_validator_value_must_be_unique"))
+		}
+		seen[key] = struct{}{}
+	}
+
+	return nil
+}
+
+// resolveFavoritePath accepts an existing file or folder. A missing path is skipped.
+func (p *FolderPlugin) resolveFavoritePath(ctx context.Context, path string, notify bool) (string, bool, bool) {
+	cleanedPath, err := normalizeFolderFavoritePath(path)
+	if err != nil {
+		if notify && p.api != nil {
+			p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: i18n.GetI18nManager().TranslateWox(ctx, "plugin_folder_favorite_path_required")})
+		}
+		return "", false, false
+	}
+
+	info, statErr := os.Stat(cleanedPath)
+	if statErr != nil {
+		if notify && p.api != nil {
+			p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, "plugin_folder_favorite_path_invalid"), cleanedPath)})
+		} else if p.api != nil {
+			p.api.Log(ctx, plugin.LogLevelWarning, fmt.Sprintf("Skipping missing favorite path: path=%q err=%v", cleanedPath, statErr))
+		}
+		return "", false, false
+	}
+
+	return cleanedPath, info.IsDir(), true
+}
+
+func normalizeFolderFavoritePath(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", errors.New("path is empty")
+	}
+
+	expandedPath, expandErr := pathquery.Expand(path)
+	if expandErr != nil {
+		return "", expandErr
+	}
+	return filepath.Clean(expandedPath), nil
+}
+
+func isSameFolderPath(left string, right string) bool {
+	if util.IsWindows() || util.IsMacOS() {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
+}
+
+func (p *FolderPlugin) notifyFavoriteSettingError(ctx context.Context, messageKey string, err error) {
+	if p.api == nil {
+		return
+	}
+	p.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to update folder favorites: %s", err.Error()))
+	p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(i18n.GetI18nManager().TranslateWox(ctx, messageKey), err.Error())})
+}
+
+func (p *FolderPlugin) buildFavoriteActionContextData(name string, path string, favoriteIndex int) map[string]string {
+	contextData := map[string]string{
+		folderFavoriteContextNameKey:  strings.TrimSpace(name),
+		folderFavoriteContextPathKey:  strings.TrimSpace(path),
+		folderFavoriteContextIndexKey: strconv.Itoa(favoriteIndex),
+		folderMRUPathKey:              strings.TrimSpace(path),
+	}
+	return contextData
+}
+
+func attachFolderMRUContext(actions []plugin.QueryResultAction, path string) []plugin.QueryResultAction {
+	for i := range actions {
+		if actions[i].Id == folderToggleHiddenFilesActionID {
+			continue
+		}
+		if actions[i].ContextData == nil {
+			actions[i].ContextData = common.ContextData{folderMRUPathKey: path}
+			continue
+		}
+		actions[i].ContextData[folderMRUPathKey] = path
+	}
+	return actions
+}
+
+// handleMRURestore rebuilds a folder or file result from the stored path.
+func (p *FolderPlugin) handleMRURestore(ctx context.Context, mruData plugin.MRUData) (*plugin.QueryResult, error) {
+	path := strings.TrimSpace(mruData.ContextData[folderMRUPathKey])
+	if path == "" {
+		path = strings.TrimSpace(mruData.ContextData[folderFavoriteContextPathKey])
+	}
+	if path == "" {
+		return nil, fmt.Errorf("empty folder path in context data")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("path no longer exists: %s", path)
+	}
+	name := strings.TrimSpace(mruData.ContextData[folderFavoriteContextNameKey])
+	if name != "" {
+		result := p.buildFavoriteResult(name, path, info.IsDir(), -1, 0)
+		return &result, nil
+	}
+	result := p.buildPathResult(path, filepath.Base(path), info.IsDir(), folderResultScore, nil)
+	return &result, nil
+}
+
+func folderFavoriteDataFromActionContext(actionContext plugin.ActionContext, fallbackName string, fallbackPath string, fallbackIndex int) (string, string, int) {
+	name := strings.TrimSpace(actionContext.ContextData[folderFavoriteContextNameKey])
+	if name == "" {
+		name = strings.TrimSpace(fallbackName)
+	}
+
+	path := strings.TrimSpace(actionContext.ContextData[folderFavoriteContextPathKey])
+	if path == "" {
+		path = strings.TrimSpace(fallbackPath)
+	}
+
+	favoriteIndex := fallbackIndex
+	if rawIndex := strings.TrimSpace(actionContext.ContextData[folderFavoriteContextIndexKey]); rawIndex != "" {
+		if parsedIndex, err := strconv.Atoi(rawIndex); err == nil {
+			favoriteIndex = parsedIndex
+		}
+	}
+
+	return name, path, favoriteIndex
+}
+
+// getFolderPluginPathIcon mirrors Explorer behavior for folders and app bundles.
+func getFolderPluginPathIcon(path string, isDir bool) common.WoxImage {
+	if !isDir {
+		return common.NewWoxImageFileIcon(path)
+	}
+
+	if util.IsMacOS() && strings.EqualFold(filepath.Ext(strings.TrimRight(path, `/\`)), ".app") {
+		return common.NewWoxImageFileIcon(path)
+	}
+	return icons.Get(icons.PluginFolder)
+}
+
+// isHiddenFolderEntry follows the same dotfile convention as File Search hidden filtering.
+func isHiddenFolderEntry(entry os.DirEntry) bool {
+	name := entry.Name()
+	return strings.HasPrefix(name, ".") && name != "." && name != ".."
+}

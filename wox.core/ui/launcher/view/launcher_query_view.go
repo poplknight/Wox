@@ -1,0 +1,685 @@
+package view
+
+import (
+	"math"
+	"strconv"
+	"time"
+
+	woxcomponent "wox/ui/launcher/component"
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+)
+
+const (
+	LauncherQueryInputKey           woxwidget.Key = "launcher-query-input-key"
+	LauncherQueryLoadingBoundaryKey woxwidget.Key = "launcher-query-loading-boundary"
+)
+
+// Keep short queries pointer-editable before the trailing window-drag region begins.
+const launcherQueryMinimumEditableWidth = float32(300)
+
+// LauncherQueryProps contains the prepared text and callbacks for the launcher query editor.
+// LauncherQueryMark is a measured semantic range under ordinary query text.
+type LauncherQueryMark struct {
+	Line     int
+	X, Width float32
+	Active   bool
+}
+
+// LauncherQueryCompletionChip is one empty-argument ghost hint measured independently of spaces.
+type LauncherQueryCompletionChip struct {
+	Text     string
+	X, Width float32
+}
+
+// LauncherQueryCompletionInsertion reserves paint space at an argument end without
+// inserting ghost text into the editable document or its accessibility value.
+type LauncherQueryCompletionInsertion struct {
+	Visible           bool
+	Line              int
+	X, Width          float32
+	Prefix, Remainder string
+}
+
+const (
+	launcherQueryTabHintSize = float32(14)
+	launcherQueryTabHintGap  = float32(4)
+)
+
+// LauncherQueryTabHint is the quiet Tab glyph shown after the next successful Tab target.
+type LauncherQueryTabHint struct {
+	Visible bool
+	Label   string
+	X       float32
+	Width   float32
+	Height  float32
+	Line    int
+}
+
+// LauncherQueryTabHintChrome sizes the inline Tab glyph for the active launcher density.
+func LauncherQueryTabHintChrome(densityScale float32) (size, gap float32) {
+	return scaledLauncherSize(launcherQueryTabHintSize, densityScale), scaledLauncherSize(launcherQueryTabHintGap, densityScale)
+}
+
+// LauncherQueryProps contains the prepared text and callbacks for the launcher query editor.
+type LauncherQueryProps struct {
+	TabFeedback         uint64
+	CaretShake          float32
+	CaretShaking        bool
+	Marks               []LauncherQueryMark
+	Label               string
+	Width               float32
+	Height              float32
+	LineHeight          float32
+	Style               woxui.TextStyle
+	State               woxui.TextEditingState
+	Lines               []LauncherQueryLine
+	CompletionSuffix    string
+	CompletionChips     []LauncherQueryCompletionChip
+	CompletionOffset    float32 // Logical offset from the last line's end for structured argument hints.
+	CompletionInsertion LauncherQueryCompletionInsertion
+	TabHint             LauncherQueryTabHint
+	CaretWidth          float32
+	CaretLine           int
+	CompositionWidth    float32
+	CompositionX        float32
+	CompositionLine     int
+	TextWidth           float32
+	CaretHeight         float32
+	TextBaseline        float32
+	Focused             bool
+	Enabled             bool
+	Theme               woxcomponent.Theme
+	OnTapAt             func(woxui.Point) `boundary:"stable"`
+	OnDoubleTapAt       func(woxui.Point) `boundary:"stable"`
+	OnTripleTapAt       func(woxui.Point) `boundary:"stable"`
+	OnTapEnd            func()            `boundary:"stable"`
+	OnDragStart         func()            `boundary:"stable"`
+	// OnSelectionStart begins a drag selection at the given editor-local point.
+	OnSelectionStart func(woxui.Point, woxui.KeyModifiers) `boundary:"stable"`
+	// OnSelectionExtend updates the active drag selection focus to the given editor-local point.
+	OnSelectionExtend func(woxui.Point) `boundary:"stable"`
+	// OnSecondaryTapDown opens the query context menu at window/client coordinates.
+	OnSecondaryTapDown func(woxui.Point)               `boundary:"stable"`
+	OnKey              func(woxui.KeyEvent) bool       `boundary:"stable"`
+	OnTextInput        func(woxui.TextInputEvent) bool `boundary:"stable"`
+	OnFocusChange      func(bool)                      `boundary:"stable"`
+	OnSetValue         func(string) error              `boundary:"stable"`
+	OnTextInputState   func(woxui.TextInputState)      `boundary:"stable"`
+	OnSelectAll        func() error                    `boundary:"stable"`
+	OnCopy             func() error                    `boundary:"stable"`
+	OnCut              func() error                    `boundary:"stable"`
+	OnPaste            func() error                    `boundary:"stable"`
+}
+
+// Equal compares every prepared rendering dependency for the launcher query editor.
+func (p LauncherQueryProps) Equal(other LauncherQueryProps) bool {
+	if p.TabFeedback != other.TabFeedback || p.CaretShake != other.CaretShake || p.CaretShaking != other.CaretShaking {
+		return false
+	}
+	if p.CompletionOffset != other.CompletionOffset || p.TabHint != other.TabHint || p.CompletionInsertion != other.CompletionInsertion {
+		return false
+	}
+	if p.Label != other.Label || p.Width != other.Width || p.Height != other.Height || p.LineHeight != other.LineHeight || p.Style != other.Style || p.State != other.State || p.CompletionSuffix != other.CompletionSuffix || p.CaretWidth != other.CaretWidth || p.CaretLine != other.CaretLine || p.CompositionWidth != other.CompositionWidth || p.CompositionX != other.CompositionX || p.CompositionLine != other.CompositionLine || p.TextWidth != other.TextWidth || p.CaretHeight != other.CaretHeight || p.TextBaseline != other.TextBaseline || p.Focused != other.Focused || p.Enabled != other.Enabled || p.Theme != other.Theme || len(p.Lines) != len(other.Lines) || len(p.Marks) != len(other.Marks) || len(p.CompletionChips) != len(other.CompletionChips) {
+		return false
+	}
+	for index := range p.Marks {
+		if p.Marks[index] != other.Marks[index] {
+			return false
+		}
+	}
+	for index := range p.CompletionChips {
+		if p.CompletionChips[index] != other.CompletionChips[index] {
+			return false
+		}
+	}
+	for index := range p.Lines {
+		if p.Lines[index] != other.Lines[index] {
+			return false
+		}
+	}
+	return true
+}
+
+// LauncherQueryBoundary retains the query editor while keeping scroll chrome outside the cache.
+// Scroll offset and scrollbar animation are retained widgets, so caching them makes
+// WOX_DEBUG_REPAINT=verify compare a live scrolled paint with a shadow rebuild at offset 0.
+func LauncherQueryBoundary(props LauncherQueryProps) woxwidget.Widget {
+	return launcherQueryScrollSurface(props, woxwidget.Boundary[LauncherQueryProps]{
+		Key: "launcher-query-boundary", Label: "header:query", Props: props,
+		Build: launcherQueryEditor,
+	})
+}
+
+// LauncherQueryLine contains adapter-measured text slices for one query line.
+type LauncherQueryLine struct {
+	Text          string
+	Selected      string
+	PrefixWidth   float32
+	SelectedWidth float32
+	TextWidth     float32
+}
+
+// LauncherStatusTag carries a measured session indicator in logical layout units.
+type LauncherStatusTag struct {
+	ID          string
+	Label       string
+	Description string
+	Width       float32
+}
+
+// LauncherHeaderProps contains the query box and its optional accessories.
+type LauncherHeaderProps struct {
+	Width             float32
+	Height            float32
+	QueryBoxHeight    float32
+	QueryEditorHeight float32
+	DensityScale      float32
+	QueryWidth        float32
+	QueryRadius       float32
+	AppPadding        woxwidget.Insets
+	Theme             woxcomponent.Theme
+	QueryHint         woxwidget.Widget
+	Query             LauncherQueryProps
+	Refinement        woxwidget.Widget
+	RefinementWidth   float32
+	Attention         woxwidget.Widget
+	AttentionWidth    float32
+	StatusTags        []LauncherStatusTag
+	Glance            woxwidget.Widget
+	GlanceWidth       float32
+	Icon              *woxui.Image
+	// Icons stacks Scope plugin icons (usually 1-3). When set, Icon is unused.
+	Icons        []*woxui.Image
+	Loading      bool
+	LoadingWidth float32
+	LoadingSize  float32
+	LoadingColor woxui.Color
+	// OnDragStart starts a window drag when the pointer presses the header's
+	// empty padding around the query pill (e.g. above the input box).
+	OnDragStart func()
+	// ShowQuerySeparator paints the line under the query only while results are visible.
+	ShowQuerySeparator bool
+}
+
+type launcherQueryLoadingProps struct {
+	Width  float32
+	Height float32
+	Size   float32
+	Color  woxui.Color
+}
+
+// LauncherScopeIconsWidth returns the full accessory slot used by a stacked scope icon group.
+func LauncherScopeIconsWidth(iconCount int, densityScale float32) float32 {
+	if iconCount <= 0 {
+		return 0
+	}
+	iconSize := scaledLauncherSize(30, densityScale)
+	overlap := scaledLauncherSize(14, densityScale)
+	rightPadding := scaledLauncherSize(19, densityScale)
+	return iconSize + float32(iconCount-1)*overlap + rightPadding
+}
+
+func (p launcherQueryLoadingProps) Equal(other launcherQueryLoadingProps) bool {
+	return p == other
+}
+
+// LauncherHeaderView builds the query box and prepared accessory views.
+func LauncherHeaderView(props LauncherHeaderProps) woxwidget.Widget {
+	queryLeftPadding := scaledLauncherSize(8, props.DensityScale)
+	if props.Theme.QueryBoxPaddingLeft != nil {
+		queryLeftPadding = float32(max(0, *props.Theme.QueryBoxPaddingLeft))
+	}
+	accessoryGap := scaledLauncherSize(12, props.DensityScale)
+	query := props.QueryHint
+	if query == nil {
+		query = LauncherQueryBoundary(props.Query)
+	}
+	children := make([]woxwidget.Widget, 0, 6)
+	children = append(children, woxwidget.Expanded{Child: woxwidget.Align{
+		Width: props.QueryWidth, Height: props.QueryBoxHeight, Vertical: 0.5,
+		Child: query,
+	}})
+	if props.Refinement != nil {
+		children = append(children, woxwidget.Align{
+			Width: props.RefinementWidth, Height: props.QueryBoxHeight, Vertical: 0.5, Child: props.Refinement,
+		})
+	}
+	for _, tag := range props.StatusTags {
+		theme := props.Theme.Controls
+		theme.DensityScale = props.DensityScale
+		// Keep session indicators in the trailing accessory area beside glance.
+		children = append(children, woxwidget.Align{
+			Width: tag.Width, Height: props.QueryBoxHeight, Vertical: 0.5,
+			Child: woxwidget.Semantics{
+				Key: woxwidget.Key(tag.ID + "-tag"), AutomationID: tag.ID, Role: woxui.AccessibilityRoleText,
+				Label: tag.Label, Description: tag.Description,
+				Child: woxcomponent.WoxWarningTag(tag.Label, tag.Width, theme),
+			},
+		})
+	}
+	if props.Attention != nil {
+		children = append(children, woxwidget.Align{
+			Width: props.AttentionWidth, Height: props.QueryBoxHeight, Vertical: 0.5, Child: props.Attention,
+		})
+	}
+	if props.Glance != nil {
+		glance := woxwidget.Align{
+			Width: props.GlanceWidth, Height: props.QueryBoxHeight, Vertical: 0.5, Child: props.Glance,
+		}
+		if props.Attention != nil {
+			// Keep the related accessories together without tightening the query's other gaps.
+			children[len(children)-1] = woxwidget.Flex{
+				Axis: woxwidget.Horizontal, Gap: scaledLauncherSize(4, props.DensityScale), CrossAxisAlignment: woxwidget.CrossAxisCenter,
+				Children: []woxwidget.Widget{children[len(children)-1], glance},
+			}
+		} else {
+			children = append(children, glance)
+		}
+	}
+	if len(props.Icons) > 0 {
+		iconSize := scaledLauncherSize(30, props.DensityScale)
+		overlap := scaledLauncherSize(14, props.DensityScale)
+		iconRightPadding := scaledLauncherSize(19, props.DensityScale)
+		accessoryWidth := LauncherScopeIconsWidth(len(props.Icons), props.DensityScale)
+		stackWidth := accessoryWidth - iconRightPadding
+		iconContainerHeight := scaledLauncherSize(34, props.DensityScale)
+		stackChildren := make([]woxwidget.StackChild, 0, len(props.Icons))
+		for index, icon := range props.Icons {
+			if icon == nil {
+				continue
+			}
+			stackChildren = append(stackChildren, woxwidget.StackChild{
+				Left: float32(index) * overlap, Top: 0,
+				Child: woxwidget.Image{Source: icon, Width: iconSize, Height: iconSize},
+			})
+		}
+		children = append(children, woxwidget.Semantics{
+			Key: "launcher-query-scope-icons-key", AutomationID: "launcher.query.scope-icons", Role: woxui.AccessibilityRoleGroup,
+			Label: "Scoped plugins", Value: strconv.Itoa(len(stackChildren)), ReadOnly: true,
+			Child: woxwidget.Align{
+				Width: accessoryWidth, Height: props.QueryBoxHeight, Vertical: 0.5,
+				Child: woxwidget.Container{
+					Width: stackWidth, Height: iconContainerHeight, Padding: woxwidget.Insets{Top: scaledLauncherSize(2, props.DensityScale)},
+					Child: woxwidget.Stack{Width: stackWidth, Height: iconSize, Children: stackChildren},
+				},
+			},
+		})
+	} else if props.Icon != nil {
+		iconSize := scaledLauncherSize(30, props.DensityScale)
+		// Flutter centers the icon in a 68px accessory slot, leaving 19px after it.
+		iconRightPadding := scaledLauncherSize(19, props.DensityScale)
+		iconContainerHeight := scaledLauncherSize(34, props.DensityScale)
+		children = append(children, woxwidget.Align{
+			Width: iconSize + iconRightPadding, Height: props.QueryBoxHeight, Vertical: 0.5,
+			Child: woxwidget.Container{Width: iconSize, Height: iconContainerHeight, Padding: woxwidget.Insets{Top: scaledLauncherSize(2, props.DensityScale)}, Child: woxwidget.Image{Source: props.Icon, Width: iconSize, Height: iconSize}},
+		})
+	}
+	if props.Loading {
+		loadingProps := launcherQueryLoadingProps{Width: props.LoadingWidth, Height: props.QueryBoxHeight, Size: props.LoadingSize, Color: props.LoadingColor}
+		children = append(children, woxwidget.Semantics{
+			Key: "launcher-query-loading-key", AutomationID: "launcher.query.loading", Role: woxui.AccessibilityRoleProgressBar,
+			Label: "Search in progress", Value: "loading", ReadOnly: true,
+			Child: woxwidget.Boundary[launcherQueryLoadingProps]{
+				Key: LauncherQueryLoadingBoundaryKey, Label: "header:loading", Props: loadingProps,
+				Build: func(props launcherQueryLoadingProps) woxwidget.Widget {
+					return woxwidget.Align{
+						Width: props.Width, Height: props.Height, Horizontal: 0.5, Vertical: 0.5,
+						Child: woxcomponent.WoxLoadingIndicator(props.Size, props.Color),
+					}
+				},
+			},
+		})
+	}
+	header := woxwidget.Widget(woxwidget.Container{
+		Width: props.Width, Height: props.Height,
+		// Bottom padding is used when the query box is anchored at the bottom so
+		// explorer/dialog overlays keep symmetric chrome instead of leaving the
+		// theme inset as empty space above the query pill.
+		Padding: woxwidget.Insets{Left: props.AppPadding.Left, Top: props.AppPadding.Top, Right: props.AppPadding.Right, Bottom: props.AppPadding.Bottom},
+		Child: woxwidget.Constrained{FillWidth: true, Child: woxwidget.Container{
+			Height: props.QueryBoxHeight, Radius: props.QueryRadius, Color: props.Theme.QueryBackground, Surface: props.Theme.Surfaces.Get("QueryBox"),
+			Padding: woxwidget.Insets{Left: queryLeftPadding, Right: scaledLauncherSize(6, props.DensityScale)},
+			Child:   woxwidget.Flex{Axis: woxwidget.Horizontal, Gap: accessoryGap, Children: children},
+		}},
+	})
+	header = queryHeaderSeparator(props, header)
+	if props.OnDragStart == nil {
+		return header
+	}
+	// Nested gestures (query editor, buttons) still win the hit test over this
+	// wrapper, so only the empty padding around the pill starts a window drag.
+	return woxwidget.Gesture{ID: "launcher-header-drag", OnDragStart: props.OnDragStart, Child: header}
+}
+
+// queryHeaderSeparator paints the line under the query while results are showing.
+// Padding insets it from the window edges, so zero padding reaches both sides and a larger inset stays under the query box.
+func queryHeaderSeparator(props LauncherHeaderProps, header woxwidget.Widget) woxwidget.Widget {
+	color, thickness, padLeft, padRight := props.Theme.QuerySeparator()
+	if !props.ShowQuerySeparator || thickness <= 0 || color.A == 0 {
+		return header
+	}
+	top := props.Height - props.AppPadding.Bottom - thickness
+	if top < 0 {
+		top = 0
+	}
+	width := props.Width - padLeft - padRight
+	if width <= 0 {
+		return header
+	}
+	return woxwidget.Stack{Width: props.Width, Height: props.Height, Children: []woxwidget.StackChild{
+		{Child: header},
+		{Left: padLeft, Top: top, Child: woxwidget.Container{Width: width, Height: thickness, Color: color}},
+	}}
+}
+
+// LauncherQueryView builds the query editor from adapter-prepared text metrics.
+func LauncherQueryView(props LauncherQueryProps) woxwidget.Widget {
+	return launcherQueryScrollSurface(props, launcherQueryEditor(props))
+}
+
+// launcherQueryLineMetrics returns the painted line box, display lines, and scrollable content height.
+func launcherQueryLineMetrics(props LauncherQueryProps) (lineHeight float32, lines []LauncherQueryLine, contentHeight float32) {
+	lineHeight = props.LineHeight
+	if lineHeight <= 0 {
+		lineHeight = props.CaretHeight
+	}
+	lines = props.Lines
+	if len(lines) == 0 {
+		lines = []LauncherQueryLine{{}}
+	}
+	return lineHeight, lines, max(props.Height, float32(len(lines))*lineHeight)
+}
+
+// launcherQueryEditor builds the retained query text painter without scroll chrome.
+func launcherQueryEditor(props LauncherQueryProps) woxwidget.Widget {
+	const cursorWidth = float32(2)
+	pointerCursor := woxui.PointerCursorText
+	if !props.Enabled {
+		pointerCursor = woxui.PointerCursorDefault
+	}
+	lineHeight, lines, contentHeight := launcherQueryLineMetrics(props)
+	contentPoint := func(position woxui.Point) woxui.Point {
+		position.X += launcherQueryHorizontalOffset(props)
+		position = launcherQueryDocumentPoint(props, position)
+		return position
+	}
+
+	var editor woxwidget.Widget = woxwidget.Gesture{
+		ID:     "query-editor",
+		Cursor: pointerCursor,
+		OnTapAt: func(position woxui.Point) {
+			if props.OnTapAt != nil {
+				props.OnTapAt(contentPoint(position))
+			}
+		},
+		OnDoubleTapAt: func(position woxui.Point) {
+			if props.OnDoubleTapAt != nil {
+				props.OnDoubleTapAt(contentPoint(position))
+			}
+		},
+		OnTripleTapAt: func(position woxui.Point) {
+			if props.OnTripleTapAt != nil {
+				props.OnTripleTapAt(contentPoint(position))
+			}
+		},
+		OnSelectionStart: func(position woxui.Point, modifiers woxui.KeyModifiers) {
+			if props.OnSelectionStart != nil {
+				props.OnSelectionStart(contentPoint(position), modifiers)
+			}
+		},
+		OnSelectionExtend: func(position woxui.Point) {
+			if props.OnSelectionExtend != nil {
+				props.OnSelectionExtend(contentPoint(position))
+			}
+		},
+		OnSecondaryTapDown: func(position woxui.Point) {
+			if props.OnSecondaryTapDown != nil {
+				props.OnSecondaryTapDown(position)
+			}
+		},
+		Child: launcherQueryFeedback(props),
+	}
+	label := props.Label
+	if label == "" {
+		label = "Search Wox"
+	}
+	editor = woxwidget.EditableText{
+		Key:              LauncherQueryInputKey,
+		AutomationID:     "launcher.query.input",
+		Label:            label,
+		Value:            props.State.Text,
+		Autofocus:        true,
+		Disabled:         !props.Enabled,
+		OnKey:            props.OnKey,
+		OnTextInput:      props.OnTextInput,
+		OnFocusChange:    props.OnFocusChange,
+		OnSetValue:       props.OnSetValue,
+		HasTextSelection: true,
+		SelectionStart:   props.State.Selection.Start(),
+		SelectionEnd:     props.State.Selection.End(),
+		OnSelectAll:      props.OnSelectAll,
+		OnCopy:           props.OnCopy,
+		OnCut:            props.OnCut,
+		OnPaste:          props.OnPaste,
+		TextInput: func(bounds woxui.Rect) woxui.TextInputState {
+			textTop := max(float32(0), bounds.Height-float32(len(lines))*lineHeight) / 2
+			return woxui.TextInputState{Enabled: true, CursorRect: woxui.Rect{X: bounds.X + props.CaretWidth - launcherQueryHorizontalOffset(props), Y: bounds.Y + textTop + float32(props.CaretLine)*lineHeight, Width: cursorWidth, Height: props.CaretHeight}}
+		},
+		Child: editor,
+	}
+	children := []woxwidget.StackChild{{Child: editor}}
+	if props.CompletionSuffix != "" {
+		children = append(children, woxwidget.StackChild{Child: woxwidget.Semantics{
+			Key: "launcher-query-completion-key", AutomationID: "launcher.query.completion", Role: woxui.AccessibilityRoleText,
+			Label: "Query completion", Value: props.CompletionSuffix, ReadOnly: true, LiveRegion: woxui.AccessibilityLiveRegionPolite,
+			Child: woxwidget.Container{},
+		}})
+	}
+	if launcherQueryTabHintVisible(props) {
+		children = append(children, woxwidget.StackChild{Child: woxwidget.Semantics{
+			Key: "launcher-query-tab-hint-key", AutomationID: "launcher.query.tab-hint", Role: woxui.AccessibilityRoleText,
+			Label: props.TabHint.Label, Value: props.TabHint.Label, ReadOnly: true,
+			Child: woxwidget.Container{},
+		}})
+	}
+	if len(children) > 1 {
+		return woxwidget.Stack{Width: props.Width, Height: contentHeight, Children: children}
+	}
+	return editor
+}
+
+// LauncherQueryLabel paints unfocused query hint elements with the same baseline as editable query text.
+func LauncherQueryLabel(props LauncherQueryProps) woxwidget.Widget {
+	props.Focused = false
+	return launcherQueryPainter(props)
+}
+
+// launcherQueryFeedback uses the retained animation clock; only the painted caret moves.
+func launcherQueryFeedback(props LauncherQueryProps) woxwidget.Widget {
+	return woxwidget.AnimatedFloat{Key: "query-tab-feedback", Target: float32(props.TabFeedback), Duration: 220 * time.Millisecond, Builder: func(value float32) woxwidget.Widget {
+		props := props
+		remaining := min(float32(1), max(float32(0), float32(props.TabFeedback)-value))
+		if props.Focused && props.State.Composition == "" {
+			props.CaretShaking = remaining > 0
+			props.CaretShake = 3 * remaining * float32(math.Sin(float64(remaining)*4*math.Pi))
+		}
+		painter := launcherQueryPainter(props)
+		if !launcherQueryTabHintVisible(props) {
+			return painter
+		}
+		lineHeight, lines, contentHeight := launcherQueryLineMetrics(props)
+		textTop := max(float32(0), contentHeight-float32(len(lines))*lineHeight) / 2
+		return woxwidget.Stack{Width: props.Width, Height: contentHeight, Children: []woxwidget.StackChild{
+			{Child: painter},
+			{Left: props.TabHint.X - launcherQueryHorizontalOffset(props), Top: launcherQueryTabHintTop(props, lineHeight, textTop), Child: launcherQueryTabGlyph(props.TabHint, props.Theme)},
+		}}
+	}}
+}
+
+func launcherQueryTabHintVisible(props LauncherQueryProps) bool {
+	return props.Focused && props.State.Composition == "" && props.TabHint.Visible && props.TabHint.Label != "" && props.TabHint.Width > 0
+}
+
+// launcherQueryLetterCenter is the visual midpoint of lowercase query ink.
+// DrawText is top-aligned; letters sit on the baseline, so the center is
+// about a quarter em above it rather than the input box or line box.
+func launcherQueryLetterCenter(props LauncherQueryProps, lineTop float32) float32 {
+	baseline := props.TextBaseline
+	if baseline <= 0 {
+		baseline = props.Style.Size * 4 / 5
+	}
+	return lineTop + baseline - props.Style.Size/4
+}
+
+// launcherQueryTabHintTop places the glyph on the query letter ink, not the
+// input box or the font line box.
+func launcherQueryTabHintTop(props LauncherQueryProps, lineHeight, textTop float32) float32 {
+	line := min(max(props.TabHint.Line, 0), max(len(props.Lines)-1, 0))
+	return launcherQueryLetterCenter(props, textTop+float32(line)*lineHeight) - props.TabHint.Height/2
+}
+
+// launcherQueryTabGlyph paints the keyboard-tab mark at the same quiet weight as ghost text.
+func launcherQueryTabGlyph(hint LauncherQueryTabHint, theme woxcomponent.Theme) woxwidget.Widget {
+	ink := theme.QueryText
+	ink.A = 96
+	return woxcomponent.KeyboardTabGlyph(hint.Width, ink)
+}
+
+// launcherQueryPainter keeps text, selection and caret geometry identical across focus transitions.
+func launcherQueryPainter(props LauncherQueryProps) woxwidget.Widget {
+	const cursorWidth = float32(2)
+	lineHeight, lines, contentHeight := launcherQueryLineMetrics(props)
+	offset := launcherQueryHorizontalOffset(props)
+	return woxwidget.CaretPainter{Width: props.Width, Height: contentHeight, Active: props.Focused, Paint: func(displayList *woxui.DisplayList, bounds woxui.Rect, focused, caretVisible bool) {
+		textTop := bounds.Y + max(float32(0), bounds.Height-float32(len(lines))*lineHeight)/2
+		for _, mark := range props.Marks {
+			color := props.Theme.QueryText
+			color.A = 24
+			if mark.Active {
+				color.A = 56
+			}
+			left, right := max(float32(0), mark.X-offset), min(bounds.Width, mark.X-offset+mark.Width)
+			displayList.FillRect(woxui.Rect{X: bounds.X + left, Y: textTop + float32(mark.Line)*lineHeight + props.CaretHeight - 1, Width: max(float32(0), right-left), Height: 1}, color)
+		}
+		lastLine := lines[len(lines)-1]
+		if focused && props.State.Composition == "" && props.CompletionSuffix != "" {
+			hintColor := props.Theme.QueryText
+			hintColor.A = 96
+			hintX := lastLine.TextWidth + props.CompletionOffset - offset
+			hintY := textTop + float32(len(lines)-1)*lineHeight
+			if insertion := props.CompletionInsertion; insertion.Visible {
+				hintX = insertion.X - offset
+				hintY = textTop + float32(insertion.Line)*lineHeight
+			}
+			if len(props.CompletionChips) > 0 {
+				chipColor := props.Theme.QueryText
+				chipColor.A = 24
+				for _, chip := range props.CompletionChips {
+					// Multiple placeholders need visible boundaries when their labels contain spaces.
+					if len(props.CompletionChips) > 1 {
+						left, right := max(float32(0), hintX+chip.X), min(bounds.Width, hintX+chip.X+chip.Width)
+						displayList.FillRect(woxui.Rect{X: bounds.X + left, Y: hintY + props.CaretHeight - 1, Width: max(float32(0), right-left), Height: 1}, chipColor)
+					}
+					displayList.DrawText(chip.Text, woxui.Rect{X: bounds.X + hintX + chip.X, Y: hintY, Width: max(float32(0), bounds.Width-hintX-chip.X), Height: lineHeight}, props.Style, hintColor)
+				}
+			} else {
+				displayList.DrawText(props.CompletionSuffix, woxui.Rect{X: bounds.X + hintX, Y: hintY, Width: max(float32(0), bounds.Width-hintX), Height: lineHeight}, props.Style, hintColor)
+			}
+		}
+		for index, line := range lines {
+			lineY := textTop + float32(index)*lineHeight
+			if focused && props.State.Composition == "" && line.Selected != "" {
+				displayList.FillRoundedRect(woxui.Rect{X: bounds.X + line.PrefixWidth - offset, Y: lineY, Width: line.SelectedWidth, Height: props.CaretHeight}, 3, props.Theme.SelectionBackground)
+			}
+			if insertion := props.CompletionInsertion; insertion.Visible && insertion.Line == index {
+				displayList.DrawText(insertion.Prefix, woxui.Rect{X: bounds.X - offset, Y: lineY, Width: bounds.Width + offset, Height: lineHeight}, props.Style, props.Theme.QueryText)
+				x := insertion.X + insertion.Width - offset
+				displayList.DrawText(insertion.Remainder, woxui.Rect{X: bounds.X + x, Y: lineY, Width: max(float32(0), bounds.Width-x), Height: lineHeight}, props.Style, props.Theme.QueryText)
+			} else {
+				displayList.DrawText(line.Text, woxui.Rect{X: bounds.X - offset, Y: lineY, Width: bounds.Width + offset, Height: lineHeight}, props.Style, props.Theme.QueryText)
+			}
+			if focused && props.State.Composition == "" && line.Selected != "" {
+				displayList.DrawText(line.Selected, woxui.Rect{X: bounds.X + line.PrefixWidth - offset, Y: lineY, Width: line.SelectedWidth, Height: lineHeight}, props.Style, props.Theme.SelectionText)
+			}
+		}
+		if !focused {
+			return
+		}
+
+		cursorX := bounds.X + props.CaretWidth - offset
+		caretY := textTop + float32(props.CaretLine)*lineHeight
+		// Native text fields hide the blinking caret once a range is selected.
+		if props.State.Selection.Collapsed() {
+			paintX := cursorX
+			if props.CaretShaking {
+				paintX = max(bounds.X, min(bounds.X+bounds.Width-cursorWidth, cursorX+props.CaretShake))
+			}
+			displayList.DrawCaret(woxui.Rect{X: paintX, Y: caretY, Width: cursorWidth, Height: props.CaretHeight}, props.Theme.Cursor, caretVisible || props.CaretShaking)
+		}
+		if props.OnTextInputState != nil {
+			props.OnTextInputState(woxui.TextInputState{Enabled: true, CursorRect: woxui.Rect{X: cursorX, Y: caretY, Width: cursorWidth, Height: props.CaretHeight}})
+		}
+		if props.State.Composition != "" {
+			compositionY := textTop + float32(props.CompositionLine)*lineHeight
+			displayList.FillRect(woxui.Rect{X: bounds.X + props.CompositionX - offset, Y: compositionY + props.CaretHeight - 1, Width: props.CompositionWidth, Height: 1}, props.Theme.Cursor)
+		}
+	}}
+}
+
+// launcherQueryDocumentPoint removes suggestion-only paint space before native
+// text hit testing, including when later arguments already contain text.
+func launcherQueryDocumentPoint(props LauncherQueryProps, point woxui.Point) woxui.Point {
+	insertion := props.CompletionInsertion
+	if !insertion.Visible {
+		return point
+	}
+	lineHeight, lines, contentHeight := launcherQueryLineMetrics(props)
+	textTop := max(float32(0), contentHeight-float32(len(lines))*lineHeight) / 2
+	line := min(max(int((point.Y-textTop)/lineHeight), 0), len(lines)-1)
+	if line == insertion.Line && point.X > insertion.X {
+		point.X = max(insertion.X, point.X-insertion.Width)
+	}
+	return point
+}
+
+// launcherQueryHorizontalOffset follows the caret while focused so long query
+// text cannot push the insertion point past the visible editor edge.
+func launcherQueryHorizontalOffset(props LauncherQueryProps) float32 {
+	if !props.Focused {
+		return 0
+	}
+	const caretInset = float32(4)
+	return max(float32(0), props.CaretWidth-max(float32(0), props.Width-caretInset))
+}
+
+// launcherQueryScrollSurface clips overflowing query lines and reserves the trailing window-drag region.
+func launcherQueryScrollSurface(props LauncherQueryProps, editor woxwidget.Widget) woxwidget.Widget {
+	lineHeight, _, contentHeight := launcherQueryLineMetrics(props)
+	keepVisible := &woxwidget.ScrollRange{Start: float32(props.CaretLine) * lineHeight, End: float32(props.CaretLine)*lineHeight + props.CaretHeight}
+	editor = woxcomponent.WoxScrollView(woxcomponent.ScrollViewProps{
+		Key: "launcher-query-scroll", Content: editor, Width: props.Width, Height: props.Height, ContentHeight: contentHeight,
+		KeepVisible: keepVisible, Theme: props.Theme.Controls, ThumbColor: props.Theme.ResultTitle, AlwaysShowScrollbar: true,
+		AutomationID: "launcher.query.scroll", Label: "Query scroll position",
+	})
+	dragLeft := min(props.Width, launcherQueryMinimumEditableWidth+props.TextWidth)
+	dragRight := float32(0)
+	if contentHeight > props.Height {
+		dragRight = 14
+	}
+	if dragLeft >= props.Width-dragRight {
+		return editor
+	}
+	return woxwidget.Stack{
+		Width: props.Width, Height: props.Height,
+		Children: []woxwidget.StackChild{
+			{Child: editor},
+			{Left: dragLeft, Child: woxwidget.Gesture{
+				ID:          "query-drag-area",
+				OnTap:       props.OnTapEnd,
+				OnDragStart: props.OnDragStart,
+				Child:       woxwidget.Container{Width: props.Width - dragLeft - dragRight, Height: props.Height},
+			}},
+		},
+	}
+}

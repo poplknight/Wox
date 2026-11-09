@@ -1,0 +1,279 @@
+# Wox Plugin Python
+
+This package provides type definitions for developing Wox plugins in Python.
+
+## Requirements
+
+- Python >= 3.8 (defined in `pyproject.toml`)
+- Python 3.12 recommended for development (defined in `.python-version`)
+
+## Installation
+
+```bash
+# Using pip
+pip install wox-plugin
+
+# Using uv (recommended)
+uv add wox-plugin
+```
+
+## Usage
+
+Query debounce can be declared in `plugin.json` at plugin, trigger and command
+levels. Command `DebounceMs` overrides `TriggerDebounceMs[keyword]`, which overrides
+the `debounce` feature's `IntervalMs`. Omit a value to inherit, or use `0` to run
+immediately. For runtime registration, pass `debounce_ms` to
+`RegisterTriggerKeywordOption` or `MetadataCommand`; `None` inherits the next level.
+Trigger/command overrides apply to input queries only.
+See the [metadata example and precedence rules](../wox.core/plugin/README.md#query-scheduling).
+
+Use `WoxPreview(..., default_hidden=True)` to keep a result's preview collapsed initially.
+Users can open it with the row icon or toggle it with Ctrl/Cmd+P. The manual choice
+applies to all results in the current query, including live updates. A new query restores
+each result's default; before manual input, each result uses its own default.
+The default is `False`. Global search does not expose plugin previews, including manually opened previews.
+
+This example returns `QueryResponse`, so the plugin's `plugin.json` should set
+`MinWoxVersion` to `2.0.4` or newer. Return `list[Result]` directly if you need
+the same plugin build to run on older Wox releases.
+
+```python
+from wox_plugin import Query, QueryResponse, Result, Context, PluginInitParams, WoxImage
+
+class MyPlugin:
+    async def init(self, ctx: Context, params: PluginInitParams) -> None:
+        self.api = params.API
+        
+    async def query(self, ctx: Context, query: Query) -> QueryResponse:
+        # Your plugin logic here
+        results = []
+        results.append(
+            Result(
+                title="Hello Wox",
+                sub_title="This is a sample result",
+                icon=WoxImage.new_emoji("🔍"),
+                score=100
+            )
+        )
+        return QueryResponse(results=results)
+
+# MUST HAVE! The plugin class will be automatically loaded by Wox
+plugin = MyPlugin()
+```
+
+Returning `list[Result]` directly is deprecated. The Python host still accepts
+it for compatibility with older Wox releases. Use `QueryResponse` only when
+`plugin.json` declares `MinWoxVersion` >= `2.0.4` so results, refinements, and
+layout hints are carried together.
+
+When a plugin needs to control the preview width or grid layout, set
+`QueryResponse.layout.result_preview_width_ratio` or
+`QueryResponse.layout.grid_layout`. The older `resultPreviewWidthRatio` and
+`gridLayout` metadata features are deprecated because they can only describe
+static plugin or command defaults.
+
+## Notifications
+
+For transient notifications on Wox 2.5.0 or newer, use `show_toast_msg()` with a required message and an optional title and action. The action receives its context data and runs at most once. The older `notify()` method remains available and preserves its original routing.
+
+```python
+from wox_plugin import ShowToastMsgOption, ToastMsgAction
+
+await self.api.show_toast_msg(ctx, ShowToastMsgOption(
+    message="The file is ready",
+    title="Transfer complete",
+    action=ToastMsgAction(name="Open", action=open_file, context_data={"path": path}),
+))
+```
+
+## Saving Settings
+
+`set_setting()` requires Wox >= 2.4.0 and accepts a `SetSettingOption`. Set
+`is_local=True` when a value must stay on the current device and remain outside
+Cloud Sync. The older `save_setting()` method remains available for plugins
+targeting Wox releases before 2.4.0, but is deprecated for new integrations.
+
+## Plugin Tools
+
+Plugin Tools are schema-checked operations that plugins register at runtime. They require Wox >= 2.4.5.
+
+```python
+from wox_plugin import (
+    PluginToolAnnotations,
+    PluginToolDescriptor,
+    RegisterPluginToolOption,
+    InvokePluginToolHandlerResult,
+    InvokePluginToolOption,
+)
+
+await self.api.register_plugin_tool(ctx, RegisterPluginToolOption(
+    tool=PluginToolDescriptor(
+        name="echo_text",
+        description="Echo the supplied text",
+        input_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+        output_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+        annotations=PluginToolAnnotations(read_only=True, idempotent=True),
+    ),
+    handler=lambda _ctx, option: InvokePluginToolHandlerResult(output={"text": option.arguments["text"]}),
+))
+
+created = await self.api.invoke_plugin_tool(ctx, InvokePluginToolOption(
+    plugin_id=notes_plugin_id,
+    name="create_note",
+    arguments={"title": "Roadmap", "text": "Ship it"},
+))
+if created.error:
+    await self.api.notify(ctx, created.error.message)
+    return
+opened = await self.api.invoke_plugin_tool(ctx, InvokePluginToolOption(
+    plugin_id=notes_plugin_id,
+    name="open_note",
+    arguments={"noteId": created.output.get("noteId")},
+))
+```
+
+## Query Requirements
+
+Plugins can declare settings that must be configured before Wox calls `query()`:
+
+```json
+{
+  "QueryRequirements": {
+    "AnyQuery": [
+      {
+        "SettingKey": "apiKey",
+        "Validators": [{ "Type": "not_empty" }],
+        "Message": "i18n:my_plugin_api_key_required"
+      }
+    ],
+    "QueryWithoutCommand": [],
+    "QueryWithCommand": {
+      "download": [
+        {
+          "SettingKey": "downloadPath",
+          "Validators": [{ "Type": "not_empty" }]
+        }
+      ]
+    }
+  }
+}
+```
+
+## License
+
+MIT
+
+## Action toolbar visibility
+
+Only the default Enter action appears in the toolbar automatically. Set
+`show_in_toolbar=True` on an execute or form `ResultAction` to also show it in
+the toolbar, with or without a `hotkey`. The default is `False`. All actions
+remain available in the Action Panel and their keyboard shortcuts continue to work.
+
+## Static HTML preview
+
+Use `WoxPreviewType.WEBVIEW` with a JSON-encoded `html` field. No HTTP server or temporary HTML file is needed; there is no separate `html` preview type.
+
+```python
+import json
+from wox_plugin import WoxPreview, WoxPreviewType
+
+preview = WoxPreview(
+    preview_type=WoxPreviewType.WEBVIEW,
+    preview_data=json.dumps({
+        "html": '<!doctype html><html><body><h1 style="color:teal">Hello Wox</h1></body></html>'
+    }),
+)
+# Assign preview to Result(preview=preview, ...).
+```
+
+Set either `html` or `url`. Optional JSON fields are `injectCss`, `userAgent`, `cacheDisabled`, and `cacheKey` (defaults to the URL or HTML). Inline HTML has no plugin-relative base URL: embed CSS/images or use absolute resource URLs. This is browser content, not sanitized Markdown; use `html.escape` for untrusted text before interpolation.
+
+## Structured queries
+
+`QueryHint` and `QueryElement` are exported by `wox_plugin`. Declare a suffix
+template in `MetadataCommand.query_hint`, read
+`query.query_hint.elements`, and use `ChangeQueryParam(query_type=QueryType.INPUT,
+query_hint=...)` for a complete instance. When structure is absent, retain
+the existing `query.search` parsing path.
+This is a development-build capability; verify release and SDK support before
+setting a distributable plugin's minimum versions.
+
+Arguments can offer ordered suggestions without restricting free text:
+
+```python
+hint = QueryHint(elements=[
+    QueryElement("filter", "argument", suggestions=["created", "assigned", "search"]),
+])
+# Use as MetadataCommand("issues", "Issues", query_hint=hint),
+# or in RegisterTriggerKeywordOption("gh", hint).
+```
+
+An empty slot shows `created / assigned / search`. Typing `cr` shows the `eated`
+suffix and a Tab mark. Tab inserts only that suffix, leaving the caret at the end;
+another Tab uses ordinary argument navigation. Matching ignores case, picks the
+first prefix match, and stops at an exact match. Unmatched input stays editable.
+Suggestions are literal input values and are not translated.
+
+For metadata with `TriggerKeywords: ["gh"]` and commands `issues` and `prs`,
+Wox automatically shows `issues / prs` after `gh ` when there is no explicit
+trigger Query Hint. Runtime commands participate; global `*` triggers do not.
+Empty previews show at most three complete candidates and an ellipsis, shrinking
+to fit the available width. Automatic command previews prefer shorter names;
+completion still searches the full list in declaration order. Tab completion of
+an automatic command appends a space and activates that command's own Query Hint.
+Ordinary argument suggestions do not append a space.
+Existing registration and ChangeQuery APIs carry suggestions; omitted suggestions
+preserve ordinary placeholders. The JSON field is `Suggestions`.
+
+To disable automatic command hints, add `{ "Name": "disableAutoCommandHint" }`
+to the plugin metadata's `Features` array. Explicit Query Hints remain available.
+
+### Result icon container
+
+Set `icon_show_container=True` on a result to show its icon inside a rounded background
+and border that adapt to the theme and selection state. The default is `false`;
+the image keeps its aspect ratio.
+
+### Updating an inline HTML preview without navigation
+
+`UpdateResult` also accepts a one-shot WebView instruction:
+`{"updateMode":"script","script":"window.updateProgress({count: 1})"}`.
+The method signature and preview type are unchanged. Do not combine this instruction
+with `html` or `url`, or return it from `query()`. It can target only the current
+result's plugin-owned inline HTML document; URL previews and noncurrent results
+return `false`. Scope the call with the query context that produced the result.
+
+`true` means accepted, not successfully executed. Wox queues accepted instructions
+in order until that document is ready. Switching results, replacing the document,
+or destroying the preview discards its pending instructions. JavaScript exceptions
+are logged without replacing the page. Wox does not return script values or await
+Promises. Instructions are neither cached nor replayed by redraws; other fields in
+the same update, such as Actions, retain their normal behavior.
+
+Return complete HTML from each query, using the latest task state. Define an updater
+in that HTML and change existing DOM nodes inside it so scrolling, selection, and
+animation survive. Serialize state as JSON rather than concatenating raw output into
+JavaScript. When embedding initial JSON in a `<script>` element, also escape `<`
+as `\u003c` to prevent a literal `</script>` from ending the element.
+
+This capability requires a Wox host containing script-mode preview updates; older
+hosts do not support it. No SDK publication is required to transport these JSON keys.
+
+```python
+from wox_plugin import UpdatableResult
+
+# query() returns HTML defining window.updateProgress, initialized with current state.
+# Later, update only the current document. Keep ctx from that query.
+state = {"count": 1, "message": "Scanning…"}
+accepted = await api.update_result(ctx, UpdatableResult(
+    id=result_id,
+    preview=WoxPreview(
+        preview_type=WoxPreviewType.WEBVIEW,
+        preview_data=json.dumps({
+            "updateMode": "script",
+            "script": "window.updateProgress(" + json.dumps(state) + ");",
+        }),
+    ),
+))
+```

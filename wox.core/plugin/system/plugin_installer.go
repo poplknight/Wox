@@ -1,0 +1,354 @@
+package system
+
+import (
+	"archive/zip"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"mime"
+	"os"
+	"path"
+	"path/filepath"
+	"strings"
+	"wox/common"
+	"wox/common/icons"
+	"wox/plugin"
+	"wox/ui"
+	"wox/updater"
+	"wox/util"
+	"wox/util/selection"
+
+	"github.com/Masterminds/semver/v3"
+	"github.com/samber/lo"
+)
+
+func init() {
+	plugin.AllSystemPlugin = append(plugin.AllSystemPlugin, &PluginInstallerPlugin{})
+}
+
+type PluginInstallerPlugin struct {
+	api plugin.API
+}
+
+func (i *PluginInstallerPlugin) GetMetadata() plugin.Metadata {
+	return plugin.Metadata{
+		Id:            common.PluginInstallerPluginID,
+		Name:          "i18n:plugin_plugin_installer_plugin_name",
+		Author:        "Wox Launcher",
+		Website:       "https://github.com/Wox-launcher/Wox",
+		Version:       "1.0.0",
+		MinWoxVersion: "2.0.0",
+		Runtime:       "Go",
+		Description:   "i18n:plugin_plugin_installer_plugin_description",
+		Icon:          icons.Get(icons.PluginInstaller).String(),
+		Entry:         "",
+		TriggerKeywords: []string{
+			"*",
+		},
+		SupportedOS: []string{
+			"Windows",
+			"Macos",
+			"Linux",
+		},
+		Features: []plugin.MetadataFeature{
+			{
+				Name: plugin.MetadataFeatureQuerySelection,
+			},
+			{
+				Name: plugin.MetadataFeatureMRU,
+				Params: map[string]any{
+					"HashBy": "identityKey",
+				},
+			},
+		},
+		HiddenFromPluginList: true,
+	}
+}
+
+func (i *PluginInstallerPlugin) Init(ctx context.Context, initParams plugin.InitParams) {
+	i.api = initParams.API
+	i.api.OnMRURestore(ctx, i.handleMRURestore)
+}
+
+func (i *PluginInstallerPlugin) Query(ctx context.Context, query plugin.Query) plugin.QueryResponse {
+	if query.Type == plugin.QueryTypeSelection && query.Selection.Type == selection.SelectionTypeFile && len(query.Selection.FilePaths) == 1 && util.IsThemePackagePath(query.Selection.FilePaths[0]) {
+		return plugin.NewQueryResponse(i.queryThemePackage(ctx, query.Selection.FilePaths[0]))
+	}
+
+	// File-selection queries also cover double-clicked .wox packages forwarded
+	// through the wox://install deeplink / OS file association.
+	if query.Type == plugin.QueryTypeSelection &&
+		query.Selection.Type == selection.SelectionTypeFile &&
+		len(query.Selection.FilePaths) == 1 &&
+		util.IsPluginPackagePath(query.Selection.FilePaths[0]) {
+		results := i.queryForSelectionFile(ctx, query.Selection.FilePaths[0])
+		// Preview panel takes 60% of the width so plugin detail is given more room.
+		ratio := 0.4
+		return plugin.QueryResponse{
+			Results: results,
+			Layout: plugin.QueryLayout{
+				ResultPreviewWidthRatio: &ratio,
+			},
+		}
+	}
+
+	return plugin.QueryResponse{}
+}
+
+func (i *PluginInstallerPlugin) queryForSelectionFile(ctx context.Context, filePath string) []plugin.QueryResult {
+	var results []plugin.QueryResult
+
+	pluginMetadata, err := plugin.GetStoreManager().ParsePluginManifestFromLocal(ctx, filePath)
+	if err != nil {
+		i.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("Failed to parse plugin manifest: %s", err.Error())})
+		return results
+	}
+
+	// Check if plugin is already installed
+	installedPlugin, isInstalled := lo.Find(plugin.GetPluginManager().GetPluginInstances(), func(item *plugin.Instance) bool {
+		return item.Metadata.Id == pluginMetadata.Id
+	})
+
+	// Determine action title and button text based on installation status and version comparison
+	actionTitleKey := "plugin_installer_install"
+	actionButtonName := "Install"
+	subTitle := fmt.Sprintf("Version: %s, Author: %s\nDescription: %s", pluginMetadata.Version, pluginMetadata.Author, pluginMetadata.GetDescription(ctx))
+
+	if isInstalled {
+		installedVersion, installedErr := semver.NewVersion(installedPlugin.Metadata.Version)
+		currentVersion, currentErr := semver.NewVersion(pluginMetadata.Version)
+
+		if installedErr == nil && currentErr == nil {
+			if installedVersion.GreaterThan(currentVersion) {
+				actionTitleKey = "plugin_installer_downgrade"
+				actionButtonName = "Downgrade"
+			} else if installedVersion.LessThan(currentVersion) {
+				actionTitleKey = "plugin_installer_upgrade"
+				actionButtonName = "Upgrade"
+				subTitle = fmt.Sprintf("v%s → v%s", installedPlugin.Metadata.Version, pluginMetadata.Version)
+			} else {
+				actionTitleKey = "plugin_installer_reinstall"
+				actionButtonName = "Reinstall"
+			}
+		}
+	}
+
+	// Get translated action title
+	actionTitle := i.api.GetTranslation(ctx, actionTitleKey)
+	pluginIcon := resolvePluginIcon(filePath, pluginMetadata)
+
+	// Create plugin detail JSON for preview
+	// The preview renders the plugin identity header directly, so local package
+	// previews include the resolved icon and current installed state instead of
+	// relying on the selected result row for that context.
+	pluginDetailData := map[string]interface{}{
+		"Id":          pluginMetadata.Id,
+		"Name":        pluginMetadata.GetName(ctx),
+		"Description": pluginMetadata.GetDescription(ctx),
+		"Author":      pluginMetadata.Author,
+		"Version":     pluginMetadata.Version,
+		"Icon":        pluginIcon,
+		"Website":     pluginMetadata.Website,
+		"Runtime":     pluginMetadata.Runtime,
+		"IsInstalled": isInstalled,
+	}
+	pluginDetailJSON, _ := json.Marshal(pluginDetailData)
+
+	// create result for plugin installation
+	results = append(results, plugin.QueryResult{
+		Title:       fmt.Sprintf("%s: %s", actionTitle, pluginMetadata.GetName(ctx)),
+		SubTitle:    subTitle,
+		Icon:        pluginIcon,
+		IdentityKey: pluginMetadata.Id,
+		Actions: []plugin.QueryResultAction{
+			{
+				Name:                   actionButtonName,
+				Icon:                   icons.Get(icons.ActionInstall),
+				PreventHideAfterAction: true,
+				ContextData:            common.ContextData{"pluginId": pluginMetadata.Id, "path": filePath},
+				Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+					util.Go(ctx, "install plugin from local", func() {
+						// notify starting
+						i.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(i.api.GetTranslation(ctx, "plugin_installer_action_start"), actionButtonName, pluginMetadata.GetName(ctx))})
+
+						installErr := plugin.GetStoreManager().InstallFromLocalWithProgress(ctx, filePath, func(message string) {
+							i.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf("%s: %s", pluginMetadata.GetName(ctx), message)})
+						})
+						if installErr != nil {
+							i.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(i.api.GetTranslation(ctx, "plugin_installer_action_failed"), strings.ToLower(actionButtonName), installErr.Error())})
+							return
+						}
+
+						// update tails and actions after successful install
+						if updatable := i.api.GetUpdatableResult(ctx, actionContext.ResultId); updatable != nil {
+							// Use the shared installed SVG instead of a platform emoji so
+							// local plugin install results match the WPM installed status.
+							newTails := []plugin.QueryResultTail{{Type: plugin.QueryResultTailTypeImage, Image: icons.Get(icons.StatusInstalled)}}
+							updatable.Tails = &newTails
+
+							// create "Start Using" action if plugin has non-wildcard trigger keyword
+							var newActions []plugin.QueryResultAction
+							instances := plugin.GetPluginManager().GetPluginInstances()
+							if len(instances) > 0 {
+								if inst, ok := lo.Find(instances, func(it *plugin.Instance) bool { return it.Metadata.Id == pluginMetadata.Id }); ok {
+									if kw := inst.PrimaryTriggerKeyword(); strings.TrimSpace(kw) != "" {
+										newActions = append(newActions, plugin.QueryResultAction{
+											Name:                   "i18n:plugin_wpm_start_using",
+											Icon:                   icons.Get(icons.ActionOpen),
+											PreventHideAfterAction: true,
+											IsDefault:              true,
+											Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+												i.api.ChangeQuery(ctx, common.PlainQuery{QueryType: plugin.QueryTypeInput, QueryText: kw + " "})
+											},
+										})
+									}
+								}
+							}
+
+							updatable.Actions = &newActions
+							i.api.UpdateResult(ctx, *updatable)
+						}
+
+						// success
+						actionVerbKey := fmt.Sprintf("plugin_installer_verb_%s_past", strings.ToLower(actionButtonName))
+						actionVerb := i.api.GetTranslation(ctx, actionVerbKey)
+						i.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(i.api.GetTranslation(ctx, "plugin_installer_action_success"), pluginMetadata.GetName(ctx), actionVerb)})
+					})
+				},
+			},
+		},
+		Preview: plugin.WoxPreview{
+			PreviewType: plugin.WoxPreviewTypePluginDetail,
+			PreviewData: string(pluginDetailJSON),
+		},
+		// Outrank generic selection results such as AI Chat (2000). Equal
+		// scores fall back to title sort, which puts "Ask in AI Chat" first.
+		Score: 3000,
+	})
+
+	return results
+}
+
+// handleMRURestore prefers an installed plugin and otherwise rebuilds the local package result.
+func (i *PluginInstallerPlugin) handleMRURestore(ctx context.Context, mruData plugin.MRUData) (*plugin.QueryResult, error) {
+	pluginID := strings.TrimSpace(mruData.ContextData["pluginId"])
+	if pluginID == "" {
+		return nil, fmt.Errorf("empty plugin id in context data")
+	}
+	if inst, ok := lo.Find(plugin.GetPluginManager().GetPluginInstances(), func(item *plugin.Instance) bool {
+		return item.Metadata.Id == pluginID
+	}); ok {
+		keyword := inst.PrimaryTriggerKeyword()
+		result := plugin.QueryResult{
+			Title:       inst.GetName(ctx),
+			SubTitle:    inst.GetDescription(ctx),
+			Icon:        common.ParseWoxImageOrDefault(inst.Metadata.Icon, icons.Get(icons.PluginInstaller)),
+			IdentityKey: inst.Metadata.Id,
+			Actions: []plugin.QueryResultAction{
+				{
+					Name:                   "i18n:plugin_wpm_start_using",
+					Icon:                   icons.Get(icons.ActionOpen),
+					PreventHideAfterAction: true,
+					ContextData:            common.ContextData{"pluginId": inst.Metadata.Id},
+					Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+						if keyword != "" {
+							i.api.ChangeQuery(ctx, common.PlainQuery{QueryType: plugin.QueryTypeInput, QueryText: keyword + " "})
+						}
+					},
+				},
+			},
+		}
+		return &result, nil
+	}
+	filePath := strings.TrimSpace(mruData.ContextData["path"])
+	if filePath == "" {
+		return nil, fmt.Errorf("plugin is no longer installed: %s", pluginID)
+	}
+	if _, err := os.Stat(filePath); err != nil {
+		return nil, fmt.Errorf("plugin package no longer exists: %s", filePath)
+	}
+	results := i.queryForSelectionFile(ctx, filePath)
+	if len(results) == 0 {
+		return nil, fmt.Errorf("failed to restore plugin package: %s", filePath)
+	}
+	return &results[0], nil
+}
+
+func resolvePluginIcon(filePath string, metadata plugin.Metadata) common.WoxImage {
+	icon := common.ParseWoxImageOrDefault(metadata.Icon, icons.Get(icons.BrandWox))
+	if icon.ImageType != common.WoxImageTypeRelativePath {
+		return icon
+	}
+
+	iconBytes, err := readFileFromZip(filePath, icon.ImageData)
+	if err != nil {
+		return icons.Get(icons.BrandWox)
+	}
+
+	return newArchiveIconImage(icon.ImageData, iconBytes)
+}
+
+func newArchiveIconImage(iconPath string, iconBytes []byte) common.WoxImage {
+	ext := strings.ToLower(filepath.Ext(iconPath))
+	if ext == ".svg" {
+		return common.NewWoxImageSvg(string(iconBytes))
+	}
+
+	mimeType := mime.TypeByExtension(ext)
+	if mimeType == "" {
+		mimeType = "image/png"
+	}
+
+	iconDataURL := fmt.Sprintf("data:%s;base64,%s", mimeType, base64.StdEncoding.EncodeToString(iconBytes))
+	return common.NewWoxImageBase64(iconDataURL)
+}
+
+func readFileFromZip(filePath string, target string) ([]byte, error) {
+	reader, err := zip.OpenReader(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+
+	targetPath := strings.TrimPrefix(path.Clean(target), "/")
+
+	for _, file := range reader.File {
+		candidate := strings.TrimPrefix(path.Clean(file.Name), "/")
+		if candidate != targetPath {
+			continue
+		}
+
+		rc, err := file.Open()
+		if err != nil {
+			return nil, err
+		}
+
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			return nil, err
+		}
+
+		return data, nil
+	}
+
+	return nil, fmt.Errorf("file %s not found in archive", targetPath)
+}
+
+// queryThemePackage presents the parsed identity before installing the exact reviewed package.
+func (i *PluginInstallerPlugin) queryThemePackage(ctx context.Context, filePath string) []plugin.QueryResult {
+	theme, err := common.ReadThemePackage(filePath, updater.CURRENT_VERSION)
+	if err != nil {
+		return []plugin.QueryResult{{Title: "i18n:plugin_theme_package_invalid", SubTitle: err.Error(), Icon: themeIcon, Score: 3000}}
+	}
+	// Match .wox installation priority above generic file-selection actions (AI Chat: 2000).
+	return []plugin.QueryResult{{Title: theme.GetName(ctx), SubTitle: theme.GetDescription(ctx), IdentityKey: theme.ThemeId, Icon: themeIcon, Score: 3000, Actions: []plugin.QueryResultAction{{Name: "i18n:plugin_theme_install_theme", Icon: icons.Get(icons.ActionInstall), PreventHideAfterAction: true, Action: func(ctx context.Context, _ plugin.ActionContext) {
+		if err := ui.GetStoreManager().Install(ctx, theme); err != nil {
+			i.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: err.Error()})
+		} else {
+			i.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_theme_install_success"})
+		}
+	}}}}}
+}

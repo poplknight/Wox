@@ -1,0 +1,242 @@
+[
+  {
+    "Id": "bb843eac-bb68-4510-b0b8-3127e54b9d0e",
+    "Name": "Omarchy",
+    "Author": "qianlifeng",
+    "Version": "1.0.2",
+    "MinWoxVersion": "2.4.4",
+    "Description": "Omarchy's default Walker menu: charcoal card, cream outline, full-width gray selection, and muted teal active icons.",
+    "ImageTheme": false,
+    "IconColors": {
+      "Background": "#2D343A",
+      "Query": "transparent",
+      "Selected": "#394144",
+      "Outline": "#C7C2B3",
+      "OutlineWidth": 2
+    },
+    "Website": "https://gist.github.com/qianlifeng/9a956736352b1e4044fafa7df22abde0",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/9a956736352b1e4044fafa7df22abde0/raw/Wox.Theme.Omarchy.json",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/8e6b4029-5da8-4501-9317-89770902f1d8"
+    ],
+    "DateCreated": "2026-09-22 00:00:00",
+    "DateUpdated": "2026-09-22 00:00:00"
+  },
+  {
+    "Id": "c243084d-25c7-4d36-a063-8be78abb2d0e",
+    "Name": "Ocean Glass",
+    "Author": "qianlifeng",
+    "Version": "1.0.0",
+    "MinWoxVersion": "2.4.4",
+    "Description": "Blue-gray content panel, native-material rim, and warm yellow accents inspired by the supplied launcher screenshot.",
+    "ImageTheme": false,
+    "IconColors": {
+      "Background": "rgba(66, 96, 113, 0.50)",
+      "Query": "#2D5268",
+      "Selected": "#30566C"
+    },
+    "Website": "https://gist.github.com/qianlifeng/2728c3736d4a47e05677dc21219c44ce",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/2728c3736d4a47e05677dc21219c44ce/raw/Wox.Theme.OceanGlass.json",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/5339f316-ba57-4780-bc4f-751a865286ee"
+    ],
+    "DateCreated": "2026-09-22 00:00:00",
+    "DateUpdated": "2026-09-22 00:00:00"
+  },
+  {
+    "Id": "5fe10860-36d5-41dc-b5d9-fca8ad89c9f9",
+    "Name": "Saffron",
+    "Author": "qianlifeng",
+    "Version": "1.0.1",
+    "MinWoxVersion": "2.4.4",
+    "Description": "Warm ivory surfaces, teal text, and a saffron line under the query.",
+    "ImageTheme": false,
+    "IconColors": {
+      "Background": "#EEE9D5FF",
+      "Query": "#EEE9D5FF",
+      "Selected": "#FFF8E3FF",
+      "Outline": "#B8B29A80",
+      "OutlineWidth": 1,
+      "Separator": "#B58B0BFF"
+    },
+    "Website": "https://gist.github.com/qianlifeng/3a1311efa39d685e5f737ab98a741bc9",
+    "DownloadUrl": "https://gist.githubusercontent.com/qianlifeng/3a1311efa39d685e5f737ab98a741bc9/raw/Wox.Theme.Saffron.json",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/780193ae-da2d-4ddf-a933-ed8703f0a619"
+    ],
+    "DateCreated": "2026-09-22 00:00:00",
+    "DateUpdated": "2026-10-12 15:08:17"
+  },
+  {
+    "Id": "807b4689-606f-4e92-8eac-35e58c5d4f87",
+    "Name": "i18n:theme_name",
+    "Author": "qianlifeng",
+    "Version": "1.1.1",
+    "MinWoxVersion": "2.4.5",
+    "Description": "i18n:theme_description",
+    "ImageTheme": true,
+    "IconColors": {
+      "Background": "#F5F1E9",
+      "Query": "#FFFCF6",
+      "Selected": "#526F89"
+    },
+    "Website": "https://github.com/qianlifeng/Wox.Theme.Knit",
+    "DownloadUrl": "https://github.com/qianlifeng/Wox.Theme.Knit/releases/latest/download/knit.wox-theme",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/qianlifeng/Wox.Theme.Knit/master/preview.png"
+    ],
+    "DateCreated": "2026-09-22 01:17:50",
+    "DateUpdated": "2026-09-29 12:53:16",
+    "I18n": {
+      "en_US": {
+        "theme_name": "Knit",
+        "theme_description": "A cozy blue-grey and cream knit frame for a quieter workspace."
+      },
+      "zh_CN": {
+        "theme_name": "织",
+        "theme_description": "蓝灰与奶油白交织的毛衣边框，让工作空间温暖而清爽。"
+      },
+      "ru_RU": {
+        "theme_name": "Вязание",
+        "theme_description": "Уютная вязаная рамка в серо-голубых и кремовых тонах."
+      },
+      "pt_BR": {
+        "theme_name": "Tricô",
+        "theme_description": "Uma moldura aconchegante de tricô em azul acinzentado e creme."
+      },
+      "ko_KR": {
+        "theme_name": "니트",
+        "theme_description": "차분한 작업 공간을 위한 블루 그레이와 크림색 니트 테두리."
+      },
+      "ja_JP": {
+        "theme_name": "ニット",
+        "theme_description": "ブルーグレーとクリーム色のニット枠で、落ち着いた作業空間に。"
+      }
+    }
+  },
+  {
+    "Id": "42da2201-34e9-41b1-933d-ff6517896c57",
+    "Name": "Dracula",
+    "Author": "dragonish",
+    "Version": "1.0.0",
+    "MinWoxVersion": "2.4.4",
+    "Description": "A dark theme inspired by the Dracula palette: near-black background, soft-white text, purple selection and cyan accents. Unofficial, not affiliated with Dracula Theme.",
+    "ImageTheme": false,
+    "IconColors": {
+      "Background": "#282A36FF",
+      "Query": "#44475A99",
+      "Selected": "#44475AFF",
+      "Outline": "#6272A459",
+      "OutlineWidth": 1,
+      "Indicator": "#BD93F9FF"
+    },
+    "Website": "https://gist.github.com/dragonish/c6118868fc93e7519ef1d11b2a5b0248",
+    "DownloadUrl": "https://gist.githubusercontent.com/dragonish/c6118868fc93e7519ef1d11b2a5b0248/raw/Wox.Theme.Dracula.json",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/85518183-361d-4310-b677-c7fe44bfea41"
+    ],
+    "DateCreated": "2026-10-16 23:20:41",
+    "DateUpdated": "2026-10-16 23:20:41"
+  },
+  {
+    "Id": "be0403fc-0fd7-443d-a257-962b769bf771",
+    "Name": "i18n:theme_name",
+    "Author": "dragonish",
+    "Version": "1.0.0",
+    "MinWoxVersion": "2.4.4",
+    "Description": "i18n:theme_description",
+    "ImageTheme": false,
+    "IconColors": {
+      "Background": "#F2EDE0FF",
+      "Query": "#F2EDE0FF",
+      "Selected": "#E9E1CEFF",
+      "Outline": "#B8B0A080",
+      "OutlineWidth": 1,
+      "Separator": "#C8452CFF",
+      "Indicator": "#C8452CFF"
+    },
+    "Website": "https://gist.github.com/dragonish/2cf9d018af5fd48991be9de497128d81",
+    "DownloadUrl": "https://gist.githubusercontent.com/dragonish/2cf9d018af5fd48991be9de497128d81/raw/Wox.Theme.FiveShadesOfInk.json",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/9d65a6ec-aaee-4343-905b-acc382179837"
+    ],
+    "DateCreated": "2026-10-17 16:58:21",
+    "DateUpdated": "2026-10-17 16:58:21",
+    "I18n": {
+      "en_US": {
+        "theme_name": "Five Shades of Ink",
+        "theme_description": "Rice-paper background with five grades of ink — scorched, dense, heavy, pale and clear — and a cinnabar seal accent."
+      },
+      "zh_CN": {
+        "theme_name": "墨分五色",
+        "theme_description": "宣纸背景，配以五种墨色——焦墨、浓墨、重墨、淡墨和清墨——并以一枚朱砂印章作为点缀。"
+      }
+    }
+  },
+  {
+    "Id": "8ccbac74-e56d-406e-8030-ed08c1dfd3cc",
+    "Name": "i18n:theme_name",
+    "Author": "dragonish",
+    "Version": "1.0.0",
+    "MinWoxVersion": "2.4.4",
+    "Description": "i18n:theme_description",
+    "ImageTheme": false,
+    "IconColors": {
+      "Background": "#222B38FF",
+      "Query": "#2A3542FF",
+      "Selected": "#354253FF",
+      "Outline": "#3A475A80",
+      "OutlineWidth": 1,
+      "Separator": "#D96A4AFF",
+      "Indicator": "#D96A4AFF"
+    },
+    "Website": "https://gist.github.com/dragonish/9278791e2a2e09ee4281f97a45545730",
+    "DownloadUrl": "https://gist.githubusercontent.com/dragonish/9278791e2a2e09ee4281f97a45545730/raw/Wox.Theme.Dai.json",
+    "ScreenshotUrls": [
+      "https://gist.github.com/user-attachments/assets/accd3487-91ea-47f0-b34f-90a1062adf56"
+    ],
+    "DateCreated": "2026-10-18 21:43:48",
+    "DateUpdated": "2026-10-18 21:43:48",
+    "I18n": {
+      "en_US": {
+        "theme_name": "Dai",
+        "theme_description": "Deep blue-black Dai ink, moon-white text, mineral blue-green accents, and a cinnabar seal stroke."
+      },
+      "zh_CN": {
+        "theme_name": "黛",
+        "theme_description": "深邃的蓝黑色黛底，月白色的文字，矿物淡石青的点缀，以及一道朱砂印章笔触。"
+      }
+    }
+  },
+  {
+    "Id": "9eb51a7c-0538-40b7-b05c-aedf88af534f",
+    "Name": "i18n:theme_name",
+    "Author": "dragonish",
+    "Version": "1.0.1",
+    "MinWoxVersion": "2.4.5",
+    "Description": "i18n:theme_description",
+    "ImageTheme": true,
+    "IconColors": {
+      "Background": "#F2EDE0",
+      "Query": "#FBD9E8",
+      "Selected": "#7A3E00"
+    },
+    "Website": "https://github.com/dragonish/Wox.Theme.WesternOilPainting",
+    "DownloadUrl": "https://github.com/dragonish/Wox.Theme.WesternOilPainting/releases/latest/download/western-oil-painting.wox-theme",
+    "ScreenshotUrls": [
+      "https://raw.githubusercontent.com/dragonish/Wox.Theme.WesternOilPainting/main/screenshot.jpg"
+    ],
+    "DateCreated": "2026-10-26 22:11:51",
+    "DateUpdated": "2026-10-26 22:11:51",
+    "I18n": {
+      "en_US": {
+        "theme_name": "Western Oil Painting",
+        "theme_description": "A Western oil-painting frame in sage, ochre and sky blue, around a warm-paper workspace with a pink query box, gold toolbar and deep burnt-sienna selection."
+      },
+      "zh_CN": {
+        "theme_name": "西方油画",
+        "theme_description": "鼠尾草绿、赭金与天青笔触的油画外框，配暖白画布内容区、粉色搜索框、金色工具栏与深焦茶选中。"
+      }
+    }
+  }
+]

@@ -1,0 +1,1439 @@
+package app
+
+import (
+	"bufio"
+	"context"
+	"encoding/csv"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/user"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"syscall"
+	"unsafe"
+	"wox/common"
+	"wox/plugin"
+	"wox/util"
+	"wox/util/fileicon"
+	"wox/util/shell"
+)
+
+var (
+	// Load version.dll for file version info
+	version                = syscall.NewLazyDLL("version.dll")
+	getFileVersionInfoSize = version.NewProc("GetFileVersionInfoSizeW")
+	getFileVersionInfo     = version.NewProc("GetFileVersionInfoW")
+	verQueryValue          = version.NewProc("VerQueryValueW")
+
+	// Load psapi.dll for process enumeration
+	psapi                = syscall.NewLazyDLL("psapi.dll")
+	enumProcesses        = psapi.NewProc("EnumProcesses")
+	getModuleFileNameExW = psapi.NewProc("GetModuleFileNameExW")
+	getProcessMemoryInfo = psapi.NewProc("GetProcessMemoryInfo")
+	kernel32             = syscall.NewLazyDLL("kernel32.dll")
+	openProcess          = kernel32.NewProc("OpenProcess")
+	closeHandle          = kernel32.NewProc("CloseHandle")
+	getProcessTimes      = kernel32.NewProc("GetProcessTimes")
+	getPackageFamilyName = kernel32.NewProc("GetPackageFamilyName")
+)
+
+const (
+	// Process access rights
+	PROCESS_QUERY_INFORMATION         = 0x0400
+	PROCESS_VM_READ                   = 0x0010
+	PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+)
+
+// PROCESS_MEMORY_COUNTERS_EX structure for GetProcessMemoryInfo
+type PROCESS_MEMORY_COUNTERS_EX struct {
+	cb                         uint32
+	PageFaultCount             uint32
+	PeakWorkingSetSize         uintptr
+	WorkingSetSize             uintptr
+	QuotaPeakPagedPoolUsage    uintptr
+	QuotaPagedPoolUsage        uintptr
+	QuotaPeakNonPagedPoolUsage uintptr
+	QuotaNonPagedPoolUsage     uintptr
+	PagefileUsage              uintptr
+	PeakPagefileUsage          uintptr
+	PrivateUsage               uintptr
+}
+
+var appRetriever = &WindowsRetriever{}
+
+type processInfo struct {
+	Pid           int
+	Path          string
+	PackageFamily string
+}
+
+type cpuSample struct {
+	kernelTime int64
+	userTime   int64
+	timestamp  int64
+}
+
+type WindowsRetriever struct {
+	api plugin.API
+
+	uwpIconCache          sync.Map // map[string]string: appID -> icon path
+	runningProcesses      []processInfo
+	runningProcessesMutex sync.RWMutex // protects runningProcesses and lastProcessUpdateTime
+	lastProcessUpdateTime int64
+	cpuSamples            sync.Map // map[string]cpuSample: app path -> last CPU sample
+}
+
+func (a *WindowsRetriever) UpdateAPI(api plugin.API) {
+	a.api = api
+}
+
+func (a *WindowsRetriever) GetPlatform() string {
+	return util.PlatformWindows
+}
+
+func getWindowsSystemRoot() string {
+	systemRoot := strings.TrimSpace(os.Getenv("SystemRoot"))
+	if systemRoot == "" {
+		systemRoot = `C:\Windows`
+	}
+
+	return filepath.Clean(systemRoot)
+}
+
+func isWindowsSystem32Path(appPath string) bool {
+	system32Path := strings.ToLower(filepath.Clean(filepath.Join(getWindowsSystemRoot(), "System32")))
+	cleanPath := strings.ToLower(filepath.Clean(appPath))
+	return strings.HasPrefix(cleanPath, system32Path+"\\") || cleanPath == system32Path
+}
+
+func (a *WindowsRetriever) GetAppDirectories(ctx context.Context) []appDirectory {
+	// get the start menu and program files directories for current user
+	usr, _ := user.Current()
+	return []appDirectory{
+		{
+			Path:           usr.HomeDir + "\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs",
+			Recursive:      true,
+			RecursiveDepth: 2,
+			trackChanges:   true,
+		},
+		{
+			Path:           usr.HomeDir + "\\AppData\\Local\\Programs",
+			Recursive:      true,
+			RecursiveDepth: 3,
+			trackChanges:   true,
+		},
+		{
+			// Exclude Programs because it is tracked separately above with trackChanges support.
+			// Excluding it here avoids double-scanning the same executables during full indexing.
+			Path:              usr.HomeDir + "\\AppData\\Local",
+			RecursiveExcludes: []string{"Temp", "Programs"},
+			Recursive:         true,
+			RecursiveDepth:    4,
+		},
+		{
+			Path:           "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs",
+			Recursive:      true,
+			RecursiveDepth: 2,
+			trackChanges:   true,
+		},
+		{
+			Path:           "C:\\Program Files",
+			Recursive:      true,
+			RecursiveDepth: 2,
+		},
+		{
+			Path:           "C:\\Program Files (x86)",
+			Recursive:      true,
+			RecursiveDepth: 2,
+		},
+		{
+			// Many built-in launchable tools like mstsc.exe only live in System32.
+			Path:           filepath.Join(getWindowsSystemRoot(), "System32"),
+			Recursive:      false,
+			RecursiveDepth: 0,
+		},
+		{
+			Path:           usr.HomeDir + "\\Desktop",
+			Recursive:      false,
+			RecursiveDepth: 0,
+			trackChanges:   true,
+		},
+	}
+}
+
+func (a *WindowsRetriever) GetAppExtensions(ctx context.Context) []string {
+	return []string{"exe", "lnk", "url"}
+}
+
+func (a *WindowsRetriever) ParseAppInfo(ctx context.Context, path string) (appInfo, error) {
+	lowerPath := strings.ToLower(path)
+	var info appInfo
+	var err error
+	switch {
+	case strings.HasSuffix(lowerPath, ".lnk"):
+		info, err = a.parseShortcut(ctx, path)
+	case strings.HasSuffix(lowerPath, ".exe"):
+		// Executable parsing already classifies artwork to filter System32 helpers.
+		// Reuse that result for Launchpad instead of extracting the same icon again.
+		return a.parseExe(ctx, path)
+	case strings.HasSuffix(lowerPath, ".url"):
+		info, err = a.parseUrlShortcut(ctx, path)
+	default:
+		return appInfo{}, errors.New("not implemented")
+	}
+	if err == nil {
+		populateLaunchpadIconMetadata(ctx, &info)
+	}
+	return info, err
+}
+
+func resolveAppIdentityForPlatform(ctx context.Context, info appInfo) string {
+	if info.Type == AppTypeUWP || info.Type == AppTypeAppsFolder || info.Type == AppTypeWindowsSetting {
+		return ""
+	}
+
+	lowerPath := strings.ToLower(strings.TrimSpace(info.Path))
+	switch {
+	case strings.HasSuffix(lowerPath, ".exe"):
+		return strings.ToLower(filepath.Base(lowerPath))
+	case strings.HasSuffix(lowerPath, ".lnk"):
+		targetPath, err := resolveShortcutTarget(ctx, info.Path)
+		if err != nil {
+			return ""
+		}
+		targetPath = strings.ToLower(strings.TrimSpace(targetPath))
+		if !strings.HasSuffix(targetPath, ".exe") {
+			return ""
+		}
+		return filepath.Base(targetPath)
+	default:
+		return ""
+	}
+}
+
+func (a *WindowsRetriever) parseShortcut(ctx context.Context, appPath string) (appInfo, error) {
+	targetPath, resolveErr := a.resolveShortcutWithAPI(ctx, appPath)
+	if resolveErr != nil {
+		return appInfo{}, fmt.Errorf("failed to resolve shortcut %s: %v", appPath, resolveErr)
+	}
+
+	icon := appIcon
+	iconSourcePath := appPath
+	resolvedIconPath := ""
+	// Resolve the shortcut artwork first; its icon may differ from the launch target.
+	iconLocation, _ := readShortcutPropertyUncached(ctx, appPath, "IconLocation")
+	if shortcutIcon, source, iconErr := fileicon.GetShortcutIcon(ctx, appPath, targetPath, iconLocation); iconErr == nil {
+		icon = common.NewWoxImageAbsolutePath(shortcutIcon)
+		iconSourcePath = source
+		resolvedIconPath = shortcutIcon
+	} else if targetPath != "" && strings.HasSuffix(strings.ToLower(targetPath), ".exe") {
+		iconSourcePath = targetPath
+		if iconPath, iconErr := fileicon.GetFileIconByPath(ctx, targetPath); iconErr != nil {
+			util.GetLogger().Error(ctx, fmt.Sprintf("Error getting icon for %s, use default icon: %s", targetPath, iconErr.Error()))
+		} else {
+			icon = common.NewWoxImageAbsolutePath(iconPath)
+		}
+	} else if iconPath, iconErr := fileicon.GetFileIconByPath(ctx, appPath); iconErr != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("Error getting icon for %s, use default icon: %s", appPath, iconErr.Error()))
+	} else {
+		icon = common.NewWoxImageAbsolutePath(iconPath)
+	}
+
+	displayName := strings.TrimSuffix(filepath.Base(appPath), filepath.Ext(appPath))
+
+	return appInfo{
+		Name:             displayName,
+		Path:             filepath.Clean(appPath),
+		Icon:             icon,
+		ResolvedIconPath: resolvedIconPath,
+		// Bug fix: .lnk files often keep the same timestamp when an updater
+		// replaces the target executable. Store the actual icon source so app
+		// cache reuse can notice target icon changes without a full index rebuild.
+		IconSourcePath: filepath.Clean(iconSourcePath),
+		Type:           AppTypeDesktop,
+		IsDefaultIcon:  icon.ImageData == appIcon.ImageData,
+	}, nil
+}
+
+func (a *WindowsRetriever) parseExe(ctx context.Context, appPath string) (appInfo, error) {
+	// use default icon if no icon is found
+	icon := appIcon
+	if iconPath, iconErr := fileicon.GetFileIconByPath(ctx, appPath); iconErr != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("Error getting icon for %s: %s", appPath, iconErr.Error()))
+	} else {
+		icon = common.NewWoxImageAbsolutePath(iconPath)
+	}
+
+	// Try to get display name from exe file version info
+	displayName := a.getFileDisplayName(ctx, appPath)
+	if displayName == "" {
+		// Fallback to exe filename if no display name found
+		displayName = strings.TrimSuffix(filepath.Base(appPath), filepath.Ext(appPath))
+		util.GetLogger().Debug(ctx, fmt.Sprintf("Using exe filename as display name: %s", displayName))
+	}
+
+	hasDedicatedIcon, iconCheckErr := fileicon.HasDedicatedExecutableIcon(ctx, appPath)
+	if iconCheckErr != nil {
+		util.GetLogger().Debug(ctx, fmt.Sprintf("Failed to classify executable icon for %s: %s", appPath, iconCheckErr.Error()))
+	}
+	// Filter generic System32 executables to reduce noise after adding System32 to the app index.
+	if isWindowsSystem32Path(appPath) && !hasDedicatedIcon {
+		return appInfo{}, fmt.Errorf("%w: system32 executable without dedicated icon", errSkipAppIndexing)
+	}
+
+	return appInfo{
+		Name:             displayName,
+		Path:             filepath.Clean(appPath),
+		Icon:             icon,
+		IconSourcePath:   filepath.Clean(appPath),
+		Type:             AppTypeDesktop,
+		IsDefaultIcon:    icon.ImageData == appIcon.ImageData,
+		HasDedicatedIcon: hasDedicatedIcon && iconCheckErr == nil,
+	}, nil
+}
+
+// parseUrlShortcut parses a .url (Internet Shortcut) file, commonly created by Steam for game shortcuts.
+// The .url file is an INI-format text file containing fields like URL, IconFile, and IconIndex.
+func (a *WindowsRetriever) parseUrlShortcut(ctx context.Context, appPath string) (appInfo, error) {
+	f, openErr := os.Open(appPath)
+	if openErr != nil {
+		return appInfo{}, fmt.Errorf("failed to open url shortcut %s: %w", appPath, openErr)
+	}
+	defer f.Close()
+
+	var targetURL string
+	var iconFile string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(strings.ToLower(line), "url=") {
+			targetURL = line[4:]
+		} else if strings.HasPrefix(strings.ToLower(line), "iconfile=") {
+			iconFile = line[9:]
+		}
+	}
+	if scanErr := scanner.Err(); scanErr != nil {
+		return appInfo{}, fmt.Errorf("failed to read url shortcut %s: %w", appPath, scanErr)
+	}
+	if targetURL == "" {
+		return appInfo{}, fmt.Errorf("url shortcut %s has no URL field", appPath)
+	}
+
+	// Resolve icon: prefer IconFile from the .url, fall back to file association icon
+	icon := appIcon
+	iconSourcePath := appPath
+	if iconFile != "" {
+		if iconPath, iconErr := fileicon.GetFileIconByPath(ctx, iconFile); iconErr != nil {
+			util.GetLogger().Debug(ctx, fmt.Sprintf("Failed to get icon from IconFile %s: %s", iconFile, iconErr.Error()))
+		} else {
+			icon = common.NewWoxImageAbsolutePath(iconPath)
+			iconSourcePath = iconFile
+		}
+	}
+	// If IconFile didn't yield an icon, try the .url file itself
+	if icon.ImageData == appIcon.ImageData {
+		if iconPath, iconErr := fileicon.GetFileIconByPath(ctx, appPath); iconErr != nil {
+			util.GetLogger().Debug(ctx, fmt.Sprintf("Failed to get icon for url shortcut %s: %s", appPath, iconErr.Error()))
+		} else {
+			icon = common.NewWoxImageAbsolutePath(iconPath)
+		}
+	}
+
+	displayName := strings.TrimSuffix(filepath.Base(appPath), filepath.Ext(appPath))
+
+	return appInfo{
+		Name:           displayName,
+		Path:           filepath.Clean(appPath),
+		Icon:           icon,
+		IconSourcePath: filepath.Clean(iconSourcePath),
+		Type:           AppTypeDesktop,
+		IsDefaultIcon:  icon.ImageData == appIcon.ImageData,
+	}, nil
+}
+
+// resolveShortcutWithAPI uses Windows API to resolve shortcut target path with proper Unicode support
+func (a *WindowsRetriever) resolveShortcutWithAPI(ctx context.Context, shortcutPath string) (string, error) {
+	// Resolve via in-process COM only. No PowerShell fallback to avoid extra processes.
+	targetPath, nativeErr := resolveShortcutTarget(ctx, shortcutPath)
+	if nativeErr != nil {
+		return "", fmt.Errorf("failed to resolve shortcut: %w", nativeErr)
+	}
+	if strings.TrimSpace(targetPath) == "" {
+		return "", fmt.Errorf("failed to resolve shortcut: empty target path")
+	}
+	return targetPath, nil
+}
+
+// getFileDisplayName gets the display name from file version info
+func (a *WindowsRetriever) getFileDisplayName(ctx context.Context, filePath string) string {
+	// Convert file path to UTF16
+	lpFileName, err := syscall.UTF16PtrFromString(filePath)
+	if err != nil {
+		util.GetLogger().Debug(ctx, fmt.Sprintf("Failed to convert file path to UTF16: %s", err.Error()))
+		return ""
+	}
+
+	// Get version info size
+	size, _, _ := getFileVersionInfoSize.Call(uintptr(unsafe.Pointer(lpFileName)), 0)
+	if size == 0 {
+		util.GetLogger().Debug(ctx, fmt.Sprintf("No version info found for file: %s", filePath))
+		return ""
+	}
+
+	// Allocate buffer for version info
+	buffer := make([]byte, size)
+
+	// Get version info
+	ret, _, _ := getFileVersionInfo.Call(
+		uintptr(unsafe.Pointer(lpFileName)),
+		0,
+		uintptr(size),
+		uintptr(unsafe.Pointer(&buffer[0])),
+	)
+	if ret == 0 {
+		util.GetLogger().Debug(ctx, fmt.Sprintf("Failed to get version info for file: %s", filePath))
+		return ""
+	}
+
+	// Try to get FileDescription first, then ProductName
+	displayNames := []string{
+		"\\StringFileInfo\\040904e4\\FileDescription",
+		"\\StringFileInfo\\040904e4\\ProductName",
+		"\\StringFileInfo\\040904b0\\FileDescription", // Simplified Chinese
+		"\\StringFileInfo\\040904b0\\ProductName",
+	}
+
+	for _, queryPath := range displayNames {
+		name := a.queryVersionString(ctx, buffer, queryPath)
+		if name != "" {
+			util.GetLogger().Debug(ctx, fmt.Sprintf("Found display name '%s' for file: %s", name, filePath))
+			return name
+		}
+	}
+
+	util.GetLogger().Debug(ctx, fmt.Sprintf("No display name found in version info for file: %s", filePath))
+	return ""
+}
+
+// queryVersionString queries a string value from version info buffer
+func (a *WindowsRetriever) queryVersionString(ctx context.Context, buffer []byte, queryPath string) string {
+	lpSubBlock, err := syscall.UTF16PtrFromString(queryPath)
+	if err != nil {
+		return ""
+	}
+
+	var lpBuffer uintptr
+	var puLen uint32
+
+	ret, _, _ := verQueryValue.Call(
+		uintptr(unsafe.Pointer(&buffer[0])),
+		uintptr(unsafe.Pointer(lpSubBlock)),
+		uintptr(unsafe.Pointer(&lpBuffer)),
+		uintptr(unsafe.Pointer(&puLen)),
+	)
+
+	if ret == 0 || puLen == 0 {
+		return ""
+	}
+
+	// Convert UTF16 string to Go string
+	// puLen is already the number of UTF16 characters (not bytes)
+	utf16Length := puLen
+	if utf16Length == 0 {
+		return ""
+	}
+
+	// Create a slice with the exact length needed
+	utf16Slice := (*[1024]uint16)(unsafe.Pointer(lpBuffer))[:utf16Length]
+	result := syscall.UTF16ToString(utf16Slice)
+
+	return result
+}
+
+func (a *WindowsRetriever) GetExtraApps(ctx context.Context) ([]appInfo, error) {
+	settingsApps := a.getWindowsSettingsApps(ctx)
+	if len(settingsApps) > 0 {
+		util.GetLogger().Info(ctx, fmt.Sprintf("Loaded %d Windows Settings items", len(settingsApps)))
+	}
+	controlPanelApps := a.getControlPanelApps(ctx)
+
+	appsFolderApps := a.GetAppsFolderApps(ctx)
+	util.GetLogger().Info(ctx, fmt.Sprintf("Found %d AppsFolder apps", len(appsFolderApps)))
+
+	return append(append(settingsApps, controlPanelApps...), appsFolderApps...), nil
+}
+
+// getPrivateWorkingSet calculates the private (non-shared) working set size for a process
+func getPrivateWorkingSet(handle syscall.Handle) (uintptr, error) {
+	type PSAPI_WORKING_SET_BLOCK struct {
+		Flags uintptr
+	}
+
+	type PSAPI_WORKING_SET_INFORMATION struct {
+		NumberOfEntries uintptr
+		WorkingSetInfo  [1]PSAPI_WORKING_SET_BLOCK
+	}
+
+	psapi := syscall.NewLazyDLL("psapi.dll")
+	queryWorkingSet := psapi.NewProc("QueryWorkingSet")
+
+	// First call to get the required buffer size
+	var wsInfo PSAPI_WORKING_SET_INFORMATION
+	queryWorkingSet.Call(
+		uintptr(handle),
+		uintptr(unsafe.Pointer(&wsInfo)),
+		unsafe.Sizeof(wsInfo),
+	)
+
+	if wsInfo.NumberOfEntries == 0 || wsInfo.NumberOfEntries > 1000000 {
+		return 0, fmt.Errorf("invalid number of entries: %d", wsInfo.NumberOfEntries)
+	}
+
+	// Allocate buffer for all entries
+	bufferSize := unsafe.Sizeof(uintptr(0)) + wsInfo.NumberOfEntries*unsafe.Sizeof(PSAPI_WORKING_SET_BLOCK{})
+	buffer := make([]byte, bufferSize)
+
+	// Second call to get actual data
+	ret, _, _ := queryWorkingSet.Call(
+		uintptr(handle),
+		uintptr(unsafe.Pointer(&buffer[0])),
+		bufferSize,
+	)
+
+	if ret == 0 {
+		return 0, fmt.Errorf("QueryWorkingSet failed")
+	}
+
+	// Parse working set entries and count private pages
+	actualEntries := *(*uintptr)(unsafe.Pointer(&buffer[0]))
+	pageSize := uintptr(4096)
+	var privateBytes uintptr
+
+	// Bit 8 of flags indicates if page is shared (1) or private (0)
+	offset := unsafe.Sizeof(uintptr(0))
+	for i := uintptr(0); i < actualEntries; i++ {
+		flags := *(*uintptr)(unsafe.Pointer(&buffer[offset+i*unsafe.Sizeof(uintptr(0))]))
+		isShared := (flags & (1 << 8)) != 0
+		if !isShared {
+			privateBytes += pageSize
+		}
+	}
+
+	return privateBytes, nil
+}
+
+func (a *WindowsRetriever) GetProcessStat(ctx context.Context, app appInfo) (*ProcessStat, error) {
+	// For multi-process apps (like Chrome), we need to sum memory from all processes with the same path
+	// Update process list if needed
+	a.runningProcessesMutex.RLock()
+	needUpdate := util.GetSystemTimestamp()-a.lastProcessUpdateTime > 1000
+	a.runningProcessesMutex.RUnlock()
+
+	if needUpdate {
+		a.runningProcessesMutex.Lock()
+		// Double-check after acquiring write lock
+		if util.GetSystemTimestamp()-a.lastProcessUpdateTime > 1000 {
+			a.lastProcessUpdateTime = util.GetSystemTimestamp()
+			a.runningProcesses = a.getRunningProcesses(ctx)
+		}
+		a.runningProcessesMutex.Unlock()
+	}
+
+	// Collect stats from all processes with the same path
+	appPathLower := strings.ToLower(filepath.Clean(app.Path))
+	uwpFamilyLower := ""
+	if app.Type == AppTypeUWP {
+		if family := a.getUWPAppFamilyName(app.Path); family != "" {
+			uwpFamilyLower = strings.ToLower(family)
+		}
+	} else if strings.HasSuffix(appPathLower, ".lnk") {
+		if targetPath, err := a.resolveShortcutWithAPI(ctx, app.Path); err == nil {
+			resolvedLower := strings.ToLower(filepath.Clean(targetPath))
+			if resolvedLower != "" {
+				appPathLower = resolvedLower
+			}
+		}
+	}
+	var totalMemory float64
+	var totalKernelTime int64
+	var totalUserTime int64
+	var processCount int
+	currentTimestamp := util.GetSystemTimestamp()
+
+	a.runningProcessesMutex.RLock()
+	processes := a.runningProcesses
+	a.runningProcessesMutex.RUnlock()
+
+	for _, proc := range processes {
+		procPathLower := strings.ToLower(filepath.Clean(proc.Path))
+		matched := false
+		if app.Type == AppTypeUWP && uwpFamilyLower != "" {
+			if proc.PackageFamily != "" {
+				matched = strings.ToLower(proc.PackageFamily) == uwpFamilyLower
+			} else {
+				matched = strings.Contains(procPathLower, "\\windowsapps\\") && strings.Contains(procPathLower, uwpFamilyLower)
+			}
+		} else {
+			matched = procPathLower == appPathLower
+		}
+		if matched {
+			// Open process with query information access
+			hProcess, _, _ := openProcess.Call(
+				uintptr(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ),
+				0,
+				uintptr(proc.Pid),
+			)
+
+			if hProcess == 0 {
+				util.GetLogger().Debug(ctx, fmt.Sprintf("Failed to open process %d for %s", proc.Pid, app.Name))
+				continue // Skip processes we can't open
+			}
+
+			// Get CPU times
+			var creationTime, exitTime, kernelTime, userTime syscall.Filetime
+			ret, _, _ := getProcessTimes.Call(
+				hProcess,
+				uintptr(unsafe.Pointer(&creationTime)),
+				uintptr(unsafe.Pointer(&exitTime)),
+				uintptr(unsafe.Pointer(&kernelTime)),
+				uintptr(unsafe.Pointer(&userTime)),
+			)
+
+			if ret != 0 {
+				// Convert FILETIME to int64 (100-nanosecond intervals)
+				kernelTime64 := int64(kernelTime.HighDateTime)<<32 | int64(kernelTime.LowDateTime)
+				userTime64 := int64(userTime.HighDateTime)<<32 | int64(userTime.LowDateTime)
+				totalKernelTime += kernelTime64
+				totalUserTime += userTime64
+			}
+
+			// Try to get private working set
+			privateWS, err := getPrivateWorkingSet(syscall.Handle(hProcess))
+
+			var memCounters PROCESS_MEMORY_COUNTERS_EX
+			memCounters.cb = uint32(unsafe.Sizeof(memCounters))
+
+			ret, _, _ = getProcessMemoryInfo.Call(
+				hProcess,
+				uintptr(unsafe.Pointer(&memCounters)),
+				uintptr(memCounters.cb),
+			)
+
+			closeHandle.Call(hProcess)
+
+			if ret != 0 {
+				// Use Private Working Set if available, otherwise fall back to Commit Size
+				if err == nil && privateWS > 0 {
+					totalMemory += float64(privateWS)
+				} else {
+					totalMemory += float64(memCounters.PagefileUsage)
+				}
+				processCount++
+			}
+		}
+	}
+
+	if processCount == 0 {
+		return nil, fmt.Errorf("no running processes found for %s", app.Name)
+	}
+
+	// Calculate CPU usage
+	var cpuPercent float64
+	if value, exists := a.cpuSamples.Load(appPathLower); exists {
+		lastSample := value.(cpuSample)
+		// Calculate time elapsed in milliseconds
+		timeElapsed := currentTimestamp - lastSample.timestamp
+		if timeElapsed > 0 {
+			// Calculate CPU time difference (in 100-nanosecond intervals)
+			kernelDiff := totalKernelTime - lastSample.kernelTime
+			userDiff := totalUserTime - lastSample.userTime
+			totalCPUTime := kernelDiff + userDiff
+
+			// Convert to percentage
+			// CPU time is in 100-nanosecond intervals, elapsed time is in milliseconds
+			// CPU% = (CPU time in ms / elapsed time in ms) * 100 / number of CPUs
+			cpuTimeMs := float64(totalCPUTime) / 10000.0 // Convert 100-ns to ms
+			rawPercent := (cpuTimeMs / float64(timeElapsed)) * 100.0
+
+			// Normalize to single CPU (divide by number of logical processors)
+			numCPU := runtime.NumCPU()
+			cpuPercent = rawPercent / float64(numCPU)
+		}
+	}
+
+	// Save current sample for next calculation
+	a.cpuSamples.Store(appPathLower, cpuSample{
+		kernelTime: totalKernelTime,
+		userTime:   totalUserTime,
+		timestamp:  currentTimestamp,
+	})
+
+	return &ProcessStat{
+		CPU:    cpuPercent,
+		Memory: totalMemory,
+	}, nil
+}
+
+func (a *WindowsRetriever) getUWPAppFamilyName(appPath string) string {
+	if !strings.HasPrefix(appPath, "shell:AppsFolder\\") {
+		return ""
+	}
+	appID := strings.TrimPrefix(appPath, "shell:AppsFolder\\")
+	if appID == "" {
+		return ""
+	}
+	parts := strings.SplitN(appID, "!", 2)
+	if len(parts) == 0 || parts[0] == "" {
+		return ""
+	}
+	return parts[0]
+}
+
+func (a *WindowsRetriever) getProcessPackageFamilyName(handle syscall.Handle) (string, error) {
+	var nameLen uint32
+	ret, _, _ := getPackageFamilyName.Call(
+		uintptr(handle),
+		uintptr(unsafe.Pointer(&nameLen)),
+		0,
+	)
+	if ret == 0 {
+		return "", nil
+	}
+	if ret != 122 { // ERROR_INSUFFICIENT_BUFFER
+		if ret == 15700 { // APPMODEL_ERROR_NO_PACKAGE
+			return "", nil
+		}
+		return "", fmt.Errorf("GetPackageFamilyName failed: %d", ret)
+	}
+	if nameLen == 0 {
+		return "", nil
+	}
+	buffer := make([]uint16, nameLen)
+	ret, _, _ = getPackageFamilyName.Call(
+		uintptr(handle),
+		uintptr(unsafe.Pointer(&nameLen)),
+		uintptr(unsafe.Pointer(&buffer[0])),
+	)
+	if ret != 0 {
+		return "", fmt.Errorf("GetPackageFamilyName failed: %d", ret)
+	}
+	return syscall.UTF16ToString(buffer), nil
+}
+
+func (a *WindowsRetriever) OpenAppFolder(ctx context.Context, app appInfo) error {
+	if app.Type != AppTypeUWP {
+		return shell.OpenFileInFolder(app.Path)
+	}
+
+	// Extract AppID from Path (format: "shell:AppsFolder\PackageFamilyName!AppId")
+	appID := strings.TrimPrefix(app.Path, "shell:AppsFolder\\")
+	if appID == "" {
+		return fmt.Errorf("invalid UWP app path: %s", app.Path)
+	}
+
+	// Get app installation location using PowerShell
+	output, err := shell.RunOutput("powershell", "-Command", fmt.Sprintf(`
+		$packageFamilyName = ($('%s' -split '!')[0])
+		$package = Get-AppxPackage | Where-Object { $_.PackageFamilyName -eq $packageFamilyName }
+		if ($package) {
+			Write-Output $package.InstallLocation
+		}
+	`, appID))
+	if err != nil {
+		return fmt.Errorf("failed to get UWP app install location: %v", err)
+	}
+
+	installLocation := strings.TrimSpace(string(output))
+	if installLocation == "" {
+		return fmt.Errorf("UWP app install location not found for: %s", appID)
+	}
+
+	return shell.OpenFileInFolder(installLocation)
+}
+
+// GetAppsFolderApps discovers Windows shell applications without indexing their metadata or icons.
+func (a *WindowsRetriever) GetAppsFolderApps(ctx context.Context) []appInfo {
+	var apps []appInfo
+
+	entries, listErr := listWindowsAppsFolderEntries()
+	if listErr != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("Error enumerating shell:AppsFolder: %v", listErr))
+	}
+	if len(entries) == 0 {
+		util.GetLogger().Info(ctx, "AppsFolder enumeration returned no items, falling back to Get-StartApps")
+		startApps, startAppsErr := a.listStartApps(ctx)
+		if startAppsErr != nil {
+			util.GetLogger().Error(ctx, fmt.Sprintf("Error listing Start apps: %v", startAppsErr))
+			return apps
+		}
+		entries = startApps
+	}
+
+	apps = extraAppsFromFolderEntries(entries, nil, strings.ToLower)
+	for _, app := range apps {
+		util.GetLogger().Info(ctx, fmt.Sprintf("Found AppsFolder app: %s, AppID: %s", app.Name, strings.TrimPrefix(app.Path, "shell:AppsFolder\\")))
+	}
+	util.GetLogger().Info(ctx, fmt.Sprintf("Found %d AppsFolder apps", len(apps)))
+	return apps
+}
+
+// PrepareExtraApps enriches AppsFolder candidates during the shared indexing phase.
+func (a *WindowsRetriever) PrepareExtraApps(ctx context.Context, apps []appInfo) []appInfo {
+	iconCachePath := filepath.Join(util.GetLocation().GetCacheDirectory(), "app-uwp-icons.json")
+	if iconCache, err := os.ReadFile(iconCachePath); err == nil {
+		var cacheMap map[string]string
+		if jsonErr := json.Unmarshal(iconCache, &cacheMap); jsonErr != nil {
+			util.GetLogger().Error(ctx, fmt.Sprintf("Error parsing uwp icon cache: %v", jsonErr))
+		} else {
+			for appID, iconPath := range cacheMap {
+				a.uwpIconCache.Store(appID, iconPath)
+			}
+			util.GetLogger().Info(ctx, fmt.Sprintf("Loaded %d uwp icon cache", len(cacheMap)))
+		}
+	} else if !os.IsNotExist(err) {
+		util.GetLogger().Error(ctx, fmt.Sprintf("Error reading uwp icon cache: %v", err))
+	}
+
+	metadataByAppID, metadataErr := a.getUWPAppMetadataBatch(ctx)
+	if metadataErr != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("Error getting UWP app metadata in batch: %v", metadataErr))
+	}
+	for i := range apps {
+		if !strings.HasPrefix(apps[i].Path, "shell:AppsFolder\\") {
+			continue
+		}
+		appID := strings.TrimPrefix(apps[i].Path, "shell:AppsFolder\\")
+		if apps[i].Type == AppTypeUWP {
+			metadata, found := metadataByAppID[appID]
+			if !found || metadata.Icon.IsEmpty() {
+				// AppsFolder can expose packaged web apps that are occasionally absent
+				// from the batch snapshot. Resolve only those misses individually so a
+				// valid app icon never falls back to the generic Apps icon.
+				if fallback, fallbackErr := a.getUWPAppMetadata(ctx, appID); fallbackErr == nil {
+					if metadata.Identity == "" {
+						metadata.Identity = fallback.Identity
+					}
+					if metadata.Icon.IsEmpty() {
+						metadata.Icon = fallback.Icon
+					}
+					metadata.CanRunAsAdministrator = metadata.CanRunAsAdministrator || fallback.CanRunAsAdministrator
+				} else {
+					util.GetLogger().Error(ctx, fmt.Sprintf("Error getting UWP app metadata for %s: %v", appID, fallbackErr))
+				}
+			}
+			if metadata.Identity != "" {
+				apps[i].Identity = metadata.Identity
+			}
+			apps[i].CanRunAsAdministrator = metadata.CanRunAsAdministrator
+			if !metadata.Icon.IsEmpty() {
+				apps[i].Icon = metadata.Icon
+				a.uwpIconCache.Store(appID, metadata.Icon.ImageData)
+			}
+		} else if resolved := resolveInboxAppsFolderPath(appID); resolved != "" {
+			if iconPath, iconErr := fileicon.GetFileIconByPath(ctx, resolved); iconErr == nil {
+				apps[i].Icon = common.NewWoxImageAbsolutePath(iconPath)
+				apps[i].IconSourcePath = filepath.Clean(resolved)
+			}
+		}
+	}
+
+	a.attachControlPanelIcons(ctx, apps)
+
+	// save icon cache
+	cacheMap := make(map[string]string)
+	count := 0
+	a.uwpIconCache.Range(func(key, value interface{}) bool {
+		cacheMap[key.(string)] = value.(string)
+		count++
+		return true
+	})
+	iconCache, err := json.Marshal(cacheMap)
+	if err != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("Error marshalling uwp icon cache: %v", err))
+	} else {
+		os.WriteFile(iconCachePath, iconCache, 0644)
+		util.GetLogger().Info(ctx, fmt.Sprintf("Saved %d uwp icon cache", count))
+	}
+
+	return apps
+}
+
+// listStartApps is a fallback when in-process AppsFolder enumeration is empty.
+func (a *WindowsRetriever) listStartApps(ctx context.Context) ([]appsFolderEntry, error) {
+	powershellCmd := `
+		[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+		Get-StartApps | Select-Object Name, AppID | ConvertTo-Csv -NoTypeInformation
+	`
+	output, err := shell.RunOutput("powershell", "-Command", powershellCmd)
+	if err != nil {
+		return nil, fmt.Errorf("error running powershell command: %w", err)
+	}
+
+	records, err := csv.NewReader(strings.NewReader(string(output))).ReadAll()
+	if err != nil {
+		return nil, fmt.Errorf("error parsing Start apps CSV: %w", err)
+	}
+	if len(records) < 2 {
+		return nil, nil
+	}
+
+	entries := make([]appsFolderEntry, 0, len(records)-1)
+	for i := 1; i < len(records); i++ {
+		record := records[i]
+		if len(record) < 2 {
+			continue
+		}
+		name := strings.TrimSpace(record[0])
+		appID := strings.TrimSpace(record[1])
+		if name == "" || appID == "" {
+			continue
+		}
+		entries = append(entries, appsFolderEntry{Name: name, AppID: appID, Packaged: strings.Contains(appID, "!") && !isAppsFolderWebAppID(appID)})
+	}
+	util.GetLogger().Info(ctx, fmt.Sprintf("Listed %d Start apps via Get-StartApps fallback", len(entries)))
+	return entries, nil
+}
+
+// getUWPAppMetadataBatch retrieves package metadata once for all Start menu UWP entries.
+func (a *WindowsRetriever) getUWPAppMetadataBatch(ctx context.Context) (map[string]uwpAppMetadata, error) {
+	powershellCmd := `
+		[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+		$packages = @{}
+		foreach ($package in @(Get-AppxPackage)) {
+			$packages[$package.PackageFamilyName] = $package
+		}
+		$manifests = @{}
+
+		Get-StartApps | Where-Object { $_.AppID -like '*!*' } | ForEach-Object {
+			$record = $_
+			$parts = $record.AppID -split '!', 2
+			if ($parts.Count -lt 2) {
+				return
+			}
+
+			$packageFamilyName = $parts[0]
+			$package = $packages[$packageFamilyName]
+			if (!$package) {
+				return
+			}
+
+			if (!$manifests.ContainsKey($packageFamilyName)) {
+				$manifests[$packageFamilyName] = Get-AppxPackageManifest $package
+			}
+			$manifest = $manifests[$packageFamilyName]
+			$applications = @($manifest.Package.Applications.Application)
+			$application = $applications | Where-Object { $_.Id -eq $parts[1] } | Select-Object -First 1
+			if (!$application) {
+				$application = $applications | Select-Object -First 1
+			}
+
+			$executable = ''
+			if ($application -and $application.Executable) {
+				$executable = [string]$application.Executable
+			}
+			$entryPoint = ''
+			if ($application -and $application.EntryPoint) {
+				$entryPoint = [string]$application.EntryPoint
+			}
+			$canRunAsAdministrator = $entryPoint -eq 'Windows.FullTrustApplication'
+
+			$iconPath = ''
+			if (Test-Path $package.InstallLocation) {
+				$logo = ''
+				$visual = if ($application) { $application.VisualElements } else { $null }
+				if ($visual) {
+					if ($visual.Square44x44Logo) {
+						$logo = $visual.Square44x44Logo
+					} elseif ($visual.Square150x150Logo) {
+						$logo = $visual.Square150x150Logo
+					} elseif ($visual.Logo) {
+						$logo = $visual.Logo
+					}
+				}
+				if (!$logo) {
+					$logo = $manifest.Package.Properties.Logo
+				}
+
+				if ($logo) {
+					$logoPath = Join-Path $package.InstallLocation $logo
+					$directory = Split-Path $logoPath
+					$filename = Split-Path $logoPath -Leaf
+					$baseFilename = [System.IO.Path]::GetFileNameWithoutExtension($filename)
+					$extension = [System.IO.Path]::GetExtension($filename)
+					$scales = @('scale-200', 'scale-400', 'scale-150', 'scale-125', 'scale-100', '')
+					$targetSizes = @('256', '64', '48', '44', '32', '24', '16')
+
+					foreach ($size in $targetSizes) {
+						foreach ($scale in $scales) {
+							$targetPath = if ($scale) {
+								Join-Path $directory "$baseFilename.targetsize-$size.$scale$extension"
+							} else {
+								Join-Path $directory "$baseFilename.targetsize-$size$extension"
+							}
+							if (Test-Path $targetPath) {
+								$iconPath = $targetPath
+								break
+							}
+						}
+						if ($iconPath) {
+							break
+						}
+					}
+
+					if (!$iconPath) {
+						foreach ($scale in $scales) {
+							$scaledPath = if ($scale) {
+								Join-Path $directory "$baseFilename.$scale$extension"
+							} else {
+								$logoPath
+							}
+							if (Test-Path $scaledPath) {
+								$iconPath = $scaledPath
+								break
+							}
+						}
+					}
+
+					if (!$iconPath -and (Test-Path $logoPath)) {
+						$iconPath = $logoPath
+					}
+				}
+			}
+
+			[PSCustomObject]@{
+				AppID = [string]$record.AppID
+				IconPath = $iconPath
+				Executable = $executable
+				CanRunAsAdministrator = $canRunAsAdministrator
+			}
+		} | ConvertTo-Csv -NoTypeInformation
+	`
+
+	// Profiles can write startup text to stdout and corrupt the CSV payload.
+	output, err := shell.RunOutput("powershell", "-NoProfile", "-NonInteractive", "-Command", powershellCmd)
+	if err != nil {
+		return nil, fmt.Errorf("PowerShell execution failed: %w", err)
+	}
+
+	records, err := csv.NewReader(strings.NewReader(strings.TrimSpace(string(output)))).ReadAll()
+	if err != nil {
+		return nil, fmt.Errorf("error parsing UWP metadata output: %w; outputBytes=%d, outputPrefix=%q", err, len(output), output[:min(len(output), 2048)])
+	}
+	if len(records) < 2 {
+		return map[string]uwpAppMetadata{}, nil
+	}
+
+	metadataByAppID := make(map[string]uwpAppMetadata, len(records)-1)
+	for i := 1; i < len(records); i++ {
+		record := records[i]
+		if len(record) < 4 {
+			continue
+		}
+
+		appID := strings.TrimSpace(record[0])
+		if appID == "" {
+			continue
+		}
+		metadata := uwpAppMetadata{
+			CanRunAsAdministrator: strings.EqualFold(strings.TrimSpace(record[3]), "true"),
+		}
+		if executable := strings.TrimSpace(record[2]); executable != "" {
+			metadata.Identity = strings.ToLower(filepath.Base(executable))
+		}
+
+		iconPath := strings.TrimSpace(record[1])
+		if iconPath == "" {
+			if value, ok := a.uwpIconCache.Load(appID); ok {
+				cachedPath := value.(string)
+				if _, statErr := os.Stat(cachedPath); statErr == nil {
+					iconPath = cachedPath
+				} else {
+					a.uwpIconCache.Delete(appID)
+				}
+			}
+		}
+		if iconPath != "" {
+			if _, statErr := os.Stat(iconPath); statErr == nil {
+				metadata.Icon = common.NewWoxImageAbsolutePath(iconPath)
+			}
+		}
+
+		metadataByAppID[appID] = metadata
+	}
+	return metadataByAppID, nil
+}
+
+func (a *WindowsRetriever) GetPid(ctx context.Context, app appInfo) int {
+	// Update process list if it's been more than 1 second since last update
+	a.runningProcessesMutex.RLock()
+	needUpdate := util.GetSystemTimestamp()-a.lastProcessUpdateTime > 1000
+	a.runningProcessesMutex.RUnlock()
+
+	if needUpdate {
+		a.runningProcessesMutex.Lock()
+		// Double-check after acquiring write lock
+		if util.GetSystemTimestamp()-a.lastProcessUpdateTime > 1000 {
+			a.lastProcessUpdateTime = util.GetSystemTimestamp()
+			a.runningProcesses = a.getRunningProcesses(ctx)
+		}
+		a.runningProcessesMutex.Unlock()
+	}
+
+	a.runningProcessesMutex.RLock()
+	processes := a.runningProcesses
+	a.runningProcessesMutex.RUnlock()
+
+	appPathLower := strings.ToLower(filepath.Clean(app.Path))
+	uwpFamilyLower := ""
+	if app.Type == AppTypeUWP {
+		if family := a.getUWPAppFamilyName(app.Path); family != "" {
+			uwpFamilyLower = strings.ToLower(family)
+		}
+	} else if app.Type == AppTypeDesktop && strings.HasSuffix(appPathLower, ".lnk") {
+		if targetPath, err := a.resolveShortcutWithAPI(ctx, app.Path); err == nil {
+			resolvedLower := strings.ToLower(filepath.Clean(targetPath))
+			if resolvedLower != "" {
+				appPathLower = resolvedLower
+			}
+		}
+	}
+
+	// Scoop's current junction differs from the versioned path returned by
+	// GetModuleFileNameExW. Compare file identity per lookup so upgrades do not
+	// leave a stale cached path, while separate installations remain distinct.
+	var appFile os.FileInfo
+	if app.Type == AppTypeDesktop {
+		appFile, _ = os.Stat(appPathLower)
+	}
+
+	// For desktop apps, match by path; for UWP apps, match by package family name
+	for _, proc := range processes {
+		procPathLower := strings.ToLower(filepath.Clean(proc.Path))
+		if app.Type == AppTypeUWP && uwpFamilyLower != "" {
+			if proc.PackageFamily != "" {
+				if strings.ToLower(proc.PackageFamily) == uwpFamilyLower {
+					return proc.Pid
+				}
+			} else if strings.Contains(procPathLower, "\\windowsapps\\") && strings.Contains(procPathLower, uwpFamilyLower) {
+				return proc.Pid
+			}
+		} else if app.Type == AppTypeDesktop {
+			if procPathLower == appPathLower {
+				return proc.Pid
+			}
+			if appFile != nil && filepath.Base(procPathLower) == filepath.Base(appPathLower) {
+				if procFile, err := os.Stat(proc.Path); err == nil && os.SameFile(appFile, procFile) {
+					return proc.Pid
+				}
+			}
+		}
+	}
+
+	return 0
+}
+
+func (a *WindowsRetriever) getRunningProcesses(ctx context.Context) []processInfo {
+	var infos []processInfo
+
+	// Allocate buffer for process IDs (max 4096 processes)
+	const maxProcesses = 4096
+	pids := make([]uint32, maxProcesses)
+	var bytesReturned uint32
+
+	// Call EnumProcesses to get all process IDs
+	ret, _, _ := enumProcesses.Call(
+		uintptr(unsafe.Pointer(&pids[0])),
+		uintptr(maxProcesses*4), // size in bytes
+		uintptr(unsafe.Pointer(&bytesReturned)),
+	)
+
+	if ret == 0 {
+		util.GetLogger().Error(ctx, "Failed to enumerate processes")
+		return infos
+	}
+
+	// Calculate number of processes returned
+	numProcesses := int(bytesReturned / 4)
+
+	// Iterate through each process
+	for i := 0; i < numProcesses; i++ {
+		pid := pids[i]
+		if pid == 0 {
+			continue
+		}
+
+		// Open process with query information and VM read access (fallback to limited info)
+		hProcess, _, _ := openProcess.Call(
+			uintptr(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ),
+			0,
+			uintptr(pid),
+		)
+		if hProcess == 0 {
+			hProcess, _, _ = openProcess.Call(
+				uintptr(PROCESS_QUERY_LIMITED_INFORMATION),
+				0,
+				uintptr(pid),
+			)
+			if hProcess == 0 {
+				continue
+			}
+		}
+
+		packageFamily, _ := a.getProcessPackageFamilyName(syscall.Handle(hProcess))
+
+		// Get the executable path if possible
+		var path string
+		var exePath [syscall.MAX_PATH]uint16
+		ret, _, _ := getModuleFileNameExW.Call(
+			hProcess,
+			0, // NULL for main executable
+			uintptr(unsafe.Pointer(&exePath[0])),
+			uintptr(syscall.MAX_PATH),
+		)
+
+		// Close process handle
+		closeHandle.Call(hProcess)
+
+		if ret != 0 {
+			path = syscall.UTF16ToString(exePath[:])
+		}
+
+		if path == "" && packageFamily == "" {
+			continue
+		}
+
+		infos = append(infos, processInfo{
+			Pid:           int(pid),
+			Path:          path,
+			PackageFamily: packageFamily,
+		})
+	}
+
+	return infos
+}
+
+type uwpAppMetadata struct {
+	Icon                  common.WoxImage
+	Identity              string
+	CanRunAsAdministrator bool
+}
+
+// getUWPAppMetadata reads the manifest entry matching the AppID so selectors can match runtime processes.
+func (a *WindowsRetriever) getUWPAppMetadata(ctx context.Context, appID string) (uwpAppMetadata, error) {
+	var cachedIconPath string
+	if value, ok := a.uwpIconCache.Load(appID); ok {
+		iconPath := value.(string)
+		// Verify cached path still exists
+		if _, err := os.Stat(iconPath); err == nil {
+			cachedIconPath = iconPath
+		} else {
+			// Remove invalid cache entry
+			a.uwpIconCache.Delete(appID)
+		}
+	}
+
+	powershellAppID := strings.ReplaceAll(appID, "'", "''")
+	powershellCmd := fmt.Sprintf(`
+		[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+		try {
+			$packageFamilyName = ($('%s' -split '!')[0])
+			$applicationId = ($('%s' -split '!', 2)[1])
+			$package = Get-AppxPackage | Where-Object { $_.PackageFamilyName -eq $packageFamilyName }
+			if (!$package) { exit 1 }
+
+			$manifest = Get-AppxPackageManifest $package
+			if (!$manifest) { exit 1 }
+
+			$applications = @($manifest.Package.Applications.Application)
+			$application = $applications | Where-Object { $_.Id -eq $applicationId } | Select-Object -First 1
+			if (!$application) {
+				$application = $applications | Select-Object -First 1
+			}
+
+			$executable = ''
+			if ($application -and $application.Executable) {
+				$executable = [string]$application.Executable
+			}
+			$entryPoint = ''
+			if ($application -and $application.EntryPoint) {
+				$entryPoint = [string]$application.EntryPoint
+			}
+			$canRunAsAdministrator = $entryPoint -eq 'Windows.FullTrustApplication'
+
+			$iconPath = ''
+			if (Test-Path $package.InstallLocation) {
+				$logo = ''
+				$visual = if ($application) { $application.VisualElements } else { $null }
+				if ($visual) {
+					if ($visual.Square44x44Logo) {
+						$logo = $visual.Square44x44Logo
+					} elseif ($visual.Square150x150Logo) {
+						$logo = $visual.Square150x150Logo
+					} elseif ($visual.Logo) {
+						$logo = $visual.Logo
+					}
+				}
+				if (!$logo) {
+					$logo = $manifest.Package.Properties.Logo
+				}
+
+				if ($logo) {
+					$logoPath = Join-Path $package.InstallLocation $logo
+
+					$directory = Split-Path $logoPath
+					$filename = Split-Path $logoPath -Leaf
+					$baseFilename = [System.IO.Path]::GetFileNameWithoutExtension($filename)
+					$extension = [System.IO.Path]::GetExtension($filename)
+
+					# Try different scaling versions and target sizes (prioritize larger sizes)
+					$scales = @('scale-200', 'scale-400', 'scale-150', 'scale-125', 'scale-100', '')
+					$targetSizes = @('256', '64', '48', '44', '32', '24', '16')
+
+					# First try filenames with sizes
+					foreach ($size in $targetSizes) {
+						foreach ($scale in $scales) {
+							$targetPath = if ($scale) {
+								Join-Path $directory "$baseFilename.targetsize-$size.$scale$extension"
+							} else {
+								Join-Path $directory "$baseFilename.targetsize-$size$extension"
+							}
+							if (Test-Path $targetPath) {
+								$iconPath = $targetPath
+								break
+							}
+						}
+						if ($iconPath) {
+							break
+						}
+					}
+
+					# Then try scaled versions
+					if (!$iconPath) {
+						foreach ($scale in $scales) {
+							$scaledPath = if ($scale) {
+								Join-Path $directory "$baseFilename.$scale$extension"
+							} else {
+								$logoPath
+							}
+							if (Test-Path $scaledPath) {
+								$iconPath = $scaledPath
+								break
+							}
+						}
+					}
+
+					# If nothing found, return original path if it exists
+					if (!$iconPath -and (Test-Path $logoPath)) {
+						$iconPath = $logoPath
+					}
+				}
+			}
+
+			[PSCustomObject]@{ IconPath = $iconPath; Executable = $executable; CanRunAsAdministrator = $canRunAsAdministrator } | ConvertTo-Csv -NoTypeInformation
+		} catch {
+			exit 1
+		}
+	`, powershellAppID, powershellAppID)
+
+	// Keep the single-app fallback isolated from profile output as well.
+	output, err := shell.RunOutput("powershell", "-NoProfile", "-NonInteractive", "-Command", powershellCmd)
+	if err != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("Error running powershell command for UWP app %s: %v", appID, err))
+		return uwpAppMetadata{}, err
+	}
+
+	outputStr := strings.TrimSpace(string(output))
+	if outputStr == "" {
+		util.GetLogger().Error(ctx, fmt.Sprintf("No output from PowerShell for UWP app %s", appID))
+		return uwpAppMetadata{}, fmt.Errorf("no output from PowerShell")
+	}
+
+	reader := csv.NewReader(strings.NewReader(outputStr))
+	records, err := reader.ReadAll()
+	if err != nil {
+		return uwpAppMetadata{}, fmt.Errorf("error parsing UWP metadata output: %w; outputBytes=%d, outputPrefix=%q", err, len(output), output[:min(len(output), 2048)])
+	}
+	if len(records) < 2 || len(records[1]) < 3 {
+		return uwpAppMetadata{}, fmt.Errorf("invalid UWP metadata output; outputBytes=%d, outputPrefix=%q", len(output), output[:min(len(output), 2048)])
+	}
+
+	iconPath := strings.TrimSpace(records[1][0])
+	executable := strings.TrimSpace(records[1][1])
+	metadata := uwpAppMetadata{CanRunAsAdministrator: strings.EqualFold(strings.TrimSpace(records[1][2]), "true")}
+	if executable != "" {
+		metadata.Identity = strings.ToLower(filepath.Base(executable))
+	}
+	if iconPath == "" {
+		iconPath = cachedIconPath
+	}
+	if iconPath == "" {
+		return metadata, nil
+	}
+
+	// Verify the path exists
+	if _, err := os.Stat(iconPath); os.IsNotExist(err) {
+		util.GetLogger().Error(ctx, fmt.Sprintf("Icon path does not exist for UWP app %s: %s", appID, iconPath))
+
+		// Try to find any icon file in the app directory as fallback
+		packageFamilyName := strings.Split(appID, "!")[0]
+		fallbackIcon, fallbackErr := a.findFallbackUWPIcon(ctx, packageFamilyName)
+		if fallbackErr == nil {
+			metadata.Icon = common.NewWoxImageAbsolutePath(fallbackIcon)
+			return metadata, nil
+		}
+
+		return metadata, fmt.Errorf("icon path does not exist: %s", iconPath)
+	}
+
+	metadata.Icon = common.NewWoxImageAbsolutePath(iconPath)
+	return metadata, nil
+}
+
+func (a *WindowsRetriever) findFallbackUWPIcon(ctx context.Context, packageFamilyName string) (string, error) {
+	// Use PowerShell to find any icon file in the UWP app directory
+	powershellCmd := fmt.Sprintf(`
+		[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+		try {
+			$package = Get-AppxPackage | Where-Object { $_.PackageFamilyName -eq '%s' }
+			if (!$package) { exit 1 }
+			if (!(Test-Path $package.InstallLocation)) { exit 1 }
+
+			# Look for any icon files in common locations
+			$iconExtensions = @('*.png', '*.jpg', '*.ico')
+			$iconDirs = @('Assets', 'Images', '')
+
+			foreach ($dir in $iconDirs) {
+				$searchPath = if ($dir) { Join-Path $package.InstallLocation $dir } else { $package.InstallLocation }
+				if (Test-Path $searchPath) {
+					foreach ($ext in $iconExtensions) {
+						$icons = Get-ChildItem -Path $searchPath -Filter $ext -ErrorAction SilentlyContinue | Sort-Object Length -Descending
+						if ($icons) {
+							# Prefer larger files (likely higher resolution)
+							Write-Output $icons[0].FullName
+							exit 0
+						}
+					}
+				}
+			}
+			exit 1
+		} catch {
+			exit 1
+		}
+	`, packageFamilyName)
+
+	output, err := shell.RunOutput("powershell", "-Command", powershellCmd)
+	if err != nil {
+		return "", fmt.Errorf("PowerShell execution failed: %v", err)
+	}
+
+	iconPath := strings.TrimSpace(string(output))
+	if iconPath == "" {
+		return "", fmt.Errorf("no fallback icon found")
+	}
+
+	return iconPath, nil
+}

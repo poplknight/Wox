@@ -1,0 +1,532 @@
+package calculator
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+	"unicode"
+	"wox/common"
+	"wox/common/icons"
+	"wox/plugin"
+	"wox/setting/definition"
+	"wox/util"
+	"wox/util/clipboard"
+
+	"github.com/shopspring/decimal"
+)
+
+var calculatorIcon = icons.Get(icons.PluginCalculator)
+
+const (
+	calculatorExpressionScore int64 = 50
+	maxCalculatorHistories          = 300
+)
+
+func init() {
+	// plugin.AllSystemPlugin = append(plugin.AllSystemPlugin, &CalculatorPlugin{})
+}
+
+type CalculatorHistory struct {
+	Expression string
+	Result     string
+	AddDate    string
+}
+
+type CalculatorPlugin struct {
+	api              plugin.API
+	histories        []CalculatorHistory
+	lastQueryText    string
+	debounceTimer    *time.Timer
+	debounceInterval time.Duration
+}
+
+func (c *CalculatorPlugin) GetMetadata() plugin.Metadata {
+	return plugin.Metadata{
+		Id:            common.CalculatorPluginID,
+		Name:          "i18n:plugin_calculator_plugin_name",
+		Author:        "Wox Launcher",
+		Website:       "https://github.com/Wox-launcher/Wox",
+		Version:       "1.0.0",
+		MinWoxVersion: "2.0.0",
+		Runtime:       "Go",
+		Description:   "i18n:plugin_calculator_plugin_description",
+		Icon:          calculatorIcon.String(),
+		Entry:         "",
+		TriggerKeywords: []string{
+			"*",
+			"calculator",
+		},
+		Commands: []plugin.MetadataCommand{},
+		SupportedOS: []string{
+			"Macos",
+			"Windows",
+			"Linux",
+		},
+		Features: []plugin.MetadataFeature{
+			{
+				Name: plugin.MetadataFeatureMRU,
+				Params: map[string]any{
+					"HashBy": "rawQuery",
+				},
+			},
+		},
+		SettingDefinitions: []definition.PluginSettingDefinitionItem{
+			{
+				Type: definition.PluginSettingDefinitionTypeSelect,
+				Value: &definition.PluginSettingValueSelect{
+					Key:          "ThousandsSeparator",
+					Label:        "i18n:plugin_calculator_thousands_separator",
+					DefaultValue: "System Locale",
+					Options: []definition.PluginSettingValueSelectOption{
+						{Label: "i18n:plugin_calculator_thousands_separator_system_locale", Value: "System Locale"},
+						{Label: "i18n:plugin_calculator_thousands_separator_comma", Value: "Comma"},
+						{Label: "i18n:plugin_calculator_thousands_separator_dot", Value: "Dot"},
+						{Label: "i18n:plugin_calculator_thousands_separator_space", Value: "Space"},
+						{Label: "i18n:plugin_calculator_thousands_separator_apostrophe", Value: "Apostrophe"},
+						{Label: "i18n:plugin_calculator_thousands_separator_none", Value: "None"},
+					},
+					Tooltip: "i18n:plugin_calculator_thousands_separator_description",
+				},
+			},
+			{
+				Type: definition.PluginSettingDefinitionTypeSelect,
+				Value: &definition.PluginSettingValueSelect{
+					Key:          "DecimalSeparator",
+					Label:        "i18n:plugin_calculator_decimal_separator",
+					DefaultValue: "System Locale",
+					Options: []definition.PluginSettingValueSelectOption{
+						{Label: "i18n:plugin_calculator_decimal_separator_system_locale", Value: "System Locale"},
+						{Label: "i18n:plugin_calculator_decimal_separator_dot", Value: "Dot"},
+						{Label: "i18n:plugin_calculator_decimal_separator_comma", Value: "Comma"},
+					},
+					Tooltip: "i18n:plugin_calculator_decimal_separator_description",
+				},
+			},
+			{
+				Type: definition.PluginSettingDefinitionTypeDynamic,
+				Value: &definition.PluginSettingValueDynamic{
+					Key: "SeparatorPreview",
+				},
+			},
+		},
+	}
+}
+
+func (c *CalculatorPlugin) Init(ctx context.Context, initParams plugin.InitParams) {
+	c.api = initParams.API
+	c.api.OnGetDynamicSetting(ctx, func(ctx context.Context, key string) definition.PluginSettingDefinitionItem {
+		if key == "SeparatorPreview" {
+			thousandsSep, decimalSep := c.getSeparators(ctx)
+			sampleNumber := "1234567.89"
+			if thousandsSep != "" {
+				sampleNumber = c.addThousandsSeparator("1234567", thousandsSep) + decimalSep + "89"
+			} else {
+				sampleNumber = "1234567" + decimalSep + "89"
+			}
+
+			return definition.PluginSettingDefinitionItem{
+				Type: definition.PluginSettingDefinitionTypeLabel,
+				Value: &definition.PluginSettingValueLabel{
+					Content:           c.api.GetTranslation(ctx, "plugin_calculator_separator_preview_example") + ": " + sampleNumber,
+					ReserveLabelSpace: true,
+				},
+			}
+		}
+
+		return definition.PluginSettingDefinitionItem{}
+	})
+
+	c.debounceInterval = 800 * time.Millisecond // 800ms debounce interval
+	c.histories = c.loadHistories(ctx)
+	c.api.OnMRURestore(ctx, c.handleMRURestore)
+}
+
+func (c *CalculatorPlugin) Query(ctx context.Context, query plugin.Query) plugin.QueryResponse {
+	var results []plugin.QueryResult
+	autoRecordQueryHistory := false
+
+	if query.TriggerKeyword == "" {
+		if !c.hasOperator(query.Search) {
+			return plugin.QueryResponse{}
+		}
+
+		// Try to calculate the expression, if it fails then it's not a valid calculator expression
+		thousandsSep, decimalSep := c.getSeparators(ctx)
+		val, err := Calculate(query.Search, thousandsSep, decimalSep)
+		if err != nil {
+			c.api.Log(ctx, plugin.LogLevelDebug, fmt.Sprintf("Calculator failed to parse expression: %v", err))
+			return plugin.QueryResponse{}
+		}
+		result := val.String()
+		formattedResult := c.formatWithSeparators(val, thousandsSep, decimalSep)
+
+		c.addCalculatorHistoryDebounced(ctx, query.Search, result)
+		autoRecordQueryHistory = true
+
+		results = append(results, plugin.QueryResult{
+			Title:       formattedResult,
+			Icon:        calculatorIcon,
+			Score:       calculatorExpressionScore,
+			IdentityKey: calculatorExpressionIdentityKey(query.Search),
+			Actions: []plugin.QueryResultAction{
+				{
+					Name:        "i18n:plugin_calculator_copy_result",
+					Icon:        icons.Get(icons.ActionCopy),
+					ContextData: calculatorMRUContext(query.Search),
+					Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+						c.histories = append(c.histories, CalculatorHistory{
+							Expression: query.Search,
+							Result:     result,
+							AddDate:    util.FormatDateTime(util.GetSystemTime()),
+						})
+						c.histories = trimCalculatorHistories(c.histories)
+						clipboard.WriteText(result)
+					},
+				},
+				{
+					Name:        "i18n:plugin_calculator_copy_result_with_thousands_separator",
+					IsDefault:   true,
+					Icon:        icons.Get(icons.ActionCopy),
+					ContextData: calculatorMRUContext(query.Search),
+					Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+						c.histories = append(c.histories, CalculatorHistory{
+							Expression: query.Search,
+							Result:     result,
+							AddDate:    util.FormatDateTime(util.GetSystemTime()),
+						})
+						c.histories = trimCalculatorHistories(c.histories)
+						clipboard.WriteText(formattedResult)
+					},
+				},
+			},
+		})
+	}
+
+	// only show history if query has trigger keyword
+	if query.TriggerKeyword != "" {
+		thousandsSep, decimalSep := c.getSeparators(ctx)
+		val, err := Calculate(query.Search, thousandsSep, decimalSep)
+		if err == nil {
+			result := val.String()
+			formattedResult := c.formatWithSeparators(val, thousandsSep, decimalSep)
+
+			c.addCalculatorHistoryDebounced(ctx, query.Search, result)
+			autoRecordQueryHistory = true
+
+			results = append(results, plugin.QueryResult{
+				Title:       formattedResult,
+				Icon:        calculatorIcon,
+				Score:       calculatorExpressionScore,
+				IdentityKey: calculatorExpressionIdentityKey(query.Search),
+				Actions: []plugin.QueryResultAction{
+					{
+						Name:        "i18n:plugin_calculator_copy_result",
+						Icon:        icons.Get(icons.ActionCopy),
+						ContextData: calculatorMRUContext(query.Search),
+						Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+							clipboard.WriteText(result)
+						},
+					},
+					{
+						Name:        "i18n:plugin_calculator_copy_result_with_thousands_separator",
+						IsDefault:   true,
+						Icon:        icons.Get(icons.ActionCopy),
+						ContextData: calculatorMRUContext(query.Search),
+						Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+							clipboard.WriteText(formattedResult)
+						},
+					},
+				},
+			})
+		}
+
+		//show top 100 histories order by desc
+		var count = 0
+		for i := len(c.histories) - 1; i >= 0; i-- {
+			h := c.histories[i]
+
+			count++
+			if count >= 100 {
+				break
+			}
+
+			if strings.Contains(h.Expression, query.Search) || strings.Contains(h.Result, query.Search) {
+				// Try to parse history result to format with thousands separator
+				historyVal, parseErr := decimal.NewFromString(h.Result)
+				formattedHistoryResult := h.Result
+				if parseErr == nil {
+					formattedHistoryResult = c.formatWithSeparators(historyVal, thousandsSep, decimalSep)
+				}
+
+				results = append(results, plugin.QueryResult{
+					Title:       h.Expression,
+					SubTitle:    formattedHistoryResult,
+					IdentityKey: calculatorExpressionIdentityKey(h.Expression),
+					Icon:        calculatorIcon,
+					Actions: []plugin.QueryResultAction{
+						{
+							Name:        "i18n:plugin_calculator_copy_result",
+							Icon:        icons.Get(icons.ActionCopy),
+							ContextData: calculatorMRUContext(h.Expression),
+							Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+								clipboard.WriteText(h.Result)
+							},
+						},
+						{
+							Name:        "i18n:plugin_calculator_copy_result_with_thousands_separator",
+							IsDefault:   true,
+							Icon:        icons.Get(icons.ActionCopy),
+							ContextData: calculatorMRUContext(h.Expression),
+							Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+								clipboard.WriteText(formattedHistoryResult)
+							},
+						},
+						{
+							Name:                   "i18n:plugin_calculator_recalculate",
+							Icon:                   icons.Get(icons.ActionRun),
+							PreventHideAfterAction: true,
+							ContextData:            calculatorMRUContext(h.Expression),
+							Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+								c.api.ChangeQuery(ctx, common.PlainQuery{
+									QueryType: plugin.QueryTypeInput,
+									QueryText: h.Expression,
+								})
+							},
+						},
+					},
+				})
+			}
+		}
+
+		if len(results) == 0 {
+			results = append(results, plugin.QueryResult{
+				Title:   "i18n:plugin_calculator_input_expression",
+				Icon:    calculatorIcon,
+				Actions: []plugin.QueryResultAction{},
+			})
+		}
+	}
+
+	return plugin.QueryResponse{Results: results, AutoRecordQueryHistory: autoRecordQueryHistory}
+}
+
+func calculatorExpressionIdentityKey(expression string) string {
+	return "calculator:" + strings.TrimSpace(expression)
+}
+
+func calculatorMRUContext(expression string) common.ContextData {
+	return common.ContextData{"query": strings.TrimSpace(expression)}
+}
+
+// handleMRURestore recalculates the stored expression so the homepage result stays current.
+func (c *CalculatorPlugin) handleMRURestore(ctx context.Context, mruData plugin.MRUData) (*plugin.QueryResult, error) {
+	query := strings.TrimSpace(mruData.ContextData["query"])
+	if query == "" {
+		return nil, fmt.Errorf("empty calculator query in context data")
+	}
+
+	thousandsSep, decimalSep := c.getSeparators(ctx)
+	val, err := Calculate(query, thousandsSep, decimalSep)
+	if err != nil {
+		return nil, fmt.Errorf("no result for query: %s", query)
+	}
+	result := val.String()
+	formattedResult := c.formatWithSeparators(val, thousandsSep, decimalSep)
+	return &plugin.QueryResult{
+		Title:       formattedResult,
+		SubTitle:    query,
+		Icon:        calculatorIcon,
+		IdentityKey: calculatorExpressionIdentityKey(query),
+		Actions: []plugin.QueryResultAction{
+			{
+				Name:        "i18n:plugin_calculator_copy_result",
+				Icon:        icons.Get(icons.ActionCopy),
+				ContextData: calculatorMRUContext(query),
+				Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+					clipboard.WriteText(result)
+				},
+			},
+			{
+				Name:        "i18n:plugin_calculator_copy_result_with_thousands_separator",
+				IsDefault:   true,
+				Icon:        icons.Get(icons.ActionCopy),
+				ContextData: calculatorMRUContext(query),
+				Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+					clipboard.WriteText(formattedResult)
+				},
+			},
+		},
+	}, nil
+}
+
+func (c *CalculatorPlugin) getDecimalSeparator(ctx context.Context) DecimalSeparator {
+	mode := c.api.GetSetting(ctx, "DecimalSeparator")
+	if mode == "" {
+		return DecimalSeparatorSystem
+	}
+	return DecimalSeparator(mode)
+}
+
+func (c *CalculatorPlugin) getThousandsSeparator(ctx context.Context) ThousandsSeparator {
+	mode := c.api.GetSetting(ctx, "ThousandsSeparator")
+	if mode == "" {
+		return ThousandsSeparatorSystem
+	}
+	return ThousandsSeparator(mode)
+}
+
+func (c *CalculatorPlugin) getSeparators(ctx context.Context) (thousandsSep string, decimalSep string) {
+	decimalSep = GetDecimalSeparator(c.getDecimalSeparator(ctx))
+	thousandsSep = GetThousandsSeparator(c.getThousandsSeparator(ctx), decimalSep)
+	if decimalSep != "" && decimalSep == thousandsSep {
+		thousandsSep = ""
+	}
+
+	return thousandsSep, decimalSep
+}
+
+func (c *CalculatorPlugin) formatWithSeparators(val decimal.Decimal, thousandsSep string, decimalSep string) string {
+	valStr := val.String()
+	parts := strings.Split(valStr, ".")
+
+	intPart := parts[0]
+	// Handle negative numbers
+	negative := false
+	if strings.HasPrefix(intPart, "-") {
+		negative = true
+		intPart = intPart[1:]
+	}
+
+	// Add thousands separators
+	formattedInt := c.addThousandsSeparator(intPart, thousandsSep)
+
+	if negative {
+		formattedInt = "-" + formattedInt
+	}
+
+	if len(parts) == 2 {
+		return formattedInt + decimalSep + parts[1]
+	}
+
+	return formattedInt
+}
+
+// addThousandsSeparator adds separators to an integer string
+func (c *CalculatorPlugin) addThousandsSeparator(s string, sep string) string {
+	n := len(s)
+	if n <= 3 {
+		return s
+	}
+
+	// Calculate how many separators we need
+	numSeps := (n - 1) / 3
+	// sep can be multi-byte? usually just 1 byte but string is safer
+	sepLen := len(sep)
+
+	result := make([]byte, n+numSeps*sepLen)
+
+	// Fill from right to left
+	j := len(result) - 1
+	for i := n - 1; i >= 0; i-- {
+		result[j] = s[i]
+		j--
+		// Add separator every 3 digits, but not at the beginning
+		if (n-i)%3 == 0 && i > 0 {
+			for k := sepLen - 1; k >= 0; k-- {
+				result[j] = sep[k]
+				j--
+			}
+		}
+	}
+
+	return string(result)
+}
+
+func (c *CalculatorPlugin) hasOperator(query string) bool {
+	if strings.ContainsAny(query, "+-*/(^") {
+		return true
+	}
+
+	if !strings.Contains(query, "(") || !strings.Contains(query, ")") {
+		return false
+	}
+
+	for _, r := range query {
+		if unicode.IsLetter(r) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *CalculatorPlugin) loadHistories(ctx context.Context) []CalculatorHistory {
+	historiesJson := c.api.GetSetting(ctx, "calculatorHistories")
+	if historiesJson == "" {
+		return []CalculatorHistory{}
+	}
+
+	var histories []CalculatorHistory
+	err := json.Unmarshal([]byte(historiesJson), &histories)
+	if err != nil {
+		c.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to unmarshal calculator history: %s", err.Error()))
+		return []CalculatorHistory{}
+	}
+
+	trimmedHistories := trimCalculatorHistories(histories)
+	if len(trimmedHistories) != len(histories) {
+		data, marshalErr := json.Marshal(trimmedHistories)
+		if marshalErr != nil {
+			c.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to marshal trimmed calculator history: %s", marshalErr.Error()))
+		} else {
+			c.api.SaveSetting(ctx, "calculatorHistories", string(data), false)
+		}
+	}
+
+	return trimmedHistories
+}
+
+// addCalculatorHistoryDebounced records the last stable calculation in the plugin's private history.
+func (c *CalculatorPlugin) addCalculatorHistoryDebounced(ctx context.Context, queryText string, result string) {
+	if !c.hasOperator(queryText) {
+		return
+	}
+
+	// Cancel existing timer if any
+	if c.debounceTimer != nil {
+		c.debounceTimer.Stop()
+	}
+
+	// Store the current query text
+	c.lastQueryText = queryText
+
+	// Create new timer that will execute after debounce interval
+	c.debounceTimer = time.AfterFunc(c.debounceInterval, func() {
+		if c.lastQueryText == queryText {
+			if len(c.histories) > 0 && c.histories[len(c.histories)-1].Expression == queryText {
+				return
+			}
+			c.histories = append(c.histories, CalculatorHistory{
+				Expression: queryText,
+				Result:     result,
+				AddDate:    util.FormatDateTime(util.GetSystemTime()),
+			})
+			c.histories = trimCalculatorHistories(c.histories)
+
+			historiesJson, err := json.Marshal(c.histories)
+			if err != nil {
+				c.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("Failed to marshal calculator history: %s", err.Error()))
+			} else {
+				c.api.SaveSetting(ctx, "calculatorHistories", string(historiesJson), false)
+			}
+		}
+	})
+}
+
+func trimCalculatorHistories(histories []CalculatorHistory) []CalculatorHistory {
+	if len(histories) <= maxCalculatorHistories {
+		return histories
+	}
+	return histories[len(histories)-maxCalculatorHistories:]
+}

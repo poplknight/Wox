@@ -1,0 +1,151 @@
+package component
+
+import (
+	"testing"
+
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+)
+
+func TestWoxButtonCentersContentInsideSymmetricPadding(t *testing.T) {
+	focusColor := woxui.Color{R: 10, G: 20, B: 30, A: 255}
+	button := WoxButton(ButtonProps{ID: "test-button", Label: "Disable", Width: 96, Theme: ControlTheme{Focus: focusColor}})
+	semantics := button.(woxwidget.Semantics)
+	focusable := semantics.Child.(woxwidget.Focusable)
+	if focusable.FocusRingColor != focusColor || focusable.FocusRingRadius != 4 {
+		t.Fatalf("button focus ring = %#v at %v, want %#v at 4", focusable.FocusRingColor, focusable.FocusRingRadius, focusColor)
+	}
+	gesture := buildHoverable(focusable.Child, false).(woxwidget.Gesture)
+	container := gesture.Child.(woxwidget.Container)
+	if container.Height != 32 || container.Radius != 4 {
+		t.Fatalf("button geometry = height %v radius %v, want height 32 radius 4", container.Height, container.Radius)
+	}
+	if container.Padding.Left != container.Padding.Right {
+		t.Fatalf("button horizontal padding = %+v, want symmetric padding", container.Padding)
+	}
+	content := container.Child.(woxwidget.Align)
+	if content.Horizontal != 0.5 || content.Vertical != 0.5 {
+		t.Fatalf("button content alignment = (%v, %v), want (0.5, 0.5)", content.Horizontal, content.Vertical)
+	}
+	label := content.Child.(woxwidget.TextBlock)
+	if label.Style.Size != CompactButtonFontSize || label.Style.Weight != woxui.FontWeightRegular || label.Height != 18 || label.AlignmentY != 0.5 {
+		t.Fatalf("button label slot = %+v, want regular %.0fpx in an 18px centered line", label, CompactButtonFontSize)
+	}
+}
+
+func TestWoxButtonLeadingAlignment(t *testing.T) {
+	button := WoxButton(ButtonProps{ID: "group", Label: "Window", Width: 300, AlignLeading: true})
+	content := buildHoverable(button.(woxwidget.Semantics).Child.(woxwidget.Focusable).Child, false).(woxwidget.Gesture).Child.(woxwidget.Container).Child.(woxwidget.Align)
+	if content.Horizontal != 0 || content.Vertical != .5 {
+		t.Fatalf("disclosure alignment = %+v", content)
+	}
+}
+
+func TestWoxButtonLabelWeightIsConfigurable(t *testing.T) {
+	regular := WoxButton(ButtonProps{ID: "disable", Label: "Disable"})
+	regularLabel := buildHoverable(regular.(woxwidget.Semantics).Child.(woxwidget.Focusable).Child, false).(woxwidget.Gesture).Child.(woxwidget.Container).Child.(woxwidget.TextBlock)
+	if regularLabel.Style.Weight != woxui.FontWeightRegular {
+		t.Fatalf("default button weight = %v, want regular", regularLabel.Style.Weight)
+	}
+
+	emphasized := WoxButton(ButtonProps{ID: "save", Label: "Save", FontWeight: woxui.FontWeightSemibold})
+	emphasizedLabel := buildHoverable(emphasized.(woxwidget.Semantics).Child.(woxwidget.Focusable).Child, false).(woxwidget.Gesture).Child.(woxwidget.Container).Child.(woxwidget.TextBlock)
+	if emphasizedLabel.Style.Weight != woxui.FontWeightSemibold {
+		t.Fatalf("explicit button weight = %v, want semibold", emphasizedLabel.Style.Weight)
+	}
+}
+
+func TestWoxButtonCentersIntrinsicContentVertically(t *testing.T) {
+	button := WoxButton(ButtonProps{ID: "apply", Label: "应用", FontSize: 13, IntrinsicWidth: true})
+	container := buildHoverable(button.(woxwidget.Semantics).Child.(woxwidget.Focusable).Child, false).(woxwidget.Gesture).Child.(woxwidget.Container)
+
+	if container.Width != 0 || container.Padding.Top != 7 || container.Padding.Bottom != 7 {
+		t.Fatalf("intrinsic button = width %v padding %+v, want natural width and 7px integer insets around an 18px label", container.Width, container.Padding)
+	}
+	label := container.Child.(woxwidget.TextBlock)
+	if label.Height != 18 || label.LineHeight != 18 || label.AlignmentY != 0.5 {
+		t.Fatalf("intrinsic label slot = %#v, want an 18px optically centered line", label)
+	}
+}
+
+func TestWoxButtonHeightFillsExplicitSlot(t *testing.T) {
+	button := WoxButton(ButtonProps{ID: "create", Label: "New Auto theme", Width: 240, Height: 40})
+	container := buildHoverable(button.(woxwidget.Semantics).Child.(woxwidget.Focusable).Child, false).(woxwidget.Gesture).Child.(woxwidget.Container)
+	if container.Width != 240 || container.Height != 40 {
+		t.Fatalf("explicit button slot = %.0fx%.0f, want 240x40", container.Width, container.Height)
+	}
+}
+
+func TestWoxButtonUsesSharedGeometry(t *testing.T) {
+	button := WoxButton(ButtonProps{ID: "add", Label: "Add"})
+	container := buildHoverable(button.(woxwidget.Semantics).Child.(woxwidget.Focusable).Child, false).(woxwidget.Gesture).Child.(woxwidget.Container)
+
+	if container.Height != 32 || container.Padding.Left != 12 || container.Padding.Right != 12 {
+		t.Fatalf("button geometry = height %v padding %+v, want 32px height and symmetric 12px padding", container.Height, container.Padding)
+	}
+	if container.Padding.Top != container.Padding.Bottom {
+		t.Fatalf("button vertical padding = %+v, want symmetric padding", container.Padding)
+	}
+}
+
+func TestWoxButtonCentersIconAndLabel(t *testing.T) {
+	button := WoxButton(ButtonProps{ID: "add", Label: "添加", Icon: &woxui.Image{}, IconSize: 18})
+	container := buildHoverable(button.(woxwidget.Semantics).Child.(woxwidget.Focusable).Child, false).(woxwidget.Gesture).Child.(woxwidget.Container)
+	content, ok := container.Child.(woxwidget.Flex)
+	if !ok || content.CrossAxisAlignment != woxwidget.CrossAxisCenter {
+		t.Fatalf("button icon and label layout = %#v, want horizontal flex with centered cross axis", container.Child)
+	}
+	if container.Padding.Top != container.Padding.Bottom {
+		t.Fatalf("icon button vertical padding = %+v, want symmetric padding", container.Padding)
+	}
+}
+
+func TestWoxButtonUsesContentWidthWhenWidthOmitted(t *testing.T) {
+	button := WoxButton(ButtonProps{ID: "cancel", Label: "Cancel"})
+	container := buildHoverable(button.(woxwidget.Semantics).Child.(woxwidget.Focusable).Child, false).(woxwidget.Gesture).Child.(woxwidget.Container)
+	if container.Width != 0 {
+		t.Fatalf("omitted width = %v, want content-sized button like Flutter WoxButton", container.Width)
+	}
+	if _, isAlign := container.Child.(woxwidget.Align); isAlign {
+		t.Fatal("content-sized buttons must not wrap labels in an expanding Align")
+	}
+	if label, ok := container.Child.(woxwidget.TextBlock); !ok || label.Value != "Cancel" || !label.ShrinkWrap {
+		t.Fatalf("content-sized label = %#v", container.Child)
+	}
+}
+
+func TestWoxButtonOutlineFollowsValueText(t *testing.T) {
+	title := woxui.Color{R: 240, G: 244, B: 248, A: 255}
+	button := WoxButton(ButtonProps{
+		ID: "add", Label: "Add", Variant: ButtonOutline,
+		Theme: ControlTheme{Text: title, TextSecondary: woxui.Color{R: 255, A: 255}},
+	})
+	container := buildHoverable(button.(woxwidget.Semantics).Child.(woxwidget.Focusable).Child, false).(woxwidget.Gesture).Child.(woxwidget.Container)
+	label := container.Child.(woxwidget.TextBlock)
+	if label.Color != title {
+		t.Fatalf("outline button label = %#v, want Text", label.Color)
+	}
+	if container.BorderColor != title {
+		t.Fatalf("outline button border = %#v, want the same Text as the label", container.BorderColor)
+	}
+}
+
+func TestWoxButtonUsesVariantAwareHoverOverlay(t *testing.T) {
+	base := woxui.Color{R: 20, G: 40, B: 60, A: 255}
+	foreground := woxui.Color{R: 220, G: 230, B: 240, A: 255}
+	button := WoxButton(ButtonProps{ID: "save", Label: "Save", Variant: ButtonPrimary, OnTap: func() {}, Theme: ControlTheme{Accent: base, AccentText: foreground}}).(woxwidget.Semantics)
+	stateful := button.Child.(woxwidget.Focusable).Child
+	normal := buildHoverable(stateful, false).(woxwidget.Gesture)
+	hovered := buildHoverable(stateful, true).(woxwidget.Gesture)
+
+	if normal.OnHoverAt == nil {
+		t.Fatal("button does not retain hover input")
+	}
+	if normal.Child.(woxwidget.Container).Color != base {
+		t.Fatal("button normal background changed")
+	}
+	want := controlHoverColor(base, foreground)
+	if got := hovered.Child.(woxwidget.Container).Color; got != want {
+		t.Fatalf("button hover background = %#v, want %#v", got, want)
+	}
+}

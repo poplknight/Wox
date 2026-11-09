@@ -1,0 +1,439 @@
+package fuzzymatch
+
+import (
+	"math/rand"
+	"testing"
+	"unsafe"
+
+	"github.com/stretchr/testify/assert"
+)
+
+// TestPinyinDifferentLengthPoolReuse exercises stale generations from longer candidates.
+func TestPinyinDifferentLengthPoolReuse(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	letters := []rune("不路蓝绿重行文件夹abcdefghijklmnopqrstuvwxyz")
+	for iteration := 0; iteration < 10000; iteration++ {
+		text := make([]rune, 2+rng.Intn(30))
+		for index := range text {
+			text[index] = letters[rng.Intn(len(letters))]
+		}
+		got := FuzzyMatch(string(text), "blu", true)
+		want := FuzzyMatchPrepared(PrepareText(string(text)), PreparePattern("blu"), true)
+		if got != want {
+			t.Fatalf("text %q: direct = %+v, prepared = %+v", string(text), got, want)
+		}
+	}
+}
+
+func TestReleasePinyinDictionaryReloads(t *testing.T) {
+	syllables, ok := LookupCharPinyin('项')
+	if !ok || len(syllables) == 0 || syllables[0] == "" {
+		t.Fatalf("pinyin for 项 = %v, ok=%v", syllables, ok)
+	}
+	ReleasePinyinDictionary()
+	pinyinDictMu.Lock()
+	unloaded := pinyinDict.Load() == nil
+	pinyinDictMu.Unlock()
+	if !unloaded {
+		t.Fatal("pinyin dictionary was still loaded after release")
+	}
+	syllables, ok = LookupCharPinyin('项')
+	if !ok || len(syllables) == 0 || syllables[0] == "" {
+		t.Fatalf("reloaded pinyin for 项 = %v, ok=%v", syllables, ok)
+	}
+}
+
+func TestPinyinCacheOwnsMappedTerm(t *testing.T) {
+	ReleaseIdleCaches()
+	defer ReleaseIdleCaches()
+	bytes := []byte("项目")
+	term := unsafe.String(&bytes[0], len(bytes))
+	getPinYin(term)
+	bytes[0] = '?'
+
+	found := false
+	pinyinCache.Range(func(key, _ any) bool {
+		found = key.(string) == "项目"
+		return false
+	})
+	if !found {
+		t.Fatal("pinyin cache retained the caller's mutable backing memory")
+	}
+}
+
+func TestFuzzyMatchExact(t *testing.T) {
+	// Exact match should have highest score
+	result := FuzzyMatch("Terminal", "Terminal", false)
+	assert.True(t, result.IsMatch)
+	assert.Greater(t, result.Score, int64(100))
+}
+
+func TestFuzzyMatchPrefix(t *testing.T) {
+	// Prefix match should have high score
+	result := FuzzyMatch("Terminal", "Term", false)
+	assert.True(t, result.IsMatch)
+	assert.Greater(t, result.Score, int64(50))
+
+	// "term" should match "Terminal" (case insensitive)
+	result = FuzzyMatch("Terminal", "term", false)
+	assert.True(t, result.IsMatch)
+}
+
+func TestFuzzyMatchCamelCase(t *testing.T) {
+	// CamelCase matching
+	result := FuzzyMatch("moduleNameResolver", "mnr", false)
+	assert.True(t, result.IsMatch)
+
+	result = FuzzyMatch("getProcessById", "gpb", false)
+	assert.True(t, result.IsMatch)
+
+	result = FuzzyMatch("XMLHttpRequest", "xhr", false)
+	assert.True(t, result.IsMatch)
+}
+
+func TestFuzzyMatchBoundary(t *testing.T) {
+	// Boundary matching (after delimiters)
+	result := FuzzyMatch("my-awesome-plugin", "map", false)
+	assert.True(t, result.IsMatch)
+
+	result = FuzzyMatch("user_profile_settings", "ups", false)
+	assert.True(t, result.IsMatch)
+
+	result = FuzzyMatch("file.name.extension", "fne", false)
+	assert.True(t, result.IsMatch)
+}
+
+func TestFuzzyMatchDiacritics(t *testing.T) {
+	// Diacritics should be normalized
+	result := FuzzyMatch("café", "cafe", false)
+	assert.True(t, result.IsMatch)
+
+	result = FuzzyMatch("naïve", "naive", false)
+	assert.True(t, result.IsMatch)
+
+	result = FuzzyMatch("Müller", "muller", false)
+	assert.True(t, result.IsMatch)
+
+	result = FuzzyMatch("Björk", "bjork", false)
+	assert.True(t, result.IsMatch)
+
+	result = FuzzyMatch("São Paulo", "sao", false)
+	assert.True(t, result.IsMatch)
+
+	// Search with diacritics should also work
+	result = FuzzyMatch("resume", "résumé", false)
+	assert.True(t, result.IsMatch)
+}
+
+func TestFuzzyMatchNoMatch(t *testing.T) {
+	// These should NOT match
+	result := FuzzyMatch("Terminal", "xyz", false)
+	assert.False(t, result.IsMatch)
+
+	result = FuzzyMatch("hello", "world", false)
+	assert.False(t, result.IsMatch)
+
+	// Pattern longer than text
+	result = FuzzyMatch("abc", "abcdef", false)
+	assert.False(t, result.IsMatch)
+}
+
+func TestFuzzxyMatchPinyinPolyphonicCharacter(t *testing.T) {
+	result := FuzzyMatch("这是一个多音字测试, 两行字", "hang", true)
+	assert.True(t, result.IsMatch)
+
+	result = FuzzyMatch("这是一个多音字测试, 行走", "xing", true)
+	assert.True(t, result.IsMatch)
+}
+
+func TestFuzzyMatchPinyinNonPinyinMixedSearch(t *testing.T) {
+	result := FuzzyMatch("QQ音乐,这是一个测试, 行走", "qqyy", true)
+	assert.True(t, result.IsMatch)
+	for _, query := range []string{"woxcs2026", "woxcs2026.txt", "woxceshi2026"} {
+		assert.True(t, FuzzyMatch("Wox测试2026.txt", query, true).IsMatch, query)
+	}
+}
+
+func TestFuzzyMatchScoreComparison(t *testing.T) {
+	// Prefix match should score higher than substring match
+	prefixResult := FuzzyMatch("Terminal", "term", false)
+	substringResult := FuzzyMatch("myTerminal", "term", false)
+	assert.Greater(t, prefixResult.Score, substringResult.Score)
+
+	// Exact match should score higher than prefix match
+	exactResult := FuzzyMatch("term", "term", false)
+	assert.Greater(t, exactResult.Score, prefixResult.Score)
+
+	// Consecutive matches should score higher than scattered matches
+	consecutiveResult := FuzzyMatch("abcdef", "abc", false)
+	scatteredResult := FuzzyMatch("aXbXcXdef", "abc", false)
+	assert.Greater(t, consecutiveResult.Score, scatteredResult.Score)
+
+	shot := FuzzyMatch("Snow Shot", "shot", false)
+	for _, candidate := range []string{"show-task-view", "Show the current awake status"} {
+		other := FuzzyMatch(candidate, "shot", false)
+		assert.True(t, other.IsMatch, candidate)
+		assert.Greater(t, shot.Score, other.Score, candidate)
+	}
+}
+
+func TestFuzzyMatchPinyinAdvanced(t *testing.T) {
+	// Full pinyin match
+	assert.True(t, FuzzyMatch("微信", "weixin", true).IsMatch)
+	assert.True(t, FuzzyMatch("支付宝", "zhifubao", true).IsMatch)
+
+	// First letter pinyin match
+	assert.True(t, FuzzyMatch("微信", "wx", true).IsMatch)
+	assert.True(t, FuzzyMatch("支付宝", "zfb", true).IsMatch)
+
+	// Partial pinyin match
+	assert.True(t, FuzzyMatch("网易云音乐", "wangyiyun", true).IsMatch)
+}
+
+func TestFuzzyMatchEdgeCases(t *testing.T) {
+	// Empty pattern should match everything
+	result := FuzzyMatch("anything", "", false)
+	assert.True(t, result.IsMatch)
+
+	// Empty text should not match non-empty pattern
+	result = FuzzyMatch("", "abc", false)
+	assert.False(t, result.IsMatch)
+
+	// Both empty
+	result = FuzzyMatch("", "", false)
+	assert.True(t, result.IsMatch)
+
+	// Single character match
+	result = FuzzyMatch("a", "a", false)
+	assert.True(t, result.IsMatch)
+
+	// Unicode characters
+	result = FuzzyMatch("日本語テスト", "日本", true)
+	assert.True(t, result.IsMatch)
+}
+
+func TestFuzzyMatchSpecialCharacters(t *testing.T) {
+	// Special characters in text
+	result := FuzzyMatch("C++ Programming", "cpro", false)
+	assert.True(t, result.IsMatch)
+
+	result = FuzzyMatch("user@example.com", "user", false)
+	assert.True(t, result.IsMatch)
+
+	result = FuzzyMatch("path/to/file.txt", "ptf", false)
+	assert.True(t, result.IsMatch)
+
+	// Test that searching for actual content works
+	result = FuzzyMatch("C++ Programming", "prog", false)
+	assert.True(t, result.IsMatch)
+}
+
+func TestStringMatcherPinyin(t *testing.T) {
+	// All first letters match
+	assert.True(t, FuzzyMatch("有道词典", "yd", true).IsMatch)
+	assert.True(t, FuzzyMatch("有道词典", "ydcd", true).IsMatch)
+	assert.True(t, FuzzyMatch("网易云音乐", "wyyy", true).IsMatch)
+	assert.True(t, FuzzyMatch("腾讯qq", "tx", true).IsMatch)
+	assert.True(t, FuzzyMatch("你好", "nh", true).IsMatch)
+	assert.True(t, FuzzyMatch("你好", "n", true).IsMatch)
+
+	// All full pinyin match
+	assert.True(t, FuzzyMatch("QQ音乐.app", "yinyue", true).IsMatch, "QQ音乐.app should match yinyue")
+	assert.True(t, FuzzyMatch("你好", "nihao", true).IsMatch)
+	assert.True(t, FuzzyMatch("你好", "ni", true).IsMatch)
+	assert.True(t, FuzzyMatch("你好", "niha", true).IsMatch)
+	assert.True(t, FuzzyMatch("网易云音乐", "wangyiyinyue", true).IsMatch)
+
+	// Mixed mode should NOT match (first letter + partial pinyin)
+	cases := []struct {
+		pattern string
+		text    string
+		match   bool
+	}{
+		{"", "", true},
+		{"", "a", true},
+		{"a", "", false},
+		{"a", "a", true},
+		{"a", "b", false},
+		{"nh", "你好", true},
+		{"h", "你好", true},
+		{"ha", "你好", false},
+		{"ii", "Ii", true},
+	}
+
+	for _, c := range cases {
+		result := FuzzyMatch(c.text, c.pattern, true)
+		if result.IsMatch != c.match {
+			t.Errorf("Test failed, pattern: %s, text: %s, expected: %v, got: %v", c.pattern, c.text, c.match, result.IsMatch)
+		}
+	}
+}
+
+func TestStringMatcherPinyinAllowsTrailingIncompleteSyllable(t *testing.T) {
+	cases := []struct {
+		pattern string
+		text    string
+	}{
+		{"shij", "视觉中国"},
+		{"shij", "世纪"},
+		{"shij", "史记"},
+		{"shij", "Python计算机视觉编程"},
+	}
+
+	for _, c := range cases {
+		result := FuzzyMatch(c.text, c.pattern, true)
+		assert.True(t, result.IsMatch, "pattern %q should match text %q", c.pattern, c.text)
+		assert.GreaterOrEqual(t, result.Score, int64(50), "pattern %q should pass strict plugin score threshold for text %q", c.pattern, c.text)
+	}
+}
+
+func TestStringMatcherPinyinRejectsNonTrailingMixedMode(t *testing.T) {
+	assert.False(t, FuzzyMatch("你好", "nhao", true).IsMatch)
+}
+
+func TestPinyinIncompleteSyllableAfterSkippedCharacter(t *testing.T) {
+	for _, title := range []string{"锁定或解除锁定任务栏", "磁力猫 - 懂你的磁力链接搜索引擎"} {
+		prepared := PrepareText(title)
+		for _, query := range []string{"jies", "jiesu", "jiesuo"} {
+			pattern := PreparePattern(query)
+			for _, result := range []FuzzyMatchResult{
+				FuzzyMatch(title, query, true),
+				FuzzyMatchPrepared(prepared, pattern, true),
+				FuzzyMatchPattern(title, pattern, false, true),
+			} {
+				assert.True(t, result.IsMatch, "query %q should match %q", query, title)
+			}
+		}
+	}
+}
+
+func TestStringMatcher(t *testing.T) {
+
+	cases := []struct {
+		pattern string
+		text    string
+		match   bool
+	}{
+		{"", "", true},
+		{"", "a", true},
+		{"a", "", false},
+		{"a", "a", true},
+		{"a", "b", false},
+	}
+
+	for _, c := range cases {
+		result := FuzzyMatch(c.text, c.pattern, false)
+		if result.IsMatch != c.match {
+			t.Errorf("Test failed, pattern: %s, text: %s, expected: %v, got: %v", c.pattern, c.text, c.match, result.IsMatch)
+		}
+	}
+}
+
+func TestIsStringMatchScore(t *testing.T) {
+	cases := []struct {
+		pattern string
+		text    string
+		match   bool
+	}{
+		{"", "", true},
+		{"", "a", true},
+		{"a", "", false},
+		{"a", "a", true},
+		{"a", "b", false},
+	}
+
+	for _, c := range cases {
+		result := FuzzyMatch(c.text, c.pattern, false)
+		if result.IsMatch != c.match {
+			t.Errorf("Test failed, pattern: %s, text: %s, expected: %v, got: %v", c.pattern, c.text, c.match, result.IsMatch)
+		}
+	}
+}
+
+// bestASCIIAlignmentScoreExhaustive finds the highest valid ASCII alignment score for a small test case.
+func bestASCIIAlignmentScoreExhaustive(text string, pattern string) int64 {
+	if len(pattern) == 0 || len(pattern) > len(text) {
+		return 0
+	}
+
+	matchedIndexes := make([]int, len(pattern))
+	bestScore := int64(0)
+	found := false
+
+	var search func(textStart int, patternIdx int)
+	search = func(textStart int, patternIdx int) {
+		if patternIdx == len(pattern) {
+			score := calculateScoreASCII(text, matchedIndexes, len(pattern))
+			if !found || score > bestScore {
+				bestScore = score
+				found = true
+			}
+			return
+		}
+
+		remaining := len(pattern) - patternIdx
+		maxStart := len(text) - remaining
+		for textIdx := textStart; textIdx <= maxStart; textIdx++ {
+			if toLowerByte(text[textIdx]) != toLowerByte(pattern[patternIdx]) {
+				continue
+			}
+
+			matchedIndexes[patternIdx] = textIdx
+			search(textIdx+1, patternIdx+1)
+		}
+	}
+
+	search(0, 0)
+	return bestScore
+}
+
+func TestFuzzyMatchASCIIPathUsesBestAlignmentScoreOnShortText(t *testing.T) {
+	result := FuzzyMatch("a_b_abc", "abc", false)
+	assert.True(t, result.IsMatch)
+
+	bestScore := bestASCIIAlignmentScoreExhaustive("a_b_abc", "abc")
+	assert.Equal(t, bestScore, result.Score, "ASCII fast path should keep the best scoring alignment for short texts")
+}
+
+func TestFuzzyMatchASCIIPathPreservesSubstringFallbackParity(t *testing.T) {
+	asciiResult := FuzzyMatch("zzabzz", "ab", false)
+	unicodeResult := FuzzyMatch("zzábzz", "ab", false)
+
+	assert.True(t, unicodeResult.IsMatch, "normalized path should keep substring fallback coverage for short contained patterns")
+	assert.Equal(t, unicodeResult, asciiResult, "ASCII fast path should stay in sync with the normalized path and Dart matcher for short contained substrings")
+}
+
+// cpu: Apple M1 Max
+// BenchmarkIsStringMatchScore-10    	 1959001	       618.8 ns/op	       0 B/op	       0 allocs/op
+func BenchmarkIsStringMatchScore(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		FuzzyMatch("刚好今天和老婆去超市 有道词典 Microsoft Word - Document.docx ", "超市", true)
+	}
+}
+
+// cpu: Apple M1 Max
+// BenchmarkFuzzyMatchNoMatch-10    	11877062	        97.95 ns/op	       0 B/op	       0 allocs/op
+func BenchmarkFuzzyMatchNoMatch(b *testing.B) {
+	// Scenario: Searching "git" in a long list of unrelated items
+	// This should be zero allocations with the optimization
+	text := "Microsoft Word - Document.docx - Final Version - 2024"
+	pattern := "git"
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		FuzzyMatch(text, pattern, true)
+	}
+}
+
+// cpu: Apple M1 Max
+// BenchmarkIsStringMatchScorePinyin-10    	  697035	      1687 ns/op	       0 B/op	       0 allocs/op
+func BenchmarkIsStringMatchScorePinyin(b *testing.B) {
+	// Scenario: Searching "yd" (YouDao) in the text, forcing Pinyin logic
+	text := "刚好今天和老婆去超市 之前的优化中存在一个过于激进的策略：当句子超过 10 个字时，会强制丢弃多音字的变体以节省计算。这导致在长句中 \"行\" 只保留了 \"hang\" 而丢失了 \"xing\" 有道词典 Microsoft Word - Document.docx "
+	pattern := "yd"
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		FuzzyMatch(text, pattern, true)
+	}
+}

@@ -1,0 +1,318 @@
+package widget
+
+import woxui "wox/ui/runtime"
+
+// Key gives one stateful or interactive widget a stable identity among its siblings.
+type Key string
+
+type semanticBehavior struct {
+	automationID     string
+	role             woxui.AccessibilityRole
+	label            string
+	description      string
+	value            string
+	actions          []woxui.AccessibilityAction
+	liveRegion       woxui.AccessibilityLiveRegion
+	enabled          bool
+	selected         bool
+	hovered          bool
+	checked          bool
+	expanded         bool
+	readOnly         bool
+	protected        bool
+	hidden           bool
+	nativeBoundary   bool
+	hasTextSelection bool
+	selectionStart   int
+	selectionEnd     int
+	textLines        []woxui.AccessibilityTextLine
+	onAction         func(action woxui.AccessibilityAction, value string) error
+}
+
+type focusBehavior struct {
+	autofocus               bool
+	disabled                bool
+	skipTraversal           bool
+	focusRingColor          woxui.Color
+	focusRingRadius         float32
+	focusRingOutsets        Insets
+	unfocusOnPointerOutside bool
+	onKeyCapture            func(event woxui.KeyEvent) bool
+	onKey                   func(event woxui.KeyEvent) bool
+	onTextInput             func(event woxui.TextInputEvent) bool
+	onFocusChange           func(focused bool)
+	textInput               func(bounds woxui.Rect) woxui.TextInputState
+}
+
+type focusScopeBehavior struct {
+	modal bool
+	onKey func(event woxui.KeyEvent) bool
+}
+
+// Keyed assigns identity without changing layout or paint.
+type Keyed struct {
+	Key   Key
+	Child Widget
+}
+
+func (w Keyed) layout(ctx context, available constraints) *node {
+	if w.Child == nil {
+		return &node{key: w.Key, kind: "keyed"}
+	}
+	child := layoutBehaviorChild(ctx, available, w.Child)
+	child.key = w.Key
+	if child.kind == "" {
+		child.kind = "keyed"
+	}
+	return child
+}
+
+// Semantics exposes one logical control to accessibility and test automation.
+type Semantics struct {
+	Key            Key
+	AutomationID   string
+	Role           woxui.AccessibilityRole
+	Label          string
+	Description    string
+	Value          string
+	Actions        []woxui.AccessibilityAction
+	LiveRegion     woxui.AccessibilityLiveRegion
+	Disabled       bool
+	Selected       bool
+	Hovered        bool
+	Checked        bool
+	Expanded       bool
+	ReadOnly       bool
+	Protected      bool
+	Hidden         bool
+	NativeBoundary bool
+	// HasTextSelection marks that SelectionStart/SelectionEnd are rune offsets in Value.
+	HasTextSelection bool
+	SelectionStart   int
+	SelectionEnd     int
+	OnAction         func(action woxui.AccessibilityAction, value string) error
+	Child            Widget
+}
+
+func (w Semantics) layout(ctx context, available constraints) *node {
+	child := layoutBehaviorChild(ctx, available, w.Child)
+	if child.semantic != nil && child.semantic.automationID != "" && child.semantic.automationID != w.AutomationID {
+		// Nested semantic controls must keep separate automation identities.
+		child = &node{bounds: woxui.Rect{Width: child.bounds.Width, Height: child.bounds.Height}, children: []*node{child}}
+	}
+	if w.Key != "" {
+		child.key = w.Key
+	}
+	if child.kind == "" {
+		child.kind = "semantics"
+	}
+	child.semantic = &semanticBehavior{
+		automationID:     w.AutomationID,
+		role:             w.Role,
+		label:            w.Label,
+		description:      w.Description,
+		value:            w.Value,
+		actions:          append([]woxui.AccessibilityAction(nil), w.Actions...),
+		liveRegion:       w.LiveRegion,
+		enabled:          !w.Disabled,
+		selected:         w.Selected,
+		hovered:          w.Hovered,
+		checked:          w.Checked,
+		expanded:         w.Expanded,
+		readOnly:         w.ReadOnly,
+		protected:        w.Protected,
+		hidden:           w.Hidden,
+		nativeBoundary:   w.NativeBoundary,
+		hasTextSelection: w.HasTextSelection,
+		selectionStart:   w.SelectionStart,
+		selectionEnd:     w.SelectionEnd,
+		onAction:         w.OnAction,
+	}
+	return child
+}
+
+// Focusable lets one retained element own keyboard focus and input callbacks.
+type Focusable struct {
+	Key       Key
+	Autofocus bool
+	Disabled  bool
+	// SkipTraversal allows pointer or programmatic focus without adding the control to the Tab order.
+	SkipTraversal    bool
+	FocusRingColor   woxui.Color
+	FocusRingRadius  float32
+	FocusRingOutsets Insets
+	// UnfocusOnPointerOutside releases focus when a primary pointer press lands outside this focusable subtree and does not target another focusable.
+	UnfocusOnPointerOutside bool
+	OnKeyCapture            func(event woxui.KeyEvent) bool
+	OnKey                   func(event woxui.KeyEvent) bool
+	OnTextInput             func(event woxui.TextInputEvent) bool
+	OnFocusChange           func(focused bool)
+	TextInput               func(bounds woxui.Rect) woxui.TextInputState
+	Child                   Widget
+}
+
+func (w Focusable) layout(ctx context, available constraints) *node {
+	child := layoutBehaviorChild(ctx, available, w.Child)
+	if w.Key != "" {
+		child.key = w.Key
+	}
+	if child.kind == "" {
+		child.kind = "focusable"
+	}
+	child.focus = &focusBehavior{
+		autofocus:               w.Autofocus,
+		disabled:                w.Disabled,
+		skipTraversal:           w.SkipTraversal,
+		focusRingColor:          w.FocusRingColor,
+		focusRingRadius:         w.FocusRingRadius,
+		focusRingOutsets:        w.FocusRingOutsets,
+		unfocusOnPointerOutside: w.UnfocusOnPointerOutside,
+		onKeyCapture:            w.OnKeyCapture,
+		onKey:                   w.OnKey,
+		onTextInput:             w.OnTextInput,
+		onFocusChange:           w.OnFocusChange,
+		textInput:               w.TextInput,
+	}
+	return child
+}
+
+// FocusScope bounds traversal and optionally traps focus while a modal surface is visible.
+type FocusScope struct {
+	Key   Key
+	Modal bool
+	OnKey func(event woxui.KeyEvent) bool
+	Child Widget
+}
+
+func (w FocusScope) layout(ctx context, available constraints) *node {
+	child := layoutBehaviorChild(ctx, available, w.Child)
+	if w.Key != "" {
+		child.key = w.Key
+	}
+	if child.kind == "" {
+		child.kind = "focus_scope"
+	}
+	child.scope = &focusScopeBehavior{modal: w.Modal, onKey: w.OnKey}
+	return child
+}
+
+// EditableText combines text-field semantics with focus, key, IME, and value actions.
+type EditableText struct {
+	Key              Key
+	AutomationID     string
+	Label            string
+	Value            string
+	ReadOnly         bool
+	Protected        bool
+	Autofocus        bool
+	Disabled         bool
+	SelectionStart   int
+	SelectionEnd     int
+	HasTextSelection bool
+	TextLines        []woxui.AccessibilityTextLine
+	FocusRingColor   woxui.Color
+	FocusRingRadius  float32
+	FocusRingOutsets Insets
+	OnKey            func(event woxui.KeyEvent) bool
+	OnTextInput      func(event woxui.TextInputEvent) bool
+	OnFocusChange    func(focused bool)
+	OnSetValue       func(value string) error
+	OnSelectAll      func() error
+	OnCopy           func() error
+	OnCut            func() error
+	OnPaste          func() error
+	TextInput        func(bounds woxui.Rect) woxui.TextInputState
+	Child            Widget
+}
+
+func (w EditableText) layout(ctx context, available constraints) *node {
+	actions := []woxui.AccessibilityAction{woxui.AccessibilityActionFocus}
+	if !w.Disabled {
+		if w.OnSelectAll != nil {
+			actions = append(actions, woxui.AccessibilityActionSelectAll)
+		}
+		if w.OnCopy != nil && !w.Protected {
+			actions = append(actions, woxui.AccessibilityActionCopy)
+		}
+		if !w.ReadOnly {
+			if w.OnSetValue != nil {
+				actions = append(actions, woxui.AccessibilityActionSetValue)
+			}
+			if w.OnCut != nil && !w.Protected {
+				actions = append(actions, woxui.AccessibilityActionCut)
+			}
+			if w.OnPaste != nil {
+				actions = append(actions, woxui.AccessibilityActionPaste)
+			}
+		}
+	}
+	child := Focusable{
+		Key:              w.Key,
+		Autofocus:        w.Autofocus,
+		Disabled:         w.Disabled,
+		FocusRingColor:   w.FocusRingColor,
+		FocusRingRadius:  w.FocusRingRadius,
+		FocusRingOutsets: w.FocusRingOutsets,
+		OnKey:            w.OnKey,
+		OnTextInput:      w.OnTextInput,
+		OnFocusChange:    w.OnFocusChange,
+		TextInput:        w.TextInput,
+		Child:            w.Child,
+	}.layout(ctx, available)
+	child.semantic = &semanticBehavior{
+		automationID: w.AutomationID,
+		role:         woxui.AccessibilityRoleTextField,
+		label:        w.Label,
+		value:        w.Value,
+		actions:      actions,
+		enabled:      !w.Disabled,
+		readOnly:     w.ReadOnly,
+		protected:    w.Protected,
+		onAction: func(action woxui.AccessibilityAction, value string) error {
+			switch action {
+			case woxui.AccessibilityActionSetValue:
+				if w.OnSetValue != nil {
+					return w.OnSetValue(value)
+				}
+			case woxui.AccessibilityActionSelectAll:
+				if w.OnSelectAll != nil {
+					return w.OnSelectAll()
+				}
+			case woxui.AccessibilityActionCopy:
+				if w.OnCopy != nil {
+					return w.OnCopy()
+				}
+			case woxui.AccessibilityActionCut:
+				if w.OnCut != nil {
+					return w.OnCut()
+				}
+			case woxui.AccessibilityActionPaste:
+				if w.OnPaste != nil {
+					return w.OnPaste()
+				}
+			}
+			return nil
+		},
+	}
+	if w.HasTextSelection {
+		child.semantic.hasTextSelection = true
+		child.semantic.selectionStart = w.SelectionStart
+		child.semantic.selectionEnd = w.SelectionEnd
+	}
+	if len(w.TextLines) > 0 {
+		child.semantic.textLines = append([]woxui.AccessibilityTextLine(nil), w.TextLines...)
+	}
+	return child
+}
+
+// layoutBehaviorChild isolates retained roots from mutations by outer behavior widgets.
+func layoutBehaviorChild(ctx context, available constraints, child Widget) *node {
+	if child == nil {
+		return &node{bounds: woxui.Rect{Width: available.width, Height: available.height}}
+	}
+	result := child.layout(ctx, available)
+	if result.boundary != nil {
+		return &node{bounds: woxui.Rect{Width: result.bounds.Width, Height: result.bounds.Height}, children: []*node{result}}
+	}
+	return result
+}

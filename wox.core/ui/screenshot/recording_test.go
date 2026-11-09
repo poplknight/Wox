@@ -1,0 +1,1581 @@
+package screenshot
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"image"
+	"image/color"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"wox/common/icons"
+	"wox/util/keyboard"
+)
+
+type recordingTestEncoder struct {
+	mu        sync.Mutex
+	started   bool
+	finalized bool
+	aborted   bool
+	frames    int
+}
+
+type recordingTestWriteCloser struct {
+	bytes.Buffer
+}
+
+func (writer *recordingTestWriteCloser) Close() error { return nil }
+
+func (encoder *recordingTestEncoder) Start(path string, width, height, fps int) error {
+	encoder.mu.Lock()
+	defer encoder.mu.Unlock()
+	encoder.started = true
+	return nil
+}
+
+func (encoder *recordingTestEncoder) WriteFrame(frame recordingFrame) error {
+	encoder.mu.Lock()
+	defer encoder.mu.Unlock()
+	encoder.frames++
+	return nil
+}
+
+func (encoder *recordingTestEncoder) Finalize() error {
+	encoder.mu.Lock()
+	defer encoder.mu.Unlock()
+	encoder.finalized = true
+	return nil
+}
+
+func (encoder *recordingTestEncoder) Abort() error {
+	encoder.mu.Lock()
+	defer encoder.mu.Unlock()
+	encoder.aborted = true
+	return nil
+}
+
+func waitForRecordingState(t *testing.T, session *recordingSession, want recordingState) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if session.currentState() == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("recording state = %s, want %s", session.currentState(), want)
+}
+
+func TestRecordingSessionStateTransitionsExcludePausedTime(t *testing.T) {
+	now := time.Unix(100, 0)
+	encoder := &recordingTestEncoder{}
+	session, err := newRecordingSession(recordingSessionConfig{
+		FPS: 30, PixelBounds: image.Rect(0, 0, 4, 2), Encoder: encoder, TempRoot: t.TempDir(),
+		Capture: func() (image.Image, error) { return image.NewRGBA(image.Rect(0, 0, 4, 2)), nil },
+		Now:     func() time.Time { return now },
+		Sleep:   func(context.Context, time.Duration) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("create recording session: %v", err)
+	}
+	if err := session.Start(context.Background()); err != nil {
+		t.Fatalf("start recording: %v", err)
+	}
+	waitForRecordingState(t, session, recordingStateRecording)
+	now = now.Add(2 * time.Second)
+	if got := session.EffectiveDuration(); got != 2*time.Second {
+		t.Fatalf("recorded duration = %s, want 2s", got)
+	}
+	if err := session.Pause(); err != nil {
+		t.Fatalf("pause recording: %v", err)
+	}
+	now = now.Add(5 * time.Second)
+	if got := session.EffectiveDuration(); got != 2*time.Second {
+		t.Fatalf("paused duration = %s, want 2s", got)
+	}
+	if err := session.Resume(); err != nil {
+		t.Fatalf("resume recording: %v", err)
+	}
+	now = now.Add(time.Second)
+	if got := session.EffectiveDuration(); got != 3*time.Second {
+		t.Fatalf("resumed duration = %s, want 3s", got)
+	}
+	path, err := session.Finish()
+	if err != nil {
+		t.Fatalf("finish recording: %v", err)
+	}
+	if path == "" || session.currentState() != recordingStateSave || !encoder.finalized {
+		t.Fatalf("finalized path=%q state=%s encoder=%t", path, session.currentState(), encoder.finalized)
+	}
+	now = now.Add(time.Minute)
+	if got := session.EffectiveDuration(); got != 3*time.Second {
+		t.Fatalf("preview duration = %s, want 3s", got)
+	}
+}
+
+// TestRecordingDurationFreezesWhenCaptureEnds covers redraws during finalization and preview.
+func TestRecordingDurationFreezesWhenCaptureEnds(t *testing.T) {
+	for _, scenario := range []string{"finish", "paused finish", "runtime error", "paused runtime error", "cancel"} {
+		t.Run(scenario, func(t *testing.T) {
+			now := time.Unix(100, 0)
+			session := &recordingSession{
+				state: recordingStateRecording, startedAt: now,
+				config: recordingSessionConfig{
+					Now: func() time.Time { return now }, Encoder: &recordingTestEncoder{},
+				},
+			}
+			now = now.Add(2 * time.Second)
+			if strings.HasPrefix(scenario, "paused") {
+				if err := session.Pause(); err != nil {
+					t.Fatal(err)
+				}
+				now = now.Add(5 * time.Second)
+			}
+			if strings.Contains(scenario, "runtime error") {
+				session.setRuntimeError(fmt.Errorf("capture failed"))
+				now = now.Add(time.Minute)
+				if got := session.EffectiveDuration(); got != 2*time.Second {
+					t.Fatalf("error duration = %s, want 2s", got)
+				}
+			}
+			session.config.OnChanged = func() {
+				// Simulate slow encoder finalization after the stop request.
+				now = now.Add(10 * time.Second)
+				if got := session.EffectiveDuration(); got != 2*time.Second {
+					t.Errorf("%s duration = %s, want 2s", session.currentState(), got)
+				}
+			}
+			if scenario == "cancel" {
+				if err := session.Cancel(); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := session.Finish(); err != nil {
+				t.Fatal(err)
+			}
+			for range 3 {
+				now = now.Add(time.Minute)
+				if got := session.EffectiveDuration(); got != 2*time.Second {
+					t.Fatalf("duration after stop = %s, want 2s", got)
+				}
+			}
+		})
+	}
+}
+
+func TestRecordingSessionRejectsDuplicateControlsAndCleansTempFile(t *testing.T) {
+	encoder := &recordingTestEncoder{}
+	session, err := newRecordingSession(recordingSessionConfig{
+		FPS: 60, PixelBounds: image.Rect(0, 0, 8, 6), Encoder: encoder, TempRoot: t.TempDir(),
+		Capture: func() (image.Image, error) { return image.NewRGBA(image.Rect(0, 0, 8, 6)), nil },
+		Sleep:   func(context.Context, time.Duration) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("create recording session: %v", err)
+	}
+	if err := session.Start(context.Background()); err != nil {
+		t.Fatalf("start recording: %v", err)
+	}
+	if err := session.Start(context.Background()); err == nil {
+		t.Fatal("duplicate start should be rejected")
+	}
+	waitForRecordingState(t, session, recordingStateRecording)
+	session.mu.Lock()
+	path := session.tempPath
+	session.mu.Unlock()
+	if err := session.Cancel(); err != nil {
+		t.Fatalf("cancel recording: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("temporary recording still exists: %v", err)
+	}
+	if !encoder.aborted || session.currentState() != recordingStateClosed {
+		t.Fatalf("cancel state=%s encoder aborted=%t", session.currentState(), encoder.aborted)
+	}
+	if err := session.Cancel(); err != nil {
+		t.Fatalf("duplicate cancel should be harmless: %v", err)
+	}
+}
+
+func TestRecordingSessionCancelStopsCountdownWithoutResurrection(t *testing.T) {
+	countdownStarted := make(chan struct{})
+	countdownStopped := make(chan struct{})
+	encoder := &recordingTestEncoder{}
+	session, err := newRecordingSession(recordingSessionConfig{
+		FPS: 30, PixelBounds: image.Rect(0, 0, 8, 6), Encoder: encoder, TempRoot: t.TempDir(),
+		Capture: func() (image.Image, error) { return image.NewRGBA(image.Rect(0, 0, 8, 6)), nil },
+		Sleep: func(ctx context.Context, _ time.Duration) error {
+			close(countdownStarted)
+			<-ctx.Done()
+			close(countdownStopped)
+			return ctx.Err()
+		},
+	})
+	if err != nil {
+		t.Fatalf("create recording session: %v", err)
+	}
+	if err := session.Start(context.Background()); err != nil {
+		t.Fatalf("start recording: %v", err)
+	}
+	<-countdownStarted
+	if err := session.Cancel(); err != nil {
+		t.Fatalf("cancel countdown: %v", err)
+	}
+	select {
+	case <-countdownStopped:
+	case <-time.After(time.Second):
+		t.Fatal("countdown goroutine did not stop after cancellation")
+	}
+	time.Sleep(10 * time.Millisecond)
+	if state := session.currentState(); state != recordingStateClosed {
+		t.Fatalf("cancelled countdown state = %s, want closed", state)
+	}
+}
+
+// TestRecordingCountdownCannotStartAfterPipelineStop covers a timer waking as cancellation snapshots the workers.
+func TestRecordingCountdownCannotStartAfterPipelineStop(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	session := &recordingSession{
+		state: recordingStateCountdown, stopCapture: cancel,
+		config: recordingSessionConfig{Now: time.Now, Sleep: func(context.Context, time.Duration) error { return nil }},
+	}
+	if err := session.stopPipelines(); err != nil {
+		t.Fatal(err)
+	}
+	session.countdown(ctx)
+	if session.state != recordingStateCountdown || session.frames != nil || session.captureDone != nil || session.workerDone != nil {
+		t.Fatal("cancelled countdown created workers after pipeline shutdown")
+	}
+}
+
+func TestRecordingSessionSerializesConcurrentFinishAndCancel(t *testing.T) {
+	encoder := &recordingTestEncoder{}
+	session, err := newRecordingSession(recordingSessionConfig{
+		FPS: 30, PixelBounds: image.Rect(0, 0, 8, 6), Encoder: encoder, TempRoot: t.TempDir(),
+		Capture: func() (image.Image, error) { return image.NewRGBA(image.Rect(0, 0, 8, 6)), nil },
+		Sleep:   func(context.Context, time.Duration) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("create recording session: %v", err)
+	}
+	if err := session.Start(context.Background()); err != nil {
+		t.Fatalf("start recording: %v", err)
+	}
+	waitForRecordingState(t, session, recordingStateRecording)
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() {
+		defer workers.Done()
+		<-start
+		_, _ = session.Finish()
+	}()
+	go func() {
+		defer workers.Done()
+		<-start
+		_ = session.Cancel()
+	}()
+	close(start)
+	workers.Wait()
+	if state := session.currentState(); state != recordingStateClosed {
+		t.Fatalf("concurrent stop state = %s, want closed", state)
+	}
+}
+
+// TestRecordingToolbarCancelKeepsUIThreadAvailable reproduces capture waiting for a native main-queue callback.
+func TestRecordingToolbarCancelKeepsUIThreadAvailable(t *testing.T) {
+	uiAvailable := make(chan struct{})
+	captureWaiting := make(chan struct{})
+	var releaseUI sync.Once
+	defer releaseUI.Do(func() { close(uiAvailable) })
+	encoder := &recordingTestEncoder{}
+	releases := 0
+	session, err := newRecordingSession(recordingSessionConfig{
+		FPS: 60, PixelBounds: image.Rect(0, 0, 4, 2), Encoder: encoder, TempRoot: t.TempDir(),
+		Capture: func() (image.Image, error) { return image.NewRGBA(image.Rect(0, 0, 4, 2)), nil },
+		Compose: func(source image.Image) (*image.RGBA, error) {
+			select {
+			case <-captureWaiting:
+			default:
+				close(captureWaiting)
+			}
+			<-uiAvailable
+			return source.(*image.RGBA), nil
+		},
+		Sleep:   func(context.Context, time.Duration) error { return nil },
+		Release: func() { releases++ },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	path := session.TempPath()
+	select {
+	case <-captureWaiting:
+	case <-time.After(time.Second):
+		t.Fatal("capture did not request its UI callback")
+	}
+	state := &recordingToolbarState{session: session, result: make(chan recordingUIResult, 1)}
+	returned := make(chan struct{})
+	go func() {
+		state.cancel()
+		state.cancel()
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		releaseUI.Do(func() { close(uiAvailable) })
+		<-returned
+		t.Fatal("Cancel blocked the UI callback while capture was waiting for the UI thread")
+	}
+	select {
+	case <-state.result:
+		t.Fatal("recording closed before capture stopped")
+	default:
+	}
+	releaseUI.Do(func() { close(uiAvailable) })
+	select {
+	case result := <-state.result:
+		if !result.result.Cancelled || result.err != nil {
+			t.Fatalf("cancel result = %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Cancel did not finish after the UI callback completed")
+	}
+	if releases != 1 || !encoder.aborted || session.currentState() != recordingStateClosed {
+		t.Fatalf("cancel cleanup: releases=%d aborted=%t state=%s", releases, encoder.aborted, session.currentState())
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("cancelled recording still exists: %v", err)
+	}
+	state.closed()
+	select {
+	case <-state.result:
+		t.Fatal("window close published a duplicate cancellation result")
+	default:
+	}
+}
+
+func TestNormalizeRecordingPixelBoundsTrimsRightAndBottom(t *testing.T) {
+	got := normalizeRecordingPixelBounds(image.Rect(-100, 25, 701, 626))
+	want := image.Rect(-100, 25, 700, 625)
+	if got != want {
+		t.Fatalf("normalized recording bounds = %v, want %v", got, want)
+	}
+}
+
+func TestNormalizeRecordingLogicalSelectionSynchronizesEvenPixelCrop(t *testing.T) {
+	got, err := normalizeRecordingLogicalSelection(image.Rect(0, 0, 2001, 1001), Rect{X: 100, Y: 50, Width: 801, Height: 501}, Size{Width: 2001, Height: 1001})
+	if err != nil {
+		t.Fatalf("normalize logical selection: %v", err)
+	}
+	pixels, err := screenshotEditorPixelSelection(image.Rect(0, 0, 2001, 1001), got, Size{Width: 2001, Height: 1001})
+	if err != nil {
+		t.Fatalf("map normalized selection: %v", err)
+	}
+	if pixels.Dx()%2 != 0 || pixels.Dy()%2 != 0 {
+		t.Fatalf("normalized pixel selection = %v, want even dimensions", pixels)
+	}
+}
+
+func TestRecordingToolbarLayoutUsesEveryOutsideEdgeAndCollapsesForFullscreen(t *testing.T) {
+	frame := Rect{X: -200, Y: -100, Width: 1400, Height: 900}
+	tests := []struct {
+		name      string
+		selection Rect
+		edge      string
+	}{
+		{name: "bottom", selection: Rect{X: 0, Y: 0, Width: 900, Height: 300}, edge: "bottom"},
+		{name: "top", selection: Rect{X: 0, Y: 500, Width: 900, Height: 250}, edge: "top"},
+		{name: "left", selection: Rect{X: 600, Y: -100, Width: 500, Height: 900}, edge: "left"},
+		{name: "right", selection: Rect{X: -180, Y: -100, Width: 220, Height: 900}, edge: "right"},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			expanded, _, collapsed := recordingToolbarLayout(frame, testCase.selection, recordingToolbarWidth, recordingToolbarHeight)
+			if collapsed {
+				t.Fatalf("toolbar unexpectedly collapsed: %+v", expanded)
+			}
+			switch testCase.edge {
+			case "bottom":
+				if expanded.Y < testCase.selection.Y+testCase.selection.Height {
+					t.Fatalf("bottom toolbar = %+v", expanded)
+				}
+			case "top":
+				if expanded.Y+expanded.Height > testCase.selection.Y {
+					t.Fatalf("top toolbar = %+v", expanded)
+				}
+			case "left":
+				if expanded.X+expanded.Width > testCase.selection.X {
+					t.Fatalf("left toolbar = %+v", expanded)
+				}
+			case "right":
+				if expanded.X < testCase.selection.X+testCase.selection.Width {
+					t.Fatalf("right toolbar = %+v", expanded)
+				}
+			}
+		})
+	}
+	_, hotspot, collapsed := recordingToolbarLayout(frame, frame, recordingToolbarWidth, recordingToolbarHeight)
+	if !collapsed || hotspot.Width != 18 || hotspot.Height != recordingToolbarHeight {
+		t.Fatalf("fullscreen hotspot = %+v collapsed=%t", hotspot, collapsed)
+	}
+}
+
+func TestRecordingToolbarLayoutScalesOutsideTheSelection(t *testing.T) {
+	frame := Rect{Width: 1920, Height: 1080}
+	selection := Rect{X: 200, Y: 200, Width: 800, Height: 400}
+	expanded, _, collapsed := recordingToolbarLayout(frame, selection, recordingToolbarWidth*2.5, recordingToolbarHeight*2.5)
+	if collapsed {
+		t.Fatalf("scaled toolbar collapsed: %+v", expanded)
+	}
+	if expanded.Width != recordingToolbarWidth*2.5 || expanded.Height != recordingToolbarHeight*2.5 {
+		t.Fatalf("scaled toolbar size = %+v", expanded)
+	}
+	if screenshotEditorRectsOverlap(expanded, selection) {
+		t.Fatalf("scaled toolbar overlaps selection: toolbar=%+v selection=%+v", expanded, selection)
+	}
+}
+
+func TestRecordingToolbarControlLayoutMatchesScreenshotSlots(t *testing.T) {
+	panel, timeRect, primary, restart, pointer, keypress, finish, cancel := recordingToolbarControlLayout(1)
+	if panel.Y != 0 || panel.Height != recordingToolbarHeight {
+		t.Fatalf("toolbar panel = %+v, want y=0 height=%v", panel, recordingToolbarHeight)
+	}
+	if timeRect.X != recordingToolbarPad {
+		t.Fatalf("time control left = %v, want %v", timeRect.X, recordingToolbarPad)
+	}
+	if gap := primary.X - (timeRect.X + timeRect.Width); gap != recordingToolbarGap+4 {
+		t.Fatalf("time to primary button gap = %v, want %v", gap, recordingToolbarGap+4)
+	}
+	buttons := []Rect{primary, restart, pointer, keypress, finish, cancel}
+	for index := 1; index < len(buttons); index++ {
+		if gap := buttons[index].X - buttons[index-1].X; gap != recordingToolbarSlot {
+			t.Fatalf("button %d slot gap = %v, want %v", index, gap, recordingToolbarSlot)
+		}
+	}
+	if got := cancel.X + cancel.Width + recordingToolbarPad; got != recordingToolbarWidth {
+		t.Fatalf("toolbar width = %v, want %v", got, recordingToolbarWidth)
+	}
+
+	state := &recordingToolbarState{editor: &screenshotEditorOverlayState{}, fps: 30}
+	state.drawToolbar(&DisplayList{}, FrameInfo{Size: Size{Width: recordingToolbarWidth, Height: recordingToolbarHeight}})
+	if state.restartRect.X-state.primaryRect.X != recordingToolbarSlot || state.cancelRect.X-state.finishRect.X != recordingToolbarSlot {
+		t.Fatalf("drawn button slots primary=%+v restart=%+v finish=%+v cancel=%+v", state.primaryRect, state.restartRect, state.finishRect, state.cancelRect)
+	}
+}
+
+func TestRecordingToolbarLayoutMatchesScreenshotSelectionGap(t *testing.T) {
+	frame := Rect{Width: 1920, Height: 1080}
+	selection := Rect{X: 200, Y: 200, Width: 800, Height: 400}
+	expanded, _, collapsed := recordingToolbarLayout(frame, selection, recordingToolbarWidth, recordingToolbarHeight)
+	if collapsed {
+		t.Fatalf("toolbar collapsed: %+v", expanded)
+	}
+	if expanded.Height != recordingToolbarHeight {
+		t.Fatalf("toolbar height = %v, want %v", expanded.Height, recordingToolbarHeight)
+	}
+	if got := expanded.Y - (selection.Y + selection.Height); got != recordingToolbarSelectionGap {
+		t.Fatalf("selection to toolbar gap = %v, want %v", got, recordingToolbarSelectionGap)
+	}
+
+	topSelection := Rect{X: 200, Y: 700, Width: 800, Height: 300}
+	topBar, _, topCollapsed := recordingToolbarLayout(frame, topSelection, recordingToolbarWidth, recordingToolbarHeight)
+	if topCollapsed {
+		t.Fatalf("top toolbar collapsed: %+v", topBar)
+	}
+	if got := topSelection.Y - (topBar.Y + topBar.Height); got != recordingToolbarSelectionGap {
+		t.Fatalf("top selection to toolbar gap = %v, want %v", got, recordingToolbarSelectionGap)
+	}
+}
+
+func TestRecordingToolbarLayoutAvoidsShortSelectionLikeScreenshot(t *testing.T) {
+	frame := Rect{Width: 1920, Height: 1080}
+	selection := Rect{X: 360, Y: 820, Width: 1203, Height: 113}
+	want := screenshotEditorToolbarPlacement(selection, frame, recordingToolbarWidth, recordingToolbarHeight, recordingToolbarHeight, 1)
+	expanded, _, collapsed := recordingToolbarLayout(frame, selection, recordingToolbarWidth, recordingToolbarHeight)
+	if collapsed {
+		t.Fatalf("short selection collapsed: %+v", expanded)
+	}
+	if expanded != want {
+		t.Fatalf("recording toolbar = %+v, want screenshot placement %+v", expanded, want)
+	}
+	if screenshotEditorRectsOverlap(expanded, selection) {
+		t.Fatalf("toolbar overlaps short selection: toolbar=%+v selection=%+v", expanded, selection)
+	}
+}
+
+func TestRecordingToolbarOmitsPrivacyAndDiscardBanners(t *testing.T) {
+	frame := FrameInfo{Size: Size{Width: recordingToolbarWidth, Height: recordingToolbarHeight}}
+	withError := &recordingToolbarState{editor: &screenshotEditorOverlayState{}, fps: 30, lastError: "Click cancel again to discard the recording"}
+	withErrorList := &DisplayList{}
+	withError.drawToolbar(withErrorList, frame)
+	clean := &recordingToolbarState{editor: &screenshotEditorOverlayState{}, fps: 30}
+	cleanList := &DisplayList{}
+	clean.drawToolbar(cleanList, frame)
+	if err := withErrorList.Compare(cleanList); err != nil {
+		t.Fatalf("toolbar should not render a discard banner: %v", err)
+	}
+
+	state := &recordingToolbarState{
+		editor:  &screenshotEditorOverlayState{},
+		fps:     30,
+		options: ScreenshotOptions{RecordingTooltips: RecordingTooltips{PrivacyWarning: "yellow privacy warning"}},
+	}
+	state.drawToolbar(&DisplayList{}, frame)
+	state.toolbarPointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: state.keypressRect.X + 8, Y: state.keypressRect.Y + 8}})
+	if !state.showKeypress {
+		t.Fatal("keyboard capture should toggle on")
+	}
+	afterToggle := &DisplayList{}
+	state.drawToolbar(afterToggle, frame)
+	expected := &recordingToolbarState{editor: &screenshotEditorOverlayState{}, fps: 30, showKeypress: true}
+	expectedList := &DisplayList{}
+	expected.drawToolbar(expectedList, frame)
+	if err := afterToggle.Compare(expectedList); err != nil {
+		t.Fatalf("enabling keyboard capture should not add a privacy banner: %v", err)
+	}
+
+	state.toolbarPointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: state.cancelRect.X + 8, Y: state.cancelRect.Y + 8}})
+	if state.lastError != "" {
+		t.Fatalf("cancel should not arm a discard warning, lastError=%q", state.lastError)
+	}
+}
+
+func TestRecordingSizeLabelAndBorderMarginScaleWithDPI(t *testing.T) {
+	state := &recordingToolbarState{
+		selection:    Rect{X: 80, Y: 80, Width: 200, Height: 100},
+		frameSize:    Size{Width: 400, Height: 300},
+		borderOrigin: Point{X: 40, Y: 40},
+		editor: &screenshotEditorOverlayState{
+			image:       testScreenshotImage(t, 400, 300),
+			uiScale:     1,
+			chromeScale: func(Rect) float32 { return 2 },
+		},
+	}
+	if got := state.scaledBorderMargin(); got != 80 {
+		t.Fatalf("scaled border margin = %v, want 80", got)
+	}
+
+	frame := FrameInfo{Size: Size{Width: 280, Height: 180}}
+	got := &DisplayList{}
+	state.drawBorder(got, frame)
+	local := recordingBorderLocalSelection(state.selection, state.borderOrigin)
+	want := &DisplayList{}
+	want.Clear(Color{})
+	want.StrokeRoundedRect(local, 0, 4, Color{R: 47, G: 128, B: 237, A: 255})
+	drawScreenshotEditorHandles(want, local, Color{R: 47, G: 128, B: 237, A: 255}, 2)
+	drawScreenshotEditorSizeLabel(want, (*Window)(nil), "200 x 100", local, Rect{}, frame.Size, 2, false)
+	if err := got.Compare(want); err != nil {
+		t.Fatalf("recording border should use live chrome scale, not stale editor.uiScale: %v", err)
+	}
+	if state.editor.uiScale != 2 {
+		t.Fatalf("editor uiScale = %v, want 2 so handle hit-testing matches the drawn chrome", state.editor.uiScale)
+	}
+	state.editor.selectionAspectRatio = 2
+	got = &DisplayList{}
+	state.drawBorder(got, frame)
+	want = &DisplayList{}
+	want.Clear(Color{})
+	want.StrokeRoundedRect(local, 0, 4, Color{R: 47, G: 128, B: 237, A: 255})
+	drawScreenshotEditorHandles(want, local, Color{R: 47, G: 128, B: 237, A: 255}, 2)
+	drawScreenshotEditorSizeLabel(want, (*Window)(nil), "200 x 100", local, Rect{}, frame.Size, 2, true)
+	if err := got.Compare(want); err != nil {
+		t.Fatalf("recording border did not show the locked ratio: %v", err)
+	}
+}
+
+// TestRecordingCaptureBorderKeepsStrokeOutsideEncodedPixels covers fractional selections and nonuniform scaling.
+func TestRecordingCaptureBorderKeepsStrokeOutsideEncodedPixels(t *testing.T) {
+	selection := Rect{X: 13.4, Y: 18.7, Width: 201.3, Height: 102.6}
+	origin := Point{X: -20, Y: 7}
+	for _, size := range []image.Point{{400, 300}, {600, 450}, {800, 375}} {
+		frame := Size{Width: 400, Height: 300}
+		pixels, err := screenshotEditorPixelSelection(image.Rect(0, 0, size.X, size.Y), selection, frame)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pixels = normalizeRecordingPixelBounds(pixels)
+		stroke := float32(3)
+		border := recordingCaptureBorder(selection, origin, frame, size.X, size.Y, stroke)
+		sx, sy := frame.Width/float32(size.X), frame.Height/float32(size.Y)
+		if border.X+stroke+origin.X >= float32(pixels.Min.X)*sx ||
+			border.Y+stroke+origin.Y >= float32(pixels.Min.Y)*sy ||
+			border.X+border.Width-stroke+origin.X <= float32(pixels.Max.X)*sx ||
+			border.Y+border.Height-stroke+origin.Y <= float32(pixels.Max.Y)*sy {
+			t.Fatalf("size %v: border %+v overlaps capture %v", size, border, pixels)
+		}
+	}
+}
+
+func TestRecordingActiveBorderUsesCaptureBounds(t *testing.T) {
+	state := &recordingToolbarState{
+		session:   &recordingSession{state: recordingStateRecording},
+		selection: Rect{X: 80.4, Y: 80.2, Width: 200, Height: 100},
+		frameSize: Size{Width: 400, Height: 300},
+		editor:    &screenshotEditorOverlayState{image: testScreenshotImage(t, 600, 450)},
+		platform:  screenshotEditorPlatform{retainRecordingBorder: true},
+	}
+	frame := FrameInfo{Size: state.frameSize}
+	got := &DisplayList{}
+	state.drawBorder(got, frame)
+	want := &DisplayList{}
+	want.Clear(Color{})
+	want.StrokeRoundedRect(recordingCaptureBorder(state.selection, Point{}, state.frameSize, 600, 450, 2), 0, 2, Color{R: 47, G: 128, B: 237, A: 255})
+	if err := got.Compare(want); err != nil {
+		t.Fatalf("active border does not use capture bounds: %v", err)
+	}
+}
+
+func TestRecordingPreviewKeepsSelectionStrokeWithoutDuplicateTooltip(t *testing.T) {
+	session := &recordingSession{state: recordingStateSave, config: recordingSessionConfig{PixelBounds: image.Rect(0, 0, 200, 100)}}
+	state := &recordingToolbarState{
+		session:          session,
+		selection:        Rect{X: 80, Y: 80, Width: 200, Height: 100},
+		frameSize:        Size{Width: 400, Height: 300},
+		hoverTooltip:     "Show pointer",
+		hoverTooltipRect: Rect{X: 10, Y: 10, Width: 40, Height: 40},
+		editor:           &screenshotEditorOverlayState{image: testScreenshotImage(t, 400, 300)},
+		platform:         screenshotEditorPlatform{retainRecordingBorder: true},
+	}
+
+	overlay := &DisplayList{}
+	state.drawOverlay(overlay, FrameInfo{Size: Size{Width: 200, Height: 100}})
+	overlayCheck := &DisplayList{}
+	overlayCheck.Clear(Color{})
+	state.drawPreview(overlayCheck, Rect{Width: 200, Height: 100}, 1)
+	overlayCheck.StrokeRoundedRect(Rect{Width: 200, Height: 100}, 0, 2, Color{R: 47, G: 128, B: 237, A: 255})
+	if err := overlay.Compare(overlayCheck); err != nil {
+		t.Fatalf("preview overlay should keep the selection stroke: %v", err)
+	}
+
+	border := &DisplayList{}
+	state.drawBorder(border, FrameInfo{Size: Size{Width: 400, Height: 300}})
+	local := recordingBorderLocalSelection(state.selection, state.borderOrigin)
+	wantBorder := &DisplayList{}
+	wantBorder.Clear(Color{})
+	drawScreenshotEditorSizeLabel(wantBorder, (*Window)(nil), "200 x 100", local, Rect{}, Size{Width: 400, Height: 300}, 1, false)
+	if err := border.Compare(wantBorder); err != nil {
+		t.Fatalf("save-state border should not restack the toolbar tooltip or covered stroke: %v", err)
+	}
+}
+
+func TestRecordingDurationTickerStopsSafely(t *testing.T) {
+	state := &recordingToolbarState{durationTickerStop: make(chan struct{})}
+	state.startDurationTicker()
+	state.stopDurationTicker()
+	state.stopDurationTicker()
+}
+
+func TestRecordingSaveDialogCanHidePreviewSurfacesWithoutWindows(t *testing.T) {
+	state := &recordingToolbarState{
+		platform: screenshotEditorPlatform{retainRecordingBorder: true},
+		session:  &recordingSession{state: recordingStateSave},
+	}
+	state.hidePreviewSurfacesForDialog()
+	state.restorePreviewSurfacesAfterDialog()
+}
+
+func TestRecordingRecordIconUsesRingAndDot(t *testing.T) {
+	icon := icons.Get("control.record")
+	if !strings.Contains(icon.ImageData, `r="8.25"`) || !strings.Contains(icon.ImageData, `r="4.75"`) {
+		t.Fatalf("record icon should be a solid circle inside a ring")
+	}
+}
+
+func TestRecordingBorderPointerMovesAndResizesReadySelection(t *testing.T) {
+	newState := func() *recordingToolbarState {
+		selection := Rect{X: 100, Y: 100, Width: 400, Height: 300}
+		return &recordingToolbarState{
+			selection: selection, frameSize: Size{Width: 1000, Height: 800},
+			borderOrigin: Point{X: selection.X - recordingBorderMargin, Y: selection.Y - recordingBorderMargin},
+			editor: &screenshotEditorOverlayState{
+				selection: selection, frameSize: Size{Width: 1000, Height: 800}, hasSelection: true,
+				activeTool: screenshotEditorToolSelect, uiScale: 1,
+			},
+		}
+	}
+	moving := newState()
+	// Start on the border band; native hit testing passes the selection interior through.
+	moving.borderPointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: recordingBorderMargin + 50, Y: recordingBorderMargin + 5}})
+	moving.borderPointer(PointerEvent{Kind: PointerMove, Button: PointerButtonPrimary, Position: Point{X: recordingBorderMargin + 70, Y: recordingBorderMargin + 20}})
+	if moving.selection.X != 120 || moving.selection.Y != 115 {
+		t.Fatalf("moved selection = %+v", moving.selection)
+	}
+
+	resizing := newState()
+	resizing.borderPointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: recordingBorderMargin, Y: recordingBorderMargin}})
+	resizing.borderPointer(PointerEvent{Kind: PointerMove, Button: PointerButtonPrimary, Position: Point{X: recordingBorderMargin + 10, Y: recordingBorderMargin + 10}})
+	if resizing.selection.X != 110 || resizing.selection.Y != 110 || resizing.selection.Width != 390 || resizing.selection.Height != 290 {
+		t.Fatalf("resized selection = %+v", resizing.selection)
+	}
+
+	offsetGrip := newState()
+	offsetGrip.borderPointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: recordingBorderMargin + 8, Y: recordingBorderMargin + 6}})
+	offsetGrip.borderPointer(PointerEvent{Kind: PointerMove, Button: PointerButtonPrimary, Position: Point{X: recordingBorderMargin + 8, Y: recordingBorderMargin + 6}})
+	if offsetGrip.selection != (Rect{X: 100, Y: 100, Width: 400, Height: 300}) {
+		t.Fatalf("off-center handle press jumped selection to %+v", offsetGrip.selection)
+	}
+	offsetGrip.borderPointer(PointerEvent{Kind: PointerMove, Button: PointerButtonPrimary, Position: Point{X: recordingBorderMargin + 18, Y: recordingBorderMargin + 16}})
+	if offsetGrip.selection != (Rect{X: 110, Y: 110, Width: 390, Height: 290}) {
+		t.Fatalf("off-center handle drag = %+v", offsetGrip.selection)
+	}
+
+	windowCoordinates := newState()
+	windowCoordinates.borderOrigin = Point{}
+	windowCoordinates.platform.cursorPosition = func() *Point {
+		return &Point{X: 20, Y: 20}
+	}
+	windowCoordinates.borderPointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: 500, Y: 400}})
+	windowCoordinates.borderPointer(PointerEvent{Kind: PointerMove, Button: PointerButtonPrimary, Position: Point{X: 520, Y: 420}})
+	if windowCoordinates.selection != (Rect{X: 100, Y: 100, Width: 420, Height: 320}) {
+		t.Fatalf("window-local drag used conflicting global cursor coordinates: %+v", windowCoordinates.selection)
+	}
+
+	scaled := newState()
+	scaled.editor.uiScale = 2
+	scaled.editor.chromeScale = func(Rect) float32 { return 2 }
+	scaled.borderPointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: recordingBorderMargin - 20, Y: recordingBorderMargin}})
+	scaled.borderPointer(PointerEvent{Kind: PointerMove, Button: PointerButtonPrimary, Position: Point{X: recordingBorderMargin - 10, Y: recordingBorderMargin}})
+	if scaled.selection.X != 110 || scaled.selection.Y != 100 || scaled.selection.Width != 390 || scaled.selection.Height != 300 {
+		t.Fatalf("DPI-scaled handle resize = %+v", scaled.selection)
+	}
+
+	ignored := newState()
+	original := ignored.selection
+	ignored.borderPointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: 4, Y: 4}})
+	ignored.borderPointer(PointerEvent{Kind: PointerMove, Button: PointerButtonPrimary, Position: Point{X: 24, Y: 24}})
+	if ignored.selection != original || ignored.editor.dragging || ignored.editor.hasSelection != true {
+		t.Fatalf("margin click should not start a new selection, got %+v dragging=%t hasSelection=%t", ignored.selection, ignored.editor.dragging, ignored.editor.hasSelection)
+	}
+}
+
+func TestRecordingBorderFollowsDraggedHandleInsteadOfPinningTopLeft(t *testing.T) {
+	origin := Point{X: 60, Y: 60}
+	original := recordingBorderLocalSelection(Rect{X: 100, Y: 100, Width: 400, Height: 300}, origin)
+	if original.X != 40 || original.Y != 40 {
+		t.Fatalf("idle local selection = %+v, want origin at margin", original)
+	}
+	shrunkFromTopLeft := recordingBorderLocalSelection(Rect{X: 110, Y: 110, Width: 390, Height: 290}, origin)
+	if shrunkFromTopLeft.X != 50 || shrunkFromTopLeft.Y != 50 || shrunkFromTopLeft.Width != 390 || shrunkFromTopLeft.Height != 290 {
+		t.Fatalf("top-left shrink local selection = %+v, want 50,50 390x290", shrunkFromTopLeft)
+	}
+	if shrunkFromTopLeft.X+shrunkFromTopLeft.Width != original.X+original.Width || shrunkFromTopLeft.Y+shrunkFromTopLeft.Height != original.Y+original.Height {
+		t.Fatalf("bottom-right should stay put: original=%+v shrunk=%+v", original, shrunkFromTopLeft)
+	}
+	movedLeft := recordingBorderLocalSelection(Rect{X: 20, Y: 100, Width: 400, Height: 300}, Point{})
+	if movedLeft.X != 20 || movedLeft.Y != 100 {
+		t.Fatalf("frame-covering local selection = %+v, want the desktop selection", movedLeft)
+	}
+}
+
+func TestRecordingBorderUsesStableFrameBounds(t *testing.T) {
+	var bounds Rect
+	var margin float32
+	setBoundsCalls := 0
+	selection := Rect{X: 100, Y: 100, Width: 400, Height: 300}
+	state := &recordingToolbarState{
+		selection:    selection,
+		frameSize:    Size{Width: 1000, Height: 800},
+		borderOrigin: Point{X: 60, Y: 60},
+		border:       &Window{},
+		editor: &screenshotEditorOverlayState{
+			selection: selection, frameSize: Size{Width: 1000, Height: 800}, hasSelection: true,
+			activeTool: screenshotEditorToolSelect, uiScale: 1,
+		},
+		platform: screenshotEditorPlatform{
+			setRecordingBounds: func(_ *Window, selection Rect, _ Size, boundsMargin float32) error {
+				setBoundsCalls++
+				bounds = selection
+				margin = boundsMargin
+				return nil
+			},
+		},
+	}
+	if err := state.positionBorder(); err != nil {
+		t.Fatal(err)
+	}
+	if state.borderOrigin != (Point{}) {
+		t.Fatalf("border origin = %+v, want stable desktop origin", state.borderOrigin)
+	}
+	if bounds != (Rect{Width: 1000, Height: 800}) || margin != 0 {
+		t.Fatalf("border bounds = %+v margin=%v", bounds, margin)
+	}
+	state.borderPointer(PointerEvent{Kind: PointerDown, Button: PointerButtonPrimary, Position: Point{X: 500, Y: 250}})
+	state.borderPointer(PointerEvent{Kind: PointerMove, Button: PointerButtonPrimary, Position: Point{X: 520, Y: 250}})
+	state.borderPointer(PointerEvent{Kind: PointerUp, Button: PointerButtonPrimary, Position: Point{X: 520, Y: 250}})
+	if setBoundsCalls != 1 {
+		t.Fatalf("drag changed border window bounds %d times, want only initial placement", setBoundsCalls)
+	}
+}
+
+func TestRecordingToolbarTooltipSitsInSelectionGapLikeScreenshot(t *testing.T) {
+	selection := Rect{X: 200, Y: 200, Width: 800, Height: 400}
+	toolbar := Rect{X: selection.X + selection.Width - recordingToolbarWidth, Y: selection.Y + selection.Height + recordingToolbarSelectionGap, Width: recordingToolbarWidth, Height: recordingToolbarHeight}
+	anchor := Rect{X: 300, Y: 10, Width: 40, Height: 40}
+	origin := Point{X: selection.X - recordingBorderMargin, Y: selection.Y - recordingBorderMargin}
+	local := recordingToolbarTooltipLocalRect(&screenshotTestSurface{}, Size{Width: 1920, Height: 1080}, toolbar, anchor, selection, origin, "Show keystrokes", 1)
+	globalY := local.Y + origin.Y
+	if globalY != toolbar.Y+anchor.Y-36 {
+		t.Fatalf("tooltip top = %v, want screenshot offset above the icon %v", globalY, toolbar.Y+anchor.Y-36)
+	}
+	selectionBottom := selection.Y + selection.Height
+	if globalY >= selectionBottom || globalY+local.Height <= selectionBottom {
+		t.Fatalf("tooltip should occupy the screenshot gap overlapping the selection edge, tooltip=%+v selectionBottom=%v", Rect{X: local.X + origin.X, Y: globalY, Width: local.Width, Height: local.Height}, selectionBottom)
+	}
+
+	toolbar.Y = selection.Y - recordingToolbarHeight - recordingToolbarSelectionGap
+	local = recordingToolbarTooltipLocalRect(&screenshotTestSurface{}, Size{Width: 1920, Height: 1080}, toolbar, anchor, selection, origin, "Show keystrokes", 1)
+	globalY = local.Y + origin.Y
+	if globalY != toolbar.Y+anchor.Y+anchor.Height+8 {
+		t.Fatalf("above-toolbar tooltip top = %v, want 8px below the icon %v", globalY, toolbar.Y+anchor.Y+anchor.Height+8)
+	}
+	if globalY >= selection.Y || globalY+local.Height <= selection.Y {
+		t.Fatalf("above-toolbar tooltip should occupy the screenshot gap overlapping the selection edge, tooltip=%+v selectionTop=%v", Rect{X: local.X + origin.X, Y: globalY, Width: local.Width, Height: local.Height}, selection.Y)
+	}
+}
+
+func TestRecordingSelectionEdgeContainsLeavesInteriorClickable(t *testing.T) {
+	selection := Rect{X: 100, Y: 100, Width: 400, Height: 300}
+	for _, point := range []Point{{X: 100, Y: 250}, {X: 500, Y: 250}, {X: 300, Y: 100}, {X: 300, Y: 400}, {X: 94, Y: 94}, {X: 94, Y: 180}} {
+		if !recordingSelectionEdgeContains(selection, point, 14) {
+			t.Fatalf("border point %+v should be interactive", point)
+		}
+	}
+	for _, point := range []Point{{X: 300, Y: 250}, {X: 50, Y: 50}, {X: 520, Y: 420}, {X: 85, Y: 180}} {
+		if recordingSelectionEdgeContains(selection, point, 14) {
+			t.Fatalf("non-border point %+v should pass through", point)
+		}
+	}
+	outerHandle := Point{X: 80, Y: 100}
+	if recordingSelectionEdgeContains(selection, outerHandle, 14) {
+		t.Fatal("unscaled 14px slop should not claim a 2x handle's outer edge")
+	}
+	if !recordingSelectionEdgeContains(selection, outerHandle, recordingSelectionInteractiveTolerance(2)) {
+		t.Fatal("DPI-scaled handle chrome should stay interactive")
+	}
+}
+
+func TestRecordingSessionDiscardPendingFrames(t *testing.T) {
+	session := &recordingSession{frames: make(chan recordingFrame, 2)}
+	session.frames <- recordingFrame{index: 1}
+	session.frames <- recordingFrame{index: 2}
+	session.DiscardPendingFrames()
+	if got := len(session.frames); got != 0 {
+		t.Fatalf("pending frame count = %d, want 0", got)
+	}
+	if got := session.framesDropped; got != 2 {
+		t.Fatalf("dropped frame count = %d, want 2", got)
+	}
+}
+
+func TestRecordingKeyLabels(t *testing.T) {
+	label := recordingKeyLabel(keyboard.RawKeyEvent{
+		Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyK, Character: "k",
+		Modifiers: keyboard.ModifierCtrl | keyboard.ModifierShift,
+	})
+	if label != "Ctrl+Shift+K" {
+		t.Fatalf("key label = %q", label)
+	}
+	if modifier := recordingKeyLabel(keyboard.RawKeyEvent{Key: keyboard.KeyLeftCtrl}); modifier != "Ctrl" {
+		t.Fatalf("standalone modifier label = %q", modifier)
+	}
+	if functional := recordingKeyLabel(keyboard.RawKeyEvent{Key: keyboard.KeyReturn}); functional != "Enter" {
+		t.Fatalf("functional key label = %q", functional)
+	}
+}
+
+func TestRecordingRawKeyKeepsNewestSixKeycaps(t *testing.T) {
+	state := &recordingToolbarState{editor: &screenshotEditorOverlayState{}, showKeypress: true}
+	for index, key := range []keyboard.Key{keyboard.KeyA, keyboard.KeyB, keyboard.KeyC, keyboard.KeyD, keyboard.KeyE, keyboard.KeyF, keyboard.KeyG} {
+		state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyDown, Key: key, Character: string(rune('a' + index))})
+	}
+	if len(state.keycaps) != 6 || state.keycaps[0].label != "B" || state.keycaps[5].label != "G" {
+		t.Fatalf("keycaps = %+v, want newest B-G", state.keycaps)
+	}
+}
+
+func TestRecordingRawKeyShowsChordsTogether(t *testing.T) {
+	state := &recordingToolbarState{editor: &screenshotEditorOverlayState{}, showKeypress: true}
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyLeftCtrl})
+	if len(state.keycaps) != 0 {
+		t.Fatalf("modifier down should wait for the rest of the chord: %+v", state.keycaps)
+	}
+	state.rawKey(keyboard.RawKeyEvent{
+		Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyC, Character: "c", Modifiers: keyboard.ModifierCtrl,
+	})
+	if len(state.keycaps) != 1 || state.keycaps[0].label != "Ctrl+C" {
+		t.Fatalf("chord keycaps = %+v, want [Ctrl+C]", labelsOf(state.keycaps))
+	}
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyUp, Key: keyboard.KeyC, Character: "c", Modifiers: keyboard.ModifierCtrl})
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyUp, Key: keyboard.KeyLeftCtrl})
+	if len(state.keycaps) != 1 || state.keycaps[0].label != "Ctrl+C" {
+		t.Fatalf("releasing a completed chord should not add a modifier-only keycap: %+v", labelsOf(state.keycaps))
+	}
+}
+
+func TestRecordingRawKeyShowsStandaloneModifiersOnRelease(t *testing.T) {
+	state := &recordingToolbarState{editor: &screenshotEditorOverlayState{}, showKeypress: true}
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyLeftCtrl})
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyLeftShift})
+	if len(state.keycaps) != 0 {
+		t.Fatalf("held modifiers should stay pending: %+v", labelsOf(state.keycaps))
+	}
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyUp, Key: keyboard.KeyLeftShift})
+	if len(state.keycaps) != 0 {
+		t.Fatalf("partial modifier release should stay pending: %+v", labelsOf(state.keycaps))
+	}
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyUp, Key: keyboard.KeyLeftCtrl})
+	if len(state.keycaps) != 1 || state.keycaps[0].label != "Ctrl+Shift" {
+		t.Fatalf("released modifier chord = %+v, want [Ctrl+Shift]", labelsOf(state.keycaps))
+	}
+}
+
+func TestRecordingRawKeyKeepsModifierForSequentialChords(t *testing.T) {
+	state := &recordingToolbarState{editor: &screenshotEditorOverlayState{}, showKeypress: true}
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyLeftCtrl})
+	state.rawKey(keyboard.RawKeyEvent{
+		Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyA, Character: "a", Modifiers: keyboard.ModifierCtrl,
+	})
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyUp, Key: keyboard.KeyA, Character: "a", Modifiers: keyboard.ModifierCtrl})
+	state.rawKey(keyboard.RawKeyEvent{
+		Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyC, Character: "c", Modifiers: keyboard.ModifierCtrl,
+	})
+	if len(state.keycaps) != 2 || state.keycaps[0].label != "Ctrl+A" || state.keycaps[1].label != "Ctrl+C" {
+		t.Fatalf("sequential chords = %+v, want [Ctrl+A Ctrl+C]", labelsOf(state.keycaps))
+	}
+}
+
+func TestRecordingRawKeyKeepsShiftedChordOnModifierRelease(t *testing.T) {
+	state := &recordingToolbarState{editor: &screenshotEditorOverlayState{}, showKeypress: true}
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyLeftCtrl})
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyLeftShift})
+	state.rawKey(keyboard.RawKeyEvent{
+		Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyV, Character: "v",
+		Modifiers: keyboard.ModifierCtrl | keyboard.ModifierShift,
+	})
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyUp, Key: keyboard.KeyLeftShift})
+	state.rawKey(keyboard.RawKeyEvent{
+		Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyV, Character: "v", Modifiers: keyboard.ModifierCtrl,
+	})
+	if len(state.keycaps) != 1 || state.keycaps[0].label != "Ctrl+Shift+V" {
+		t.Fatalf("shifted chord keycaps = %+v, want [Ctrl+Shift+V]", labelsOf(state.keycaps))
+	}
+}
+
+func TestRecordingRawKeyMergesEchoAfterKeyUp(t *testing.T) {
+	state := &recordingToolbarState{editor: &screenshotEditorOverlayState{}, showKeypress: true}
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyLeftCtrl})
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyLeftShift})
+	state.rawKey(keyboard.RawKeyEvent{
+		Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyV, Character: "v",
+		Modifiers: keyboard.ModifierCtrl | keyboard.ModifierShift,
+	})
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyUp, Key: keyboard.KeyV, Character: "v"})
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyUp, Key: keyboard.KeyLeftShift})
+	state.rawKey(keyboard.RawKeyEvent{
+		Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyV, Character: "v", Modifiers: keyboard.ModifierCtrl,
+	})
+	if len(state.keycaps) != 1 || state.keycaps[0].label != "Ctrl+Shift+V" {
+		t.Fatalf("echo after key-up = %+v, want [Ctrl+Shift+V]", labelsOf(state.keycaps))
+	}
+}
+
+func TestRecordingRawKeyMergesEchoAfterModifiersRelease(t *testing.T) {
+	state := &recordingToolbarState{editor: &screenshotEditorOverlayState{}, showKeypress: true}
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyLeftCtrl})
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyLeftShift})
+	state.rawKey(keyboard.RawKeyEvent{
+		Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyV, Character: "v",
+		Modifiers: keyboard.ModifierCtrl | keyboard.ModifierShift,
+	})
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyUp, Key: keyboard.KeyV, Character: "v"})
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyUp, Key: keyboard.KeyLeftShift})
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyUp, Key: keyboard.KeyLeftCtrl})
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyLeftCtrl})
+	state.rawKey(keyboard.RawKeyEvent{
+		Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyV, Character: "v", Modifiers: keyboard.ModifierCtrl,
+	})
+	if len(state.keycaps) != 1 || state.keycaps[0].label != "Ctrl+Shift+V" {
+		t.Fatalf("echo after full release = %+v, want [Ctrl+Shift+V]", labelsOf(state.keycaps))
+	}
+}
+
+func TestRecordingRawKeyUpgradesChordWhenShiftJoins(t *testing.T) {
+	state := &recordingToolbarState{editor: &screenshotEditorOverlayState{}, showKeypress: true}
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyLeftCtrl})
+	state.rawKey(keyboard.RawKeyEvent{
+		Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyC, Character: "c", Modifiers: keyboard.ModifierCtrl,
+	})
+	state.rawKey(keyboard.RawKeyEvent{Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyLeftShift})
+	state.rawKey(keyboard.RawKeyEvent{
+		Type: keyboard.EventTypeKeyDown, Key: keyboard.KeyC, Character: "c",
+		Modifiers: keyboard.ModifierCtrl | keyboard.ModifierShift,
+	})
+	if len(state.keycaps) != 1 || state.keycaps[0].label != "Ctrl+Shift+C" {
+		t.Fatalf("upgraded chord keycaps = %+v, want [Ctrl+Shift+C]", labelsOf(state.keycaps))
+	}
+}
+
+func labelsOf(keycaps []recordingKeycap) []string {
+	labels := make([]string, len(keycaps))
+	for index, keycap := range keycaps {
+		labels[index] = keycap.label
+	}
+	return labels
+}
+
+func TestRecordingKeycapsExpireWithoutPersistence(t *testing.T) {
+	state := &recordingToolbarState{
+		editor:  &screenshotEditorOverlayState{image: testScreenshotImage(t, 20, 20), selection: Rect{Width: 20, Height: 20}},
+		keycaps: []recordingKeycap{{label: "A", expiresAt: time.Now().Add(-time.Millisecond)}},
+	}
+	state.drawOverlay(&DisplayList{}, FrameInfo{Size: Size{Width: 20, Height: 20}})
+	if len(state.keycaps) != 0 {
+		t.Fatalf("expired keycaps = %+v, want none", state.keycaps)
+	}
+}
+
+func TestRenderRecordingKeycapsCompositesOnlyInsideSelection(t *testing.T) {
+	target := image.NewRGBA(image.Rect(0, 0, 200, 120))
+	for index := 0; index < len(target.Pix); index += 4 {
+		target.Pix[index], target.Pix[index+1], target.Pix[index+2], target.Pix[index+3] = 80, 80, 80, 255
+	}
+	selection := Rect{X: 30, Y: 20, Width: 140, Height: 90}
+	if err := renderRecordingKeycaps(target, selection, Size{Width: 200, Height: 120}, []recordingKeycap{{label: "Ctrl+K", expiresAt: time.Now().Add(time.Second)}}, time.Now(), 1); err != nil {
+		t.Fatalf("render keycaps: %v", err)
+	}
+	if outside := target.RGBAAt(5, 5); outside != (color.RGBA{R: 80, G: 80, B: 80, A: 255}) {
+		t.Fatalf("outside selection pixel changed: %+v", outside)
+	}
+	dark, bright := false, false
+	for y := 58; y < 110; y++ {
+		for x := 30; x < 170; x++ {
+			pixel := target.RGBAAt(x, y)
+			dark = dark || pixel.R < 40
+			bright = bright || pixel.R > 200
+		}
+	}
+	if !dark || !bright {
+		t.Fatalf("keycap contrast dark=%t bright=%t, want a dark cap with legible text", dark, bright)
+	}
+}
+
+func TestRenderRecordingKeycapsCentersAfterExpiredHints(t *testing.T) {
+	changedBounds := func(keycaps []recordingKeycap) image.Rectangle {
+		target := image.NewRGBA(image.Rect(0, 0, 400, 240))
+		for index := 0; index < len(target.Pix); index += 4 {
+			target.Pix[index], target.Pix[index+1], target.Pix[index+2], target.Pix[index+3] = 80, 80, 80, 255
+		}
+		now := time.Now()
+		if err := renderRecordingKeycaps(target, Rect{Width: 400, Height: 240}, Size{Width: 400, Height: 240}, keycaps, now, 1); err != nil {
+			t.Fatal(err)
+		}
+		minX, minY, maxX, maxY := target.Bounds().Max.X, target.Bounds().Max.Y, target.Bounds().Min.X, target.Bounds().Min.Y
+		for y := target.Bounds().Min.Y; y < target.Bounds().Max.Y; y++ {
+			for x := target.Bounds().Min.X; x < target.Bounds().Max.X; x++ {
+				if target.RGBAAt(x, y).R != 80 {
+					minX, minY = min(minX, x), min(minY, y)
+					maxX, maxY = max(maxX, x+1), max(maxY, y+1)
+				}
+			}
+		}
+		return image.Rect(minX, minY, maxX, maxY)
+	}
+	now := time.Now()
+	visible := []recordingKeycap{{label: "Ctrl+V", expiresAt: now.Add(time.Second)}}
+	withExpired := []recordingKeycap{
+		{label: "Ctrl+C", expiresAt: now.Add(-time.Millisecond)},
+		{label: "Ctrl+V", expiresAt: now.Add(time.Second)},
+	}
+	if only, afterExpire := changedBounds(visible), changedBounds(withExpired); only != afterExpire {
+		t.Fatalf("visible keycap bounds %v vs %v after an expired sibling, want the same centered placement", only, afterExpire)
+	}
+}
+
+func TestRenderRecordingKeycapsScalesWithActiveDisplayDPI(t *testing.T) {
+	changedHeight := func(scale float32) int {
+		target := image.NewRGBA(image.Rect(0, 0, 400, 240))
+		for index := 0; index < len(target.Pix); index += 4 {
+			target.Pix[index], target.Pix[index+1], target.Pix[index+2], target.Pix[index+3] = 80, 80, 80, 255
+		}
+		if err := renderRecordingKeycaps(target, Rect{Width: 400, Height: 240}, Size{Width: 400, Height: 240}, []recordingKeycap{{label: "Ctrl+K", expiresAt: time.Now().Add(time.Second)}}, time.Now(), scale); err != nil {
+			t.Fatal(err)
+		}
+		minY, maxY := target.Bounds().Max.Y, target.Bounds().Min.Y
+		for y := target.Bounds().Min.Y; y < target.Bounds().Max.Y; y++ {
+			for x := target.Bounds().Min.X; x < target.Bounds().Max.X; x++ {
+				if target.RGBAAt(x, y).R != 80 {
+					minY, maxY = min(minY, y), max(maxY, y+1)
+				}
+			}
+		}
+		return maxY - minY
+	}
+	if at100, at150 := changedHeight(1), changedHeight(1.5); at150 < int(float32(at100)*1.4) {
+		t.Fatalf("keycap heights at 100%%=%d and 150%%=%d, want physical DPI scaling", at100, at150)
+	}
+}
+
+func TestRenderRecordingKeycapsCentersSingleLetterInk(t *testing.T) {
+	for _, label := range []string{"T", "E", "S"} {
+		target := image.NewRGBA(image.Rect(0, 0, 400, 240))
+		for index := 0; index < len(target.Pix); index += 4 {
+			target.Pix[index], target.Pix[index+1], target.Pix[index+2], target.Pix[index+3] = 80, 80, 80, 255
+		}
+		if err := renderRecordingKeycaps(target, Rect{Width: 400, Height: 240}, Size{Width: 400, Height: 240}, []recordingKeycap{{label: label, expiresAt: time.Now().Add(time.Second)}}, time.Now(), 1); err != nil {
+			t.Fatal(err)
+		}
+		keyMinX, keyMaxX, inkMinX, inkMaxX := 400, 0, 400, 0
+		for y := 0; y < 240; y++ {
+			for x := 0; x < 400; x++ {
+				switch red := target.RGBAAt(x, y).R; {
+				case red < 40:
+					keyMinX, keyMaxX = min(keyMinX, x), max(keyMaxX, x+1)
+				case red > 200:
+					inkMinX, inkMaxX = min(inkMinX, x), max(inkMaxX, x+1)
+				}
+			}
+		}
+		if inkMaxX <= inkMinX || keyMaxX <= keyMinX {
+			t.Fatalf("%s missing keycap or letter ink: key=%d..%d ink=%d..%d", label, keyMinX, keyMaxX, inkMinX, inkMaxX)
+		}
+		keyCenter := (keyMinX + keyMaxX) / 2
+		inkCenter := (inkMinX + inkMaxX) / 2
+		if offset := inkCenter - keyCenter; offset < -2 || offset > 2 {
+			t.Fatalf("%s letter ink center %d vs keycap center %d", label, inkCenter, keyCenter)
+		}
+	}
+}
+
+func TestCleanupRecordingOrphansKeepsRecentAndUnrelatedFiles(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now()
+	oldVideo := filepath.Join(root, "old.mp4")
+	recentVideo := filepath.Join(root, "recent.mp4")
+	unrelated := filepath.Join(root, "old.txt")
+	for _, path := range []string{oldVideo, recentVideo, unrelated} {
+		if err := os.WriteFile(path, []byte("test"), 0o600); err != nil {
+			t.Fatalf("create fixture: %v", err)
+		}
+	}
+	oldTime := now.Add(-25 * time.Hour)
+	if err := os.Chtimes(oldVideo, oldTime, oldTime); err != nil {
+		t.Fatalf("age old video: %v", err)
+	}
+	if err := os.Chtimes(unrelated, oldTime, oldTime); err != nil {
+		t.Fatalf("age unrelated file: %v", err)
+	}
+	if err := cleanupRecordingOrphans(root, now, 24*time.Hour); err != nil {
+		t.Fatalf("cleanup orphans: %v", err)
+	}
+	if _, err := os.Stat(oldVideo); !os.IsNotExist(err) {
+		t.Fatalf("old video was not removed: %v", err)
+	}
+	for _, path := range []string{recentVideo, unrelated} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("preserved file %q: %v", path, err)
+		}
+	}
+}
+
+func TestExportRecordingAtomicallyRejectsTemporaryFileAsTarget(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recording.mp4")
+	if err := os.WriteFile(path, []byte("video"), 0o600); err != nil {
+		t.Fatalf("write recording: %v", err)
+	}
+	if err := exportRecordingAtomically(context.Background(), path, path, recordingExportMP4, 0, nil); err == nil {
+		t.Fatal("publishing over the temporary file should be rejected")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("temporary file should remain retryable: %v", err)
+	}
+}
+
+func TestFFmpegRecordingEncoderProducesSilentH264MP4(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg is unavailable")
+	}
+	ffprobe, err := exec.LookPath("ffprobe")
+	if err != nil {
+		t.Skip("ffprobe is unavailable")
+	}
+	path := filepath.Join(t.TempDir(), "synthetic.mp4")
+	encoder := &ffmpegRecordingEncoder{}
+	if err := encoder.Start(path, 64, 32, 30); err != nil {
+		t.Fatalf("start encoder: %v", err)
+	}
+	for index := int64(0); index < 12; index++ {
+		frame := image.NewRGBA(image.Rect(0, 0, 64, 32))
+		fill := color.RGBA{R: uint8(index * 10), G: 80, B: 160, A: 255}
+		for pixel := 0; pixel < len(frame.Pix); pixel += 4 {
+			frame.Pix[pixel], frame.Pix[pixel+1], frame.Pix[pixel+2], frame.Pix[pixel+3] = fill.R, fill.G, fill.B, fill.A
+		}
+		if err := encoder.WriteFrame(recordingFrame{image: frame, index: index}); err != nil {
+			t.Fatalf("encode frame: %v", err)
+		}
+	}
+	if err := encoder.Finalize(); err != nil {
+		t.Fatalf("finalize encoder: %v", err)
+	}
+	output, err := exec.Command(ffprobe, "-v", "error", "-show_entries", "stream=codec_type,codec_name", "-of", "json", path).Output()
+	if err != nil {
+		t.Fatalf("probe encoded MP4: %v", err)
+	}
+	var probe struct {
+		Streams []struct {
+			CodecType string `json:"codec_type"`
+			CodecName string `json:"codec_name"`
+		} `json:"streams"`
+	}
+	if err := json.Unmarshal(output, &probe); err != nil {
+		t.Fatalf("decode ffprobe output: %v", err)
+	}
+	if len(probe.Streams) != 1 || probe.Streams[0].CodecType != "video" || probe.Streams[0].CodecName != "h264" {
+		t.Fatalf("encoded streams = %+v, want one H.264 video stream", probe.Streams)
+	}
+}
+
+func TestFFmpegRecordingEncoderHoldsFramesAcrossCaptureGaps(t *testing.T) {
+	writer := &recordingTestWriteCloser{}
+	encoder := &ffmpegRecordingEncoder{stdin: writer}
+	first := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	second := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	for index := 0; index < len(first.Pix); index += 4 {
+		first.Pix[index], first.Pix[index+3] = 255, 255
+		second.Pix[index+2], second.Pix[index+3] = 255, 255
+	}
+	if err := encoder.WriteFrame(recordingFrame{image: first, index: 0}); err != nil {
+		t.Fatalf("write first frame: %v", err)
+	}
+	if err := encoder.WriteFrame(recordingFrame{image: second, index: 3}); err != nil {
+		t.Fatalf("write gapped frame: %v", err)
+	}
+	firstYUV, err := bgraToI420(first)
+	if err != nil {
+		t.Fatalf("convert first frame: %v", err)
+	}
+	secondYUV, err := bgraToI420(second)
+	if err != nil {
+		t.Fatalf("convert second frame: %v", err)
+	}
+	frameBytes := len(firstYUV)
+	if got, want := writer.Len(), frameBytes*4; got != want {
+		t.Fatalf("encoded bytes = %d, want %d held frames", got, want)
+	}
+	if !bytes.Equal(writer.Bytes()[frameBytes*2:frameBytes*3], firstYUV) {
+		t.Fatal("capture gap should hold the previous frame")
+	}
+	if !bytes.Equal(writer.Bytes()[frameBytes*3:], secondYUV) {
+		t.Fatal("latest capture should be written at its timeline position")
+	}
+}
+
+func TestSwapRecordingFrameRedBlueExchangesPackedChannels(t *testing.T) {
+	frame := image.NewRGBA(image.Rect(0, 0, 2, 1))
+	frame.SetRGBA(0, 0, color.RGBA{R: 10, G: 20, B: 30, A: 255})
+	frame.SetRGBA(1, 0, color.RGBA{R: 200, G: 150, B: 40, A: 128})
+	swapRecordingFrameRedBlue(frame)
+	if got := frame.RGBAAt(0, 0); got != (color.RGBA{R: 30, G: 20, B: 10, A: 255}) {
+		t.Fatalf("swapped pixel = %+v, want R/B exchanged", got)
+	}
+	if got := frame.RGBAAt(1, 0); got != (color.RGBA{R: 40, G: 150, B: 200, A: 128}) {
+		t.Fatalf("second swapped pixel = %+v, want R/B exchanged", got)
+	}
+}
+
+func TestCropRecordingFrameCopiesOnlySelection(t *testing.T) {
+	source := image.NewRGBA(image.Rect(0, 0, 20, 10))
+	source.SetRGBA(12, 4, color.RGBA{R: 255, A: 255})
+	cropped, err := cropRecordingFrame(source, image.Rect(10, 2, 16, 8))
+	if err != nil {
+		t.Fatalf("crop recording frame: %v", err)
+	}
+	if cropped.Bounds() != image.Rect(0, 0, 6, 6) {
+		t.Fatalf("cropped bounds = %v, want 6x6 at origin", cropped.Bounds())
+	}
+	if got := cropped.RGBAAt(2, 2); got != (color.RGBA{R: 255, A: 255}) {
+		t.Fatalf("cropped pixel = %+v, want the selected source pixel", got)
+	}
+}
+
+func TestCropRecordingFrameReusesAlreadyCroppedRGBA(t *testing.T) {
+	source := image.NewRGBA(image.Rect(0, 0, 8, 6))
+	cropped, err := cropRecordingFrame(source, image.Rect(40, 20, 48, 26))
+	if err != nil {
+		t.Fatalf("reuse cropped frame: %v", err)
+	}
+	if cropped != source {
+		t.Fatal("already-cropped RGBA should be reused without another desktop-sized copy")
+	}
+}
+
+func TestApplyRecordingOverlaysDrawsCursorInCropSpace(t *testing.T) {
+	frame := image.NewRGBA(image.Rect(0, 0, 80, 80))
+	pointer := Point{X: 28, Y: 26}
+	if err := applyRecordingOverlays(frame, image.Rect(20, 20, 100, 100), &pointer, nil, true, false, time.Now(), 1); err != nil {
+		t.Fatalf("apply recording overlays: %v", err)
+	}
+	found := false
+	for y := 0; y < 40; y++ {
+		for x := 0; x < 40; x++ {
+			if frame.RGBAAt(x, y).A > 0 {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("cursor should be drawn relative to the cropped origin")
+	}
+}
+
+func TestOverlayRecordingCursorUsesDPIScale(t *testing.T) {
+	small := image.NewRGBA(image.Rect(0, 0, 120, 120))
+	large := image.NewRGBA(image.Rect(0, 0, 120, 120))
+	if err := overlayRecordingCursor(small, Point{X: 8, Y: 8}, 1); err != nil {
+		t.Fatalf("draw 1x cursor: %v", err)
+	}
+	if err := overlayRecordingCursor(large, Point{X: 8, Y: 8}, 2.5); err != nil {
+		t.Fatalf("draw 2.5x cursor: %v", err)
+	}
+	smallCount, largeCount := 0, 0
+	for y := 0; y < 120; y++ {
+		for x := 0; x < 120; x++ {
+			if small.Pix[small.PixOffset(x, y)+3] > 0 {
+				smallCount++
+			}
+			if large.Pix[large.PixOffset(x, y)+3] > 0 {
+				largeCount++
+			}
+		}
+	}
+	if largeCount <= smallCount {
+		t.Fatalf("scaled cursor coverage = %d, unscaled = %d, want a larger pointer at 250%% DPI", largeCount, smallCount)
+	}
+}
+
+func TestDrawRecordingCountdownUsesRedFillAndWhiteOutline(t *testing.T) {
+	displayList := &DisplayList{}
+	drawRecordingCountdown(displayList, nil, Rect{Width: 800, Height: 600}, 3*time.Second-recordingCountdownFadeDuration, 1)
+	if displayList.CommandCount() < 9 {
+		t.Fatalf("countdown commands = %d, want a white outline plus red fill", displayList.CommandCount())
+	}
+	size := recordingCountdownFontSize(Rect{Width: 800, Height: 600}, 1)
+	if size < recordingCountdownLogicalSize {
+		t.Fatalf("countdown size = %v, want at least %v", size, recordingCountdownLogicalSize)
+	}
+	scaled := recordingCountdownFontSize(Rect{Width: 3000, Height: 2000}, 2.5)
+	if scaled <= size {
+		t.Fatalf("countdown size at 250%% DPI = %v, unscaled = %v, want a larger digit", scaled, size)
+	}
+	if recordingCountdownFill.R < 200 || recordingCountdownFill.G > 80 || recordingCountdownFill.B > 80 {
+		t.Fatalf("countdown fill = %+v, want red", recordingCountdownFill)
+	}
+	if recordingCountdownStroke != (Color{R: 255, G: 255, B: 255, A: 255}) {
+		t.Fatalf("countdown stroke = %+v, want white", recordingCountdownStroke)
+	}
+}
+
+func TestRecordingPreviewPixelSizeCapsLongEdgeAndStaysEven(t *testing.T) {
+	width, height := recordingPreviewPixelSize(3024, 2072)
+	if width > recordingPreviewMaxEdge || height > recordingPreviewMaxEdge {
+		t.Fatalf("preview size = %dx%d, exceeds %d", width, height, recordingPreviewMaxEdge)
+	}
+	if width%2 != 0 || height%2 != 0 {
+		t.Fatalf("preview size = %dx%d, want even dimensions", width, height)
+	}
+	if width < 2 || height < 2 {
+		t.Fatalf("preview size = %dx%d", width, height)
+	}
+}
+
+func TestRecordingSessionFinishLeavesTempPathForPreview(t *testing.T) {
+	encoder := &recordingTestEncoder{}
+	session, err := newRecordingSession(recordingSessionConfig{
+		FPS: 30, PixelBounds: image.Rect(0, 0, 4, 2), Encoder: encoder, TempRoot: t.TempDir(),
+		Capture: func() (image.Image, error) { return image.NewRGBA(image.Rect(0, 0, 4, 2)), nil },
+		Sleep:   func(context.Context, time.Duration) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("create recording session: %v", err)
+	}
+	if err := session.Start(context.Background()); err != nil {
+		t.Fatalf("start recording: %v", err)
+	}
+	waitForRecordingState(t, session, recordingStateRecording)
+	path, err := session.Finish()
+	if err != nil {
+		t.Fatalf("finish recording: %v", err)
+	}
+	if path == "" || session.TempPath() != path {
+		t.Fatalf("temp path = %q session = %q", path, session.TempPath())
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("finalized recording missing: %v", err)
+	}
+	if session.currentState() != recordingStateSave {
+		t.Fatalf("state = %s, want save", session.currentState())
+	}
+}
+
+func TestExtractRecordingPreviewFrameFromEncodedMP4(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg is unavailable")
+	}
+	path := filepath.Join(t.TempDir(), "preview-source.mp4")
+	encoder := &ffmpegRecordingEncoder{}
+	if err := encoder.Start(path, 64, 32, 30); err != nil {
+		t.Fatalf("start encoder: %v", err)
+	}
+	frame := image.NewRGBA(image.Rect(0, 0, 64, 32))
+	for pixel := 0; pixel < len(frame.Pix); pixel += 4 {
+		frame.Pix[pixel], frame.Pix[pixel+1], frame.Pix[pixel+2], frame.Pix[pixel+3] = 40, 80, 200, 255
+	}
+	for index := int64(0); index < 6; index++ {
+		if err := encoder.WriteFrame(recordingFrame{image: frame, index: index}); err != nil {
+			t.Fatalf("encode frame: %v", err)
+		}
+	}
+	if err := encoder.Finalize(); err != nil {
+		t.Fatalf("finalize encoder: %v", err)
+	}
+	preview, err := extractRecordingPreviewFrame(path, 32, 16)
+	if err != nil {
+		t.Fatalf("extract preview frame: %v", err)
+	}
+	if preview.Bounds().Dx() != 32 || preview.Bounds().Dy() != 16 {
+		t.Fatalf("preview bounds = %v, want 32x16", preview.Bounds())
+	}
+}
+
+// TestRecordingSessionKeycapPixelScale covers point-based displays and physical-coordinate desktops.
+func TestRecordingSessionKeycapPixelScale(t *testing.T) {
+	for _, scale := range []float32{1, 1.5, 2} {
+		t.Run(fmt.Sprint(scale), func(t *testing.T) {
+			width, height := int(400*scale), int(240*scale)
+			state := &recordingToolbarState{
+				fps: 30, showKeypress: true,
+				selection: Rect{Width: 400, Height: 240}, frameSize: Size{Width: 400, Height: 240},
+				editor:  &screenshotEditorOverlayState{image: testScreenshotImage(t, width, height)},
+				keycaps: []recordingKeycap{{label: "K", expiresAt: time.Now().Add(time.Hour)}},
+			}
+			session, err := state.newSession()
+			if err != nil {
+				t.Fatal(err)
+			}
+			frame, err := session.config.Compose(image.NewRGBA(image.Rect(0, 0, width, height)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			minY, maxY := height, 0
+			for y := 0; y < height; y++ {
+				for x := 0; x < width; x++ {
+					if frame.RGBAAt(x, y).A != 0 {
+						minY, maxY = min(minY, y), max(maxY, y+1)
+					}
+				}
+			}
+			if got := maxY - minY; got < int(34*scale) || got > int(40*scale) {
+				t.Fatalf("keycap height=%d at pixel scale %v", got, scale)
+			}
+		})
+	}
+}
+
+// TestRecordingEncoderPreservesRedAndBlue checks the actual MP4 round trip, including channel order.
+func TestRecordingEncoderPreservesRedAndBlue(t *testing.T) {
+	ffmpeg, err := recordingFFmpegPath()
+	if err != nil {
+		t.Skip("ffmpeg unavailable")
+	}
+	frame := image.NewRGBA(image.Rect(0, 0, 64, 32))
+	for y := 0; y < 32; y++ {
+		for x := 0; x < 64; x++ {
+			i := frame.PixOffset(x, y)
+			frame.Pix[i+3] = 255
+			if x < 32 {
+				frame.Pix[i] = 255 // BGR0 blue.
+			} else {
+				frame.Pix[i+2] = 255 // BGR0 red.
+			}
+		}
+	}
+	path := filepath.Join(t.TempDir(), "colors.mp4")
+	encoder := &ffmpegRecordingEncoder{}
+	if err := encoder.Start(path, 64, 32, 30); err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.WriteFrame(recordingFrame{image: frame}); err != nil {
+		_ = encoder.Abort()
+		t.Fatal(err)
+	}
+	if err := encoder.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	pixels, err := exec.Command(ffmpeg, "-v", "error", "-i", path, "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pixels) != 64*32*3 {
+		t.Fatalf("decoded bytes=%d", len(pixels))
+	}
+	blue, red := pixels[(16*64+16)*3:][:3], pixels[(16*64+48)*3:][:3]
+	if blue[2] < 230 || blue[0] > 20 || red[0] < 230 || red[2] > 20 {
+		t.Fatalf("colors changed after MP4 encoding: blue RGB=%v red RGB=%v", blue, red)
+	}
+}
+
+// TestRecordingKeycapEdgesHavePixelCoverage catches binary circle fills before
+// encoding, including fading caps and fractional capture/display scales.
+func TestRecordingKeycapEdgesHavePixelCoverage(t *testing.T) {
+	for _, scale := range []float32{1, 1.25, 1.5, 2} {
+		for _, remaining := range []time.Duration{time.Second, 175 * time.Millisecond} {
+			t.Run(fmt.Sprintf("scale=%g/lifetime=%s", scale, remaining), func(t *testing.T) {
+				now := time.Unix(100, 0)
+				target := image.NewRGBA(image.Rect(0, 0, 400, 270))
+				selection := Rect{X: 17.25, Y: 13.5, Width: 240, Height: 140}
+				if err := renderRecordingKeycaps(target, selection, Size{Width: 320, Height: 180}, []recordingKeycap{{label: "A", expiresAt: now.Add(remaining)}}, now, scale); err != nil {
+					t.Fatal(err)
+				}
+				fullAlpha := uint8(230)
+				if remaining < 350*time.Millisecond {
+					fullAlpha = uint8(remaining.Milliseconds() * 230 / 350)
+				}
+				partial, solid := 0, 0
+				var levels [256]bool
+				for index := 0; index < len(target.Pix); index += 4 {
+					r, g, b, alpha := target.Pix[index], target.Pix[index+1], target.Pix[index+2], target.Pix[index+3]
+					if r > alpha || g > alpha || b > alpha {
+						t.Fatal("keycap color is not premultiplied by coverage")
+					}
+					if alpha > 0 && alpha < fullAlpha {
+						partial++
+						levels[alpha] = true
+					}
+					if alpha == fullAlpha {
+						solid++
+					}
+				}
+				distinct := 0
+				for _, present := range levels {
+					if present {
+						distinct++
+					}
+				}
+				if partial < 10 || distinct < 4 || solid == 0 {
+					t.Fatalf("keycap edge coverage: partial=%d levels=%d solid=%d; want smooth edges and a solid interior", partial, distinct, solid)
+				}
+			})
+		}
+	}
+}

@@ -1,0 +1,349 @@
+package setting
+
+import (
+	"context"
+	"fmt"
+	"reflect"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"wox/common"
+	"wox/database"
+	"wox/util"
+	"wox/util/autostart"
+
+	"github.com/samber/lo"
+)
+
+var managerInstance atomic.Pointer[Manager]
+var managerOnce sync.Once
+var logger *util.Log
+
+type Manager struct {
+	woxSetting *WoxSetting
+	mruManager *MRUManager
+	// autoBackupOnce keeps the daily backup loop from being scheduled twice.
+	autoBackupOnce sync.Once
+	// backupMu guards the single in-flight backup and its watchers.
+	backupMu       sync.Mutex
+	backupRunning  bool
+	backupWatchSeq int
+	backupWatchers []backupWatch
+}
+
+const queryCompletionFeedbackLimit = 1000
+
+func GetSettingManager() *Manager {
+	managerOnce.Do(func() {
+		logger = util.GetLogger()
+		db := database.GetDB()
+		if db == nil {
+			logger.Error(context.Background(), "Database not initialized, cannot create Setting Manager")
+			panic("database not initialized")
+		}
+
+		store := NewWoxSettingStore(db)
+		manager := &Manager{}
+		manager.woxSetting = NewWoxSetting(store)
+		manager.mruManager = NewMRUManager(db)
+		managerInstance.Store(manager)
+	})
+	return managerInstance.Load()
+}
+
+// CurrentWoxSetting returns live settings when the manager is already initialized.
+// Callers that can run before the database exists, including tests, receive nil.
+func CurrentWoxSetting() *WoxSetting {
+	manager := managerInstance.Load()
+	if manager == nil {
+		return nil
+	}
+	return manager.woxSetting
+}
+
+// PeekUiDensity reads the live interface size without initializing settings.
+// Overlays can appear in tests and before the database exists; those callers keep normal density.
+func PeekUiDensity() UiDensity {
+	manager := managerInstance.Load()
+	if manager == nil || manager.woxSetting == nil || manager.woxSetting.UiDensity == nil {
+		return UiDensityNormal
+	}
+	return NormalizeUiDensity(string(manager.woxSetting.UiDensity.Get()))
+}
+
+// CurrentUiDensityScale is the multiplier currently applied to launcher, chat, and overlay text.
+func CurrentUiDensityScale() float32 {
+	return UiDensityScale(PeekUiDensity())
+}
+
+func (m *Manager) Init(ctx context.Context) error {
+	if err := m.checkAutostart(ctx); err != nil {
+		logger.Error(ctx, fmt.Sprintf("failed to check autostart status: %v", err))
+	}
+
+	return nil
+}
+
+func (m *Manager) checkAutostart(ctx context.Context) error {
+	actualAutostart, err := autostart.IsAutostart(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to check autostart status: %w", err)
+	}
+
+	configAutostart := m.woxSetting.EnableAutostart.Get()
+	if actualAutostart != configAutostart {
+		util.GetLogger().Warn(ctx, fmt.Sprintf("Autostart setting mismatch: config %v, actual %v", configAutostart, actualAutostart))
+
+		if configAutostart {
+			util.GetLogger().Info(ctx, "Attempting to fix autostart configuration...")
+			if err := autostart.SetAutostart(ctx, true); err != nil {
+				util.GetLogger().Error(ctx, fmt.Sprintf("Failed to fix autostart: %s", err.Error()))
+				m.woxSetting.EnableAutostart.Set(false)
+			} else {
+				util.GetLogger().Info(ctx, "Autostart configuration fixed successfully")
+			}
+		} else {
+			// This case is less common, but we can ensure it's disabled if config says so.
+			if err := autostart.SetAutostart(ctx, false); err != nil {
+				util.GetLogger().Error(ctx, fmt.Sprintf("Failed to disable autostart: %s", err.Error()))
+				m.woxSetting.EnableAutostart.Set(true) // Revert setting if action fails
+			}
+		}
+	}
+	return nil
+}
+
+func (m *Manager) GetWoxSetting(ctx context.Context) *WoxSetting {
+	return m.woxSetting
+}
+
+func (m *Manager) GetLatestQueryHistory(ctx context.Context, limit int) []QueryHistory {
+	histories := m.woxSetting.QueryHistories.Get()
+
+	// Sort by timestamp descending and limit results
+	var result []QueryHistory
+	count := 0
+	for i := len(histories) - 1; i >= 0 && count < limit; i-- {
+		result = append(result, histories[i])
+		count++
+	}
+
+	return result
+}
+
+func (m *Manager) LoadPluginSetting(ctx context.Context, pluginId string, defaultSettings map[string]string) (*PluginSetting, error) {
+	pluginSettingStore := NewPluginSettingStore(database.GetDB(), pluginId)
+	pluginSetting := NewPluginSetting(pluginSettingStore, defaultSettings)
+	return pluginSetting, nil
+}
+
+func (m *Manager) AddActionedResult(ctx context.Context, pluginId string, resultTitle string, resultSubTitle string, query string) {
+	resultHash := NewResultHash(pluginId, resultTitle, resultSubTitle)
+	m.AddActionedResultByHash(ctx, resultHash, query)
+}
+
+// AddActionedResultByHash stores an actioned result for callers that own a stable result identity.
+func (m *Manager) AddActionedResultByHash(ctx context.Context, resultHash ResultHash, query string) {
+	actionedResult := ActionedResult{
+		Timestamp: util.GetSystemTimestamp(),
+		Query:     query,
+	}
+
+	actionedResults := m.woxSetting.ActionedResults.Get()
+	if v, ok := actionedResults.Load(resultHash); ok {
+		v = append(v, actionedResult)
+		if len(v) > 100 {
+			v = v[len(v)-100:]
+		}
+		actionedResults.Store(resultHash, v)
+	} else {
+		actionedResults.Store(resultHash, []ActionedResult{actionedResult})
+	}
+	m.woxSetting.ActionedResults.Set(actionedResults)
+}
+
+// HasActionedResults reports whether usage history exists for a result identity.
+func (m *Manager) HasActionedResults(resultHash ResultHash) bool {
+	actionedResults, ok := m.woxSetting.ActionedResults.Get().Load(resultHash)
+	return ok && len(actionedResults) > 0
+}
+
+// ClearActionedResults removes usage history for a result identity.
+func (m *Manager) ClearActionedResults(ctx context.Context, resultHash ResultHash) bool {
+	actionedResults := m.woxSetting.ActionedResults.Get()
+	if _, ok := actionedResults.Load(resultHash); !ok {
+		return false
+	}
+	actionedResults.Delete(resultHash)
+	m.woxSetting.ActionedResults.Set(actionedResults)
+	util.GetLogger().Info(ctx, fmt.Sprintf("clear actioned results: %s", resultHash))
+	return true
+}
+
+// PinResult pins one score identity for a query text. The same result can stay pinned under other queries.
+func (m *Manager) PinResult(ctx context.Context, resultHash ResultHash, query string) {
+	query = normalizePinedQuery(query)
+	results := m.woxSetting.PinedResults.Get()
+	current, _ := results.Load(resultHash)
+	if current.hasQuery(query) {
+		return
+	}
+	util.GetLogger().Info(ctx, fmt.Sprintf("pin result: %s, query: %s", resultHash, query))
+	results.Store(resultHash, current.withQuery(query))
+	m.woxSetting.PinedResults.Set(results)
+}
+
+// IsPinedResult reports whether this score identity is pinned for the given query text.
+func (m *Manager) IsPinedResult(ctx context.Context, resultHash ResultHash, query string) bool {
+	current, ok := m.woxSetting.PinedResults.Get().Load(resultHash)
+	return ok && current.hasQuery(query)
+}
+
+// UnpinResult removes the pin for one query and keeps pins for other queries.
+func (m *Manager) UnpinResult(ctx context.Context, resultHash ResultHash, query string) {
+	query = normalizePinedQuery(query)
+	results := m.woxSetting.PinedResults.Get()
+	current, ok := results.Load(resultHash)
+	if !ok || !current.hasQuery(query) {
+		return
+	}
+	util.GetLogger().Info(ctx, fmt.Sprintf("unpin result: %s, query: %s", resultHash, query))
+	updated, keep := current.withoutQuery(query)
+	if keep {
+		results.Store(resultHash, updated)
+	} else {
+		results.Delete(resultHash)
+	}
+	m.woxSetting.PinedResults.Set(results)
+}
+
+func (m *Manager) AddQueryHistory(ctx context.Context, query common.PlainQuery) {
+	query.QueryHint = query.QueryHint.Clone()
+	histories := m.woxSetting.QueryHistories.Get()
+	newHistory := QueryHistory{
+		Query:     query,
+		Timestamp: util.GetSystemTimestamp(),
+	}
+
+	// Remove duplicate if exists (same type/text/selection/scope identity)
+	histories = lo.Filter(histories, func(item QueryHistory, index int) bool {
+		if item.Query.IsEmpty() {
+			return false
+		}
+		return !plainQueryHistoryEqual(item.Query, query)
+	})
+
+	// Add new history at the end
+	histories = append(histories, newHistory)
+
+	// Keep only the most recent 1000 entries
+	if len(histories) > 1000 {
+		histories = histories[len(histories)-1000:]
+	}
+
+	if err := m.woxSetting.QueryHistories.Set(histories); err != nil {
+		util.GetLogger().Error(ctx, fmt.Sprintf("failed to persist query history: %s", err.Error()))
+	}
+}
+
+func plainQueryHistoryEqual(left, right common.PlainQuery) bool {
+	if !reflect.DeepEqual(left.QueryHint, right.QueryHint) {
+		return false
+	}
+	if left.QueryType != right.QueryType || left.QueryText != right.QueryText {
+		return false
+	}
+	if left.QuerySelection.String() != right.QuerySelection.String() {
+		return false
+	}
+	return left.QueryScope.Identity() == right.QueryScope.Identity()
+}
+
+// GetQueryCompletionFeedbacks returns accepted inline completion feedback for ranking.
+func (m *Manager) GetQueryCompletionFeedbacks(ctx context.Context) []QueryCompletionFeedback {
+	feedbacks := m.woxSetting.QueryCompletionFeedbacks.Get()
+	return append([]QueryCompletionFeedback(nil), feedbacks...)
+}
+
+// RecordQueryCompletionFeedback upserts one accepted inline completion hint.
+func (m *Manager) RecordQueryCompletionFeedback(ctx context.Context, inputPrefix string, completionText string, source string) bool {
+	if inputPrefix == "" || completionText == "" || completionText == inputPrefix || !strings.HasPrefix(completionText, inputPrefix) {
+		return false
+	}
+
+	feedbacks := m.woxSetting.QueryCompletionFeedbacks.Get()
+	now := util.GetSystemTimestamp()
+	updated := false
+	var acceptedFeedback QueryCompletionFeedback
+	nextFeedbacks := make([]QueryCompletionFeedback, 0, len(feedbacks)+1)
+	for _, feedback := range feedbacks {
+		if feedback.CompletionText != completionText {
+			nextFeedbacks = append(nextFeedbacks, feedback)
+			continue
+		}
+
+		feedback.LastInputPrefix = inputPrefix
+		feedback.Source = source
+		feedback.AcceptCount++
+		feedback.LastAcceptedTimestamp = now
+		acceptedFeedback = feedback
+		updated = true
+	}
+
+	if !updated {
+		acceptedFeedback = QueryCompletionFeedback{
+			CompletionText:        completionText,
+			LastInputPrefix:       inputPrefix,
+			Source:                source,
+			AcceptCount:           1,
+			LastAcceptedTimestamp: now,
+		}
+	}
+
+	feedbacks = append(nextFeedbacks, acceptedFeedback)
+	if len(feedbacks) > queryCompletionFeedbackLimit {
+		feedbacks = feedbacks[len(feedbacks)-queryCompletionFeedbackLimit:]
+	}
+
+	m.woxSetting.QueryCompletionFeedbacks.Set(feedbacks)
+	return true
+}
+
+// MRU related methods
+
+func (m *Manager) AddMRUItem(ctx context.Context, item MRUItem) error {
+	return m.mruManager.AddMRUItem(ctx, item)
+}
+
+func (m *Manager) GetMRUItems(ctx context.Context, limit int) ([]MRUItem, error) {
+	return m.mruManager.GetMRUItems(ctx, limit)
+}
+
+func (m *Manager) RemoveMRUItem(ctx context.Context, hash string) error {
+	return m.mruManager.RemoveMRUItem(ctx, hash)
+}
+
+func (m *Manager) CleanupOldMRUItems(ctx context.Context, keepCount int) error {
+	return m.mruManager.CleanupOldMRUItems(ctx, keepCount)
+}
+
+// StartMRUCleanup starts a background goroutine to periodically clean up old MRU items
+func (m *Manager) StartMRUCleanup(ctx context.Context) {
+	util.Go(ctx, "MRU cleanup", func() {
+		ticker := time.NewTicker(24 * time.Hour) // Clean up once per day
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				// Keep only the most recent 100 MRU items
+				if err := m.CleanupOldMRUItems(ctx, 100); err != nil {
+					util.GetLogger().Error(ctx, fmt.Sprintf("failed to cleanup old MRU items: %s", err.Error()))
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	})
+}

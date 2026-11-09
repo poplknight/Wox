@@ -1,0 +1,388 @@
+package component
+
+import (
+	"testing"
+	"unicode/utf8"
+
+	"wox/common"
+	woxui "wox/ui/runtime"
+)
+
+func TestNoteEditorImageKeepsHeightAfterLeavingViewport(t *testing.T) {
+	for _, image := range []woxui.Image{{Width: 400, Height: 800}, {Width: 1000, Height: 500}} {
+		meta := &common.NoteImage{Scale: 40}
+		loadedWidth, loadedHeight := noteEditorImageSize(&image, meta, 500, 1, 0)
+		deferredWidth, deferredHeight := noteEditorImageSize(nil, meta, 500, 1, float32(image.Width)/float32(image.Height))
+		if loadedWidth != deferredWidth || loadedHeight != deferredHeight {
+			t.Fatalf("image %dx%d changes size after unloading: loaded %.1fx%.1f, deferred %.1fx%.1f", image.Width, image.Height, loadedWidth, loadedHeight, deferredWidth, deferredHeight)
+		}
+	}
+}
+
+func TestDocumentFromEditorKeepsRepeatedLinkLabel(t *testing.T) {
+	document := common.NoteDocument{Blocks: []common.NoteBlock{{
+		Type: common.NoteBlockParagraph,
+		Text: "Wox经历过两届主要维护者。然后第二届主要维护者",
+		Spans: []common.NoteSpan{
+			{Start: 6, End: 13, Link: "https://example.com/a"},
+			{Start: 16, End: 24, Link: "https://example.com/b"},
+		},
+	}}}
+	parsed := DocumentFromEditor("Wox经历过两轮主要维护者。然后第二届主要维护者", document)
+	if len(parsed.Blocks) != 1 || parsed.Blocks[0].Text != "Wox经历过两轮主要维护者。然后第二届主要维护者" {
+		t.Fatalf("edited text = %#v", parsed.Blocks)
+	}
+	if len(parsed.Blocks[0].Spans) != 2 || parsed.Blocks[0].Spans[0].Link != "https://example.com/a" || parsed.Blocks[0].Spans[0].Start != 6 || parsed.Blocks[0].Spans[0].End != 13 {
+		t.Fatalf("first link after edit = %#v", parsed.Blocks[0].Spans)
+	}
+	if parsed.Blocks[0].Spans[1].Link != "https://example.com/b" || parsed.Blocks[0].Spans[1].Start != 16 || parsed.Blocks[0].Spans[1].End != 24 {
+		t.Fatalf("second link after edit = %#v", parsed.Blocks[0].Spans)
+	}
+}
+
+func TestDocumentFromEditorKeepsHeadingsWhenInsertingLinesBefore(t *testing.T) {
+	document := common.NoteDocument{Blocks: []common.NoteBlock{
+		{ID: "h2", Type: common.NoteBlockHeading2, Text: "Heading 2"},
+		{ID: "p1", Type: common.NoteBlockParagraph, Text: "Test"},
+		{ID: "h3", Type: common.NoteBlockHeading3, Text: "Heading 3"},
+		{ID: "p2", Type: common.NoteBlockParagraph, Text: "Test"},
+	}}
+	parsed := DocumentFromEditor("Heading 2\nTest\n\n\nHeading 3\nTest", document)
+	want := []common.NoteBlockType{common.NoteBlockHeading2, common.NoteBlockParagraph, common.NoteBlockParagraph, common.NoteBlockParagraph, common.NoteBlockHeading3, common.NoteBlockParagraph}
+	if len(parsed.Blocks) != len(want) {
+		t.Fatalf("blocks = %#v", parsed.Blocks)
+	}
+	for index, blockType := range want {
+		if parsed.Blocks[index].Type != blockType {
+			t.Fatalf("block %d type = %v, want %v (%#v)", index, parsed.Blocks[index].Type, blockType, parsed.Blocks)
+		}
+	}
+	if parsed.Blocks[4].ID != "h3" || parsed.Blocks[5].ID != "p2" {
+		t.Fatalf("shifted block ids = %q %q", parsed.Blocks[4].ID, parsed.Blocks[5].ID)
+	}
+}
+
+func TestNoteTaskGroupIncludesIndentedChildren(t *testing.T) {
+	document := common.NoteDocument{Blocks: []common.NoteBlock{
+		{ID: "a", Type: common.NoteBlockTask, Text: "parent"},
+		{ID: "b", Type: common.NoteBlockTask, Text: "child", Indent: 1},
+		{ID: "c", Type: common.NoteBlockTask, Text: "other"},
+	}}
+	start, end := NoteTaskGroup(document, 0)
+	if start != 0 || end != 2 {
+		t.Fatalf("parent group = [%d, %d), want [0, 2)", start, end)
+	}
+	start, end = NoteTaskGroup(document, 1)
+	if start != 1 || end != 2 {
+		t.Fatalf("child group = [%d, %d), want [1, 2)", start, end)
+	}
+}
+
+func TestMoveNoteTaskGroupReordersWithChildren(t *testing.T) {
+	document := common.NoteDocument{Blocks: []common.NoteBlock{
+		{ID: "a", Type: common.NoteBlockTask, Text: "first"},
+		{ID: "b", Type: common.NoteBlockTask, Text: "second"},
+		{ID: "c", Type: common.NoteBlockTask, Text: "child", Indent: 1},
+		{ID: "d", Type: common.NoteBlockParagraph, Text: "tail"},
+	}}
+	moved, index := MoveNoteTaskGroup(document, 1, 0)
+	if index != 0 || moved.Blocks[0].ID != "b" || moved.Blocks[1].ID != "c" || moved.Blocks[2].ID != "a" || moved.Blocks[3].ID != "d" {
+		t.Fatalf("move second to top = index %d blocks %#v", index, moved.Blocks)
+	}
+	moved, index = MoveNoteTaskGroup(document, 1, 4)
+	if index != 2 || moved.Blocks[0].ID != "a" || moved.Blocks[1].ID != "d" || moved.Blocks[2].ID != "b" || moved.Blocks[3].ID != "c" {
+		t.Fatalf("move second past tail = index %d blocks %#v", index, moved.Blocks)
+	}
+	unchanged, index := MoveNoteTaskGroup(document, 1, 1)
+	if index != 1 || unchanged.Blocks[1].ID != "b" {
+		t.Fatalf("no-op move = index %d blocks %#v", index, unchanged.Blocks)
+	}
+}
+
+func TestNoteTaskLiveDestUsesLineMidpoints(t *testing.T) {
+	document := common.NoteDocument{Blocks: []common.NoteBlock{
+		{ID: "a", Type: common.NoteBlockTask, Text: "one"},
+		{ID: "b", Type: common.NoteBlockTask, Text: "two"},
+		{ID: "c", Type: common.NoteBlockTask, Text: "three"},
+	}}
+	_, _, ranges := ProjectNoteDocument(document, woxui.TextStyle{Size: 14}, ControlTheme{})
+	lines := []textFieldLine{
+		{start: ranges[0].Start, end: ranges[0].End},
+		{start: ranges[1].Start, end: ranges[1].End},
+		{start: ranges[2].Start, end: ranges[2].End},
+	}
+	if dest := noteTaskLiveDest(document, ranges, 1, 0, 24, lines); dest != 0 {
+		t.Fatalf("above first midpoint = %d, want 0", dest)
+	}
+	if dest := noteTaskLiveDest(document, ranges, 1, 36, 24, lines); dest != 1 {
+		t.Fatalf("over self = %d, want 1", dest)
+	}
+	if dest := noteTaskLiveDest(document, ranges, 1, 70, 24, lines); dest != 3 {
+		t.Fatalf("past last midpoint = %d, want 3", dest)
+	}
+}
+
+func TestNoteTaskDropAndNudgeDest(t *testing.T) {
+	document := common.NoteDocument{Blocks: []common.NoteBlock{
+		{ID: "a", Type: common.NoteBlockTask, Text: "one"},
+		{ID: "b", Type: common.NoteBlockTask, Text: "two"},
+		{ID: "c", Type: common.NoteBlockTask, Text: "three"},
+	}}
+	_, _, ranges := ProjectNoteDocument(document, woxui.TextStyle{Size: 14}, ControlTheme{})
+	if dest := NoteTaskDropDest(document, ranges, 1, ranges[0].TextStart); dest != 0 {
+		t.Fatalf("drop onto first = %d, want 0", dest)
+	}
+	if dest := NoteTaskDropDest(document, ranges, 1, ranges[2].TextStart); dest != 3 {
+		t.Fatalf("drop onto last = %d, want 3", dest)
+	}
+	if dest := NoteTaskDropDest(document, ranges, 1, ranges[1].TextStart); dest != 1 {
+		t.Fatalf("drop onto self = %d, want 1", dest)
+	}
+	if dest := NoteTaskNudgeDest(document, 1, -1); dest != 0 {
+		t.Fatalf("nudge up = %d, want 0", dest)
+	}
+	if dest := NoteTaskNudgeDest(document, 1, 1); dest != 3 {
+		t.Fatalf("nudge down = %d, want 3", dest)
+	}
+}
+
+func TestProjectNoteDocumentShrinksASingleParagraphSeparator(t *testing.T) {
+	document := common.NoteDocument{Blocks: []common.NoteBlock{
+		{Type: common.NoteBlockParagraph, Text: "first"},
+		{Type: common.NoteBlockParagraph},
+		{Type: common.NoteBlockParagraph, Text: "second"},
+	}}
+	value, runs, _ := ProjectNoteDocument(document, woxui.TextStyle{Size: 14}, ControlTheme{})
+	if value != "first\n\nsecond" {
+		t.Fatalf("projection = %q, want the separator block to stay in the text", value)
+	}
+	lines := textFieldRichLines(value, nil, woxui.TextStyle{Size: 14}, 400, true, NoteFieldRuns(runs))
+	layout := textFieldLayoutLines(lines, 24)
+	if layout.box(1) != noteParagraphGap || layout.top(2) != 24+noteParagraphGap {
+		t.Fatalf("separator line box %v top %v, want a %v gap instead of a full line", layout.box(1), layout.top(2), noteParagraphGap)
+	}
+}
+
+func TestProjectNoteDocumentHeadingLineHeight(t *testing.T) {
+	for _, scale := range []float32{1, 2} {
+		document := common.NoteDocument{Blocks: []common.NoteBlock{
+			{Type: common.NoteBlockHeading1, Text: "Heading"},
+			{Type: common.NoteBlockParagraph, Text: "body"},
+		}}
+		style := woxui.TextStyle{Size: 14 * scale}
+		value, runs, _ := ProjectNoteDocument(document, style, ControlTheme{})
+		lines := textFieldRichLines(value, nil, style, 400, true, NoteFieldRuns(runs))
+		layout := textFieldLayoutLines(lines, 20*scale)
+		if layout.box(0) != 28*scale || layout.box(1) != 20*scale {
+			t.Fatalf("scale %v: heading and body boxes = %v, %v", scale, layout.box(0), layout.box(1))
+		}
+	}
+}
+
+func TestProjectNoteDocumentKeepsExtraBlankLinesFullHeight(t *testing.T) {
+	document := common.NoteDocument{Blocks: []common.NoteBlock{
+		{Type: common.NoteBlockParagraph, Text: "first"},
+		{Type: common.NoteBlockParagraph},
+		{Type: common.NoteBlockParagraph},
+		{Type: common.NoteBlockParagraph, Text: "second"},
+	}}
+	value, runs, _ := ProjectNoteDocument(document, woxui.TextStyle{Size: 14}, ControlTheme{})
+	lines := textFieldRichLines(value, nil, woxui.TextStyle{Size: 14}, 400, true, NoteFieldRuns(runs))
+	layout := textFieldLayoutLines(lines, 24)
+	if layout.top(len(lines)-1) != 24*3 {
+		t.Fatalf("tops end at %v across %d lines, want two full blank lines", layout.top(len(lines)-1), len(lines))
+	}
+}
+
+func TestProjectNoteDocumentSpacesAdjacentParagraphs(t *testing.T) {
+	document := common.NoteDocument{Blocks: []common.NoteBlock{
+		{Type: common.NoteBlockParagraph, Text: "first"},
+		{Type: common.NoteBlockHeading2, Text: "Title"},
+		{Type: common.NoteBlockBullet, Text: "item"},
+		{Type: common.NoteBlockBullet, Text: "next"},
+		{Type: common.NoteBlockParagraph, Text: "second"},
+	}}
+	value, runs, _ := ProjectNoteDocument(document, woxui.TextStyle{Size: 14}, ControlTheme{})
+	if value != "first\nTitle\n• item\n• next\nsecond" {
+		t.Fatalf("projection = %q", value)
+	}
+	if gap := noteRunGap(runs, utf8.RuneCountInString("first")); gap != noteParagraphGap {
+		t.Fatalf("paragraph gap = %v, want %v", gap, noteParagraphGap)
+	}
+	if gap := noteRunGap(runs, utf8.RuneCountInString("first\nTitle")); gap != noteParagraphGap {
+		t.Fatalf("heading gap = %v, want %v", gap, noteParagraphGap)
+	}
+	if gap := noteRunGap(runs, utf8.RuneCountInString("first\nTitle\n• item")); gap != 0 {
+		t.Fatalf("list item gap = %v, want list items to stay compact", gap)
+	}
+	if gap := noteRunGap(runs, utf8.RuneCountInString(value)); gap != 0 {
+		t.Fatalf("last block gap = %v, want 0", gap)
+	}
+	_, zoomed, _ := ProjectNoteDocument(document, woxui.TextStyle{Size: 28}, ControlTheme{})
+	if gap := noteRunGap(zoomed, utf8.RuneCountInString("first")); gap != noteParagraphGap*2 {
+		t.Fatalf("zoomed paragraph gap = %v, want %v", gap, noteParagraphGap*2)
+	}
+	fields := NoteFieldRuns(runs)
+	lines := textFieldRichLines(value, nil, woxui.TextStyle{Size: 14}, 400, true, fields)
+	layout := textFieldLayoutLines(lines, 24)
+	// first, Title, two list lines, second. Gaps follow the paragraph and the heading only.
+	if layout.top(1) != 24+noteParagraphGap || layout.top(2) != 24+noteParagraphGap+24+noteParagraphGap {
+		t.Fatalf("paragraph tops = %v %v, want space only between prose blocks", layout.top(1), layout.top(2))
+	}
+}
+
+func noteRunGap(runs []NoteTextRun, end int) float32 {
+	gap := float32(0)
+	for _, run := range runs {
+		if run.End == end && run.BlockGap > gap {
+			gap = run.BlockGap
+		}
+	}
+	return gap
+}
+
+func TestProjectNoteDocumentUsesSharedListGutters(t *testing.T) {
+	document := common.NoteDocument{Blocks: []common.NoteBlock{
+		{Type: common.NoteBlockBullet, Text: "bullet"},
+		{Type: common.NoteBlockOrdered, Text: "ordered"},
+	}}
+	_, runs, _ := ProjectNoteDocument(document, woxui.TextStyle{Size: 14}, ControlTheme{})
+	markers := make([]TextFieldRichRun, 0, 2)
+	for _, run := range runs {
+		if run.ListMarker != "" {
+			markers = append(markers, run.FieldRun())
+		}
+	}
+	if len(markers) != 2 {
+		t.Fatalf("list marker runs = %d, want 2", len(markers))
+	}
+	bullet, ordered := markers[0], markers[1]
+	if bullet.Advance != 16 || ordered.Advance != 24 || bullet.Paint == nil || ordered.Paint == nil {
+		t.Fatalf("list gutters = %v/%v, want painted 16/24", bullet.Advance, ordered.Advance)
+	}
+}
+
+func TestNoteTaskAtCaret(t *testing.T) {
+	document := common.NoteDocument{Blocks: []common.NoteBlock{
+		{ID: "p", Type: common.NoteBlockParagraph, Text: "plain"},
+		{ID: "t", Type: common.NoteBlockTask, Text: "task"},
+	}}
+	_, _, ranges := ProjectNoteDocument(document, woxui.TextStyle{Size: 14}, ControlTheme{})
+	if index := NoteTaskAtCaret(document, ranges, woxui.TextSelection{Focus: ranges[0].TextStart}); index != -1 {
+		t.Fatalf("caret in paragraph = %d, want -1", index)
+	}
+	if index := NoteTaskAtCaret(document, ranges, woxui.TextSelection{Focus: ranges[1].TextStart}); index != 1 {
+		t.Fatalf("caret in task = %d, want 1", index)
+	}
+}
+
+func TestNoteEditorTaskReorderHandleFollowsCaret(t *testing.T) {
+	document := common.NoteDocument{Blocks: []common.NoteBlock{
+		{ID: "p", Type: common.NoteBlockParagraph, Text: "plain"},
+		{ID: "t", Type: common.NoteBlockTask, Text: "task"},
+	}}
+	_, _, ranges := ProjectNoteDocument(document, woxui.TextStyle{Size: 14}, ControlTheme{})
+	segment := NoteDocumentSegment{Start: 0, End: 2}
+	started := false
+	props := NoteEditorProps{
+		Document: document, Selection: woxui.TextSelection{Focus: ranges[1].TextStart}, Focused: true,
+		ReorderingTask: -1, OnReorderTaskStart: func(int) { started = true }, OnReorderTaskDrag: func(int, float32) {},
+	}
+	handle := noteEditorTaskReorderHandle(props, segment, ranges)
+	if handle == nil || handle.Start != ranges[1].Start || handle.End != ranges[1].End || handle.Size != 16 {
+		t.Fatalf("caret on task handle = %#v, want range %+v", handle, ranges[1])
+	}
+	handle.OnPanStart()
+	if !started {
+		t.Fatal("handle pan must start a reorder")
+	}
+	props.Selection = woxui.TextSelection{Focus: ranges[0].TextStart}
+	if handle := noteEditorTaskReorderHandle(props, segment, ranges); handle != nil {
+		t.Fatal("caret on a paragraph must hide the reorder handle")
+	}
+	hovered := -2
+	props.Focused = false
+	props.HoveredTask = 1
+	props.OnHoverTask = func(block int) { hovered = block }
+	handle = noteEditorTaskReorderHandle(props, segment, ranges)
+	if handle == nil || handle.Start != ranges[1].Start {
+		t.Fatalf("hover on task handle = %#v", handle)
+	}
+	noteEditorHoverTask(props, ranges)(ranges[1].TextStart, true)
+	if hovered != 1 {
+		t.Fatalf("hover task = %d, want 1", hovered)
+	}
+}
+
+func TestSelectionAcrossDividerDoesNotPanic(t *testing.T) {
+	document := common.NoteDocument{Blocks: []common.NoteBlock{
+		{Type: common.NoteBlockParagraph, Text: "before", Spans: []common.NoteSpan{{Start: 0, End: 6, Bold: true}}},
+		{Type: common.NoteBlockDivider},
+		{Type: common.NoteBlockParagraph, Text: "after", Spans: []common.NoteSpan{{Start: 0, End: 5, Bold: true}}},
+	}}
+	value, _, ranges := ProjectNoteDocument(document, woxui.TextStyle{Size: 14}, ControlTheme{})
+	all := woxui.TextSelection{Anchor: 0, Focus: len([]rune(value))}
+	if formats := NoteActiveFormats(document, ranges, all); !formats["bold"] {
+		t.Fatalf("select-all formats = %#v, want bold from the text blocks", formats)
+	}
+	updated := ToggleNoteInline(document, ranges, all, "bold", "")
+	if len(updated.Blocks[0].Spans) != 0 || len(updated.Blocks[2].Spans) != 0 || len(updated.Blocks[1].Spans) != 0 {
+		t.Fatalf("toggle bold across divider = %#v, want bold removed from text and none on the divider", updated.Blocks)
+	}
+}
+
+// typeNoteLine replays a line one rune at a time through the editor projection, the way the note
+// window reparses the backing text on every keystroke.
+func typeNoteLine(line string) common.NoteDocument {
+	document := common.NoteDocument{Version: 1, Blocks: []common.NoteBlock{{Type: common.NoteBlockParagraph}}}
+	for _, char := range line {
+		text, _, _ := ProjectNoteDocument(document, woxui.TextStyle{Size: 14}, ControlTheme{})
+		document = DocumentFromEditor(text+string(char), document)
+	}
+	return document
+}
+
+func TestTypingTaskPrefixCreatesTaskBlock(t *testing.T) {
+	for _, testCase := range []struct {
+		line    string
+		checked bool
+	}{
+		{"- [ ] buy milk", false},
+		{"- [x] buy milk", true},
+		{"[ ] buy milk", false},
+		{"[x] buy milk", true},
+	} {
+		document := typeNoteLine(testCase.line)
+		if len(document.Blocks) != 1 {
+			t.Fatalf("typing %q produced %d blocks, want 1", testCase.line, len(document.Blocks))
+		}
+		block := document.Blocks[0]
+		if block.Type != common.NoteBlockTask || block.Checked != testCase.checked || block.Text != "buy milk" {
+			t.Fatalf("typing %q = type %s checked %v text %q, want task checked %v text %q",
+				testCase.line, block.Type, block.Checked, block.Text, testCase.checked, "buy milk")
+		}
+	}
+}
+
+func TestTypingBulletAndOrderedPrefixesStayLists(t *testing.T) {
+	for _, testCase := range []struct {
+		line      string
+		blockType common.NoteBlockType
+		text      string
+	}{
+		{"- buy milk", common.NoteBlockBullet, "buy milk"},
+		{"1. buy milk", common.NoteBlockOrdered, "buy milk"},
+		{"- 1. buy milk", common.NoteBlockBullet, "1. buy milk"},
+		{"- [draft] buy milk", common.NoteBlockBullet, "[draft] buy milk"},
+	} {
+		document := typeNoteLine(testCase.line)
+		if len(document.Blocks) != 1 {
+			t.Fatalf("typing %q produced %d blocks, want 1", testCase.line, len(document.Blocks))
+		}
+		block := document.Blocks[0]
+		if block.Type != testCase.blockType || block.Text != testCase.text {
+			t.Fatalf("typing %q = type %s text %q, want type %s text %q",
+				testCase.line, block.Type, block.Text, testCase.blockType, testCase.text)
+		}
+	}
+}

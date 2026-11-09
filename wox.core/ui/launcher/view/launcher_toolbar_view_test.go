@@ -1,0 +1,426 @@
+package view
+
+import (
+	"testing"
+
+	woxcomponent "wox/ui/launcher/component"
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+)
+
+// TestToolbarIndependentDivider verifies transparent and disabled borders without resizing the toolbar.
+func TestToolbarIndependentDivider(t *testing.T) {
+	for _, width := range []float32{0, 1, 3} {
+		color := woxui.Color{R: 50, G: 180, B: 120, A: 80}
+		built := LauncherToolbarView(LauncherToolbarProps{Width: 800, Height: 40, Window: &woxui.Window{}, DensityScale: 1.5, Theme: woxcomponent.Theme{ToolbarBorder: color, ToolbarBorderWidth: width}}).(woxwidget.Stack)
+		divider := built.Children[2].Child.(woxwidget.Painter)
+		if built.Height != 40 || divider.Height != width {
+			t.Fatalf("width %v: invalid divider geometry", width)
+		}
+		actual, expected := &woxui.DisplayList{}, &woxui.DisplayList{}
+		bounds := woxui.Rect{X: -20, Y: 10, Width: 800, Height: width}
+		divider.Paint(actual, bounds)
+		if width > 0 {
+			expected.FillRect(bounds, color)
+		}
+		if err := actual.Compare(expected); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestLauncherToolbarSplitGivesStatusPriority(t *testing.T) {
+	left, right := launcherToolbarSplit(740, 220, 150, 16)
+	if left != 220 || right != 504 {
+		t.Fatalf("toolbar split = left %v right %v, want status to keep 220 and leave 504 for shortcuts", left, right)
+	}
+}
+
+// TestToolbarTextOnlyCount keeps the label flush with the status area and preserves
+// reserved actions across launcher themes, densities, and constrained widths.
+func TestToolbarTextOnlyCount(t *testing.T) {
+	for _, scale := range []float32{0.9, 1, 1.1, 1.5} {
+		for _, width := range []float32{400, 800} {
+			for _, color := range []woxui.Color{{R: 30, G: 30, B: 30, A: 255}, {R: 230, G: 230, B: 230, A: 255}} {
+				props := LauncherToolbarProps{
+					Width: width, Height: 40 * scale, Window: &woxui.Window{}, DensityScale: scale,
+					Label: "已索引 20,646 个文件", Theme: woxcomponent.Theme{ToolbarText: color},
+					Actions: []LauncherToolbarAction{
+						{ID: "open", Label: "Open", HotkeyLabels: []string{"Enter"}, Pinned: true},
+						{ID: launcherToolbarMoreActionID, Label: "Actions", HotkeyLabels: []string{"Ctrl", "J"}},
+					},
+				}
+				built := LauncherToolbarView(props).(woxwidget.Stack)
+				row := built.Children[1].Child.(woxwidget.Container).Child.(woxwidget.Align).Child.(woxwidget.Flex)
+				left := row.Children[0].(woxwidget.Container).Child.(woxwidget.Flex)
+				status := left.Children[0].(woxwidget.Semantics).Child.(woxwidget.Flex)
+				if len(status.Children) != 1 {
+					t.Fatalf("text-only status contains an icon or placeholder: %+v", status)
+				}
+				label := status.Children[0].(woxwidget.Align).Child.(woxwidget.Text)
+				if label.Value != props.Label || label.Color != color || label.Style.Size != scaledLauncherSize(woxcomponent.ToolbarFontSize, scale) {
+					t.Fatalf("label lost toolbar typography or theme: %+v", label)
+				}
+				right := row.Children[2].(woxwidget.Container).Child.(woxwidget.Flex)
+				if len(right.Children) != 2 {
+					t.Fatalf("width=%v scale=%v: reserved shortcuts disappeared", width, scale)
+				}
+			}
+		}
+	}
+}
+
+func TestLauncherToolbarSplitEllipsizesStatusToKeepReservedShortcuts(t *testing.T) {
+	left, right := launcherToolbarSplit(300, 220, 150, 16)
+	if left != 134 || right != 150 {
+		t.Fatalf("toolbar split = left %v right %v, want the long status to shrink to 134 so Enter and More stay", left, right)
+	}
+}
+
+func TestFitLauncherToolbarActionsKeepsEnterAndMoreThenFills(t *testing.T) {
+	actions := []measuredLauncherToolbarAction{
+		{id: "toolbar-action-result-hide-launcher-0", width: 80, pinned: true},
+		{id: "toolbar-action-result-open-folder-1", width: 80},
+		{id: "toolbar-action-toolbar-keep-open-0", width: 70},
+		{id: launcherToolbarMoreActionID, width: 70},
+	}
+	tight, used := fitLauncherToolbarActions(actions, 0, 150)
+	if used != 150 || !toolbarActionIDsEqual(tight, "toolbar-action-result-hide-launcher-0", launcherToolbarMoreActionID) {
+		t.Fatalf("tight toolbar actions = %v width %v, want Enter and More", toolbarActionIDs(tight), used)
+	}
+	wider, used := fitLauncherToolbarActions(actions, 0, 230)
+	if used != 230 || !toolbarActionIDsEqual(wider, "toolbar-action-result-hide-launcher-0", "toolbar-action-result-open-folder-1", launcherToolbarMoreActionID) {
+		t.Fatalf("wider toolbar actions = %v width %v, want Enter, the next hotkey, and More", toolbarActionIDs(wider), used)
+	}
+}
+
+func toolbarActionIDs(actions []measuredLauncherToolbarAction) []string {
+	ids := make([]string, len(actions))
+	for index, action := range actions {
+		ids[index] = action.id
+	}
+	return ids
+}
+
+func toolbarActionIDsEqual(actions []measuredLauncherToolbarAction, want ...string) bool {
+	if len(actions) != len(want) {
+		return false
+	}
+	for index, action := range actions {
+		if action.id != want[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestLauncherToolbarBoundaryEqualCoversAllFields(t *testing.T) {
+	woxwidget.AssertEqualCoversAllFields(t, LauncherToolbarAction{})
+	woxwidget.AssertEqualCoversAllFields(t, LauncherToolbarProps{})
+}
+
+func TestLauncherToolbarAboutMenuButtonSemantics(t *testing.T) {
+	tapped := false
+	built := LauncherToolbarView(LauncherToolbarProps{
+		Width: 800, Height: 40, Window: &woxui.Window{}, DensityScale: 1,
+		MenuVisible: true, MenuActive: true, MenuLabel: "About Menu",
+		OnMenuTap: func() { tapped = true },
+	}).(woxwidget.Stack)
+	body := built.Children[1].Child.(woxwidget.Container)
+	row := body.Child.(woxwidget.Align).Child.(woxwidget.Flex)
+	left := row.Children[0].(woxwidget.Container)
+	semantics := left.Child.(woxwidget.Flex).Children[0].(woxwidget.Semantics)
+	if semantics.AutomationID != "launcher.toolbar.about-menu" || semantics.Label != "About Menu" || !semantics.Expanded {
+		t.Fatalf("about menu semantics = %#v", semantics)
+	}
+	if err := semantics.OnAction(woxui.AccessibilityActionActivate, ""); err != nil || !tapped {
+		t.Fatalf("activate about menu: tapped %v err %v", tapped, err)
+	}
+	if len(left.Child.(woxwidget.Flex).Children) != 1 {
+		t.Fatal("about menu button must occupy the left status slot without a message")
+	}
+}
+
+func TestLauncherToolbarOmitsEmptyLeftContent(t *testing.T) {
+	built := LauncherToolbarView(LauncherToolbarProps{
+		Width: 800, Height: 40, Window: &woxui.Window{}, DensityScale: 1,
+		Actions: []LauncherToolbarAction{{ID: "execute", Label: "Execute", HotkeyLabels: []string{"Enter"}}},
+	}).(woxwidget.Stack)
+	body := built.Children[1].Child.(woxwidget.Container)
+	alignment := body.Child.(woxwidget.Align)
+	row := alignment.Child.(woxwidget.Flex)
+	if body.Padding.Top != 0 || body.Padding.Bottom != 0 || alignment.Height != 40 || alignment.Vertical != 0.5 {
+		t.Fatalf("toolbar alignment = padding %#v child %#v, want full-height vertical center", body.Padding, alignment)
+	}
+	left := row.Children[0].(woxwidget.Container)
+	right := row.Children[2].(woxwidget.Container)
+	if left.Height != 32 || right.Height != 32 {
+		t.Fatalf("toolbar row height = left %v right %v, want 32 so action hover insets fit", left.Height, right.Height)
+	}
+	if len(left.Child.(woxwidget.Flex).Children) != 0 {
+		t.Fatal("empty toolbar status must not consume the action row")
+	}
+}
+
+func TestLauncherToolbarUsesBlankCenterForWindowDragging(t *testing.T) {
+	dragged := false
+	built := LauncherToolbarView(LauncherToolbarProps{
+		Width: 800, Height: 40, Window: &woxui.Window{}, DensityScale: 1,
+		OnDragStart: func() { dragged = true },
+		Actions:     []LauncherToolbarAction{{ID: "execute", Label: "Execute", HotkeyLabels: []string{"Enter"}}},
+	}).(woxwidget.Stack)
+	body := built.Children[1].Child.(woxwidget.Container)
+	row := body.Child.(woxwidget.Align).Child.(woxwidget.Flex)
+	dragArea := row.Children[1].(woxwidget.Gesture)
+	dragArea.OnDragStart()
+
+	if !dragged {
+		t.Fatal("blank toolbar area did not start window dragging")
+	}
+	if dragArea.ID != "launcher-toolbar-drag-area" {
+		t.Fatalf("toolbar drag area id = %q, want launcher-toolbar-drag-area", dragArea.ID)
+	}
+}
+
+func TestLauncherToolbarExposesStatusAndActionSemantics(t *testing.T) {
+	activated := false
+	built := LauncherToolbarView(LauncherToolbarProps{
+		Width: 800, Height: 40, Window: &woxui.Window{}, DensityScale: 1, Label: "Toolbar fixture ready",
+		Actions: []LauncherToolbarAction{{ID: "toolbar-action-keep-open", Label: "Keep open", HotkeyLabels: []string{"Ctrl", "K"}, OnTap: func() { activated = true }}},
+	}).(woxwidget.Stack)
+	body := built.Children[1].Child.(woxwidget.Container)
+	row := body.Child.(woxwidget.Align).Child.(woxwidget.Flex)
+
+	leftFlex := row.Children[0].(woxwidget.Container).Child.(woxwidget.Flex)
+	left := leftFlex.Children[0].(woxwidget.Semantics)
+	if left.AutomationID != "launcher.toolbar.status" || left.Role != woxui.AccessibilityRoleGroup || left.Value != "Toolbar fixture ready" {
+		t.Fatalf("toolbar status semantics = %#v", left)
+	}
+
+	right := row.Children[2].(woxwidget.Container).Child.(woxwidget.Flex)
+	action := right.Children[0].(woxwidget.Semantics)
+	if action.AutomationID != "toolbar-action-keep-open" || action.Role != woxui.AccessibilityRoleButton {
+		t.Fatalf("toolbar action semantics = %#v", action)
+	}
+	if err := action.OnAction(woxui.AccessibilityActionActivate, ""); err != nil {
+		t.Fatalf("activate toolbar action semantics: %v", err)
+	}
+	if !activated {
+		t.Fatal("toolbar action semantics did not invoke the action")
+	}
+
+	stateful, ok := action.Child.(woxwidget.Stateful)
+	if !ok {
+		t.Fatalf("toolbar action child = %T, want shared hoverable state", action.Child)
+	}
+	gesture := stateful.CreateState().Build(woxwidget.StateContext{}, stateful.Widget).(woxwidget.Gesture)
+	if gesture.OnTap == nil || gesture.OnHoverAt == nil {
+		t.Fatalf("toolbar action gesture = tap %v hover %v, want shared hover state", gesture.OnTap != nil, gesture.OnHoverAt != nil)
+	}
+}
+
+func TestLauncherToolbarKeepsSixteenPixelActionContentSpacing(t *testing.T) {
+	built := LauncherToolbarView(LauncherToolbarProps{
+		Width: 800, Height: 40, Window: &woxui.Window{}, DensityScale: 1,
+		Actions: []LauncherToolbarAction{
+			{ID: "execute", Label: "Execute", HotkeyLabels: []string{"Enter"}},
+			{ID: "background", Label: "Execute in Background", HotkeyLabels: []string{"Ctrl", "Enter"}},
+		},
+	}).(woxwidget.Stack)
+	body := built.Children[1].Child.(woxwidget.Container)
+	row := body.Child.(woxwidget.Align).Child.(woxwidget.Flex)
+	right := row.Children[2].(woxwidget.Container).Child.(woxwidget.Flex)
+	if len(right.Children) != 2 {
+		t.Fatalf("toolbar action count = %d, want both actions visible", len(right.Children))
+	}
+	if right.Gap != 0 {
+		t.Fatalf("toolbar action gap = %v, want 0 so 8px hover padding keeps 16px between contents", right.Gap)
+	}
+}
+
+func TestLauncherToolbarOmitsEmptyActionLabels(t *testing.T) {
+	theme := woxcomponent.Theme{
+		ToolbarBackground: woxui.Color{R: 20, G: 24, B: 28, A: 255},
+		ToolbarText:       woxui.Color{R: 220, G: 230, B: 240, A: 255},
+	}
+	empty, emptyWidth := launcherToolbarActionSurface(LauncherToolbarAction{ID: "blank", HotkeyLabels: []string{"Enter"}}, theme, &woxui.Window{}, 1, false)
+	labeled, labeledWidth := launcherToolbarActionSurface(LauncherToolbarAction{ID: "more", Label: "Actions", HotkeyLabels: []string{"Ctrl", "J"}}, theme, &woxui.Window{}, 1, false)
+
+	emptyFlex := empty.(woxwidget.Container).Child.(woxwidget.Flex)
+	if len(emptyFlex.Children) != 1 {
+		t.Fatalf("empty toolbar action children = %d, want only the Enter keycap", len(emptyFlex.Children))
+	}
+	labeledFlex := labeled.(woxwidget.Container).Child.(woxwidget.Flex)
+	if len(labeledFlex.Children) != 2 {
+		t.Fatalf("labeled toolbar action children = %d, want label and keycaps", len(labeledFlex.Children))
+	}
+	if _, isAlign := emptyFlex.Children[0].(woxwidget.Align); isAlign {
+		t.Fatal("empty toolbar action must not use Align with width 0, which fills the row and overlaps the next action")
+	}
+	if _, isText := emptyFlex.Children[0].(woxwidget.Text); isText {
+		t.Fatal("empty toolbar action must not render a blank label before the Enter keycap")
+	}
+	if emptyWidth >= labeledWidth {
+		t.Fatalf("empty toolbar action width = %v, want smaller than labeled width %v", emptyWidth, labeledWidth)
+	}
+
+	built := LauncherToolbarView(LauncherToolbarProps{
+		Width: 800, Height: 40, Window: &woxui.Window{}, DensityScale: 1,
+		Actions: []LauncherToolbarAction{
+			{ID: "blank", HotkeyLabels: []string{"Enter"}},
+			{ID: "more", Label: "Actions", HotkeyLabels: []string{"Ctrl", "J"}},
+		},
+	}).(woxwidget.Stack)
+	right := built.Children[1].Child.(woxwidget.Container).Child.(woxwidget.Align).Child.(woxwidget.Flex).Children[2].(woxwidget.Container)
+	if right.Width != emptyWidth+labeledWidth {
+		t.Fatalf("toolbar action row width = %v, want %v so empty Enter does not overlap More Actions", right.Width, emptyWidth+labeledWidth)
+	}
+}
+
+func TestLauncherToolbarActionHoversLabelAndKeycapsTogether(t *testing.T) {
+	theme := woxcomponent.Theme{
+		ToolbarBackground: woxui.Color{R: 20, G: 24, B: 28, A: 255},
+		ToolbarText:       woxui.Color{R: 220, G: 230, B: 240, A: 255},
+	}
+	action := LauncherToolbarAction{ID: "open", Label: "Open", HotkeyLabels: []string{"Enter"}}
+	normal, normalWidth := launcherToolbarActionSurface(action, theme, &woxui.Window{}, 1, false)
+	hovered, hoveredWidth := launcherToolbarActionSurface(action, theme, &woxui.Window{}, 1, true)
+	if normalWidth != hoveredWidth {
+		t.Fatalf("toolbar action hover width = %v, want unchanged %v", hoveredWidth, normalWidth)
+	}
+
+	normalContainer := normal.(woxwidget.Container)
+	hoveredContainer := hovered.(woxwidget.Container)
+	want := woxcomponent.ControlHoverColor(theme.ToolbarBackground, theme.ToolbarText)
+	if normalContainer.Height != 32 || hoveredContainer.Height != 32 {
+		t.Fatalf("toolbar action height = %v / %v, want 32 with 2px vertical inset", normalContainer.Height, hoveredContainer.Height)
+	}
+	if normalContainer.Padding != (woxwidget.Insets{Left: 8, Top: 2, Right: 8, Bottom: 2}) || hoveredContainer.Padding != normalContainer.Padding {
+		t.Fatalf("toolbar action padding = %#v / %#v, want stable 8px horizontal and 2px vertical inset", normalContainer.Padding, hoveredContainer.Padding)
+	}
+	if normalContainer.Color != (woxui.Color{}) {
+		t.Fatalf("toolbar action default background = %#v, want transparent", normalContainer.Color)
+	}
+	if hoveredContainer.Color != want {
+		t.Fatalf("toolbar action hover background = %#v, want %#v", hoveredContainer.Color, want)
+	}
+
+	normalChip := toolbarActionKeycapFill(t, normalContainer)
+	hoveredChip := toolbarActionKeycapFill(t, hoveredContainer)
+	if normalChip != theme.ToolbarBackground {
+		t.Fatalf("toolbar keycap default fill = %#v, want toolbar background", normalChip)
+	}
+	if hoveredChip != want {
+		t.Fatalf("toolbar keycap hover fill = %#v, want shared action hover %#v", hoveredChip, want)
+	}
+}
+
+// TestToolbarPrimaryHierarchy keeps configured emphasis independent of hover and secondary actions.
+func TestToolbarPrimaryHierarchy(t *testing.T) {
+	for _, alpha := range []uint8{0, 160, 255} {
+		for _, hovered := range []bool{false, true} {
+			for _, primary := range []bool{false, true} {
+				normal := woxui.Color{R: 80, G: 90, B: 100, A: 200}
+				emphasis := woxui.Color{R: 120, G: 180, B: 160, A: alpha}
+				theme := woxcomponent.Theme{ToolbarText: normal, ToolbarPrimaryFontColor: &emphasis}
+				built, _ := launcherToolbarActionSurface(LauncherToolbarAction{ID: "action", Pinned: primary, Label: "Action", HotkeyLabels: []string{"Enter"}}, theme, &woxui.Window{}, 1, hovered)
+				label := built.(woxwidget.Container).Child.(woxwidget.Flex).Children[0].(woxwidget.Text)
+				want := normal
+				if primary {
+					want = emphasis
+				}
+				if label.Color != want {
+					t.Fatalf("primary=%v hovered=%v: color = %v, want %v", primary, hovered, label.Color, want)
+				}
+			}
+		}
+	}
+}
+
+// TestToolbarOpenPanelKeepsHoverHighlight covers open/closed and pointer transitions without changing geometry.
+func TestToolbarOpenPanelKeepsHoverHighlight(t *testing.T) {
+	theme := woxcomponent.Theme{ToolbarBackground: woxui.Color{R: 20, A: 100}, ToolbarText: woxui.Color{R: 160, A: 255}}
+	var expectedWidth float32
+	for _, active := range []bool{false, true, false} {
+		for _, hovered := range []bool{false, true} {
+			built, width := launcherToolbarActionSurface(LauncherToolbarAction{ID: launcherToolbarMoreActionID, Label: "Actions", HotkeyLabels: []string{"Ctrl", "J"}, Active: active}, theme, &woxui.Window{}, 1, hovered)
+			if expectedWidth == 0 {
+				expectedWidth = width
+			}
+			want, wantChip := woxui.Color{}, theme.ToolbarBackground
+			if active || hovered {
+				want = woxcomponent.ControlHoverColor(theme.ToolbarBackground, theme.ToolbarText)
+				wantChip = want
+			}
+			container := built.(woxwidget.Container)
+			if container.Color != want || toolbarActionKeycapFill(t, container) != wantChip || width != expectedWidth {
+				t.Fatalf("active=%v hovered=%v: incorrect trigger highlight or width", active, hovered)
+			}
+		}
+	}
+}
+
+func toolbarActionKeycapFill(t *testing.T, action woxwidget.Container) woxui.Color {
+	t.Helper()
+	chip := action.Child.(woxwidget.Flex).Children[1].(woxwidget.Container).Child.(woxwidget.Align).Child.(woxwidget.Flex).Children[0].(woxwidget.Stack)
+	return chip.Children[0].Child.(woxwidget.Container).Color
+}
+
+func TestLauncherGlassFooterBlocksCoveredResults(t *testing.T) {
+	for _, scale := range []float32{1, 1.5, 2, 2.5} {
+		activated, covered := 0, 0
+		host := woxwidget.NewHost(func(woxui.FrameInfo) woxwidget.Widget {
+			return LauncherView(LauncherViewProps{
+				Width: 400, Height: 200, FooterOverlay: true,
+				Content: woxwidget.Gesture{ID: "covered-result", OnTap: func() { covered++ }, Child: woxwidget.Container{Width: 400, Height: 200}},
+				Footer: LauncherToolbarView(LauncherToolbarProps{
+					Width: 400, Height: 40, DensityScale: 1, Window: &woxui.Window{},
+					Actions: []LauncherToolbarAction{{ID: "execute", Label: "Execute", HotkeyLabels: []string{"Enter"}, OnTap: func() { activated++ }}},
+				}),
+			})
+		})
+		host.AttachServices(actionSearchHostServices{})
+		host.Frame(&woxui.DisplayList{}, woxui.FrameInfo{Size: woxui.Size{Width: 400, Height: 200}, PixelSize: woxui.PixelSize{Width: int(400 * scale), Height: int(200 * scale)}, Scale: scale})
+		foundToolbar := false
+		for _, node := range host.Snapshot().Tree.Nodes {
+			if node.AutomationID == "launcher.toolbar" {
+				foundToolbar = true
+				if node.Bounds != (woxui.Rect{Y: 160, Width: 400, Height: 40}) {
+					t.Fatalf("scale %v: toolbar bounds %+v", scale, node.Bounds)
+				}
+			}
+		}
+		if !foundToolbar {
+			t.Fatal("missing toolbar semantics")
+		}
+		for _, point := range []woxui.Point{{X: 5, Y: 198}, {X: 370, Y: 180}} {
+			host.Pointer(woxui.PointerEvent{Kind: woxui.PointerDown, Button: woxui.PointerButtonPrimary, Position: point})
+			host.Pointer(woxui.PointerEvent{Kind: woxui.PointerUp, Button: woxui.PointerButtonPrimary, Position: point})
+		}
+		if covered != 0 || activated != 1 {
+			t.Fatalf("scale %v: covered result activations %d, toolbar activations %d", scale, covered, activated)
+		}
+	}
+}
+
+func TestLauncherToolbarUsesThemeTintedMaterial(t *testing.T) {
+	for _, tint := range []woxui.Color{{R: 35, G: 41, B: 51, A: 76}, {R: 255, G: 255, B: 255, A: 128}} {
+		built := LauncherToolbarView(LauncherToolbarProps{Width: 400, Height: 40, Theme: woxcomponent.Theme{ToolbarBackground: tint, ToolbarBorderWidth: 1}}).(woxwidget.Stack)
+		body := built.Children[1].Child.(woxwidget.Container)
+		if !body.Floating || body.Color != tint {
+			t.Fatalf("toolbar material = floating %v tint %+v, want %+v", body.Floating, body.Color, tint)
+		}
+	}
+}
+
+// TestToolbarTextureUsesRoundedMaterial prevents the image from covering panel corners.
+func TestToolbarTextureUsesRoundedMaterial(t *testing.T) {
+	texture := &woxwidget.ImageSurface{}
+	tree := LauncherToolbarView(LauncherToolbarProps{Width: 500, Height: 40, Theme: woxcomponent.Theme{AppContentBorderRadius: 16, Surfaces: &woxcomponent.ThemeSurfaceSet{Items: map[string]*woxwidget.ImageSurface{"Toolbar": texture}}}}).(woxwidget.Stack)
+	layers := tree.Children[1].Child.(woxwidget.Clip).Child.(woxwidget.Stack)
+	backdrop := layers.Children[0].Child.(woxwidget.Container)
+	body := layers.Children[1].Child.(woxwidget.Container)
+	if backdrop.Surface != texture || backdrop.Radius != 16 || body.Surface != nil {
+		t.Fatal("toolbar texture must follow rounded backdrop instead of rectangular body")
+	}
+}

@@ -1,0 +1,600 @@
+package view
+
+import (
+	"testing"
+
+	woxcomponent "wox/ui/launcher/component"
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+)
+
+func TestFormTextFieldRendersErrorUnderControl(t *testing.T) {
+	const message = "Value cannot be empty"
+	field := FormTextField(FormTextFieldProps{
+		ID: "requirement-form-field-0", Label: "API Key", Description: "Paste the key here", Error: message,
+		Width: 400, Theme: woxcomponent.ControlTheme{Error: woxui.Color{R: 232, G: 95, B: 95, A: 255}},
+	})
+	errorNode, ok := findFormSemanticsByAutomationID(field, "requirement-form-field-0-error")
+	if !ok {
+		t.Fatal("textbox field error is missing requirement-form-field-0-error")
+	}
+	if errorNode.Label != message || errorNode.Value != message || errorNode.LiveRegion != woxui.AccessibilityLiveRegionPolite {
+		t.Fatalf("textbox field error = %#v, want labeled text %q", errorNode, message)
+	}
+}
+
+func TestFormTextFieldInvokesOnBlurWhenFocusLost(t *testing.T) {
+	focused := false
+	blurred := false
+	field := FormTextField(FormTextFieldProps{
+		ID: "api-key", Label: "API Key", Width: 400, LabelWidth: 100,
+		OnFocus: func() { focused = true },
+		OnBlur:  func() { blurred = true },
+		Theme:   woxcomponent.ControlTheme{},
+	})
+	row := field.(woxwidget.Container).Child.(woxwidget.Flex)
+	controlColumn := row.Children[1].(woxwidget.Expanded).Child.(woxwidget.Flex)
+	input := controlColumn.Children[0].(woxwidget.Stateful).Widget.(woxcomponent.TextFieldProps)
+	if input.OnFocusChange == nil {
+		t.Fatal("textbox is missing OnFocusChange")
+	}
+	input.OnFocusChange(true)
+	if !focused || blurred {
+		t.Fatalf("focus = %v blur = %v, want only OnFocus", focused, blurred)
+	}
+	input.OnFocusChange(false)
+	if !blurred {
+		t.Fatal("losing focus must call OnBlur")
+	}
+}
+
+func findFormSemanticsByAutomationID(widget woxwidget.Widget, automationID string) (woxwidget.Semantics, bool) {
+	switch node := widget.(type) {
+	case woxwidget.Semantics:
+		if node.AutomationID == automationID {
+			return node, true
+		}
+		return findFormSemanticsByAutomationID(node.Child, automationID)
+	case woxwidget.Keyed:
+		return findFormSemanticsByAutomationID(node.Child, automationID)
+	case woxwidget.Container:
+		return findFormSemanticsByAutomationID(node.Child, automationID)
+	case woxwidget.Expanded:
+		return findFormSemanticsByAutomationID(node.Child, automationID)
+	case woxwidget.Align:
+		return findFormSemanticsByAutomationID(node.Child, automationID)
+	case woxwidget.Clip:
+		return findFormSemanticsByAutomationID(node.Child, automationID)
+	case woxwidget.Flex:
+		for _, child := range node.Children {
+			if found, ok := findFormSemanticsByAutomationID(child, automationID); ok {
+				return found, true
+			}
+		}
+	}
+	return woxwidget.Semantics{}, false
+}
+
+func TestFormPanelUsesIntrinsicHeightUpToMaximum(t *testing.T) {
+	panel := FormPanel(FormPanelProps{
+		Width: 388, MaximumHeight: 420, Rows: []woxwidget.Widget{woxwidget.Container{Width: 360, Height: 44}},
+		CancelLabel: "Cancel (Esc)", SaveLabel: "Save (Cmd+Enter)", Theme: woxcomponent.ControlTheme{},
+	}).(woxwidget.Container)
+	if panel.Height != 0 {
+		t.Fatalf("form panel height = %.0f, want intrinsic height", panel.Height)
+	}
+	column := panel.Child.(woxwidget.Flex)
+	if len(column.Children) != 2 {
+		t.Fatalf("form panel child count = %d, want body and actions without a title row", len(column.Children))
+	}
+	body := column.Children[0].(woxwidget.ScrollView)
+	if body.Width != 360 || body.Height != 0 || body.MaxHeight != 354 {
+		t.Fatalf("form body constraints = width %.0f height %.0f max %.0f, want Flutter 360 wide and intrinsic up to 354", body.Width, body.Height, body.MaxHeight)
+	}
+	buttons := column.Children[1].(woxwidget.Align).Child.(woxwidget.Flex)
+	cancel := buttons.Children[0].(woxwidget.Semantics)
+	save := buttons.Children[1].(woxwidget.Semantics)
+	if cancel.Label != "Cancel (Esc)" || save.Label != "Save (Cmd+Enter)" {
+		t.Fatalf("form action labels = %q / %q", cancel.Label, save.Label)
+	}
+	for _, child := range buttons.Children {
+		container := focusedControlGesture(child).Child.(woxwidget.Container)
+		if container.Width != 0 {
+			t.Fatalf("form action width = %v, want content-sized", container.Width)
+		}
+	}
+}
+
+func TestFormSwitchFieldUsesAccessibleSwitch(t *testing.T) {
+	field := FormSwitchField(FormSwitchFieldProps{ID: "history", Label: "History", Width: 400, Height: 40, LabelWidth: 100, Checked: true, Theme: woxcomponent.ControlTheme{}, OnChange: func(bool) {}})
+	row := field.(woxwidget.Container).Child.(woxwidget.Flex)
+	controlColumn := row.Children[1].(woxwidget.Expanded).Child.(woxwidget.Flex)
+	control := controlColumn.Children[0].(woxwidget.Semantics)
+	if control.Role != woxui.AccessibilityRoleCheckBox || !control.Checked {
+		t.Fatalf("switch semantics = role %q checked %v", control.Role, control.Checked)
+	}
+}
+
+func TestFormSelectFieldOutlineUsesValueText(t *testing.T) {
+	text := woxui.Color{R: 230, G: 234, B: 240, A: 255}
+	field := FormSelectField(FormSelectFieldProps{
+		ID: "model", Label: "Default Model", Value: "deepseek-v4-flash", Width: 400, Height: 44, LabelWidth: 100,
+		Theme: woxcomponent.ControlTheme{Text: text, TextSecondary: woxui.Color{R: 255, A: 255}},
+	})
+	row := field.(woxwidget.Container).Child.(woxwidget.Flex)
+	control := focusedControlGesture(row.Children[1].(woxwidget.Expanded).Child.(woxwidget.Flex).Children[0]).Child.(woxwidget.Container)
+	want := text
+	want.A = 80
+	if control.BorderColor != want {
+		t.Fatalf("form dropdown outline = %#v, want Text %#v", control.BorderColor, want)
+	}
+}
+
+func TestFormSelectFieldUsesOutlinedDropdown(t *testing.T) {
+	field := FormSelectField(FormSelectFieldProps{ID: "action", Label: "Action", Value: "Paste", Width: 400, Height: 44, LabelWidth: 100, Theme: woxcomponent.ControlTheme{}})
+	row := field.(woxwidget.Container).Child.(woxwidget.Flex)
+	controlColumn := row.Children[1].(woxwidget.Expanded).Child.(woxwidget.Flex)
+	semantics := controlColumn.Children[0].(woxwidget.Semantics)
+	gesture := focusedControlGesture(semantics)
+	control := gesture.Child.(woxwidget.Container)
+	if control.BorderWidth != 1 {
+		t.Fatalf("dropdown border width = %.0f, want 1", control.BorderWidth)
+	}
+	content := control.Child.(woxwidget.Flex)
+	if len(content.Children) != 2 {
+		t.Fatalf("dropdown child count = %d, want value and indicator", len(content.Children))
+	}
+}
+
+func TestFormFieldNaturalHeightMeasuresWrappedDescription(t *testing.T) {
+	field := FormSelectField(FormSelectFieldProps{
+		ID: "action", Label: "Action", Description: "A description that may wrap onto multiple lines",
+		Value: "Paste", Width: 240, LabelWidth: 100, Theme: woxcomponent.ControlTheme{},
+	})
+	container := field.(woxwidget.Container)
+	if container.Height != 0 || container.Padding.Bottom != 10 {
+		t.Fatalf("natural row geometry = height %.0f bottom %.0f, want intrinsic height with 10px spacing", container.Height, container.Padding.Bottom)
+	}
+	row := container.Child.(woxwidget.Flex)
+	controlColumn := row.Children[1].(woxwidget.Expanded).Child.(woxwidget.Flex)
+	description := controlColumn.Children[1].(woxwidget.TextBlock)
+	if description.Height != 0 || description.MaxLines != 0 {
+		t.Fatalf("natural description limits = height %.0f lines %d, want measured wrapped content", description.Height, description.MaxLines)
+	}
+}
+
+func TestFormFieldMarkdownDescriptionOpensLinks(t *testing.T) {
+	opened := ""
+	field := FormSelectField(FormSelectFieldProps{
+		ID: "browser-port", Label: "Server Port", Description: "Install the [Chrome extension](https://example.com).",
+		Value: "34988", Width: 500, LabelWidth: 100, Theme: woxcomponent.ControlTheme{}, OnOpenLink: func(target string) { opened = target },
+	})
+	row := field.(woxwidget.Container).Child.(woxwidget.Flex)
+	controlColumn := row.Children[1].(woxwidget.Expanded).Child.(woxwidget.Flex)
+	markdown := controlColumn.Children[1].(woxwidget.Flex)
+	paragraph := markdown.Children[0].(woxwidget.Wrap)
+	for _, child := range paragraph.Children {
+		if link, ok := child.(woxwidget.Semantics); ok && link.Role == woxui.AccessibilityRoleLink {
+			_ = link.OnAction(woxui.AccessibilityActionActivate, "")
+			break
+		}
+	}
+	if opened != "https://example.com" {
+		t.Fatalf("opened link = %q, want Markdown target", opened)
+	}
+}
+
+func TestFormModelFieldUsesCompactAnchoredDropdown(t *testing.T) {
+	var openedAt woxui.Rect
+	field := FormModelField(FormModelFieldProps{
+		ID: "dictation-model", Label: "Recognition model", Value: "Qwen3-ASR 0.6B",
+		Width: 720, Height: 44, LabelWidth: 120, Theme: woxcomponent.ControlTheme{}, OnTap: func(anchor woxui.Rect) { openedAt = anchor },
+	})
+	row := field.(woxwidget.Container).Child.(woxwidget.Flex)
+	controlColumn := row.Children[1].(woxwidget.Expanded).Child.(woxwidget.Flex)
+	semantics := controlColumn.Children[0].(woxwidget.Semantics)
+	gesture := focusedControlGesture(semantics)
+	control := gesture.Child.(woxwidget.Container)
+	if control.Height != woxcomponent.SettingsControlHeight || control.BorderWidth != 1 {
+		t.Fatalf("model trigger geometry = height %.0f border %.0f, want standard %.0f/1", control.Height, control.BorderWidth, woxcomponent.SettingsControlHeight)
+	}
+	if gesture.OnTap != nil || gesture.OnTapBounds == nil {
+		t.Fatal("model trigger should open a field-anchored dropdown")
+	}
+	anchor := woxui.Rect{X: 300, Y: 140, Width: 580, Height: woxcomponent.SettingsControlHeight}
+	gesture.OnTapBounds(anchor)
+	if openedAt != anchor {
+		t.Fatalf("model menu anchor = %#v, want %#v", openedAt, anchor)
+	}
+}
+
+func TestFormHotkeyFieldStartsAtMeasuredControlColumn(t *testing.T) {
+	field := FormHotkeyField(FormHotkeyFieldProps{
+		ID: "dictation-hotkey", Label: "Hotkey", Description: "Press or hold a modifier",
+		Width: 720, Height: 64, LabelWidth: 120, Theme: woxcomponent.ControlTheme{},
+	})
+	container := field.(woxwidget.Container)
+	if container.Height != 64 {
+		t.Fatalf("hotkey row height = %.0f, want tooltip content plus bottom spacing at 64", container.Height)
+	}
+	row := container.Child.(woxwidget.Flex)
+	if row.Gap != 12 {
+		t.Fatalf("hotkey label gap = %.0f, want Flutter 12", row.Gap)
+	}
+	label := row.Children[0].(woxwidget.Container)
+	if label.Width != 120 {
+		t.Fatalf("hotkey label width = %.0f, want measured width 120", label.Width)
+	}
+	controlColumn := row.Children[1].(woxwidget.Expanded).Child.(woxwidget.Flex)
+	control := controlColumn.Children[0].(woxwidget.Stack)
+	recorder := control.Children[0].Child.(woxwidget.Align)
+	if control.Children[0].Left != 0 || control.Children[0].Top != 0 || recorder.Height != woxcomponent.SettingsControlHeight || recorder.Vertical != 0.5 {
+		t.Fatalf("hotkey recorder alignment = position %#v child %#v", control.Children[0], recorder)
+	}
+	description := controlColumn.Children[1].(woxwidget.TextBlock)
+	if description.Value != "Press or hold a modifier" {
+		t.Fatalf("hotkey description = %q", description.Value)
+	}
+}
+
+func TestFormHotkeyFieldCanAlignRecorderToTheRightOfItsControlColumn(t *testing.T) {
+	field := FormHotkeyField(FormHotkeyFieldProps{
+		ID: "onboarding-hotkey", Label: "Hotkey", Description: "Show or hide Wox", Labels: []string{"Alt", "Space"},
+		Width: 720, Height: 62, LabelWidth: 132, AlignRecorderRight: true, Theme: woxcomponent.ControlTheme{},
+	})
+	container := field.(woxwidget.Container)
+	row := container.Child.(woxwidget.Flex)
+	controlColumn := row.Children[1].(woxwidget.Expanded).Child.(woxwidget.Flex)
+	control := controlColumn.Children[0].(woxwidget.Stack)
+	if !control.Children[0].AnchorRight || control.Children[0].Right != 0 {
+		t.Fatalf("hotkey recorder geometry = %#v, want right-anchored control", control.Children[0])
+	}
+	description := controlColumn.Children[1].(woxwidget.TextBlock)
+	if description.Value != "Show or hide Wox" {
+		t.Fatalf("hotkey description = %q, want description below right control", description.Value)
+	}
+}
+
+func TestFormHotkeyFieldShowsRegistrationErrorWhenNotRecording(t *testing.T) {
+	field := FormHotkeyField(FormHotkeyFieldProps{
+		ID: "onboarding-hotkey", Label: "Hotkey", Description: "Show or hide Wox", Labels: []string{"Alt", "Space"},
+		Status: "Used by another application", StatusPlacement: HotkeyStatusBelow, Error: true, Width: 720, Height: 62, LabelWidth: 132, AlignRecorderRight: true, Theme: woxcomponent.ControlTheme{},
+	})
+	container := field.(woxwidget.Container)
+	row := container.Child.(woxwidget.Flex)
+	controlColumn := row.Children[1].(woxwidget.Expanded).Child.(woxwidget.Flex)
+	control := controlColumn.Children[0].(woxwidget.Flex)
+	if control.Axis != woxwidget.Vertical || len(control.Children) != 2 {
+		t.Fatalf("hotkey control = %#v, want recorder above status", control)
+	}
+	status := control.Children[1].(woxwidget.TextBlock)
+	if status.Value != "Used by another application" {
+		t.Fatalf("hotkey registration error = %q", status.Value)
+	}
+	if controlColumn.Children[1].(woxwidget.TextBlock).Value != "Show or hide Wox" {
+		t.Fatalf("hotkey description should stay below the status line")
+	}
+}
+
+func TestFormHotkeyFieldStatusPlacementBelowUsesControlColumn(t *testing.T) {
+	field := FormHotkeyField(FormHotkeyFieldProps{
+		ID: "action-hotkey", Label: "Hotkey", Description: "Restore this result",
+		Status: "Press any key", StatusPlacement: HotkeyStatusBelow, Recording: true, Width: 420, LabelWidth: 80, Theme: woxcomponent.ControlTheme{},
+	})
+	controlColumn := field.(woxwidget.Container).Child.(woxwidget.Flex).Children[1].(woxwidget.Expanded).Child.(woxwidget.Flex)
+	control := controlColumn.Children[0].(woxwidget.Flex)
+	if control.Axis != woxwidget.Vertical {
+		t.Fatalf("below placement axis = %v, want vertical", control.Axis)
+	}
+	if status := control.Children[1].(woxwidget.TextBlock); status.Value != "Press any key" {
+		t.Fatalf("below placement status = %q", status.Value)
+	}
+}
+
+func TestFormHotkeyFieldUsesFlutterSettingsLayout(t *testing.T) {
+	field := FormHotkeyField(FormHotkeyFieldProps{
+		ID: "main-hotkey", Label: "Hotkey", Description: "Show or hide Wox",
+		Width: 1120, LabelWidth: 550, SettingsLayout: true, Recording: true, Status: "Press any key", Theme: woxcomponent.ControlTheme{},
+	})
+	container := field.(woxwidget.Container)
+	row := container.Child.(woxwidget.Flex)
+	label := row.Children[0].(woxwidget.Container)
+	if label.Width != 550 || row.Gap != 32 {
+		t.Fatalf("settings label geometry = width %.0f gap %.0f, want Flutter 550/32", label.Width, row.Gap)
+	}
+	labelColumn := label.Child.(woxwidget.Constrained).Child.(woxwidget.Flex)
+	description := labelColumn.Children[1].(woxwidget.TextBlock)
+	if description.Value != "Show or hide Wox" {
+		t.Fatalf("settings description = %q, want it below the label", description.Value)
+	}
+	controlArea := row.Children[1].(woxwidget.Stack)
+	if controlArea.Width != 534 || !controlArea.Children[0].AnchorRight || controlArea.Children[0].Right != 2 {
+		t.Fatalf("settings recorder geometry = width %.0f right anchored %v inset %.0f, want 534/true/2", controlArea.Width, controlArea.Children[0].AnchorRight, controlArea.Children[0].Right)
+	}
+	hint := controlArea.Children[1]
+	hintAlignment := hint.Child.(woxwidget.Align)
+	if hint.Left != -582 || hint.Top != 0 || hintAlignment.Height != woxcomponent.SettingsControlHeight || hintAlignment.Vertical != 0.5 {
+		t.Fatalf("settings hint geometry = position %#v child %#v", hint, hintAlignment)
+	}
+	hintClip := hintAlignment.Child.(woxwidget.Clip)
+	if hintClip.Width != 1006 {
+		t.Fatalf("settings hint clip width = %.0f, want the same 12px gap used by right-side hints", hintClip.Width)
+	}
+}
+
+func TestFormHotkeyFieldShrinksSettingsLabelToKeepRecorderVisible(t *testing.T) {
+	field := FormHotkeyField(FormHotkeyFieldProps{
+		ID: "main-hotkey", Label: "Hotkey", Description: "Show or hide Wox", Labels: []string{"Super", "Space"},
+		Width: 676, LabelWidth: 550, SettingsLayout: true, Theme: woxcomponent.ControlTheme{},
+	})
+	container := field.(woxwidget.Container)
+	row := container.Child.(woxwidget.Flex)
+	label := row.Children[0].(woxwidget.Container)
+	controlArea := row.Children[1].(woxwidget.Stack)
+	if label.Width != 440 || controlArea.Width != woxcomponent.SettingsChoiceControlWidth {
+		t.Fatalf("narrow settings label/control widths = %.0f/%.0f, want 440/%.0f", label.Width, controlArea.Width, woxcomponent.SettingsChoiceControlWidth)
+	}
+	if !controlArea.Children[0].AnchorRight || controlArea.Children[0].Right != 2 {
+		t.Fatalf("narrow settings recorder geometry = %#v, want right anchored with 2px inset", controlArea.Children[0])
+	}
+}
+
+func TestFormAIModelFieldRendersValidationError(t *testing.T) {
+	const message = "Value cannot be empty"
+	props := FormAIModelFieldProps{ID: "default-model", Width: 600, Error: message}
+	state := &formAIModelFieldState{}
+	state.InitState(woxwidget.StateContext{}, props)
+	defer state.Dispose()
+	built := state.Build(woxwidget.StateContext{}, props)
+	errorNode, ok := findFormSemanticsByAutomationID(built, "default-model-error")
+	if !ok || errorNode.Value != message || errorNode.LiveRegion != woxui.AccessibilityLiveRegionPolite {
+		t.Fatalf("AI model validation error = %#v, found=%v", errorNode, ok)
+	}
+}
+
+func TestFormAIModelFieldOffersAISettingsWhenNoModelSelected(t *testing.T) {
+	opened := false
+	field := FormAIModelField(FormAIModelFieldProps{
+		ID: "default-model", Label: "AI model", Provider: "Not selected", Model: "",
+		ModelsAvailable: false, ManageLabel: "Open AI settings", OnManageModels: func() { opened = true },
+		Width: 920, Height: 44, LabelWidth: 180, Theme: woxcomponent.ControlTheme{},
+	})
+	stateful := field.(woxwidget.Stateful)
+	state := &formAIModelFieldState{}
+	state.InitState(woxwidget.StateContext{}, stateful.Widget)
+	built := state.Build(woxwidget.StateContext{}, stateful.Widget).(woxwidget.Container)
+	row := built.Child.(woxwidget.Flex)
+	controlColumn := row.Children[1].(woxwidget.Expanded).Child.(woxwidget.Flex)
+	controls := controlColumn.Children[0].(woxwidget.Flex)
+	action := controls.Children[2].(woxwidget.Stateful)
+	if action.Key != "default-model-manage" {
+		t.Fatalf("empty AI model action key = %q, want the AI settings link", action.Key)
+	}
+	props := action.Widget.(woxcomponent.IconButtonProps)
+	if props.Disabled || props.OnTap == nil {
+		t.Fatal("AI settings link should stay enabled when no model is selected")
+	}
+	props.OnTap()
+	if !opened {
+		t.Fatal("AI settings link should invoke OnManageModels")
+	}
+}
+
+func TestFormAIModelFieldUsesFlutterProviderAndModelProportions(t *testing.T) {
+	field := FormAIModelField(FormAIModelFieldProps{
+		ID: "default-model", Label: "Default model", Provider: "deepseek", Model: "deepseek-v4-flash",
+		ModelsAvailable: true, Width: 920, Height: 44, LabelWidth: 180, Theme: woxcomponent.ControlTheme{},
+	})
+	stateful := field.(woxwidget.Stateful)
+	state := &formAIModelFieldState{}
+	state.InitState(woxwidget.StateContext{}, stateful.Widget)
+	built := state.Build(woxwidget.StateContext{}, stateful.Widget).(woxwidget.Container)
+	row := built.Child.(woxwidget.Flex)
+	controlColumn := row.Children[1].(woxwidget.Expanded).Child.(woxwidget.Flex)
+	controls := controlColumn.Children[0].(woxwidget.Flex)
+	if len(controls.Children) != 3 {
+		t.Fatalf("AI model control count = %d, want provider, model, and edit", len(controls.Children))
+	}
+	provider := focusedControlGesture(controls.Children[0]).Child.(woxwidget.Container)
+	model := focusedControlGesture(controls.Children[1]).Child.(woxwidget.Container)
+	if model.Width < provider.Width*1.9 || model.Width > provider.Width*2.1 {
+		t.Fatalf("AI model widths provider/model = %.0f/%.0f, want Flutter 1:2 proportions", provider.Width, model.Width)
+	}
+	if controls.Gap != 8 {
+		t.Fatalf("AI model selector gap = %.0f, want 8", controls.Gap)
+	}
+}
+
+func TestFormTextFieldKeepsSuffixOutsideInput(t *testing.T) {
+	assertFormTextFieldSuffix(t, "天", formSuffixWidth(nil, "天", woxcomponent.ControlTheme{}))
+	assertFormTextFieldSuffix(t, "items", formSuffixWidth(nil, "items", woxcomponent.ControlTheme{}))
+}
+
+func TestFormSuffixWidthKeepsLatinUnitsVisible(t *testing.T) {
+	if got := formSuffixWidth(nil, "ms", woxcomponent.ControlTheme{}); got != 16 {
+		t.Fatalf("ms width = %.0f, want 16", got)
+	}
+	if got := formSuffixWidth(nil, "item", woxcomponent.ControlTheme{}); got != 32 {
+		t.Fatalf("item width = %.0f, want 32 so it is wider than the old 20 slot", got)
+	}
+	if got := formSuffixWidth(nil, "items", woxcomponent.ControlTheme{}); got != 40 {
+		t.Fatalf("items width = %.0f, want 40", got)
+	}
+	if got := formSuffixWidth(nil, "天", woxcomponent.ControlTheme{}); got != woxcomponent.SettingsControlFontSize {
+		t.Fatalf("天 width = %.0f, want the 13 control size", got)
+	}
+}
+
+func assertFormTextFieldSuffix(t *testing.T, suffix string, wantWidth float32) {
+	t.Helper()
+	field := FormTextField(FormTextFieldProps{ID: "days", Label: "Days", Suffix: suffix, Width: 400, Height: 44, LabelWidth: 100, MaxLines: 1, Theme: woxcomponent.ControlTheme{}})
+	row := field.(woxwidget.Container).Child.(woxwidget.Flex)
+	controlColumn := row.Children[1].(woxwidget.Expanded).Child.(woxwidget.Flex)
+	valueRow := controlColumn.Children[0].(woxwidget.Flex)
+	input := valueRow.Children[0].(woxwidget.Stateful).Widget.(woxcomponent.TextFieldProps)
+	slot := valueRow.Children[1].(woxwidget.Align)
+	label := slot.Child.(woxwidget.Text)
+	if label.Value != suffix {
+		t.Fatalf("suffix = %q, want %q", label.Value, suffix)
+	}
+	if slot.Width != wantWidth {
+		t.Fatalf("suffix slot = %.0f, want measured %.0f so %q is not clipped", slot.Width, wantWidth, suffix)
+	}
+	if input.Width != 288-wantWidth-8 {
+		t.Fatalf("input width = %.0f, want %.0f so the suffix keeps its own slot", input.Width, 288-wantWidth-8)
+	}
+}
+
+func TestFormTextFieldBrowseButtonSharesOneControlRow(t *testing.T) {
+	field := FormTextField(FormTextFieldProps{
+		ID: "cwd", Label: "Directory", Width: 400, LabelWidth: 100,
+		OnBrowse: func() {}, BrowseLabel: "Browse",
+		Theme: woxcomponent.ControlTheme{TextSecondary: woxui.Color{A: 190}, Text: woxui.Color{A: 255}},
+	})
+	row := field.(woxwidget.Container).Child.(woxwidget.Flex)
+	controlColumn := row.Children[1].(woxwidget.Expanded).Child.(woxwidget.Flex)
+	valueRow := controlColumn.Children[0].(woxwidget.Flex)
+	if valueRow.Axis != woxwidget.Horizontal {
+		t.Fatalf("browse layout axis = %v, want one horizontal control row", valueRow.Axis)
+	}
+	input := valueRow.Children[0].(woxwidget.Stateful).Widget.(woxcomponent.TextFieldProps)
+	browse := valueRow.Children[1].(woxwidget.Semantics)
+	if browse.Label != "Browse" || browse.AutomationID != "cwd-browse" {
+		t.Fatalf("browse button = %+v, want outline Browse", browse)
+	}
+	stateful := browse.Child.(woxwidget.Focusable).Child.(woxwidget.Stateful)
+	container := stateful.CreateState().Build(woxwidget.StateContext{}, stateful.Widget).(woxwidget.Gesture).Child.(woxwidget.Container)
+	browseWidth := formBrowseButtonWidth("Browse")
+	if input.Width+8+container.Width != 288 || container.Width != browseWidth {
+		t.Fatalf("dirPath input/browse widths = %.0f/%.0f, want one full control row of 288", input.Width, container.Width)
+	}
+	if container.BorderWidth != 0 {
+		t.Fatalf("browse border width = %v, want a quiet filled action", container.BorderWidth)
+	}
+}
+
+func TestFormStaticFieldHeadUsesSectionHeader(t *testing.T) {
+	theme := woxcomponent.ControlTheme{TextSecondary: woxui.Color{R: 140, G: 146, B: 154, A: 255}}
+	field := FormStaticField(FormStaticFieldProps{
+		Width: 400, Value: "Content Search", Kind: "head", Theme: theme,
+	}).(woxwidget.Container)
+	if field.Width != 400 || field.Padding.Top != woxcomponent.SectionHeaderLead {
+		t.Fatalf("head lead-in = %#v, want 20 above the shared section divider", field)
+	}
+	header := field.Child.(woxwidget.Container)
+	if header.Width != 400 || header.Height != 43 {
+		t.Fatalf("head geometry = %#v, want a 43-high section header", header)
+	}
+	column := header.Child.(woxwidget.Flex)
+	if column.Axis != woxwidget.Vertical || len(column.Children) != 2 {
+		t.Fatalf("head children = %#v, want divider and title", column)
+	}
+	divider := column.Children[0].(woxwidget.Container)
+	if divider.Height != 1 {
+		t.Fatalf("head divider = %#v, want a 1-unit rule", divider)
+	}
+	title := column.Children[1].(woxwidget.Container).Child.(woxwidget.Flex).Children[0].(woxwidget.Expanded).Child.(woxwidget.Align).Child.(woxwidget.Text)
+	if title.Value != "CONTENT SEARCH" || title.Style.Size != woxcomponent.SettingsSectionTitleFontSize || title.Style.Weight != woxui.FontWeightSemibold || title.Color != theme.TextSecondary {
+		t.Fatalf("head label = %#v, want 11 semibold uppercase TextSecondary", title)
+	}
+}
+
+func TestFormStatsFieldUsesQuietCardLayout(t *testing.T) {
+	theme := woxcomponent.ControlTheme{
+		InputBackground: woxui.Color{R: 40, G: 40, B: 44, A: 255},
+		Border:          woxui.Color{R: 80, G: 80, B: 84, A: 255},
+		Text:            woxui.Color{R: 250, G: 250, B: 250, A: 255},
+		TextSecondary:   woxui.Color{R: 160, G: 160, B: 164, A: 255},
+	}
+	field := FormStatsField(FormStatsFieldProps{
+		Width: 420, Title: "Index Stats",
+		Rows:  []FormStatsRow{{Label: "Disk Usage", Value: "29.4 MB"}, {Label: "Files", Value: "130,945"}},
+		Theme: theme,
+	})
+	semantics := field.(woxwidget.Semantics)
+	if semantics.Role != woxui.AccessibilityRoleGroup || semantics.Label != "Index Stats" {
+		t.Fatalf("stats semantics = role %q label %q", semantics.Role, semantics.Label)
+	}
+	wrapper := semantics.Child.(woxwidget.Container)
+	if wrapper.Padding.Top != 16 || wrapper.Padding.Bottom != 12 {
+		t.Fatalf("stats outer padding = %+v, want 16/12 section spacing", wrapper.Padding)
+	}
+	card := wrapper.Child.(woxwidget.Container)
+	if card.Radius != 8 || card.BorderWidth != 1 || card.Color != theme.InputBackground || card.BorderColor != theme.Border {
+		t.Fatalf("stats card chrome = radius %.0f border %.0f fill %#v stroke %#v", card.Radius, card.BorderWidth, card.Color, card.BorderColor)
+	}
+	column := card.Child.(woxwidget.Flex)
+	title := column.Children[0].(woxwidget.Text)
+	if title.Value != "Index Stats" || title.Style.Size != woxcomponent.SettingsLabelFontSize || title.Style.Weight != woxui.FontWeightSemibold {
+		t.Fatalf("stats title = %+v", title)
+	}
+	rows := column.Children[1].(woxwidget.Flex)
+	if rows.Gap != 8 || len(rows.Children) != 2 {
+		t.Fatalf("stats rows = gap %.0f count %d", rows.Gap, len(rows.Children))
+	}
+	first := rows.Children[0].(woxwidget.Container).Child.(woxwidget.Flex)
+	if first.Children[0].(woxwidget.Text).Value != "Disk Usage" || first.Children[2].(woxwidget.Text).Value != "29.4 MB" {
+		t.Fatalf("first stats row = %#v", first.Children)
+	}
+}
+
+func TestFormServiceFieldUsesSwitchRowLayout(t *testing.T) {
+	field := FormServiceField(FormServiceFieldProps{
+		Width: 420, LabelWidth: 80, Title: "Fast indexing", Description: "Install the optional Windows service.", Status: "Running", Detail: "2.8.0",
+		Actions: []FormServiceAction{{ID: "install", Label: "Install service", Primary: true, Enabled: true}},
+		Theme:   woxcomponent.ControlTheme{Text: woxui.Color{R: 160, G: 160, B: 164, A: 255}, InputBackground: woxui.Color{R: 32, G: 32, B: 36, A: 255}},
+	})
+	semantics := field.(woxwidget.Semantics)
+	if semantics.Role != woxui.AccessibilityRoleGroup || semantics.Label != "Fast indexing" {
+		t.Fatalf("service semantics = role %q label %q", semantics.Role, semantics.Label)
+	}
+	row := semantics.Child.(woxwidget.Container).Child.(woxwidget.Flex)
+	label := row.Children[0].(woxwidget.Container).Child.(woxwidget.Text)
+	if label.Value != "Fast indexing" {
+		t.Fatalf("service label = %q, want the shared form label column", label.Value)
+	}
+	controlColumn := row.Children[1].(woxwidget.Expanded).Child.(woxwidget.Flex)
+	control := controlColumn.Children[0].(woxwidget.Flex)
+	if control.Children[0].(woxwidget.Text).Value != "Running" {
+		t.Fatalf("service status = %#v", control.Children[0])
+	}
+	tag := control.Children[1].(woxwidget.Container).Child.(woxwidget.TextBlock)
+	if tag.Value != "v2.8.0" {
+		t.Fatalf("service version tag = %q, want v2.8.0", tag.Value)
+	}
+	button := control.Children[3].(woxwidget.Semantics)
+	if button.Label != "Install service" || button.Role != woxui.AccessibilityRoleButton || button.Disabled {
+		t.Fatalf("service action = %+v", button)
+	}
+	chrome := focusedControlGesture(button).Child.(woxwidget.Container)
+	if chrome.BorderWidth != 0 || chrome.Color != (woxui.Color{R: 32, G: 32, B: 36, A: 255}) {
+		t.Fatalf("service action chrome = border %.0f fill %#v, want the shared secondary button", chrome.BorderWidth, chrome.Color)
+	}
+	description := controlColumn.Children[1].(woxwidget.TextBlock)
+	if description.Value != "Install the optional Windows service." {
+		t.Fatalf("service description = %q", description.Value)
+	}
+}
+
+func TestFormServiceVersionLabelPrefixesInstalledVersions(t *testing.T) {
+	if got := formServiceVersionLabel("2.8.0"); got != "v2.8.0" {
+		t.Fatalf("version = %q, want v2.8.0", got)
+	}
+	if got := formServiceVersionLabel("2.8.0 → 2.9.0"); got != "v2.8.0 → v2.9.0" {
+		t.Fatalf("update version = %q", got)
+	}
+	if got := formServiceVersionLabel("Update required"); got != "" {
+		t.Fatalf("status detail = %q, want no version tag", got)
+	}
+}
+
+func TestFormTextFieldUsesMeasuredActionLabelWidth(t *testing.T) {
+	field := FormTextField(FormTextFieldProps{ID: "content", Label: "内容", Width: 360, LabelWidth: 60, MaxLines: 8, Theme: woxcomponent.ControlTheme{}})
+	row := field.(woxwidget.Container).Child.(woxwidget.Flex)
+	label := row.Children[0].(woxwidget.Container)
+	controlColumn := row.Children[1].(woxwidget.Expanded).Child.(woxwidget.Flex)
+	input := controlColumn.Children[0].(woxwidget.Stateful).Widget.(woxcomponent.TextFieldProps)
+	if label.Width != 60 || input.Width != 288 {
+		t.Fatalf("form label/input widths = %.0f/%.0f, want measured 60 and expanded 288", label.Width, input.Width)
+	}
+}

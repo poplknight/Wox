@@ -1,0 +1,2247 @@
+package launcher
+
+import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"mime"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"unicode"
+
+	"wox/plugin"
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+	"wox/util"
+)
+
+const formTableRowIDKey = "wox_table_row_id"
+
+type formTableEditorState struct {
+	target       *formFieldsState
+	fieldIndex   int
+	definition   formDefinition
+	rows         []map[string]any
+	selected     int
+	rowForm      *formFieldsState
+	rowIndex     int
+	rowBase      map[string]any
+	providerTest *aiProviderTestState
+	// rowEditorOnly closes the whole overlay when a row opened directly from an inline table exits.
+	rowEditorOnly     bool
+	status            string
+	fieldErrors       map[string]string
+	invalid           bool
+	saving            bool
+	deletePending     int
+	deleteDirect      bool
+	appPicker         *formTableAppPickerState
+	choicePicker      *formTableChoicePickerState
+	queryVariable     *formTableQueryVariablePickerState
+	favicon           *formTableFaviconState
+	emojiPicker       *formTableEmojiPickerState
+	skillAdd          *formTableSkillAddState
+	mcpJSONImport     *formTableMCPJSONImportState
+	queryPreset       queryHotkeyPreset
+	windowGroupEditor *windowGroupEditorState
+	patternPreview    *formTablePatternPreviewState
+	// queryVariableEdit is the parameter placeholder currently expanded for renaming.
+	queryVariableEdit queryVariableToken
+	// collapsedGroups is the current add/edit disclosure state, keyed by group.
+	collapsedGroups map[string]bool
+}
+
+type formTableEditorSnapshot struct {
+	definition        formDefinition
+	rows              []map[string]any
+	selected          int
+	rowForm           *formFieldsSnapshot
+	rowIndex          int
+	providerTest      *aiProviderTestState
+	status            string
+	fieldErrors       map[string]string
+	invalid           bool
+	saving            bool
+	deletePending     int
+	deleteDirect      bool
+	appPicker         *formTableAppPickerSnapshot
+	choicePicker      *formTableChoicePickerSnapshot
+	queryVariable     *formTableQueryVariablePickerSnapshot
+	favicon           *formTableFaviconState
+	emojiPicker       *formTableEmojiPickerSnapshot
+	skillAdd          *formTableSkillAddSnapshot
+	mcpJSONImport     *formTableMCPJSONImportSnapshot
+	queryPreset       queryHotkeyPreset
+	windowGroupEditor *windowGroupEditorSnapshot
+	patternPreview    *formTablePatternPreviewSnapshot
+	collapsedGroups   map[string]bool
+}
+
+type queryHotkeyPreset string
+
+const (
+	queryHotkeyPresetNormal   queryHotkeyPreset = "normal"
+	queryHotkeyPresetWebPanel queryHotkeyPreset = "web-panel"
+	queryHotkeyPresetSilent   queryHotkeyPreset = "silent"
+	queryHotkeyPresetCustom   queryHotkeyPreset = "custom"
+)
+
+type formTableAppPickerState struct {
+	fieldIndex int
+	current    ignoredHotkeyApp
+}
+
+type formTableAppPickerSnapshot struct {
+	fieldIndex int
+	current    ignoredHotkeyApp
+}
+
+type formTableChoicePickerState struct {
+	fieldIndex int
+	anchor     woxui.Rect
+}
+
+type formTableChoicePickerSnapshot struct {
+	fieldIndex   int
+	anchor       woxui.Rect
+	title        string
+	currentValue string
+	options      []formOption
+	filterable   bool
+}
+
+type formTableQueryVariablePickerState struct {
+	fieldIndex   int
+	anchor       woxui.Rect
+	triggerStart int
+	selected     int
+}
+
+type formTableEmojiPickerState struct {
+	fieldIndex   int
+	initialEmoji string
+}
+
+type formTableEmojiPickerSnapshot struct {
+	fieldIndex   int
+	initialEmoji string
+}
+
+type formTableQueryVariablePickerSnapshot struct {
+	fieldIndex int
+	anchor     woxui.Rect
+	query      string
+	selected   int
+	kind       string
+}
+
+type queryHotkeyVariable struct {
+	value, label, description, icon string
+}
+
+const (
+	formTableQueryVariableKindQueryHotkey = "queryHotkey"
+	formTableQueryVariableKindAICommand   = "aiCommand"
+	formTableQueryVariableKindDictation   = "dictation"
+	formTableQueryVariableKindWebSearch   = "webSearch"
+)
+
+var queryHotkeyVariables = []queryHotkeyVariable{
+	{"{wox:selected_text}", "i18n:ui_query_variable_selected_text", "i18n:ui_query_variable_selected_text_tooltip", "copy"},
+	{"{wox:selected_file}", "i18n:ui_query_variable_selected_file", "i18n:ui_query_variable_selected_file_tooltip", "document"},
+	{"{wox:active_browser_url}", "i18n:ui_query_variable_active_browser_url", "i18n:ui_query_variable_active_browser_url_tooltip", "external"},
+	{"{wox:file_explorer_path}", "i18n:ui_query_variable_file_explorer_path", "i18n:ui_query_variable_file_explorer_path_tooltip", "folder-open"},
+	{"{wox:clipboard_text}", "i18n:ui_query_variable_clipboard_text", "i18n:ui_query_variable_clipboard_text_tooltip", "copy"},
+}
+
+var aiCommandPromptVariables = []queryHotkeyVariable{
+	{"{wox:input_text}", "i18n:ui_query_variable_input_text", "i18n:ui_query_variable_input_text_tooltip", "edit"},
+}
+
+var dictationPromptVariables = []queryHotkeyVariable{
+	{"{wox:dictation_text}", "i18n:ui_query_variable_dictation_text", "i18n:ui_query_variable_dictation_text_tooltip", "waveform"},
+	{"{wox:selected_text}", "i18n:ui_query_variable_selected_text", "i18n:ui_query_variable_selected_text_tooltip", "copy"},
+}
+
+var webSearchQueryVariables = []queryHotkeyVariable{
+	{plugin.ParameterQueryVariable("query"), "i18n:ui_query_variable_parameter", "i18n:ui_query_variable_parameter_tooltip", "edit"},
+	{"{wox:selected_text}", "i18n:ui_query_variable_selected_text", "i18n:ui_query_variable_selected_text_tooltip", "copy"},
+	{"{wox:clipboard_text}", "i18n:ui_query_variable_clipboard_text", "i18n:ui_query_variable_clipboard_text_tooltip", "copy"},
+}
+
+const (
+	queryHotkeyTestSelectedText = "test text"
+	queryHotkeyTestSelectedFile = "/path/to/test.txt"
+	queryHotkeyTestBrowserURL   = "https://example.com"
+	queryHotkeyTestExplorerPath = "/path/to/folder"
+)
+
+// replaceQueryHotkeyVariablesForTest swaps runtime placeholders for stable sample values so the query can be previewed.
+func replaceQueryHotkeyVariablesForTest(query string) string {
+	replaced := query
+	replaced = strings.ReplaceAll(replaced, plugin.QueryVariableClipboardText, "clipboard text")
+	replaced = strings.ReplaceAll(replaced, plugin.QueryVariableSelectedText, queryHotkeyTestSelectedText)
+	replaced = strings.ReplaceAll(replaced, plugin.QueryVariableSelectedFile, queryHotkeyTestSelectedFile)
+	replaced = strings.ReplaceAll(replaced, plugin.QueryVariableActiveBrowserUrl, queryHotkeyTestBrowserURL)
+	replaced = strings.ReplaceAll(replaced, plugin.QueryVariableFileExplorerPath, queryHotkeyTestExplorerPath)
+	return replaced
+}
+
+// runFormTableQueryTest opens the launcher with the edited query so the user can verify it
+// without leaving the row editor. Query hotkeys carry {wox:...} variables that are replaced
+// with sample values; fields without them, such as query aliases, pass through unchanged.
+func (c *formTableController) runFormTableQueryTest(index int) {
+	state := c.activeFormTableEditor()
+	if state == nil || state.rowForm == nil || index < 0 || index >= len(state.rowForm.definitions) || !state.rowForm.definitions[index].Value.QueryTest {
+		return
+	}
+	if state.rowForm.editor != nil {
+		syncFormFieldsEditorLocked(state.rowForm)
+	}
+	// Keep leading/trailing spaces from the editor; only reject blank-only queries.
+	queryText := state.rowForm.values[state.rowForm.definitions[index].Value.Key]
+	if strings.TrimSpace(queryText) == "" {
+		return
+	}
+	c.closeFormTableQueryVariablePicker()
+	c.runQueryTest(newInputQuery(replaceQueryHotkeyVariablesForTest(queryText)))
+}
+
+// decodeFormTableRows preserves JSON numbers and unknown row fields so the shared editor can round-trip future column types safely.
+func decodeFormTableRows(value string) ([]map[string]any, error) {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "null" {
+		return []map[string]any{}, nil
+	}
+	decoder := json.NewDecoder(bytes.NewBufferString(value))
+	decoder.UseNumber()
+	var decoded []map[string]any
+	if err := decoder.Decode(&decoded); err != nil {
+		return nil, err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("unexpected trailing JSON value")
+		}
+		return nil, err
+	}
+	if decoded == nil {
+		decoded = []map[string]any{}
+	}
+	return decoded, nil
+}
+
+func cloneFormTableRow(row map[string]any) map[string]any {
+	copy := make(map[string]any, len(row))
+	for key, value := range row {
+		copy[key] = value
+	}
+	return copy
+}
+
+func cloneFormTableRows(rows []map[string]any) []map[string]any {
+	copy := make([]map[string]any, len(rows))
+	for index, row := range rows {
+		copy[index] = cloneFormTableRow(row)
+	}
+	return copy
+}
+
+func snapshotFormTableEditorLocked(state *formTableEditorState) *formTableEditorSnapshot {
+	if state == nil {
+		return nil
+	}
+	var rowForm *formFieldsSnapshot
+	if state.rowForm != nil {
+		snapshot := snapshotFormFieldsLocked(state.rowForm)
+		rowForm = &snapshot
+	}
+	var appPicker *formTableAppPickerSnapshot
+	if state.appPicker != nil {
+		appPicker = &formTableAppPickerSnapshot{
+			fieldIndex: state.appPicker.fieldIndex,
+			current:    state.appPicker.current,
+		}
+	}
+	var choicePicker *formTableChoicePickerSnapshot
+	if state.choicePicker != nil && state.rowForm != nil && state.choicePicker.fieldIndex >= 0 && state.choicePicker.fieldIndex < len(state.rowForm.definitions) {
+		definition := state.rowForm.definitions[state.choicePicker.fieldIndex]
+		choicePicker = &formTableChoicePickerSnapshot{
+			fieldIndex: state.choicePicker.fieldIndex, anchor: state.choicePicker.anchor, title: definition.Value.Label,
+			currentValue: state.rowForm.values[definition.Value.Key], options: append([]formOption(nil), definition.Value.Options...),
+			filterable: definition.Value.Filterable,
+		}
+	}
+	var queryVariable *formTableQueryVariablePickerSnapshot
+	if picker := state.queryVariable; picker != nil && state.rowForm != nil && picker.fieldIndex >= 0 && picker.fieldIndex < len(state.rowForm.definitions) {
+		query := ""
+		if picker.triggerStart >= 0 {
+			value := []rune(state.rowForm.values[state.rowForm.definitions[picker.fieldIndex].Value.Key])
+			caret := len(value)
+			if state.rowForm.editor != nil {
+				caret = state.rowForm.editor.State().Selection.Focus
+			}
+			if picker.triggerStart < caret && caret <= len(value) {
+				query = string(value[picker.triggerStart+1 : caret])
+			}
+		}
+		queryVariable = &formTableQueryVariablePickerSnapshot{
+			fieldIndex: picker.fieldIndex, anchor: picker.anchor, query: query, selected: picker.selected,
+			kind: formTableQueryVariableKindForField(state, picker.fieldIndex),
+		}
+	}
+	var favicon *formTableFaviconState
+	if state.favicon != nil {
+		copy := *state.favicon
+		favicon = &copy
+	}
+	var emojiPicker *formTableEmojiPickerSnapshot
+	if picker := state.emojiPicker; picker != nil {
+		emojiPicker = &formTableEmojiPickerSnapshot{fieldIndex: picker.fieldIndex, initialEmoji: picker.initialEmoji}
+	}
+	var skillAdd *formTableSkillAddSnapshot
+	if state.skillAdd != nil {
+		fields := snapshotFormFieldsLocked(state.skillAdd.fields)
+		skillAdd = &formTableSkillAddSnapshot{tab: state.skillAdd.tab, fields: &fields, error: state.skillAdd.error, cloning: state.skillAdd.cloning}
+	}
+	var mcpJSONImport *formTableMCPJSONImportSnapshot
+	if state.mcpJSONImport != nil {
+		fields := snapshotFormFieldsLocked(state.mcpJSONImport.fields)
+		mcpJSONImport = &formTableMCPJSONImportSnapshot{fields: &fields, error: state.mcpJSONImport.error}
+	}
+	return &formTableEditorSnapshot{
+		definition:        state.definition,
+		rows:              cloneFormTableRows(state.rows),
+		selected:          state.selected,
+		rowForm:           rowForm,
+		rowIndex:          state.rowIndex,
+		providerTest:      snapshotAIProviderTest(state.providerTest, rowForm),
+		status:            state.status,
+		fieldErrors:       cloneFormTableFieldErrors(state.fieldErrors),
+		invalid:           state.invalid,
+		saving:            state.saving,
+		deletePending:     state.deletePending,
+		deleteDirect:      state.deleteDirect,
+		appPicker:         appPicker,
+		choicePicker:      choicePicker,
+		queryVariable:     queryVariable,
+		favicon:           favicon,
+		emojiPicker:       emojiPicker,
+		skillAdd:          skillAdd,
+		mcpJSONImport:     mcpJSONImport,
+		queryPreset:       state.queryPreset,
+		windowGroupEditor: snapshotWindowGroupEditorLocked(state.windowGroupEditor),
+		patternPreview:    snapshotFormTablePatternPreviewLocked(state.patternPreview),
+		collapsedGroups:   cloneFormTableCollapsedGroups(state.collapsedGroups),
+	}
+}
+
+func (c *formTableController) finishOpeningFormTable() {
+	c.updateFormTableTextInput(false)
+	c.invalidateFormTableWindow()
+}
+
+func (c *formTableController) openFormTableLocked(target *formFieldsState, index int) {
+	if target == nil || index < 0 || index >= len(target.definitions) || target.definitions[index].Type != "table" {
+		return
+	}
+	syncFormFieldsEditorLocked(target)
+	setFormFieldsFocusLocked(target, index)
+	definition := target.definitions[index]
+	rows, err := decodeFormTableRows(target.values[definition.Value.Key])
+	selected := -1
+	if len(rows) > 0 {
+		selected = 0
+	}
+	state := &formTableEditorState{target: target, fieldIndex: index, definition: definition, rows: rows, selected: selected, rowIndex: -1, deletePending: -1}
+	if err != nil {
+		state.rows = []map[string]any{}
+		state.invalid = true
+		state.status = "Invalid table JSON. Close this editor without saving to preserve the original value."
+	}
+	if c.targetUsesSettings(target) {
+		c.settingsEditor = state
+	} else {
+		c.launcherEditor = state
+	}
+}
+
+// closeFormTableEditor returns input ownership to the form that opened the portable table overlay.
+func (c *formTableController) closeFormTableEditor() {
+	c.stopHotkeyRecording()
+	state := c.activeFormTableEditor()
+	if state == c.settingsEditor {
+		c.settingsEditor = nil
+	} else if state == c.launcherEditor {
+		c.launcherEditor = nil
+	}
+	textInput := state != nil && c.targetCurrent(state.target) && state.target.editor != nil
+	settingsTarget := state != nil && c.targetUsesSettings(state.target)
+	if settingsTarget {
+		c.updateSettingsText(textInput)
+		c.settings.invalidateSettingsWindow()
+	} else {
+		c.updateLauncherText(textInput)
+		_ = c.launcher().Invalidate()
+	}
+}
+
+func (c *formTableController) selectFormTableRow(index int) {
+	state := c.activeFormTableEditor()
+	if state != nil && state.rowForm == nil && index >= 0 && index < len(state.rows) {
+		state.selected = index
+		state.deletePending = -1
+		state.deleteDirect = false
+		state.status = ""
+	}
+	c.invalidateFormTableWindow()
+}
+
+func (c *formTableController) moveFormTableSelection(delta int) {
+	state := c.activeFormTableEditor()
+	if state != nil && state.rowForm == nil && len(state.rows) > 0 {
+		if state.selected < 0 {
+			state.selected = 0
+		} else {
+			state.selected = (state.selected + delta + len(state.rows)) % len(state.rows)
+		}
+		state.deletePending = -1
+		state.deleteDirect = false
+		state.status = ""
+	}
+	c.invalidateFormTableWindow()
+}
+
+// formTableRowLookup reads a table cell by column key, then falls back to a
+// case-insensitive match so rows saved with Go's default JSON field names
+// (Path vs path) still render in the settings table.
+func formTableRowLookup(row map[string]any, key string) (any, bool) {
+	if row == nil {
+		return nil, false
+	}
+	if value, ok := row[key]; ok {
+		return value, true
+	}
+	for existingKey, value := range row {
+		if strings.EqualFold(existingKey, key) {
+			return value, true
+		}
+	}
+	return nil, false
+}
+
+// deleteFormTableRowKeyAliases drops case-variant keys after writing the canonical column key.
+func deleteFormTableRowKeyAliases(row map[string]any, key string) {
+	for existingKey := range row {
+		if existingKey != key && strings.EqualFold(existingKey, key) {
+			delete(row, existingKey)
+		}
+	}
+}
+
+func formTableColumnValue(column formTableColumn, row map[string]any) string {
+	value, ok := formTableRowLookup(row, column.Key)
+	if !ok || value == nil {
+		return ""
+	}
+	if column.Type == "woxImage" {
+		return formTableWoxImageValue(value)
+	}
+	if column.Type == "app" {
+		return formTableAppValue(value)
+	}
+	if formTableColumnIsTextList(column.Type) {
+		switch list := value.(type) {
+		case []any:
+			items := make([]string, 0, len(list))
+			for _, item := range list {
+				items = append(items, fmt.Sprint(item))
+			}
+			return strings.Join(items, "\n")
+		case []string:
+			return strings.Join(list, "\n")
+		}
+	}
+	if column.Type == "selectAIModel" {
+		if text, ok := value.(string); ok {
+			return text
+		}
+		if encoded, err := json.Marshal(value); err == nil {
+			return string(encoded)
+		}
+	}
+	return fmt.Sprint(value)
+}
+
+func formTableColumnDefinition(column formTableColumn, row map[string]any) (formDefinition, bool) {
+	value := formDefinitionValue{Key: column.Key, Label: column.Label, Tooltip: column.Tooltip, Validators: column.Validators, ColumnType: column.Type, QueryVariableKind: column.QueryVariableKind, QueryTest: column.QueryTest, Group: column.Group}
+	switch column.Type {
+	case "text", "queryHotkeyQuery", "aiCommandPrompt", "dictationPrompt", "queryVariable":
+		value.MaxLines = max(1, column.TextMaxLines)
+		return formDefinition{Type: "textbox", Value: value}, true
+	case "password":
+		value.MaxLines = 1
+		return formDefinition{Type: "password", Value: value}, true
+	case "dirPath":
+		value.MaxLines = 1
+		return formDefinition{Type: "dirPath", Value: value}, true
+	case "textList", "queryVariableList":
+		value.MaxLines = max(4, column.TextMaxLines)
+		return formDefinition{Type: "textbox", Value: value}, true
+	case "checkbox":
+		return formDefinition{Type: "checkbox", Value: value}, true
+	case "select":
+		value.Options = append([]formOption(nil), column.SelectOptions...)
+		value.Filterable = column.Filterable
+		return formDefinition{Type: "select", Value: value}, true
+	case "selectAIModel":
+		return formDefinition{Type: "selectAIModel", Value: value}, true
+	case "hotkey":
+		return formDefinition{Type: "hotkey", Value: value}, true
+	case "woxImage":
+		value.MaxLines = 1
+		return formDefinition{Type: "woxImage", Value: value}, true
+	case "app":
+		return formDefinition{Type: "app", Value: value}, true
+	default:
+		current := formTableColumnValue(column, row)
+		if current == "" {
+			current = "Not editable in Go UI yet"
+		} else {
+			current = "Read-only in Go UI: " + current
+		}
+		// ponytail: Specialized table columns stay read-only until a real setting needs their native picker; untouched values still round-trip.
+		return formDefinition{Type: "label", Value: formDefinitionValue{Content: column.Label + " · " + current}}, false
+	}
+}
+
+func formTableRowFields(definition formDefinition, row map[string]any) (formFieldsState, map[string]bool) {
+	values := make(map[string]string, len(definition.Value.Columns))
+	textLists := make(map[string]bool)
+	for _, column := range definition.Value.Columns {
+		if column.HideInUpdate {
+			continue
+		}
+		_, editable := formTableColumnDefinition(column, row)
+		if !editable {
+			continue
+		}
+		value, exists := formTableRowLookup(row, column.Key)
+		if !exists {
+			switch column.Type {
+			case "checkbox":
+				values[column.Key] = "false"
+			case "select":
+				if len(column.SelectOptions) > 0 {
+					values[column.Key] = column.SelectOptions[0].Value
+				}
+			case "woxImage":
+				values[column.Key] = "🤖"
+			case "app":
+				values[column.Key] = "{}"
+			}
+		} else {
+			values[column.Key] = formTableColumnValue(column, map[string]any{column.Key: value})
+		}
+		if column.EmptyAsZero {
+			values[column.Key] = normalizeEmptyAsZeroFormValue(values[column.Key])
+		}
+		if formTableColumnIsTextList(column.Type) {
+			textLists[column.Key] = true
+		}
+	}
+	definitions := formTableVisibleRowDefinitions(definition, values)
+	fields := newFormFieldsState(definitions, values, true)
+	for key, value := range values {
+		if _, exists := fields.values[key]; !exists {
+			fields.values[key] = value
+		}
+	}
+	return fields, textLists
+}
+
+func formTableColumnVisible(column formTableColumn, values map[string]string) bool {
+	if column.VisibleWhen.Key == "" {
+		return true
+	}
+	current := values[column.VisibleWhen.Key]
+	for _, want := range column.VisibleWhen.Values {
+		if current == want {
+			return !column.VisibleWhen.Not
+		}
+	}
+	return column.VisibleWhen.Not
+}
+
+func formTableRowDependsOnField(definition formDefinition, key string) bool {
+	if key == "" {
+		return false
+	}
+	for _, column := range definition.Value.Columns {
+		if column.VisibleWhen.Key == key {
+			return true
+		}
+	}
+	return false
+}
+
+// formTableVisibleRowDefinitions keeps only the add/edit fields that match the current row values.
+func formTableVisibleRowDefinitions(definition formDefinition, values map[string]string) []formDefinition {
+	fields := make([]formDefinition, 0, len(definition.Value.Columns))
+	for _, column := range definition.Value.Columns {
+		if column.HideInUpdate || !formTableColumnVisible(column, values) {
+			continue
+		}
+		field, _ := formTableColumnDefinition(column, nil)
+		fields = append(fields, field)
+	}
+	return fields
+}
+
+// applyFormTableRowVisibleFieldsLocked rebuilds the row editor after a field that other columns depend on changes.
+func applyFormTableRowVisibleFieldsLocked(state *formTableEditorState) {
+	if state == nil || state.rowForm == nil {
+		return
+	}
+	syncFormFieldsEditorLocked(state.rowForm)
+	focusedKey := ""
+	if state.rowForm.focused >= 0 && state.rowForm.focused < len(state.rowForm.definitions) {
+		focusedKey = state.rowForm.definitions[state.rowForm.focused].Value.Key
+	}
+	state.rowForm.definitions = formTableVisibleRowDefinitions(state.definition, state.rowForm.values)
+	focused := -1
+	for index, field := range state.rowForm.definitions {
+		if focused < 0 && formDefinitionFocusable(field) && !formTableRowFieldCollapsed(state.definition, field, state.collapsedGroups) {
+			focused = index
+		}
+		if field.Value.Key == focusedKey && !formTableRowFieldCollapsed(state.definition, field, state.collapsedGroups) {
+			focused = index
+			break
+		}
+	}
+	if focused >= 0 {
+		setFormFieldsFocusLocked(state.rowForm, focused)
+	} else {
+		state.rowForm.focused = -1
+		state.rowForm.editor = nil
+	}
+}
+
+// normalizeEmptyAsZeroFormValue maps blank and zero to an empty editor value for EmptyAsZero columns.
+func normalizeEmptyAsZeroFormValue(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || trimmed == "0" {
+		return ""
+	}
+	return trimmed
+}
+
+func (c *formTableController) beginAddFormTableRow() {
+	c.beginFormTableRowEdit(-1, false, false)
+}
+
+func (c *formTableController) beginAddFormTableRowDirect() {
+	if c.beginWindowManagerGroupEdit(-1, true) {
+		return
+	}
+	c.beginFormTableRowEdit(-1, true, false)
+}
+
+func (c *formTableController) beginEditFormTableRow() {
+	c.beginSelectedFormTableRowEdit(false)
+}
+
+func (c *formTableController) beginEditFormTableRowDirect() {
+	if state := c.activeFormTableEditor(); state != nil && isWindowManagerGroupsEditor(c.pluginSettings().Form(), state) {
+		if state.selected >= 0 {
+			if c.beginWindowManagerGroupEdit(state.selected, true) {
+				return
+			}
+		}
+	}
+	c.beginSelectedFormTableRowEdit(true)
+}
+
+// beginSelectedFormTableRowEdit preserves whether the selected row came from the list or an inline table.
+func (c *formTableController) beginSelectedFormTableRowEdit(rowEditorOnly bool) {
+	index := -1
+	if state := c.activeFormTableEditor(); state != nil {
+		index = state.selected
+	}
+	if index >= 0 {
+		c.beginFormTableRowEdit(index, rowEditorOnly, false)
+	}
+}
+
+// beginCloneFormTableRowDirect opens a new-row editor prefilled from the selected row.
+func (c *formTableController) beginCloneFormTableRowDirect() {
+	index := -1
+	if state := c.activeFormTableEditor(); state != nil {
+		index = state.selected
+	}
+	if index >= 0 {
+		c.beginFormTableRowEdit(index, true, true)
+	}
+}
+
+func (c *formTableController) beginFormTableRowEdit(index int, rowEditorOnly, cloneRow bool) {
+	requestModels := false
+	state := c.activeFormTableEditor()
+	if state == nil || state.invalid || state.saving || state.rowForm != nil || index >= len(state.rows) {
+		return
+	}
+	if index >= 0 && (state.definition.Value.Key == "AISkills" || formTableSkillRowReadOnly(state.definition, state.rows[index])) {
+		return
+	}
+	base := map[string]any{}
+	if index >= 0 {
+		base = cloneFormTableRow(state.rows[index])
+	}
+	if cloneRow {
+		index = -1
+	}
+	fields, _ := formTableRowFields(state.definition, base)
+	state.collapsedGroups = defaultFormTableCollapsedGroups(state.definition)
+	if state.definition.Value.Key == "QueryHotkeys" {
+		state.queryPreset = inferQueryHotkeyPreset(fields.values)
+	}
+	aiSettings := c.aiSettings()
+	if aiSettings != nil {
+		if models := aiSettings.Models(); len(models) > 0 {
+			applyAIModelOptionsLocked(&fields, models)
+		}
+	}
+	state.rowForm = &fields
+	state.appPicker = nil
+	state.queryVariable = nil
+	state.rowIndex = index
+	state.rowBase = base
+	state.rowEditorOnly = rowEditorOnly
+	state.patternPreview = nil
+	if formTableHasPatternPreview(state.definition) {
+		c.initFormTablePatternPreview(state)
+	}
+	clearFormTableRowValidationLocked(state)
+	state.deletePending = -1
+	state.deleteDirect = false
+	if aiSettings != nil {
+		applyAIProviderDefaultHostLocked(state, false, aiSettings.ProviderCatalog())
+		requestModels = hasFormDefinitionType(fields.definitions, "selectAIModel") && !aiSettings.ModelsLoaded() && !aiSettings.ModelsLoading()
+		if requestModels {
+			aiSettings.SetModelsLoading(true)
+		}
+	}
+	textInput := fields.editor != nil
+	c.updateFormTableTextInput(textInput)
+	if requestModels {
+		util.Go(c.lifecycleCtx, "load AI models for form table", c.loadAIModels)
+	}
+	c.invalidateFormTableWindow()
+}
+
+// inferQueryHotkeyPreset maps persisted display values back to Flutter's task-oriented presets.
+func inferQueryHotkeyPreset(values map[string]string) queryHotkeyPreset {
+	width := strings.TrimSpace(values["Width"])
+	maxResults := strings.TrimSpace(values["MaxResultCount"])
+	hasDisplayOptions := values["Position"] != "" && values["Position"] != "system_default" ||
+		values["HideQueryBox"] == "true" || values["HideToolbar"] == "true" || values["HideResults"] == "true" ||
+		width != "" && width != "0" || maxResults != "" && maxResults != "0"
+	if values["IsSilentExecution"] == "true" && !hasDisplayOptions {
+		return queryHotkeyPresetSilent
+	}
+	if values["HideQueryBox"] == "true" && values["HideToolbar"] == "true" && values["HideResults"] == "true" && values["IsSilentExecution"] != "true" {
+		return queryHotkeyPresetWebPanel
+	}
+	if hasDisplayOptions {
+		return queryHotkeyPresetCustom
+	}
+	return queryHotkeyPresetNormal
+}
+
+// queryHotkeyFieldVisible keeps each preset limited to the fields shown by Flutter.
+func queryHotkeyFieldVisible(preset queryHotkeyPreset, key string, editing bool) bool {
+	switch key {
+	case "Name", "Hotkey", "Query":
+		return true
+	case "Position", "Width", "MaxResultCount":
+		return preset == queryHotkeyPresetWebPanel || preset == queryHotkeyPresetCustom
+	case "IsSilentExecution", "HideQueryBox", "HideToolbar", "HideResults":
+		return preset == queryHotkeyPresetCustom
+	case "Disabled":
+		return editing
+	default:
+		return false
+	}
+}
+
+// applyQueryHotkeyPreset mirrors Flutter's task presets and clears display values hidden by the selected mode.
+func (c *formTableController) applyQueryHotkeyPreset(preset string) {
+	state := c.activeFormTableEditor()
+	if state == nil || state.definition.Value.Key != "QueryHotkeys" || state.rowForm == nil {
+		return
+	}
+	syncFormFieldsEditorLocked(state.rowForm)
+	selected := queryHotkeyPreset(preset)
+	switch selected {
+	case queryHotkeyPresetNormal, queryHotkeyPresetSilent:
+		state.rowForm.values["Position"] = "system_default"
+		state.rowForm.values["HideQueryBox"] = "false"
+		state.rowForm.values["HideToolbar"] = "false"
+		state.rowForm.values["HideResults"] = "false"
+		state.rowForm.values["Width"] = ""
+		state.rowForm.values["MaxResultCount"] = ""
+		state.rowForm.values["IsSilentExecution"] = fmt.Sprint(selected == queryHotkeyPresetSilent)
+	case queryHotkeyPresetWebPanel:
+		state.rowForm.values["Position"] = "center"
+		state.rowForm.values["HideQueryBox"] = "true"
+		state.rowForm.values["HideToolbar"] = "true"
+		state.rowForm.values["HideResults"] = "true"
+		state.rowForm.values["Width"] = "500"
+		state.rowForm.values["MaxResultCount"] = "12"
+		state.rowForm.values["IsSilentExecution"] = "false"
+	case queryHotkeyPresetCustom:
+	default:
+		return
+	}
+	state.queryPreset = selected
+	state.queryVariable = nil
+	state.status = ""
+	c.updateFormTableTextInput(false)
+	c.invalidateFormTableWindow()
+}
+
+func (c *formTableController) cancelFormTableRowEdit() {
+	state := c.activeFormTableEditor()
+	closeEditor := state != nil && state.rowEditorOnly
+	if closeEditor {
+		c.closeFormTableEditor()
+		return
+	}
+	c.stopHotkeyRecording()
+	if state := c.activeFormTableEditor(); state != nil {
+		state.rowForm = nil
+		state.rowIndex = -1
+		state.rowBase = nil
+		state.rowEditorOnly = false
+		state.appPicker = nil
+		state.queryVariable = nil
+		state.patternPreview = nil
+		state.collapsedGroups = nil
+		state.status = ""
+	}
+	c.updateFormTableTextInput(false)
+	c.invalidateFormTableWindow()
+}
+
+func formTableRowFromFields(definition formDefinition, fields *formFieldsState, base map[string]any) map[string]any {
+	row := cloneFormTableRow(base)
+	delete(row, formTableRowIDKey)
+	for key := range row {
+		if strings.HasPrefix(key, "_wox_original_") {
+			delete(row, key)
+		}
+	}
+	for _, column := range definition.Value.Columns {
+		if column.HideInUpdate {
+			continue
+		}
+		value, editable := fields.values[column.Key]
+		if !editable {
+			continue
+		}
+		switch column.Type {
+		case "checkbox":
+			row[column.Key] = value == "true"
+		case "textList", "queryVariableList":
+			lines := strings.Split(strings.ReplaceAll(value, "\r\n", "\n"), "\n")
+			items := make([]string, 0, len(lines))
+			for _, line := range lines {
+				if line != "" {
+					items = append(items, line)
+				}
+			}
+			row[column.Key] = items
+		case "text", "password", "dirPath", "queryHotkeyQuery", "aiCommandPrompt", "dictationPrompt", "queryVariable", "select", "selectAIModel", "hotkey":
+			row[column.Key] = value
+		case "woxImage":
+			image, _ := parseFormTableWoxImage(value)
+			row[column.Key] = image
+		case "app":
+			app, _ := parseFormTableApp(value)
+			row[column.Key] = app
+		}
+		deleteFormTableRowKeyAliases(row, column.Key)
+	}
+	normalizeEmptyAsZeroFieldValues(definition, fields.values)
+	for _, column := range definition.Value.Columns {
+		if column.EmptyAsZero {
+			row[column.Key], _ = strconv.Atoi(strings.TrimSpace(fields.values[column.Key]))
+		}
+	}
+	return row
+}
+
+// normalizeEmptyAsZeroFieldValues keeps editor values blank when EmptyAsZero columns still contain a stored 0.
+func normalizeEmptyAsZeroFieldValues(definition formDefinition, values map[string]string) {
+	for _, column := range definition.Value.Columns {
+		if column.EmptyAsZero {
+			values[column.Key] = normalizeEmptyAsZeroFormValue(values[column.Key])
+		}
+	}
+}
+
+func cloneFormTableFieldErrors(errors map[string]string) map[string]string {
+	if len(errors) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(errors))
+	for key, message := range errors {
+		cloned[key] = message
+	}
+	return cloned
+}
+
+// clearFormTableRowValidationLocked clears dialog-level and per-field validation after the user edits again.
+func clearFormTableRowValidationLocked(state *formTableEditorState) {
+	if state == nil {
+		return
+	}
+	state.status = ""
+	state.fieldErrors = nil
+	state.providerTest = nil
+}
+
+func (c *formTableController) translateFormTableFieldErrors(errors map[string]string) map[string]string {
+	if len(errors) == 0 {
+		return nil
+	}
+	translated := make(map[string]string, len(errors))
+	for key, message := range errors {
+		translated[key] = c.language.translate(message)
+	}
+	return translated
+}
+
+func validateFormTableRow(definition formDefinition, fields *formFieldsState, rows []map[string]any, editingIndex int) map[string]string {
+	normalizeEmptyAsZeroFieldValues(definition, fields.values)
+	errors := validateFormFieldErrors(fields.definitions, fields.values)
+	if errors == nil {
+		errors = map[string]string{}
+	}
+	for _, column := range definition.Value.Columns {
+		if errors[column.Key] != "" {
+			continue
+		}
+		if column.Type == "woxImage" {
+			if _, err := parseFormTableWoxImage(fields.values[column.Key]); err != nil {
+				errors[column.Key] = err.Error()
+				continue
+			}
+		}
+		if column.Type == "app" {
+			if _, err := parseFormTableApp(fields.values[column.Key]); err != nil {
+				errors[column.Key] = err.Error()
+				continue
+			}
+		}
+		unique := false
+		for _, validator := range column.Validators {
+			if validator.Type == "unique" {
+				unique = true
+				break
+			}
+		}
+		if !unique {
+			continue
+		}
+		candidate := fields.values[column.Key]
+		for index, row := range rows {
+			if index != editingIndex && formTableColumnValue(column, row) == candidate {
+				errors[column.Key] = "i18n:ui_validator_value_must_be_unique"
+				break
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+// formTableWoxImageValue presents the common emoji case compactly while preserving every structured image type as JSON.
+func formTableWoxImageValue(value any) string {
+	if image, ok := value.(woxImage); ok {
+		if image.ImageType == "emoji" {
+			return image.ImageData
+		}
+	}
+	if image, ok := value.(map[string]any); ok {
+		imageType, _ := image["ImageType"].(string)
+		imageData, _ := image["ImageData"].(string)
+		if imageType == "emoji" {
+			return imageData
+		}
+	}
+	if encoded, err := json.Marshal(value); err == nil {
+		return string(encoded)
+	}
+	return fmt.Sprint(value)
+}
+
+// parseFormTableWoxImage turns the portable emoji shorthand or a full WoxImage object into the core DTO shape.
+func parseFormTableWoxImage(value string) (map[string]any, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, fmt.Errorf("Icon must not be empty")
+	}
+	if !strings.HasPrefix(value, "{") {
+		return map[string]any{"ImageType": "emoji", "ImageData": value}, nil
+	}
+	var image woxImage
+	if err := json.Unmarshal([]byte(value), &image); err != nil {
+		return nil, fmt.Errorf("Icon must be an emoji or valid WoxImage JSON: %w", err)
+	}
+	if strings.TrimSpace(image.ImageType) == "" || strings.TrimSpace(image.ImageData) == "" {
+		return nil, fmt.Errorf("WoxImage JSON requires ImageType and ImageData")
+	}
+	return map[string]any{"ImageType": image.ImageType, "ImageData": image.ImageData}, nil
+}
+
+func formTableAppValue(value any) string {
+	if encoded, err := json.Marshal(value); err == nil {
+		return string(encoded)
+	}
+	return "{}"
+}
+
+func parseFormTableApp(value string) (map[string]any, error) {
+	var app ignoredHotkeyApp
+	if err := json.Unmarshal([]byte(value), &app); err != nil {
+		return nil, fmt.Errorf("Application selection is invalid: %w", err)
+	}
+	if strings.TrimSpace(app.Identity) == "" {
+		return nil, fmt.Errorf("Select an application")
+	}
+	encoded, err := json.Marshal(app)
+	if err != nil {
+		return nil, err
+	}
+	var result map[string]any
+	if err := json.Unmarshal(encoded, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (c *formTableController) saveFormTableRowEdit() {
+	c.commitHotkeyRecordingValue()
+	c.stopHotkeyRecording()
+	state := c.activeFormTableEditor()
+	if state == nil || state.rowForm == nil || state.invalid || state.saving || !c.targetCurrent(state.target) {
+		return
+	}
+	syncFormFieldsEditorLocked(state.rowForm)
+	clearFormTableRowValidationLocked(state)
+	if validationMessage := c.validatePluginTriggerKeywordTableRow(state); validationMessage != "" {
+		state.fieldErrors = map[string]string{"keyword": validationMessage}
+		expandFormTableGroupsForErrors(state)
+		c.invalidateFormTableWindow()
+		return
+	}
+	if fieldErrors := validateFormTableRow(state.definition, state.rowForm, state.rows, state.rowIndex); len(fieldErrors) > 0 {
+		if c.activeFormTableEditor() == state {
+			state.fieldErrors = c.translateFormTableFieldErrors(fieldErrors)
+			expandFormTableGroupsForErrors(state)
+		}
+		c.invalidateFormTableWindow()
+		return
+	}
+	if fieldErrors := validateAISettingsTableRow(state.definition, state.rowForm); len(fieldErrors) > 0 {
+		state.fieldErrors = fieldErrors
+		expandFormTableGroupsForErrors(state)
+		c.invalidateFormTableWindow()
+		return
+	}
+	if fieldErrors := c.validateWebSearchTableRow(state.definition, state.rowForm); len(fieldErrors) > 0 {
+		state.fieldErrors = fieldErrors
+		expandFormTableGroupsForErrors(state)
+		c.invalidateFormTableWindow()
+		return
+	}
+	previousValue := state.target.values[state.definition.Value.Key]
+	if !c.applyFormTableIgnoreRuleSave(state) {
+		return
+	}
+	if err := c.commitFormTableRowsLocked(state); err != nil {
+		state.status = err.Error()
+		c.invalidateFormTableWindow()
+		return
+	}
+	pluginForm := c.pluginSettings().Form()
+	pluginTarget := pluginForm != nil && state.target == &pluginForm.formFieldsState
+	persist := c.settingsOwned(state.target)
+	closeEditor := state.rowEditorOnly
+	key := state.definition.Value.Key
+	value := state.target.values[key]
+	state.rowForm = nil
+	state.rowIndex = -1
+	state.rowBase = nil
+	state.rowEditorOnly = false
+	state.patternPreview = nil
+	clearFormTableRowValidationLocked(state)
+	if persist {
+		state.saving = true
+		c.settings.saving = true
+	}
+	if closeEditor {
+		c.closeFormTableEditor()
+	} else {
+		c.updateFormTableTextInput(false)
+		c.invalidateFormTableWindow()
+	}
+	if persist {
+		util.Go(c.lifecycleCtx, "save settings table", func() {
+			c.saveSettingsTable(state, key, value, previousValue)
+		})
+	} else if pluginTarget {
+		c.submitPluginSettings()
+	}
+}
+
+func (c *formTableController) deleteFormTableRow() {
+	c.beginFormTableRowDelete(false)
+}
+
+// beginDeleteFormTableRowDirect removes the selected row after the inline two-click confirmation.
+func (c *formTableController) beginDeleteFormTableRowDirect() {
+	state := c.activeFormTableEditor()
+	if state == nil || state.invalid || state.saving || state.rowForm != nil || state.selected < 0 || state.selected >= len(state.rows) || !c.targetCurrent(state.target) || formTableSkillRowReadOnly(state.definition, state.rows[state.selected]) {
+		return
+	}
+	if len(state.rows) <= state.definition.Value.MinimumRowCount {
+		c.closeFormTableEditor()
+		return
+	}
+	state.deletePending = state.selected
+	state.deleteDirect = true
+	c.confirmFormTableRowDelete()
+}
+
+func (c *formTableController) beginFormTableRowDelete(direct bool) {
+	state := c.activeFormTableEditor()
+	if state == nil || state.invalid || state.saving || state.rowForm != nil || state.selected < 0 || state.selected >= len(state.rows) || !c.targetCurrent(state.target) || formTableSkillRowReadOnly(state.definition, state.rows[state.selected]) {
+		return
+	}
+	if len(state.rows) <= state.definition.Value.MinimumRowCount {
+		state.status = c.language.translate(state.definition.Value.MinimumRowMessage)
+		c.invalidateFormTableWindow()
+		return
+	}
+	state.deletePending = state.selected
+	state.deleteDirect = direct
+	state.status = ""
+	c.updateFormTableTextInput(false)
+	c.invalidateFormTableWindow()
+}
+
+// cancelFormTableRowDelete dismisses the confirmation without mutating the table.
+func (c *formTableController) cancelFormTableRowDelete() {
+	state := c.activeFormTableEditor()
+	if state == nil || state.deletePending < 0 {
+		return
+	}
+	direct := state.deleteDirect
+	state.deletePending = -1
+	state.deleteDirect = false
+	if direct {
+		c.closeFormTableEditor()
+		return
+	}
+	c.invalidateFormTableWindow()
+}
+
+// confirmFormTableRowDelete re-matches the captured row against the latest table value before removal.
+func (c *formTableController) confirmFormTableRowDelete() {
+	state := c.activeFormTableEditor()
+	if state == nil || state.invalid || state.saving || state.rowForm != nil || state.deletePending < 0 || state.deletePending >= len(state.rows) || !c.targetCurrent(state.target) {
+		return
+	}
+	originalRow := cloneFormTableRow(state.rows[state.deletePending])
+	direct := state.deleteDirect
+	state.deletePending = -1
+	state.deleteDirect = false
+	previousValue := state.target.values[state.definition.Value.Key]
+	freshRows, err := decodeFormTableRows(previousValue)
+	if err != nil {
+		state.status = err.Error()
+		c.invalidateFormTableWindow()
+		return
+	}
+	deleteIndex := findFormTableRow(freshRows, originalRow)
+	if deleteIndex < 0 {
+		if direct {
+			c.closeFormTableEditor()
+		} else {
+			c.invalidateFormTableWindow()
+		}
+		return
+	}
+	state.rows = append(freshRows[:deleteIndex], freshRows[deleteIndex+1:]...)
+	state.selected = min(deleteIndex, len(state.rows)-1)
+	if len(state.rows) == 0 {
+		state.selected = -1
+	}
+	persist := false
+	pluginTarget := false
+	key := state.definition.Value.Key
+	value := ""
+	if err := c.commitFormTableRowsLocked(state); err != nil {
+		state.status = err.Error()
+	} else {
+		state.status = ""
+		persist = c.settingsOwned(state.target)
+		pluginForm := c.pluginSettings().Form()
+		pluginTarget = pluginForm != nil && state.target == &pluginForm.formFieldsState
+		value = state.target.values[key]
+		if persist {
+			state.saving = true
+			c.settings.saving = true
+		}
+	}
+	if direct {
+		c.closeFormTableEditor()
+	} else {
+		c.invalidateFormTableWindow()
+	}
+	if persist {
+		util.Go(c.lifecycleCtx, "save settings table after delete", func() {
+			c.saveSettingsTable(state, key, value, previousValue)
+		})
+	} else if pluginTarget {
+		c.submitPluginSettings()
+	}
+}
+
+func findFormTableRow(rows []map[string]any, original map[string]any) int {
+	for index, candidate := range rows {
+		matches := true
+		for key, value := range original {
+			if key == formTableRowIDKey {
+				continue
+			}
+			if fmt.Sprint(candidate[key]) != fmt.Sprint(value) {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return index
+		}
+	}
+	return -1
+}
+
+func (c *formTableController) commitFormTableRowsLocked(state *formTableEditorState) error {
+	rows := cloneFormTableRows(state.rows)
+	for _, row := range rows {
+		delete(row, formTableRowIDKey)
+	}
+	encoded, err := json.Marshal(rows)
+	if err != nil {
+		return fmt.Errorf("encode table rows: %w", err)
+	}
+	state.target.values[state.definition.Value.Key] = string(encoded)
+	return nil
+}
+
+func (c *formTableController) toggleFormTableRowGroup(key string) {
+	state := c.activeFormTableEditor()
+	if state == nil || state.rowForm == nil || key == "" {
+		return
+	}
+	if _, ok := formTableGroupByKey(state.definition, key); !ok {
+		return
+	}
+	if state.collapsedGroups == nil {
+		state.collapsedGroups = map[string]bool{}
+	}
+	state.collapsedGroups[key] = !state.collapsedGroups[key]
+	c.ensureFormTableRowFocusVisibleLocked(state)
+	textInput := state.rowForm.editor != nil
+	c.updateFormTableTextInput(textInput)
+	c.invalidateFormTableWindow()
+}
+
+func (c *formTableController) ensureFormTableRowFocusVisibleLocked(state *formTableEditorState) {
+	if state == nil || state.rowForm == nil || len(state.rowForm.definitions) == 0 {
+		return
+	}
+	index := state.rowForm.focused
+	if index >= 0 && index < len(state.rowForm.definitions) &&
+		formDefinitionFocusable(state.rowForm.definitions[index]) &&
+		!formTableRowFieldCollapsed(state.definition, state.rowForm.definitions[index], state.collapsedGroups) {
+		return
+	}
+	for candidate, field := range state.rowForm.definitions {
+		if formDefinitionFocusable(field) && !formTableRowFieldCollapsed(state.definition, field, state.collapsedGroups) {
+			setFormFieldsFocusLocked(state.rowForm, candidate)
+			return
+		}
+	}
+	state.rowForm.focused = -1
+	state.rowForm.editor = nil
+}
+
+func (c *formTableController) focusFormTableRowField(index int) {
+	var target *formFieldsState
+	if state := c.activeFormTableEditor(); state != nil {
+		target = state.rowForm
+	}
+	c.stopHotkeyRecordingForDifferentField(target, index)
+	state := c.activeFormTableEditor()
+	if state == nil || state.rowForm == nil || index < 0 || index >= len(state.rowForm.definitions) || !formDefinitionFocusable(state.rowForm.definitions[index]) {
+		return
+	}
+	if formTableRowFieldCollapsed(state.definition, state.rowForm.definitions[index], state.collapsedGroups) {
+		return
+	}
+	syncFormFieldsEditorLocked(state.rowForm)
+	state.rowForm.active = true
+	if state.rowForm.focused != index || state.rowForm.editor == nil {
+		setFormFieldsFocusLocked(state.rowForm, index)
+	}
+	textInput := state.rowForm.editor != nil
+	c.updateFormTableTextInput(textInput)
+	c.invalidateFormTableWindow()
+}
+
+func (c *formTableController) moveFormTableRowFocus(delta int) {
+	state := c.activeFormTableEditor()
+	if state == nil || state.rowForm == nil || len(state.rowForm.definitions) == 0 {
+		return
+	}
+	syncFormFieldsEditorLocked(state.rowForm)
+	index := state.rowForm.focused
+	for step := 0; step < len(state.rowForm.definitions); step++ {
+		index = (index + delta + len(state.rowForm.definitions)) % len(state.rowForm.definitions)
+		if formDefinitionFocusable(state.rowForm.definitions[index]) && !formTableRowFieldCollapsed(state.definition, state.rowForm.definitions[index], state.collapsedGroups) {
+			setFormFieldsFocusLocked(state.rowForm, index)
+			break
+		}
+	}
+	host := c.formTableHost()
+	if host != nil {
+		host.RequestFocus(woxwidget.Key(fmt.Sprintf("form-table-row-field-%d", index)))
+	}
+	c.stopHotkeyRecordingForDifferentField(state.rowForm, index)
+	textInput := state.rowForm.editor != nil
+	c.updateFormTableTextInput(textInput)
+	c.invalidateFormTableWindow()
+}
+
+func (c *formTableController) changeFormTableRowChoice(index, delta int) {
+	if state := c.activeFormTableEditor(); state != nil && state.rowForm != nil {
+		changeFormFieldsChoiceLocked(state.rowForm, index, delta)
+		if index >= 0 && index < len(state.rowForm.definitions) {
+			key := state.rowForm.definitions[index].Value.Key
+			if key == "Name" {
+				applyAIProviderDefaultHostLocked(state, true, c.aiSettings().ProviderCatalog())
+			}
+			if formTableRowDependsOnField(state.definition, key) {
+				applyFormTableRowVisibleFieldsLocked(state)
+			}
+			if key == "IncludeFuture" && state.patternPreview != nil {
+				state.patternPreview.unchecked = map[string]bool{}
+				state.patternPreview.seedFromSaved = false
+				c.refreshFormTablePatternPreview(state)
+			}
+		}
+		clearFormTableRowValidationLocked(state)
+	}
+	c.updateFormTableTextInput(false)
+	c.invalidateFormTableWindow()
+}
+
+// snapFormTableQueryVariableSelection keeps the live editor caret and selection outside collapsed placeholder interiors.
+func (c *formTableController) snapFormTableQueryVariableSelection() {
+	state := c.activeFormTableEditor()
+	if state == nil || state.rowForm == nil || state.rowForm.editor == nil || formTableQueryVariableKindForField(state, state.rowForm.focused) == "" {
+		return
+	}
+	editor := state.rowForm.editor
+	current := editor.State()
+	editing := state.queryVariableEdit
+	if current.Selection.Collapsed() {
+		if caret, ok := snapQueryVariableCaret(current.Text, current.Selection.Focus, editing); ok {
+			editor.SetCaret(caret)
+			state.queryVariableEdit = queryVariableToken{}
+			return
+		}
+		if token, ok := queryVariableParameterTokenContaining(current.Text, current.Selection.Focus); ok && queryVariableTokenMatchesEdit(token, editing) {
+			state.queryVariableEdit = token
+			return
+		}
+		state.queryVariableEdit = queryVariableToken{}
+		return
+	}
+	if token, ok := queryVariableParameterTokenContaining(current.Text, current.Selection.Focus); ok && queryVariableTokenMatchesEdit(token, editing) {
+		state.queryVariableEdit = token
+	} else {
+		state.queryVariableEdit = queryVariableToken{}
+	}
+	start, end, changed := expandQueryVariableSelection(current.Text, current.Selection.Start(), current.Selection.End(), editing)
+	if !changed {
+		return
+	}
+	if current.Selection.Anchor <= current.Selection.Focus {
+		editor.SetSelection(start, end)
+		return
+	}
+	editor.SetSelection(end, start)
+}
+
+// handleFormTableQueryVariableEditorKey deletes and navigates complete {wox:...} placeholders as one unit.
+func (c *formTableController) handleFormTableQueryVariableEditorKey(event woxui.KeyEvent) bool {
+	if !event.Down || event.Composing || event.Modifiers.HasPrimary() {
+		return false
+	}
+	state := c.activeFormTableEditor()
+	if state == nil || state.rowForm == nil || state.rowForm.editor == nil {
+		return false
+	}
+	editor := state.rowForm.editor
+	current := editor.State()
+	text := current.Text
+	selection := current.Selection
+	editing := state.queryVariableEdit
+	extend := event.Modifiers&woxui.KeyModifierShift != 0
+	switch event.Key {
+	case woxui.KeyEnter:
+		if event.Modifiers != 0 {
+			return false
+		}
+		if token, ok := queryVariableCompleteTokenContaining(text, selection.Focus); ok {
+			editor.SetCaret(token.end)
+			state.queryVariableEdit = queryVariableToken{}
+			c.finishFormTableQueryVariableEditorMove()
+			return true
+		}
+	case woxui.KeyBackspace:
+		if !selection.Collapsed() {
+			c.snapFormTableQueryVariableSelection()
+			if !editor.DeleteSelection() {
+				return false
+			}
+			c.finishFormTableQueryVariableEditorChange()
+			return true
+		}
+		if token, ok := queryVariableTokenBefore(text, selection.Focus, editing); ok {
+			applyQueryVariableSelection(editor, token.start, token.end)
+			editor.DeleteSelection()
+			c.finishFormTableQueryVariableEditorChange()
+			return true
+		}
+		if token, ok := queryVariableTokenContaining(text, selection.Focus, editing); ok {
+			applyQueryVariableSelection(editor, token.start, token.end)
+			editor.DeleteSelection()
+			c.finishFormTableQueryVariableEditorChange()
+			return true
+		}
+	case woxui.KeyDelete:
+		if !selection.Collapsed() {
+			c.snapFormTableQueryVariableSelection()
+			if !editor.DeleteSelection() {
+				return false
+			}
+			c.finishFormTableQueryVariableEditorChange()
+			return true
+		}
+		if token, ok := queryVariableTokenAfter(text, selection.Focus, editing); ok {
+			applyQueryVariableSelection(editor, token.start, token.end)
+			editor.DeleteSelection()
+			c.finishFormTableQueryVariableEditorChange()
+			return true
+		}
+		if token, ok := queryVariableTokenContaining(text, selection.Focus, editing); ok {
+			applyQueryVariableSelection(editor, token.start, token.end)
+			editor.DeleteSelection()
+			c.finishFormTableQueryVariableEditorChange()
+			return true
+		}
+	case woxui.KeyArrowLeft:
+		if token, ok := queryVariableTokenBefore(text, selection.Focus, editing); ok {
+			if extend {
+				applyQueryVariableSelection(editor, selection.Anchor, token.start)
+			} else {
+				editor.SetCaret(token.start)
+			}
+			c.finishFormTableQueryVariableEditorMove()
+			return true
+		}
+		if token, ok := queryVariableTokenContaining(text, selection.Focus, editing); ok {
+			if extend {
+				applyQueryVariableSelection(editor, selection.Anchor, token.start)
+			} else {
+				editor.SetCaret(token.start)
+			}
+			c.finishFormTableQueryVariableEditorMove()
+			return true
+		}
+	case woxui.KeyArrowRight:
+		if token, ok := queryVariableTokenAfter(text, selection.Focus, editing); ok {
+			if extend {
+				applyQueryVariableSelection(editor, selection.Anchor, token.end)
+			} else {
+				editor.SetCaret(token.end)
+			}
+			c.finishFormTableQueryVariableEditorMove()
+			return true
+		}
+		if token, ok := queryVariableTokenContaining(text, selection.Focus, editing); ok {
+			if extend {
+				applyQueryVariableSelection(editor, selection.Anchor, token.end)
+			} else {
+				editor.SetCaret(token.end)
+			}
+			c.finishFormTableQueryVariableEditorMove()
+			return true
+		}
+	}
+	return false
+}
+
+// finishFormTableQueryVariableEditorChange persists placeholder edits and refreshes the variable picker.
+func (c *formTableController) finishFormTableQueryVariableEditorChange() {
+	state := c.activeFormTableEditor()
+	if state == nil || state.rowForm == nil {
+		return
+	}
+	syncFormFieldsEditorLocked(state.rowForm)
+	clearFormTableRowValidationLocked(state)
+	c.updateFormTableQueryVariableTrigger(state.rowForm.focused)
+	c.updateFormTableTextInput(true)
+	c.invalidateFormTableWindow()
+}
+
+// finishFormTableQueryVariableEditorMove keeps picker trigger state aligned after caret jumps.
+func (c *formTableController) finishFormTableQueryVariableEditorMove() {
+	state := c.activeFormTableEditor()
+	if state == nil || state.rowForm == nil {
+		return
+	}
+	c.updateFormTableQueryVariableTrigger(state.rowForm.focused)
+	c.updateFormTableTextInput(true)
+	c.invalidateFormTableWindow()
+}
+
+func (c *formTableController) editFormTableRowKey(event woxui.KeyEvent) {
+	state := c.activeFormTableEditor()
+	if state != nil && state.rowForm != nil && state.rowForm.editor != nil && state.rowForm.focused >= 0 && state.rowForm.focused < len(state.rowForm.definitions) {
+		_, changed := handleFormEditorKey(state.rowForm.editor, state.rowForm.definitions[state.rowForm.focused], event)
+		if changed {
+			syncFormFieldsEditorLocked(state.rowForm)
+			clearFormTableRowValidationLocked(state)
+		}
+	}
+	c.invalidateFormTableWindow()
+}
+
+func (c *formTableController) setFormTableRowText(index int, value string) {
+	state := c.activeFormTableEditor()
+	changed := state != nil && state.rowForm != nil && !state.saving && setFormFieldsTextLocked(state.rowForm, index, value)
+	if changed {
+		clearFormTableRowValidationLocked(state)
+		if formTableQueryVariableKindForField(state, index) != "" {
+			c.updateFormTableQueryVariableTrigger(index)
+		}
+		if state.patternPreview != nil && index >= 0 && index < len(state.rowForm.definitions) && state.rowForm.definitions[index].Value.Key == "Pattern" {
+			c.refreshFormTablePatternPreview(state)
+		}
+	}
+	if changed {
+		c.invalidateFormTableWindow()
+	}
+}
+
+const queryVariableTokenPrefix = "{wox:"
+
+type queryVariableToken struct {
+	start, end int
+}
+
+// queryVariableTokens returns complete {wox:...} placeholders that must be edited as one unit.
+func queryVariableTokens(value string) []queryVariableToken {
+	runes := []rune(value)
+	prefix := []rune(queryVariableTokenPrefix)
+	tokens := make([]queryVariableToken, 0)
+	for index := 0; index <= len(runes)-len(prefix); index++ {
+		if !queryVariableHasPrefix(runes, index, prefix) {
+			continue
+		}
+		end := -1
+		for cursor := index + len(prefix); cursor < len(runes); cursor++ {
+			if runes[cursor] == '}' {
+				end = cursor + 1
+				break
+			}
+			if runes[cursor] == '{' {
+				break
+			}
+		}
+		if end > index {
+			tokens = append(tokens, queryVariableToken{start: index, end: end})
+			index = end - 1
+		}
+	}
+	return tokens
+}
+
+func queryVariableHasPrefix(runes []rune, start int, prefix []rune) bool {
+	if start < 0 || start+len(prefix) > len(runes) {
+		return false
+	}
+	for offset, current := range prefix {
+		if runes[start+offset] != current {
+			return false
+		}
+	}
+	return true
+}
+
+func queryVariableTokenBefore(value string, caret int, editing queryVariableToken) (queryVariableToken, bool) {
+	for _, token := range queryVariableAtomicTokens(value, editing) {
+		if token.end == caret {
+			return token, true
+		}
+	}
+	return queryVariableToken{}, false
+}
+
+func queryVariableTokenAfter(value string, caret int, editing queryVariableToken) (queryVariableToken, bool) {
+	for _, token := range queryVariableAtomicTokens(value, editing) {
+		if token.start == caret {
+			return token, true
+		}
+	}
+	return queryVariableToken{}, false
+}
+
+func queryVariableTokenContaining(value string, caret int, editing queryVariableToken) (queryVariableToken, bool) {
+	for _, token := range queryVariableAtomicTokens(value, editing) {
+		if token.start < caret && caret < token.end {
+			return token, true
+		}
+	}
+	return queryVariableToken{}, false
+}
+
+// queryVariableParameterTokenContaining finds the editable parameter placeholder under the caret.
+func queryVariableParameterTokenContaining(value string, caret int) (queryVariableToken, bool) {
+	for _, token := range queryVariableTokens(value) {
+		if token.start < caret && caret < token.end && queryVariableIsEditableParameter(queryVariableTokenText(value, token)) {
+			return token, true
+		}
+	}
+	return queryVariableToken{}, false
+}
+
+// expandQueryVariableSelection grows a range so it never splits a complete {wox:...} placeholder.
+func expandQueryVariableSelection(value string, start, end int, editing queryVariableToken) (int, int, bool) {
+	if start > end {
+		start, end = end, start
+	}
+	nextStart, nextEnd := start, end
+	changed := false
+	for _, token := range queryVariableAtomicTokens(value, editing) {
+		if start < token.end && end > token.start {
+			if token.start < nextStart {
+				nextStart = token.start
+				changed = true
+			}
+			if token.end > nextEnd {
+				nextEnd = token.end
+				changed = true
+			}
+		}
+	}
+	return nextStart, nextEnd, changed
+}
+
+// snapQueryVariableCaret moves a caret that landed inside a placeholder to the nearer edge.
+func snapQueryVariableCaret(value string, caret int, editing queryVariableToken) (int, bool) {
+	token, ok := queryVariableTokenContaining(value, caret, editing)
+	if !ok {
+		return caret, false
+	}
+	if caret-token.start <= token.end-caret {
+		return token.start, true
+	}
+	return token.end, true
+}
+
+func applyQueryVariableSelection(editor *woxwidget.TextEditingController, anchor, focus int) {
+	if editor == nil {
+		return
+	}
+	if anchor == focus {
+		editor.SetCaret(focus)
+		return
+	}
+	editor.SetSelection(anchor, focus)
+}
+
+// queryVariableTriggerStart finds an unfinished { insert. Editing inside a closed placeholder is not an insert.
+func queryVariableTriggerStart(value string, caret int) int {
+	if _, inside := queryVariableCompleteTokenContaining(value, caret); inside {
+		return -1
+	}
+	runes := []rune(value)
+	caret = max(0, min(caret, len(runes)))
+	runes = runes[:caret]
+	for index := len(runes) - 1; index >= 0; index-- {
+		if runes[index] != '{' {
+			continue
+		}
+		for _, current := range runes[index+1:] {
+			if current == '}' || unicode.IsSpace(current) {
+				return -1
+			}
+		}
+		return index
+	}
+	return -1
+}
+
+// queryVariableCompleteTokenContaining reports a closed {wox:...} placeholder under the caret.
+func queryVariableCompleteTokenContaining(value string, caret int) (queryVariableToken, bool) {
+	for _, token := range queryVariableTokens(value) {
+		if token.start < caret && caret < token.end {
+			return token, true
+		}
+	}
+	return queryVariableToken{}, false
+}
+
+// formTableColumnIsTextList reports newline-separated list columns, including query-variable lists.
+func formTableColumnIsTextList(columnType string) bool {
+	return columnType == "textList" || columnType == "queryVariableList"
+}
+
+// formTableQueryVariableKind maps a field onto the placeholder set it can insert.
+func formTableQueryVariableKind(definition formDefinition) string {
+	if definition.Value.QueryVariableKind != "" {
+		return definition.Value.QueryVariableKind
+	}
+	if kind := formTableQueryVariableKindFromColumnType(definition.Value.ColumnType); kind != "" {
+		return kind
+	}
+	switch definition.Value.Tooltip {
+	case "i18n:ui_query_hotkeys_query_tooltip":
+		return formTableQueryVariableKindQueryHotkey
+	case "i18n:plugin_ai_command_prompt_tooltip":
+		return formTableQueryVariableKindAICommand
+	case "i18n:plugin_dictation_action_prompt_tooltip":
+		return formTableQueryVariableKindDictation
+	case "i18n:plugin_websearch_title_tooltip", "i18n:plugin_websearch_urls_tooltip":
+		return formTableQueryVariableKindWebSearch
+	}
+	return ""
+}
+
+// formTableQueryVariableKindFromColumnType maps a table column type onto its placeholder set.
+func formTableQueryVariableKindFromColumnType(columnType string) string {
+	switch columnType {
+	case "queryHotkeyQuery":
+		return formTableQueryVariableKindQueryHotkey
+	case "aiCommandPrompt":
+		return formTableQueryVariableKindAICommand
+	case "dictationPrompt":
+		return formTableQueryVariableKindDictation
+	}
+	return ""
+}
+
+// formTableQueryVariableKindForField resolves a row field's placeholder set, including query-hotkey fallbacks used by tests.
+func formTableQueryVariableKindForField(state *formTableEditorState, index int) string {
+	if state == nil || state.rowForm == nil || index < 0 || index >= len(state.rowForm.definitions) {
+		return ""
+	}
+	definition := state.rowForm.definitions[index]
+	if kind := formTableQueryVariableKind(definition); kind != "" {
+		return kind
+	}
+	for _, column := range state.definition.Value.Columns {
+		if column.Key == definition.Value.Key {
+			if column.QueryVariableKind != "" {
+				return column.QueryVariableKind
+			}
+			if kind := formTableQueryVariableKindFromColumnType(column.Type); kind != "" {
+				return kind
+			}
+			break
+		}
+	}
+	if state.definition.Value.Key == "QueryHotkeys" && definition.Value.Key == "Query" {
+		return formTableQueryVariableKindQueryHotkey
+	}
+	return ""
+}
+
+// formTableQueryVariables returns the placeholders offered by one variable-capable field kind.
+func formTableQueryVariables(kind string) []queryHotkeyVariable {
+	switch kind {
+	case formTableQueryVariableKindAICommand:
+		return aiCommandPromptVariables
+	case formTableQueryVariableKindDictation:
+		return dictationPromptVariables
+	case formTableQueryVariableKindWebSearch:
+		return webSearchQueryVariables
+	default:
+		return queryHotkeyVariables
+	}
+}
+
+func (c *formTableController) updateFormTableQueryVariableTrigger(index int) {
+	state := c.activeFormTableEditor()
+	if state == nil || state.rowForm == nil || state.rowForm.editor == nil || formTableQueryVariableKindForField(state, index) == "" {
+		return
+	}
+	editorState := state.rowForm.editor.State()
+	start := queryVariableTriggerStart(editorState.Text, editorState.Selection.Focus)
+	if start < 0 {
+		state.queryVariable = nil
+		return
+	}
+	anchor := woxui.Rect{}
+	if state.queryVariable != nil && state.queryVariable.fieldIndex == index {
+		anchor = state.queryVariable.anchor
+	} else {
+		host := c.formTableHost()
+		if host != nil {
+			anchor, _ = host.BoundsForKey(woxwidget.Key(fmt.Sprintf("form-table-row-field-%d", index)))
+		}
+	}
+	state.queryVariable = &formTableQueryVariablePickerState{fieldIndex: index, anchor: anchor, triggerStart: start}
+}
+
+func (c *formTableController) filteredQueryHotkeyVariables(kind, query string) []queryHotkeyVariable {
+	options := formTableQueryVariables(kind)
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return options
+	}
+	filtered := make([]queryHotkeyVariable, 0, len(options))
+	for _, option := range options {
+		searchable := option.value + " " + c.language.translate(option.label)
+		if strings.Contains(strings.ToLower(searchable), query) {
+			filtered = append(filtered, option)
+		}
+	}
+	if len(filtered) == 0 {
+		return options
+	}
+	return filtered
+}
+
+func (c *formTableController) openFormTableQueryVariablePicker(index int, anchor woxui.Rect) {
+	state := c.activeFormTableEditor()
+	if state == nil || state.rowForm == nil || formTableQueryVariableKindForField(state, index) == "" {
+		return
+	}
+	if state.rowForm.focused != index || state.rowForm.editor == nil {
+		setFormFieldsFocusLocked(state.rowForm, index)
+	}
+	state.appPicker = nil
+	state.choicePicker = nil
+	state.status = ""
+	host := c.formTableHost()
+	if host != nil {
+		if bounds, ok := host.BoundsForKey(woxwidget.Key(fmt.Sprintf("form-table-row-field-%d-trailing", index))); ok {
+			anchor = bounds
+		}
+		host.RequestFocus(woxwidget.Key(fmt.Sprintf("form-table-row-field-%d", index)))
+	}
+	state.queryVariable = &formTableQueryVariablePickerState{fieldIndex: index, anchor: anchor, triggerStart: -1}
+	c.updateFormTableTextInput(true)
+	c.invalidateFormTableWindow()
+}
+
+func (c *formTableController) closeFormTableQueryVariablePicker() {
+	state := c.activeFormTableEditor()
+	if state != nil {
+		state.queryVariable = nil
+	}
+	c.updateFormTableTextInput(state != nil && state.rowForm != nil && state.rowForm.editor != nil)
+	c.invalidateFormTableWindow()
+}
+
+func (c *formTableController) chooseFormTableQueryVariable(index int) {
+	state := c.activeFormTableEditor()
+	if state == nil || state.rowForm == nil || state.queryVariable == nil {
+		return
+	}
+	picker := state.queryVariable
+	options := c.filteredQueryHotkeyVariables(formTableQueryVariableKindForField(state, picker.fieldIndex), snapshotFormTableEditorLocked(state).queryVariable.query)
+	if index < 0 || index >= len(options) || picker.fieldIndex < 0 || picker.fieldIndex >= len(state.rowForm.definitions) {
+		return
+	}
+	if state.rowForm.focused != picker.fieldIndex || state.rowForm.editor == nil {
+		setFormFieldsFocusLocked(state.rowForm, picker.fieldIndex)
+	}
+	editor := state.rowForm.editor
+	selection := editor.State().Selection
+	start, end := selection.Start(), selection.End()
+	if picker.triggerStart >= 0 {
+		start = picker.triggerStart
+		end = selection.Focus
+	}
+	runes := []rune(editor.State().Text)
+	start = max(0, min(start, len(runes)))
+	end = max(start, min(end, len(runes)))
+	inserted := []rune(options[index].value)
+	next := append(append(append([]rune{}, runes[:start]...), inserted...), runes[end:]...)
+	editor.SetText(string(next), false)
+	token := queryVariableToken{start: start, end: start + len(inserted)}
+	if nameStart, nameEnd, ok := queryVariableParameterNameRange(string(next), token); ok {
+		state.queryVariableEdit = token
+		editor.SetSelection(nameStart, nameEnd)
+	} else {
+		state.queryVariableEdit = queryVariableToken{}
+		editor.SetCaret(start + len(inserted))
+	}
+	syncFormFieldsEditorLocked(state.rowForm)
+	state.queryVariable = nil
+	state.status = ""
+	c.updateFormTableTextInput(true)
+	c.invalidateFormTableWindow()
+}
+
+func (c *formTableController) moveFormTableQueryVariableSelection(delta int) {
+	state := c.activeFormTableEditor()
+	if state == nil || state.queryVariable == nil {
+		return
+	}
+	snapshot := snapshotFormTableEditorLocked(state).queryVariable
+	count := len(c.filteredQueryHotkeyVariables(snapshot.kind, snapshot.query))
+	if count > 0 {
+		state.queryVariable.selected = (state.queryVariable.selected + delta + count) % count
+	}
+	c.invalidateFormTableWindow()
+}
+
+// pickFormTableRowImage stores an uploaded image in the same portable WoxImage shape used by Flutter.
+func (c *formTableController) pickFormTableRowImage(index int) {
+	state := c.activeFormTableEditor()
+	if state == nil || state.rowForm == nil || index < 0 || index >= len(state.rowForm.definitions) || state.rowForm.definitions[index].Type != "woxImage" {
+		return
+	}
+	rowForm := state.rowForm
+
+	c.updateFormTableTextInput(false)
+	path, err := c.formTableNativeWindow().PickFile(woxui.FileDialogOptions{})
+	var image woxImage
+	if err == nil && path != "" {
+		var data []byte
+		data, err = os.ReadFile(path)
+		if err == nil {
+			if strings.EqualFold(filepath.Ext(path), ".svg") {
+				image = woxImage{ImageType: "svg", ImageData: string(data)}
+			} else {
+				mediaType := mime.TypeByExtension(filepath.Ext(path))
+				if mediaType == "" {
+					mediaType = "application/octet-stream"
+				}
+				image = woxImage{ImageType: "base64", ImageData: "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(data)}
+			}
+		}
+	}
+
+	if c.activeFormTableEditor() != state || state.rowForm != rowForm {
+		return
+	}
+	if err != nil {
+		state.status = err.Error()
+	} else if path != "" {
+		encoded, encodeErr := json.Marshal(image)
+		if encodeErr != nil {
+			state.status = encodeErr.Error()
+		} else {
+			rowForm.values[rowForm.definitions[index].Value.Key] = string(encoded)
+			state.status = ""
+		}
+	}
+	c.updateFormTableTextInput(false)
+	c.invalidateFormTableWindow()
+}
+
+// pickFormTableRowDirectory uses the platform window adapter while keeping the selected path in the shared row form.
+func (c *formTableController) pickFormTableRowDirectory(index int) {
+	state := c.activeFormTableEditor()
+	if state == nil || state.rowForm == nil || index < 0 || index >= len(state.rowForm.definitions) || state.rowForm.definitions[index].Type != "dirPath" {
+		return
+	}
+	rowForm := state.rowForm
+	c.updateFormTableTextInput(false)
+	path, err := c.formTableNativeWindow().PickFile(woxui.FileDialogOptions{Directory: true})
+	if c.activeFormTableEditor() != state || state.rowForm != rowForm {
+		return
+	}
+	if err != nil {
+		state.status = err.Error()
+	} else if path != "" {
+		setFormFieldsFocusLocked(rowForm, index)
+		rowForm.editor.SetText(path, false)
+		syncFormFieldsEditorLocked(rowForm)
+		state.status = ""
+	}
+	textInput := rowForm.editor != nil
+	c.updateFormTableTextInput(textInput)
+	c.invalidateFormTableWindow()
+}
+
+// onFormTableKey gives the modal table editor first refusal before launcher or settings navigation.
+func (c *formTableController) onFormTableKey(event woxui.KeyEvent) bool {
+	state := c.activeFormTableEditor()
+	if state == nil || !c.targetCurrent(state.target) {
+		return false
+	}
+	rowForm := state.rowForm
+	focused := -1
+	fieldType := ""
+	if rowForm != nil {
+		focused = rowForm.focused
+		if focused >= 0 && focused < len(rowForm.definitions) {
+			fieldType = rowForm.definitions[focused].Type
+		}
+	}
+	if !event.Down {
+		return false
+	}
+	if queryVariable := state.queryVariable; queryVariable != nil {
+		switch event.Key {
+		case woxui.KeyEscape:
+			c.closeFormTableQueryVariablePicker()
+			return true
+		case woxui.KeyArrowUp:
+			c.moveFormTableQueryVariableSelection(-1)
+			return true
+		case woxui.KeyArrowDown:
+			c.moveFormTableQueryVariableSelection(1)
+			return true
+		case woxui.KeyEnter, woxui.KeyTab:
+			c.chooseFormTableQueryVariable(queryVariable.selected)
+			return true
+		}
+	}
+	if event.Composing {
+		return false
+	}
+	if state.favicon != nil {
+		if event.Key == woxui.KeyEscape {
+			c.closeFormTableFavicon()
+			return true
+		}
+		return false
+	}
+
+	if state.skillAdd != nil {
+		// The add-skill dialog owns Enter and Escape; printable keys continue into
+		// the focused text field for normal editing.
+		if event.Down {
+			switch event.Key {
+			case woxui.KeyEscape:
+				c.cancelFormTableSkillAdd()
+				return true
+			case woxui.KeyEnter:
+				c.addFormTableSkill()
+				return true
+			}
+		}
+		return false
+	}
+	if state.mcpJSONImport != nil {
+		if event.Down && event.Key == woxui.KeyEscape {
+			c.cancelFormTableMCPJSONImport()
+			return true
+		}
+		return false
+	}
+	if editor := state.windowGroupEditor; editor != nil {
+		if event.Key == woxui.KeyEscape {
+			if editor.appPickerSlot != "" {
+				c.closeWindowManagerGroupAppPicker()
+			} else if editor.urlEditorSlot != "" {
+				c.cancelWindowManagerGroupUrlEditor()
+			} else {
+				c.cancelWindowManagerGroupEdit()
+			}
+			return true
+		}
+		// The retained dialog controls own navigation and editing. Returning false for
+		// printable keys lets the native window continue into its text input client.
+		return false
+	}
+	selected := state.selected
+	saving := state.saving
+	appPicker := state.appPicker
+	choicePicker := state.choicePicker
+	multiline := false
+	textEditable := false
+	if rowForm != nil {
+		if focused >= 0 && focused < len(rowForm.definitions) {
+			multiline = fieldType == "textbox" && rowForm.definitions[focused].Value.MaxLines > 1
+			textEditable = formDefinitionTextEditable(rowForm.definitions[focused])
+		}
+	}
+	if state.deletePending >= 0 {
+		if event.Down {
+			switch event.Key {
+			case woxui.KeyEscape:
+				c.cancelFormTableRowDelete()
+			case woxui.KeyEnter:
+				c.confirmFormTableRowDelete()
+			}
+		}
+		return true
+	}
+	if choicePicker != nil {
+		if event.Key == woxui.KeyEscape {
+			c.closeFormTableChoicePicker()
+			return true
+		}
+		// Printable keys must reach the native search field while a filterable dropdown is open.
+		return !formTableChoicePickerFilterable(state)
+	}
+	if state.emojiPicker != nil {
+		if event.Key == woxui.KeyEscape {
+			c.closeFormTableEmojiPicker()
+			return true
+		}
+		// Printable keys must continue into the focused search field's native text input client.
+		return false
+	}
+	if appPicker != nil {
+		if event.Key == woxui.KeyEscape {
+			c.closeFormTableAppPicker()
+			return true
+		}
+		return false
+	}
+	if event.Key == woxui.KeyEscape {
+		if rowForm != nil {
+			c.cancelFormTableRowEdit()
+		} else {
+			c.closeFormTableEditor()
+		}
+		return true
+	}
+	if saving {
+		return true
+	}
+	if rowForm == nil {
+		switch event.Key {
+		case woxui.KeyArrowUp:
+			c.moveFormTableSelection(-1)
+		case woxui.KeyArrowDown:
+			c.moveFormTableSelection(1)
+		case woxui.KeyEnter:
+			if selected >= 0 {
+				c.beginEditFormTableRow()
+			} else {
+				c.beginAddFormTableRow()
+			}
+		case woxui.KeyDelete:
+			c.deleteFormTableRow()
+		default:
+			if event.Modifiers.HasPrimary() && event.Key == woxui.Key("n") {
+				c.beginAddFormTableRow()
+			} else {
+				return true
+			}
+		}
+		return true
+	}
+	if event.Modifiers.HasPrimary() && (event.Key == woxui.KeyEnter || event.Key == woxui.Key("s")) {
+		c.saveFormTableRowEdit()
+		return true
+	}
+	if fieldType == "hotkey" || fieldType == "dictationHotkey" {
+		return false
+	}
+	if textEditable {
+		if formTableQueryVariableKindForField(state, focused) != "" && c.handleFormTableQueryVariableEditorKey(event) {
+			return true
+		}
+		switch event.Key {
+		case woxui.KeyArrowDown:
+			if !multiline {
+				c.moveFormTableRowFocus(1)
+				return true
+			}
+		case woxui.KeyArrowUp:
+			if !multiline {
+				c.moveFormTableRowFocus(-1)
+				return true
+			}
+		case woxui.KeyEnter:
+			return !multiline
+		}
+		return false
+	}
+	if event.Key == woxui.KeyTab && event.Modifiers & ^woxui.KeyModifierShift == 0 {
+		return false
+	}
+	switch event.Key {
+	case woxui.KeyArrowDown:
+		if multiline {
+			c.editFormTableRowKey(event)
+			break
+		}
+		c.moveFormTableRowFocus(1)
+	case woxui.KeyArrowUp:
+		if multiline {
+			c.editFormTableRowKey(event)
+		} else {
+			c.moveFormTableRowFocus(-1)
+		}
+	case woxui.KeyArrowLeft:
+		if fieldType == "select" || fieldType == "selectAIModel" {
+			c.changeFormTableRowChoice(focused, -1)
+		} else {
+			c.editFormTableRowKey(event)
+		}
+	case woxui.KeyArrowRight:
+		if fieldType == "select" || fieldType == "selectAIModel" {
+			c.changeFormTableRowChoice(focused, 1)
+		} else {
+			c.editFormTableRowKey(event)
+		}
+	case woxui.KeySpace, woxui.KeyEnter:
+		if event.Key == woxui.KeyEnter && multiline {
+			c.editFormTableRowKey(event)
+		} else if fieldType == "hotkey" {
+			c.recordFormTableRowHotkey(focused)
+		} else if fieldType == "app" {
+			c.openFormTableAppPicker(focused)
+		} else if fieldType == "select" || fieldType == "selectAIModel" {
+			c.openFocusedFormTableRowChoice(focused)
+		} else if fieldType == "checkbox" {
+			c.changeFormTableRowChoice(focused, 1)
+		}
+	default:
+		c.editFormTableRowKey(event)
+	}
+	return true
+}
+
+func (c *formTableController) onFormTableTextInput(_ woxui.TextInputEvent) bool {
+	state := c.activeFormTableEditor()
+	if state == nil || !c.targetCurrent(state.target) {
+		return false
+	}
+	return state.favicon == nil && state.appPicker == nil && state.emojiPicker == nil && !formTableChoicePickerFilterable(state)
+}

@@ -1,0 +1,58 @@
+package component
+
+import (
+	"testing"
+
+	woxwidget "wox/ui/widget"
+)
+
+func TestSettingFieldUsesSharedTypography(t *testing.T) {
+	field := WoxSettingField(SettingFieldProps{Label: "Font", Description: "Used throughout Wox", Width: 400, LabelWidth: 180}).(woxwidget.Container)
+	label := field.Child.(woxwidget.Flex).Children[0].(woxwidget.Container).Child.(woxwidget.Constrained).Child.(woxwidget.Flex)
+	labelText := label.Children[0].(woxwidget.Text)
+	description := label.Children[1].(woxwidget.TextBlock)
+
+	if labelText.Style.Size != SettingsLabelFontSize || description.Style.Size != SettingsHelpFontSize {
+		t.Fatalf("setting typography = %v/%v, want %v/%v", labelText.Style.Size, description.Style.Size, SettingsLabelFontSize, SettingsHelpFontSize)
+	}
+	if field.Height != 0 || description.Height != 0 || description.MaxLines != 0 {
+		t.Fatalf("setting row height = %.0f, want intrinsic height", field.Height)
+	}
+}
+
+func TestSettingFieldKeepsLabelAccessoryBesideTitle(t *testing.T) {
+	accessory := woxwidget.Text{Value: "i"}
+	field := WoxSettingField(SettingFieldProps{
+		Label: "Plan", Description: "Help", Width: 400, LabelWidth: 180, LabelAccessory: accessory,
+	}).(woxwidget.Container)
+	label := field.Child.(woxwidget.Flex).Children[0].(woxwidget.Container).Child.(woxwidget.Constrained).Child.(woxwidget.Flex)
+	heading := label.Children[0].(woxwidget.Flex)
+	if heading.Gap != 5 || heading.CrossAxisAlignment != woxwidget.CrossAxisCenter {
+		t.Fatalf("label accessory layout = gap %v alignment %v, want gap 5 and centered", heading.Gap, heading.CrossAxisAlignment)
+	}
+	if heading.Children[0].(woxwidget.Text).Value != "Plan" {
+		t.Fatalf("setting title = %q, want Plan", heading.Children[0].(woxwidget.Text).Value)
+	}
+	if heading.Children[1].(woxwidget.Text).Value != "i" {
+		t.Fatal("label accessory was not placed beside the title")
+	}
+	if label.Children[1].(woxwidget.TextBlock).Value != "Help" {
+		t.Fatal("help text should wrap below the title and accessory")
+	}
+}
+
+func TestSettingFieldCanAllocateRemainingWidthToLabel(t *testing.T) {
+	field := WoxSettingField(SettingFieldProps{Label: "Backups", Width: 400, Child: woxwidget.Container{Width: 80}}).(woxwidget.Container)
+	row := field.Child.(woxwidget.Flex)
+	if _, ok := row.Children[0].(woxwidget.Expanded); !ok {
+		t.Fatalf("automatic setting label slot = %T, want Expanded", row.Children[0])
+	}
+}
+
+func TestSettingTextFieldUsesStandardControlGeometry(t *testing.T) {
+	field := WoxSettingTextField(TextFieldProps{ID: "font", Label: "Font", Width: 240}).(woxwidget.Stateful)
+	props := field.Widget.(TextFieldProps)
+	if props.Height != SettingsControlHeight || props.Padding.Top != 6 || props.Padding.Bottom != 6 {
+		t.Fatalf("setting text field geometry = height %.0f padding %+v, want %.0f with 6px vertical padding", props.Height, props.Padding, SettingsControlHeight)
+	}
+}

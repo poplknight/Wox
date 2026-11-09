@@ -1,0 +1,308 @@
+package common
+
+import (
+	"context"
+	"encoding/base64"
+	"image"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+	"wox/util"
+	"wox/util/imagecache"
+)
+
+// TestGridIconDeferredConversionReusesDiskCache verifies cold grids do no raster
+// work and retain full-size output across queries and a cold memory cache.
+func TestGridIconDeferredConversionReusesDiskCache(t *testing.T) {
+	initConvertIconTestLocation(t)
+	ctx := context.Background()
+	source := NewWoxImageAbsolutePath(writeTestImage(t, 256, 256))
+	config := IconConversion{Size: ResultGridIconSize, AllowLazy: true}
+	lazy, err := ConvertPluginIcon(ctx, source, "grid-cache", "", config)
+	if err != nil || lazy.ImageType != WoxImageTypeLazyLoad {
+		t.Fatalf("cold grid conversion = %+v, %v", lazy, err)
+	}
+	payload, err := ParseWoxLazyLoadImagePayload(lazy)
+	if err != nil || payload.Source == nil || *payload.Source != source || payload.TargetSize != 256 {
+		t.Fatalf("lazy source/size lost: %+v, %v", payload, err)
+	}
+	files, err := os.ReadDir(payload.CacheScope)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if len(files) != 0 {
+		t.Fatal("cold query generated offscreen icon artifacts")
+	}
+	resolved, err := ConvertPluginIcon(ctx, source, "grid-cache", "", IconConversion{Size: payload.TargetSize, CacheScope: payload.CacheScope})
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(resolved.ImageData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dimensions, _, err := image.DecodeConfig(file)
+	file.Close()
+	if err != nil || dimensions.Width != 256 || dimensions.Height != 256 {
+		t.Fatalf("grid resolution degraded: %+v, %v", dimensions, err)
+	}
+	// Remove the source to prove reuse does not decode it again, even after
+	// forgetting positive path lookups as happens on process restart.
+	if err := os.Remove(source.ImageData); err != nil {
+		t.Fatal(err)
+	}
+	for _, coldMemory := range []bool{false, true} {
+		if coldMemory {
+			ClearConvertIconPathExistenceCache()
+		}
+		warm, err := ConvertPluginIcon(ctx, source, "grid-cache", "", config)
+		if err != nil || warm != resolved {
+			t.Fatalf("warm grid did not reuse disk artifact: %+v, %v", warm, err)
+		}
+	}
+}
+
+// TestGridFileIconDefersOSExtraction ensures missing paths cannot trigger shell
+// fallback or raster work before a visible cell requests its icon.
+func TestGridFileIconDefersOSExtraction(t *testing.T) {
+	initConvertIconTestLocation(t)
+	source := NewWoxImageFileIcon(filepath.Join(t.TempDir(), "missing.exe"))
+	icon, err := ConvertPluginIcon(context.Background(), source, "grid-file", "", IconConversion{Size: ResultGridIconSize, AllowLazy: true})
+	if err != nil || icon.ImageType != WoxImageTypeLazyLoad {
+		t.Fatalf("file icon was synchronously extracted: %+v, %v", icon, err)
+	}
+	payload, err := ParseWoxLazyLoadImagePayload(icon)
+	if err != nil || payload.Source == nil || *payload.Source != source || payload.TargetSize != ResultGridIconSize || payload.CacheScope == "" {
+		t.Fatalf("deferred file source lost: %+v, %v", payload, err)
+	}
+}
+
+func TestPluginImageCacheIsolationAndReload(t *testing.T) {
+	initConvertIconTestLocation(t)
+	ctx := context.Background()
+	pngPath := writeTestImage(t, 64, 64)
+	pngBytes, err := os.ReadFile(pngPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A root-level SVG and a GetCacheFolder source must work without asset scanning.
+	pluginFiles, err := util.GetLocation().EnsurePluginCacheDirectory("first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	svgPath := filepath.Join(pluginFiles, "status.svg")
+	if err := os.WriteFile(svgPath, []byte(`<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><path fill="red" d="M0 0h16v16H0z"/></svg>`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	sources := []WoxImage{
+		NewWoxImageAbsolutePath(pngPath),
+		NewWoxImageBase64("data:image/png;base64," + base64.StdEncoding.EncodeToString(pngBytes)),
+		NewWoxImageAbsolutePath(svgPath),
+		NewWoxImageAbsolutePath(writeTestGIF(t)),
+	}
+	sharedDirectory := t.TempDir()
+	for _, source := range sources {
+		t.Run(source.ImageType+filepath.Ext(source.ImageData), func(t *testing.T) {
+			hash := source.Hash()
+			first, err := ConvertPluginIcon(ctx, source, "first", sharedDirectory, IconConversion{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			second, err := ConvertPluginIcon(ctx, source, "second", sharedDirectory, IconConversion{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if first.ImageData == second.ImageData {
+				t.Fatal("plugins must not share artifacts")
+			}
+			if err := ClearPluginImageCache("first"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(first.ImageData); !os.IsNotExist(err) {
+				t.Fatalf("old artifact survived: %v", err)
+			}
+			if imagecache.IsKnownExistingDerivedPath(first.ImageData) {
+				t.Fatal("positive path cache survived deletion")
+			}
+			if _, err := os.Stat(second.ImageData); err != nil {
+				t.Fatalf("sibling artifact lost: %v", err)
+			}
+			if _, err := os.Stat(svgPath); err != nil {
+				t.Fatalf("GetCacheFolder source lost: %v", err)
+			}
+			fresh, err := ConvertPluginIcon(ctx, source, "first", sharedDirectory, IconConversion{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fresh.ImageData == first.ImageData {
+				t.Fatal("UI would reuse the old image key")
+			}
+			if _, err := os.Stat(fresh.ImageData); err != nil {
+				t.Fatal(err)
+			}
+			if source.Hash() != hash {
+				t.Fatal("cache lifecycle changed image identity")
+			}
+		})
+	}
+	updated := []byte(`<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><path fill="blue" d="M0 0h16v16H0z"/></svg>`)
+	if err := os.WriteFile(svgPath, updated, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ClearPluginImageCache("first"); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := ConvertPluginIcon(ctx, NewWoxImageAbsolutePath(svgPath), "first", "", IconConversion{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(fresh.ImageData)
+	if err != nil || string(got) != string(updated) {
+		t.Fatalf("SVG bytes were not refreshed: %s, %v", got, err)
+	}
+}
+
+func TestPluginImageCacheRemoteAndStaleLazyRequest(t *testing.T) {
+	initConvertIconTestLocation(t)
+	ctx := context.Background()
+	data, err := os.ReadFile(writeTestImage(t, 64, 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		_, _ = w.Write(data)
+	}))
+	defer server.Close()
+	source := NewWoxImageUrl(server.URL + "/icon.png")
+	config := IconConversion{AllowLazy: true}
+	lazy, err := ConvertPluginIcon(ctx, source, "remote", "", config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := ParseWoxLazyLoadImagePayload(lazy)
+	if err != nil || payload.Source == nil {
+		t.Fatalf("lazy payload: %v", err)
+	}
+	if requests.Load() != 0 {
+		t.Fatal("lazy conversion fetched the URL eagerly")
+	}
+	candidate := NewWoxImageLazyLoadCandidate(source, ResultListIconSize)
+	owned, err := ConvertPluginIcon(ctx, candidate, "remote", "", config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownedPayload, err := ParseWoxLazyLoadImagePayload(owned)
+	if err != nil || ownedPayload.CacheScope != payload.CacheScope {
+		t.Fatalf("existing lazy candidate lost ownership: %+v, %v", ownedPayload, err)
+	}
+
+	config.AllowLazy = false
+	warm, err := ConvertPluginIcon(ctx, source, "remote", "", config)
+	if err != nil || warm.ImageType != WoxImageTypeAbsolutePath {
+		t.Fatalf("warm: %+v", warm)
+	}
+	if err := ClearPluginImageCache("remote"); err != nil {
+		t.Fatal(err)
+	}
+	config.CacheScope = payload.CacheScope
+	if _, err := ConvertPluginIcon(ctx, source, "remote", "", config); err == nil {
+		t.Fatal("stale lazy request was accepted")
+	}
+	if requests.Load() != 1 {
+		t.Fatal("stale lazy request downloaded an image")
+	}
+	// Simulate restart: memory generations disappear, but removed disk files cannot return.
+	root, _, err := pluginImageCacheFor("remote")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pluginImageCaches.Delete(root)
+	ClearConvertIconPathExistenceCache()
+	config.CacheScope = ""
+	fresh, err := ConvertPluginIcon(ctx, source, "remote", "", config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(fresh.ImageData); err != nil {
+		t.Fatal(err)
+	}
+	if fresh.ImageData == "" {
+		t.Fatal("restart returned an empty artifact")
+	}
+	if _, err := os.Stat(fresh.ImageData); err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("raw download was not reused after the resized artifact was cleared, requests=%d", requests.Load())
+	}
+}
+
+func TestPluginImageCacheRemoteDownloadsRunTogether(t *testing.T) {
+	initConvertIconTestLocation(t)
+	ctx := context.Background()
+	data, err := os.ReadFile(writeTestImage(t, 32, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := inFlight.Add(1)
+		for {
+			seen := maxInFlight.Load()
+			if current <= seen || maxInFlight.CompareAndSwap(seen, current) {
+				break
+			}
+		}
+		defer inFlight.Add(-1)
+		<-release
+		_, _ = w.Write(data)
+	}))
+	defer server.Close()
+
+	const icons = 4
+	var started sync.WaitGroup
+	started.Add(icons)
+	errs := make(chan error, icons)
+	for index := 0; index < icons; index++ {
+		source := NewWoxImageUrl(server.URL + "/icon-" + strconv.Itoa(index) + ".png")
+		go func() {
+			started.Done()
+			_, err := ConvertPluginIcon(ctx, source, "remote-grid", "", IconConversion{})
+			errs <- err
+		}()
+	}
+	started.Wait()
+	deadline := time.After(2 * time.Second)
+	for maxInFlight.Load() < icons {
+		select {
+		case <-deadline:
+			close(release)
+			t.Fatalf("remote downloads overlapped %d/%d", maxInFlight.Load(), icons)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	close(release)
+	for index := 0; index < icons; index++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestPluginImageCacheRejectsUnsafeOwner(t *testing.T) {
+	initConvertIconTestLocation(t)
+	err := ClearPluginImageCache("../other")
+	if err == nil {
+		t.Fatal("unsafe plugin ID accepted")
+	}
+}

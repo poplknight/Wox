@@ -1,0 +1,203 @@
+package automationdriver
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"wox/ui/automation"
+)
+
+// LaunchOptions configures one isolated Wox automation process.
+type LaunchOptions struct {
+	Args           []string
+	Environment    []string
+	StartupTimeout time.Duration
+}
+
+// Process owns a Wox automation process and its driver client.
+type Process struct {
+	Client *Client
+
+	command  *exec.Cmd
+	infoFile string
+	done     chan struct{}
+	waitErr  error
+	close    sync.Once
+}
+
+// InfoFile returns the endpoint metadata file shared with smoke test clients.
+func (p *Process) InfoFile() string {
+	if p == nil {
+		return ""
+	}
+	return p.infoFile
+}
+
+// Launch starts a wox_automation binary and waits for authenticated endpoint metadata.
+func Launch(ctx context.Context, executable string, options LaunchOptions) (*Process, error) {
+	if strings.TrimSpace(executable) == "" {
+		return nil, fmt.Errorf("automation executable is required")
+	}
+	startupTimeout := options.StartupTimeout
+	if startupTimeout <= 0 {
+		startupTimeout = 30 * time.Second
+	}
+	infoDirectory, err := os.MkdirTemp("", "wox-automation-")
+	if err != nil {
+		return nil, err
+	}
+	infoFile := filepath.Join(infoDirectory, "endpoint.json")
+	token, err := processToken()
+	if err != nil {
+		_ = os.RemoveAll(infoDirectory)
+		return nil, err
+	}
+
+	command := exec.CommandContext(ctx, executable, options.Args...)
+	command.Env = mergeEnvironment(os.Environ(), append(options.Environment,
+		"WOX_AUTOMATION_TOKEN="+token,
+		"WOX_AUTOMATION_INFO_FILE="+infoFile,
+	))
+	command.Stdout = os.Stderr
+	command.Stderr = os.Stderr
+	configureProcess(command)
+	if err := command.Start(); err != nil {
+		_ = os.RemoveAll(infoDirectory)
+		return nil, fmt.Errorf("start Wox automation process: %w", err)
+	}
+
+	process := &Process{command: command, infoFile: infoFile, done: make(chan struct{})}
+	go func() {
+		process.waitErr = command.Wait()
+		close(process.done)
+	}()
+	startupCtx, cancel := context.WithTimeout(ctx, startupTimeout)
+	defer cancel()
+	infoResult := make(chan struct {
+		info automation.Info
+		err  error
+	}, 1)
+	go func() {
+		info, readErr := ReadInfo(startupCtx, infoFile)
+		infoResult <- struct {
+			info automation.Info
+			err  error
+		}{info: info, err: readErr}
+	}()
+	select {
+	case <-process.done:
+		_ = os.RemoveAll(infoDirectory)
+		return nil, fmt.Errorf("Wox exited before automation was ready: %v", process.waitErr)
+	case result := <-infoResult:
+		if result.err != nil {
+			_ = process.Close()
+			return nil, fmt.Errorf("wait for Wox automation endpoint: %w", result.err)
+		}
+		client, clientErr := NewClient(result.info)
+		if clientErr != nil {
+			_ = process.Close()
+			return nil, clientErr
+		}
+		process.Client = client
+		return process, nil
+	}
+}
+
+// ExitState reports how Wox exited, or false while it is still running. A crashed
+// Wox makes every later automation call fail with a connection error that reads
+// like a test bug, so callers report the process exit before the test failure.
+func (p *Process) ExitState() (string, bool) {
+	if p == nil {
+		return "", false
+	}
+	select {
+	case <-p.done:
+	default:
+		return "", false
+	}
+	if p.waitErr == nil {
+		return "exited with status 0", true
+	}
+	// On Windows an unhandled native exception surfaces as the exception code in
+	// the exit status, which is the only signal distinguishing a crash from a kill.
+	return p.waitErr.Error(), true
+}
+
+// Wait blocks until Wox exits or the caller's context is canceled.
+func (p *Process) Wait(ctx context.Context) error {
+	if p == nil {
+		return nil
+	}
+	select {
+	case <-p.done:
+		return p.waitErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Close hides remaining windows, asks the process to quit, then removes endpoint metadata.
+func (p *Process) Close() error {
+	if p == nil {
+		return nil
+	}
+	var closeErr error
+	p.close.Do(func() {
+		select {
+		case <-p.done:
+		default:
+			// Hide Regular-policy windows before killing so macOS Dock can
+			// drop the smoke-binary tile instead of leaving a ghost icon.
+			if p.Client != nil {
+				resetCtx, resetCancel := context.WithTimeout(context.Background(), 3*time.Second)
+				_ = p.Client.Reset(resetCtx)
+				resetCancel()
+			}
+			if p.command != nil && p.command.Process != nil {
+				closeErr = terminateProcess(p.command)
+			}
+		}
+		select {
+		case <-p.done:
+		case <-time.After(5 * time.Second):
+		}
+		_ = os.RemoveAll(filepath.Dir(p.infoFile))
+	})
+	return closeErr
+}
+
+func processToken() (string, error) {
+	value := make([]byte, 32)
+	if _, err := rand.Read(value); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(value), nil
+}
+
+func mergeEnvironment(base, overrides []string) []string {
+	values := map[string]string{}
+	order := []string{}
+	for _, entry := range append(append([]string(nil), base...), overrides...) {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok || key == "" {
+			continue
+		}
+		if _, exists := values[key]; !exists {
+			order = append(order, key)
+		}
+		values[key] = value
+	}
+	result := make([]string, 0, len(order))
+	for _, key := range order {
+		result = append(result, key+"="+values[key])
+	}
+	return result
+}

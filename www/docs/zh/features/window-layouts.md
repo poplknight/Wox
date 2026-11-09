@@ -1,0 +1,49 @@
+---
+title: "窗口布局和工作区恢复"
+description: "从 Wox 吸附窗口，并在 Windows 和 macOS 上保存、恢复多应用工作区布局。"
+---
+
+# 窗口布局和工作区恢复
+
+<ReleaseStamp />
+
+在 Windows 和 macOS 上，窗口管理插件可以吸附当前窗口，也可以恢复已保存的工作区。从 v2.4.9 起，Wox 还在 Linux 的 Hyprland 桌面提供专用窗口命令。
+
+![Wox 窗口布局](/images/guide/plugin_window_manager.png)
+
+## 吸附当前窗口
+
+查询 `window`，再加上布局名：
+
+```text
+window left
+window right-half
+window maximize
+window next-display
+```
+
+常见命令包括二分、四分、三分、最大化、居中、最小化、还原，以及移到上一块或下一块显示器。很多命令也接受 `left`、`左半屏` 这类别名。
+
+## 恢复工作区
+
+工作区布局会记住哪些应用属于哪些显示器槽位。
+
+1. 打开 **设置 -> 插件 -> 窗口管理**。
+2. 在 **工作区布局** 中新增一个工作区。
+3. 为每块显示器选择布局，并把应用分配到槽位。
+4. 运行：
+
+```text
+window group
+window group Work
+```
+
+Wox 会把匹配的窗口移到保存的槽位。如果指定应用还没打开，且 Wox 知道它的路径，可以先启动应用，再放置窗口。
+
+如果想一键完成，把快捷键查询绑定到 `window group Work`。当查询只对应一个工作区时，**静默执行** 可以不显示启动器直接应用。见 [快捷键](/zh/guide/usage/hotkeys)。
+
+工作区布局处理的是当前显示器上的普通应用窗口。如果某个应用阻止系统窗口管理，或保存的显示器未连接，Wox 会尽量应用能处理的部分。
+
+## Linux 上的 Hyprland
+
+从 v2.4.9 起，在 Hyprland 桌面中，查询 `window` 可以使用合成器原生操作，例如切换浮动或全屏、交换窗口，以及在工作区或显示器之间移动窗口。用 `window focus-window` 可以查找并聚焦已有窗口。可用操作取决于当前桌面状态。Hyprland 不使用上文的 Windows/macOS 吸附布局或已保存工作区；其他 Linux 桌面环境目前不提供这些窗口管理命令。

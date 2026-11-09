@@ -1,0 +1,1480 @@
+package launcher
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+
+	"wox/plugin"
+	woxcomponent "wox/ui/launcher/component"
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+)
+
+type formTableHostServices struct{}
+
+func (formTableHostServices) MeasureText(string, woxui.TextStyle) (woxui.TextMetrics, error) {
+	return woxui.TextMetrics{}, nil
+}
+func (formTableHostServices) Invalidate() error               { return nil }
+func (formTableHostServices) InvalidateRect(woxui.Rect) error { return nil }
+func (formTableHostServices) SetTextInputState(woxui.TextInputState) error {
+	return nil
+}
+func (formTableHostServices) SetPointerCursor(woxui.PointerCursor) error { return nil }
+func (formTableHostServices) UpdateAccessibility(woxui.AccessibilityTree, woxui.AccessibilityActionHandler) error {
+	return nil
+}
+
+func TestFormTableTabIncludesFooterButtons(t *testing.T) {
+	definition := formDefinition{Type: "table", Value: formDefinitionValue{Key: "Commands"}}
+	form := &formState{formFieldsState: newFormFieldsState([]formDefinition{definition}, map[string]string{"Commands": "[]"}, true)}
+	deps := CommonDeps{}
+	rowForm := newFormFieldsState([]formDefinition{{Type: "checkbox", Value: formDefinitionValue{Key: "Disabled"}}}, nil, true)
+	app := bindTestApp(&App{
+		forms: formActionController{
+			form: form,
+		},
+		formTables:     formTableController{launcherEditor: &formTableEditorState{target: &form.formFieldsState, rowForm: &rowForm, deletePending: -1}},
+		aiSettings:     newAISettingsController(deps),
+		pluginSettings: newPluginSettingsController(deps),
+		hotkeySettings: newHotkeySettingsController(deps),
+	})
+	host := woxwidget.NewHost(func(woxui.FrameInfo) woxwidget.Widget {
+		return woxwidget.Flex{Axis: woxwidget.Vertical, Children: []woxwidget.Widget{
+			woxwidget.Focusable{Key: "form-table-row-field-0", OnKey: app.formTables.onFormTableKey, Child: woxwidget.Container{Width: 100, Height: 30}},
+			woxwidget.Focusable{Key: "form-table-row-cancel", Child: woxwidget.Container{Width: 100, Height: 30}},
+			woxwidget.Focusable{Key: "form-table-row-save", Child: woxwidget.Container{Width: 100, Height: 30}},
+		}}
+	})
+	host.AttachServices(formTableHostServices{})
+	displayList := woxui.DisplayList{}
+	host.Frame(&displayList, woxui.FrameInfo{Size: woxui.Size{Width: 200, Height: 100}, PixelSize: woxui.PixelSize{Width: 200, Height: 100}, Scale: 1})
+	host.RequestFocus("form-table-row-field-0")
+	app.host = host
+
+	if !host.Key(woxui.KeyEvent{Key: woxui.KeyTab, Down: true}) || !host.HasFocus("form-table-row-cancel") {
+		t.Fatal("Tab from the last field should focus Cancel")
+	}
+	if !host.Key(woxui.KeyEvent{Key: woxui.KeyTab, Down: true}) || !host.HasFocus("form-table-row-save") {
+		t.Fatal("Tab from Cancel should focus Save")
+	}
+	if !host.Key(woxui.KeyEvent{Key: woxui.KeyTab, Down: true}) || !host.HasFocus("form-table-row-field-0") {
+		t.Fatal("Tab from Save should wrap to the first field")
+	}
+	if !host.Key(woxui.KeyEvent{Key: woxui.KeyTab, Modifiers: woxui.KeyModifierShift, Down: true}) || !host.HasFocus("form-table-row-save") {
+		t.Fatal("Shift+Tab from the first field should focus Save")
+	}
+}
+
+func TestFormTableWoxImageCellDoesNotRepeatEmojiAsText(t *testing.T) {
+	icon := woxImage{ImageType: "emoji", ImageData: "🤖"}
+	cacheKey := imageKey(icon) + "-svg-24"
+	app := bindTestApp(&App{
+		imageStore: imageStore{
+			images:         map[string]*woxui.Image{cacheKey: {Width: 1, Height: 1}},
+			imageRequested: map[string]string{},
+			imageLastUsed:  map[string]uint64{},
+			imageErrors:    map[string]string{},
+		},
+	})
+
+	cell := app.formTables.formTableViewCell(formTableColumn{Key: "Icon", Type: "woxImage"}, map[string]any{"Icon": icon}, woxcomponent.ControlTheme{}, 1)
+
+	if cell.Icon == nil {
+		t.Fatal("woxImage cell should render its image")
+	}
+	if cell.Text != "" {
+		t.Fatalf("woxImage cell text = %q, want empty so emoji is not rendered twice", cell.Text)
+	}
+	if cell.IconSize != 24 {
+		t.Fatalf("woxImage cell icon size = %v, want Flutter's 24", cell.IconSize)
+	}
+}
+
+func TestFormTableCheckboxCellShowsLocalizedDisabledText(t *testing.T) {
+	app := bindTestApp(&App{language: languageCatalog{translations: map[string]string{"ui_disabled": "Disabled"}}})
+	column := formTableColumn{Key: "Disabled", Type: "checkbox"}
+
+	unchecked := app.formTables.formTableViewCell(column, map[string]any{"Disabled": false}, woxcomponent.ControlTheme{}, 1)
+	if unchecked.Text != "" || unchecked.Icon != nil {
+		t.Fatalf("unchecked cell = %#v, want no text or icon", unchecked)
+	}
+
+	checked := app.formTables.formTableViewCell(column, map[string]any{"Disabled": true}, woxcomponent.ControlTheme{}, 1)
+	if checked.Text != "Disabled" || checked.Icon != nil {
+		t.Fatalf("checked cell = %#v, want localized text without an icon", checked)
+	}
+}
+
+func TestFormTableDisabledColumnBecomesRowStatus(t *testing.T) {
+	app := bindTestApp(&App{
+		language: languageCatalog{
+			translations: map[string]string{
+				"ui_disabled":                      "Disabled",
+				"plugin_dictation_action_disabled": "Disabled",
+			},
+		},
+	})
+	if !formTableIsRowStatusColumn(formTableColumn{Key: "Disabled", Type: "checkbox"}) {
+		t.Fatal("Disabled checkbox should be a row status")
+	}
+	if !formTableIsRowStatusColumn(formTableColumn{Key: "disabled", Type: "checkbox"}) {
+		t.Fatal("disabled checkbox should be a row status")
+	}
+	if formTableIsRowStatusColumn(formTableColumn{Key: "KeepInBackground", Type: "checkbox"}) {
+		t.Fatal("KeepInBackground must not become a hidden row-status column")
+	}
+	if formTableIsRowStatusColumn(formTableColumn{Key: "Disabled", Type: "text"}) {
+		t.Fatal("non-checkbox Disabled fields are not row status")
+	}
+
+	definition := formDefinition{Value: formDefinitionValue{Key: "QueryHotkeys", Columns: []formTableColumn{
+		{Key: "Name", Type: "text", Label: "Name"},
+		{Key: "Disabled", Type: "checkbox", Label: "i18n:ui_disabled"},
+	}}}
+	rows := app.formTables.formTableViewRows(definition, []formTableColumn{{Key: "Name", Type: "text"}}, []map[string]any{
+		{"Name": "Clipboard", "Disabled": false},
+		{"Name": "Chat", "Disabled": true},
+	}, woxcomponent.ControlTheme{}, 1)
+	if len(rows) != 2 || rows[0].Status != "" || rows[1].Status != "Disabled" {
+		t.Fatalf("row status = %#v, want only the disabled row labeled", rows)
+	}
+	if rows[1].Cells[0].SearchText != "Chat Disabled" {
+		t.Fatalf("search text = %q, want the status included", rows[1].Cells[0].SearchText)
+	}
+}
+
+func TestFormTableMultilineFieldUsesRowFormEditingController(t *testing.T) {
+	definition := formDefinition{Type: "textbox", Value: formDefinitionValue{Key: "InjectCss", Label: "Inject CSS", MaxLines: 12}}
+	fields := newFormFieldsState([]formDefinition{definition}, map[string]string{"InjectCss": "header {\n  display: none;\n}"}, true)
+	snapshot := snapshotFormFieldsLocked(&fields)
+	app := bindTestApp(&App{})
+
+	row := app.formTables.buildFormTableRowField(snapshot, formFieldCallbacks{}, settingsPalette(), 0, definition, 600, 120, "")
+	rowContainer := row.(woxwidget.Container)
+	columns := rowContainer.Child.(woxwidget.Flex)
+	rightColumn := columns.Children[1].(woxwidget.Flex)
+	field := rightColumn.Children[0].(woxwidget.Stateful).Widget.(woxcomponent.TextFieldProps)
+
+	if snapshot.editor == nil || field.Controller != snapshot.editor || field.Controller != fields.editor {
+		t.Fatal("focused multiline table field must share the row form editing controller")
+	}
+	field.Controller.SelectAll()
+	selection := fields.editor.State().Selection
+	if selection.Anchor != 0 || selection.Focus != len([]rune(fields.values["InjectCss"])) {
+		t.Fatalf("shared Ctrl+A selection = %#v, want complete InjectCss value", selection)
+	}
+
+	field.Controller.SetCaret(len([]rune(field.Controller.Text())))
+	field.Controller.InsertText("\nfooter { display: none; }")
+	setFormFieldsTextLocked(&fields, 0, field.Controller.Text())
+	if !field.Controller.Undo() {
+		t.Fatal("shared row form controller should retain undo history after value synchronization")
+	}
+	setFormFieldsTextLocked(&fields, 0, field.Controller.Text())
+	if !field.Controller.Redo() {
+		t.Fatal("shared row form controller should retain redo history after undo synchronization")
+	}
+}
+
+func TestFormTableAppPickerLeavesSearchInputToHost(t *testing.T) {
+	definition := formDefinition{Type: "table", Value: formDefinitionValue{Key: "Apps"}}
+	form := &formState{formFieldsState: newFormFieldsState([]formDefinition{definition}, map[string]string{"Apps": "[]"}, true)}
+	deps := CommonDeps{}
+	app := bindTestApp(&App{
+		forms: formActionController{
+			form: form,
+		},
+		formTables:     formTableController{launcherEditor: &formTableEditorState{target: &form.formFieldsState, appPicker: &formTableAppPickerState{}, deletePending: -1}},
+		aiSettings:     newAISettingsController(deps),
+		pluginSettings: newPluginSettingsController(deps),
+		hotkeySettings: newHotkeySettingsController(deps),
+	})
+	key := woxui.KeyEvent{Key: "a", Down: true}
+	if app.formTables.onFormTableKey(key) {
+		t.Fatal("printable keys should reach the picker search field")
+	}
+	if app.formTables.onFormTableTextInput(woxui.TextInputEvent{Kind: woxui.TextInputCommit, Text: "app"}) {
+		t.Fatal("committed text should reach the picker search field")
+	}
+	if !app.formTables.onFormTableKey(woxui.KeyEvent{Key: woxui.KeyEscape, Down: true}) || app.formTables.launcherEditor.appPicker != nil {
+		t.Fatal("Escape should close the app picker")
+	}
+}
+
+func TestFormTableFilterableChoicePickerLeavesSearchInputToHost(t *testing.T) {
+	definition := formDefinition{Type: "table", Value: formDefinitionValue{Key: "AIProviders"}}
+	form := &formState{formFieldsState: newFormFieldsState([]formDefinition{definition}, map[string]string{"AIProviders": "[]"}, true)}
+	rowForm := newFormFieldsState([]formDefinition{
+		{Type: "select", Value: formDefinitionValue{Key: "Name", Filterable: true, Options: []formOption{{Label: "openai", Value: "openai"}}}},
+	}, map[string]string{"Name": "openai"}, true)
+	deps := CommonDeps{}
+	app := bindTestApp(&App{
+		forms: formActionController{
+			form: form,
+		},
+		formTables: formTableController{launcherEditor: &formTableEditorState{
+			target: &form.formFieldsState, rowForm: &rowForm, choicePicker: &formTableChoicePickerState{fieldIndex: 0}, deletePending: -1,
+		}},
+		aiSettings:     newAISettingsController(deps),
+		pluginSettings: newPluginSettingsController(deps),
+		hotkeySettings: newHotkeySettingsController(deps),
+	})
+	key := woxui.KeyEvent{Key: "g", Down: true}
+	if app.formTables.onFormTableKey(key) {
+		t.Fatal("printable keys should reach the provider dropdown search field")
+	}
+	if app.formTables.onFormTableTextInput(woxui.TextInputEvent{Kind: woxui.TextInputCommit, Text: "groq"}) {
+		t.Fatal("committed text should reach the provider dropdown search field")
+	}
+	if !app.formTables.onFormTableKey(woxui.KeyEvent{Key: woxui.KeyEscape, Down: true}) || app.formTables.launcherEditor.choicePicker != nil {
+		t.Fatal("Escape should close the provider dropdown")
+	}
+}
+
+func TestFormTableEmojiPickerLeavesSearchInputToHost(t *testing.T) {
+	definition := formDefinition{Type: "table", Value: formDefinitionValue{Key: "TrayQueries"}}
+	form := &formState{formFieldsState: newFormFieldsState([]formDefinition{definition}, map[string]string{"TrayQueries": "[]"}, true)}
+	deps := CommonDeps{}
+	app := bindTestApp(&App{
+		forms: formActionController{
+			form: form,
+		},
+		formTables:     formTableController{launcherEditor: &formTableEditorState{target: &form.formFieldsState, emojiPicker: &formTableEmojiPickerState{}, deletePending: -1}},
+		aiSettings:     newAISettingsController(deps),
+		pluginSettings: newPluginSettingsController(deps),
+		hotkeySettings: newHotkeySettingsController(deps),
+	})
+	key := woxui.KeyEvent{Key: "a", Down: true}
+	if app.formTables.onFormTableKey(key) {
+		t.Fatal("printable keys should reach the emoji picker search field")
+	}
+	if app.formTables.onFormTableTextInput(woxui.TextInputEvent{Kind: woxui.TextInputCommit, Text: "emoji"}) {
+		t.Fatal("committed text should reach the emoji picker search field")
+	}
+	if !app.formTables.onFormTableKey(woxui.KeyEvent{Key: woxui.KeyEscape, Down: true}) || app.formTables.launcherEditor.emojiPicker != nil {
+		t.Fatal("Escape should close the emoji picker")
+	}
+}
+
+func TestQueryHotkeyPresetsMatchFlutterDefaults(t *testing.T) {
+	fields := newFormFieldsState([]formDefinition{
+		{Type: "textbox", Value: formDefinitionValue{Key: "Name"}},
+		{Type: "textbox", Value: formDefinitionValue{Key: "Width"}},
+	}, map[string]string{"Position": "system_default", "Width": "", "MaxResultCount": ""}, true)
+	app := bindTestApp(&App{
+		formTables: formTableController{launcherEditor: &formTableEditorState{
+			definition: formDefinition{Value: formDefinitionValue{Key: "QueryHotkeys"}}, rowForm: &fields,
+		}},
+	})
+
+	app.formTables.applyQueryHotkeyPreset(string(queryHotkeyPresetWebPanel))
+	if fields.values["Position"] != "center" || fields.values["Width"] != "500" || fields.values["MaxResultCount"] != "12" || fields.values["HideQueryBox"] != "true" || fields.values["HideToolbar"] != "true" || fields.values["HideResults"] != "true" {
+		t.Fatalf("web panel values = %#v", fields.values)
+	}
+	app.formTables.applyQueryHotkeyPreset(string(queryHotkeyPresetNormal))
+	if fields.values["Position"] != "system_default" || fields.values["Width"] != "" || fields.values["MaxResultCount"] != "" || fields.values["HideQueryBox"] != "false" || fields.values["HideToolbar"] != "false" || fields.values["HideResults"] != "false" {
+		t.Fatalf("normal values = %#v", fields.values)
+	}
+}
+
+func TestQueryHotkeyPresetVisibilityMatchesFlutter(t *testing.T) {
+	if !queryHotkeyFieldVisible(queryHotkeyPresetNormal, "Query", false) || queryHotkeyFieldVisible(queryHotkeyPresetNormal, "Width", false) {
+		t.Fatal("normal preset should show core fields only")
+	}
+	if !queryHotkeyFieldVisible(queryHotkeyPresetWebPanel, "Position", false) || queryHotkeyFieldVisible(queryHotkeyPresetWebPanel, "HideToolbar", false) {
+		t.Fatal("preview preset should show display sizing without custom chrome toggles")
+	}
+	if !queryHotkeyFieldVisible(queryHotkeyPresetCustom, "HideResults", false) || !queryHotkeyFieldVisible(queryHotkeyPresetCustom, "HideToolbar", false) || queryHotkeyFieldVisible(queryHotkeyPresetCustom, "Disabled", false) || !queryHotkeyFieldVisible(queryHotkeyPresetCustom, "Disabled", true) {
+		t.Fatal("custom preset should expose chrome fields and edit-only disabled state")
+	}
+}
+
+func TestQueryVariableTriggerIgnoresEditInsidePlaceholder(t *testing.T) {
+	value := "Search Google for {wox:parameter?name=d}"
+	caret := strings.Index(value, "name=d") + len("name=d")
+	if got := queryVariableTriggerStart(value, caret); got != -1 {
+		t.Fatalf("editing inside a complete parameter should not open the picker, got %d", got)
+	}
+	fields := newFormFieldsState([]formDefinition{{
+		Type: "textbox", Value: formDefinitionValue{Key: "Title", QueryVariableKind: formTableQueryVariableKindWebSearch},
+	}}, map[string]string{"Title": value}, true)
+	app := bindTestApp(&App{
+		formTables: formTableController{launcherEditor: &formTableEditorState{
+			definition: formDefinition{Value: formDefinitionValue{Key: "webSearches"}}, rowForm: &fields,
+		}},
+	})
+	fields.editor.SetCaret(caret)
+	app.formTables.updateFormTableQueryVariableTrigger(0)
+	if app.formTables.launcherEditor.queryVariable != nil {
+		t.Fatal("renaming a parameter should not keep the insert picker open")
+	}
+}
+
+func TestQueryHotkeyVariablePickerTriggersAndReplacesText(t *testing.T) {
+	if got := queryVariableTriggerStart("x {sel tail", 6); got != 2 {
+		t.Fatalf("middle-caret trigger = %d", got)
+	}
+	fields := newFormFieldsState([]formDefinition{{Type: "textbox", Value: formDefinitionValue{Key: "Query"}}}, map[string]string{"Query": ""}, true)
+	app := bindTestApp(&App{
+		formTables: formTableController{launcherEditor: &formTableEditorState{
+			definition: formDefinition{Value: formDefinitionValue{Key: "QueryHotkeys"}}, rowForm: &fields,
+		}},
+	})
+
+	app.formTables.setFormTableRowText(0, "open {sel")
+	if app.formTables.launcherEditor.queryVariable == nil || app.formTables.launcherEditor.queryVariable.triggerStart != 5 {
+		t.Fatal("typing an unfinished variable should open the picker at its trigger")
+	}
+	app.formTables.chooseFormTableQueryVariable(0)
+	if got := fields.values["Query"]; got != "open {wox:selected_text}" {
+		t.Fatalf("typed variable replacement = %q", got)
+	}
+
+	fields.editor.SetSelection(0, 4)
+	app.formTables.openFormTableQueryVariablePicker(0, woxui.Rect{})
+	app.formTables.chooseFormTableQueryVariable(1)
+	if got := fields.values["Query"]; got != "{wox:selected_file} {wox:selected_text}" {
+		t.Fatalf("button variable replacement = %q", got)
+	}
+}
+
+func TestAICommandPromptVariablePickerTriggersAndReplacesText(t *testing.T) {
+	fields := newFormFieldsState([]formDefinition{{
+		Type: "textbox", Value: formDefinitionValue{Key: "prompt", Tooltip: "i18n:plugin_ai_command_prompt_tooltip"},
+	}}, map[string]string{"prompt": ""}, true)
+	app := bindTestApp(&App{
+		formTables: formTableController{launcherEditor: &formTableEditorState{
+			definition: formDefinition{Value: formDefinitionValue{Key: "commands"}}, rowForm: &fields,
+		}},
+	})
+
+	app.formTables.setFormTableRowText(0, "Summarize {inp")
+	if app.formTables.launcherEditor.queryVariable == nil || app.formTables.launcherEditor.queryVariable.triggerStart != 10 {
+		t.Fatal("typing an unfinished AI command variable should open the picker at its trigger")
+	}
+	app.formTables.chooseFormTableQueryVariable(0)
+	if got := fields.values["prompt"]; got != "Summarize {wox:input_text}" {
+		t.Fatalf("typed AI command variable replacement = %q", got)
+	}
+
+	fields.editor.SetText("Extract facts:\n", false)
+	fields.editor.SetCaret(len([]rune("Extract facts:\n")))
+	app.formTables.openFormTableQueryVariablePicker(0, woxui.Rect{})
+	app.formTables.chooseFormTableQueryVariable(0)
+	if got := fields.values["prompt"]; got != "Extract facts:\n{wox:input_text}" {
+		t.Fatalf("button AI command variable replacement = %q", got)
+	}
+}
+
+func TestDictationPromptVariablePickerInsertsDictationText(t *testing.T) {
+	fields := newFormFieldsState([]formDefinition{{
+		Type: "textbox", Value: formDefinitionValue{Key: "prompt", Tooltip: "i18n:plugin_dictation_action_prompt_tooltip"},
+	}}, map[string]string{"prompt": "Rewrite "}, true)
+	app := bindTestApp(&App{
+		formTables: formTableController{launcherEditor: &formTableEditorState{
+			definition: formDefinition{Value: formDefinitionValue{Key: "actions"}}, rowForm: &fields,
+		}},
+	})
+
+	fields.editor.SetCaret(len([]rune(fields.values["prompt"])))
+	app.formTables.openFormTableQueryVariablePicker(0, woxui.Rect{})
+	app.formTables.chooseFormTableQueryVariable(0)
+	if got := fields.values["prompt"]; got != "Rewrite {wox:dictation_text}" {
+		t.Fatalf("dictation variable replacement = %q", got)
+	}
+}
+
+func TestQueryVariableTokensIgnoreIncompletePlaceholders(t *testing.T) {
+	value := "open {wox:selected_ and {wox:selected_text} done"
+	tokens := queryVariableTokens(value)
+	closed := strings.Index(value, "{wox:selected_text}")
+	if len(tokens) != 1 || tokens[0].start != closed || tokens[0].end != closed+len("{wox:selected_text}") {
+		t.Fatalf("tokens = %#v, want only the closed selected_text placeholder at %d", tokens, closed)
+	}
+}
+
+func TestQueryVariableTokensKeepParameterizedPlaceholders(t *testing.T) {
+	value := "q={wox:parameter?name=query 123}&t={wox:parameter?name=time}"
+	tokens := queryVariableTokens(value)
+	first := "{wox:parameter?name=query 123}"
+	second := "{wox:parameter?name=time}"
+	if len(tokens) != 2 || tokens[0].start != 2 || tokens[0].end != 2+len(first) || tokens[1].end-tokens[1].start != len(second) {
+		t.Fatalf("parameterized tokens = %#v", tokens)
+	}
+}
+
+func TestQueryVariableBackspaceDeletesWholePlaceholder(t *testing.T) {
+	fields := newFormFieldsState([]formDefinition{{
+		Type: "textbox", Value: formDefinitionValue{Key: "Query", Tooltip: "i18n:ui_query_hotkeys_query_tooltip"},
+	}}, map[string]string{"Query": "ai translate {wox:selected_text} now"}, true)
+	app := bindTestApp(&App{
+		formTables: formTableController{launcherEditor: &formTableEditorState{
+			definition: formDefinition{Value: formDefinitionValue{Key: "QueryHotkeys"}}, rowForm: &fields,
+		}},
+	})
+	fields.editor.SetCaret(len([]rune("ai translate {wox:selected_text}")))
+	if !app.formTables.handleFormTableQueryVariableEditorKey(woxui.KeyEvent{Key: woxui.KeyBackspace, Down: true}) {
+		t.Fatal("backspace after a complete placeholder should be handled")
+	}
+	if got := fields.values["Query"]; got != "ai translate  now" {
+		t.Fatalf("backspace text = %q, want the whole placeholder removed", got)
+	}
+}
+
+func TestQueryVariableDeleteRemovesWholePlaceholder(t *testing.T) {
+	fields := newFormFieldsState([]formDefinition{{
+		Type: "textbox", Value: formDefinitionValue{Key: "prompt", Tooltip: "i18n:plugin_ai_command_prompt_tooltip"},
+	}}, map[string]string{"prompt": "Summarize {wox:input_text} please"}, true)
+	app := bindTestApp(&App{
+		formTables: formTableController{launcherEditor: &formTableEditorState{
+			definition: formDefinition{Value: formDefinitionValue{Key: "commands"}}, rowForm: &fields,
+		}},
+	})
+	fields.editor.SetCaret(len([]rune("Summarize ")))
+	if !app.formTables.handleFormTableQueryVariableEditorKey(woxui.KeyEvent{Key: woxui.KeyDelete, Down: true}) {
+		t.Fatal("delete before a complete placeholder should be handled")
+	}
+	if got := fields.values["prompt"]; got != "Summarize  please" {
+		t.Fatalf("delete text = %q, want the whole placeholder removed", got)
+	}
+}
+
+func TestQueryVariableArrowsJumpPlaceholder(t *testing.T) {
+	fields := newFormFieldsState([]formDefinition{{
+		Type: "textbox", Value: formDefinitionValue{Key: "Query", Tooltip: "i18n:ui_query_hotkeys_query_tooltip"},
+	}}, map[string]string{"Query": "{wox:selected_file}"}, true)
+	app := bindTestApp(&App{
+		formTables: formTableController{launcherEditor: &formTableEditorState{
+			definition: formDefinition{Value: formDefinitionValue{Key: "QueryHotkeys"}}, rowForm: &fields,
+		}},
+	})
+	fields.editor.SetCaret(len([]rune("{wox:selected_file}")))
+	if !app.formTables.handleFormTableQueryVariableEditorKey(woxui.KeyEvent{Key: woxui.KeyArrowLeft, Down: true}) {
+		t.Fatal("left arrow should jump to the start of the placeholder")
+	}
+	if got := fields.editor.State().Selection.Focus; got != 0 {
+		t.Fatalf("caret after left = %d, want 0", got)
+	}
+	if !app.formTables.handleFormTableQueryVariableEditorKey(woxui.KeyEvent{Key: woxui.KeyArrowRight, Down: true}) {
+		t.Fatal("right arrow should jump to the end of the placeholder")
+	}
+	if got := fields.editor.State().Selection.Focus; got != len([]rune("{wox:selected_file}")) {
+		t.Fatalf("caret after right = %d, want placeholder end", got)
+	}
+}
+
+func TestQueryVariableCaretSnapsOutOfPlaceholder(t *testing.T) {
+	fields := newFormFieldsState([]formDefinition{{
+		Type: "textbox", Value: formDefinitionValue{Key: "Query", Tooltip: "i18n:ui_query_hotkeys_query_tooltip"},
+	}}, map[string]string{"Query": "x{wox:selected_text}y"}, true)
+	app := bindTestApp(&App{
+		formTables: formTableController{launcherEditor: &formTableEditorState{
+			definition: formDefinition{Value: formDefinitionValue{Key: "QueryHotkeys"}}, rowForm: &fields,
+		}},
+	})
+	fields.editor.SetCaret(3)
+	app.formTables.snapFormTableQueryVariableSelection()
+	if got := fields.editor.State().Selection.Focus; got != 1 {
+		t.Fatalf("snapped caret = %d, want placeholder start", got)
+	}
+}
+
+func TestQueryVariablePartialSelectionDeletesWholePlaceholder(t *testing.T) {
+	fields := newFormFieldsState([]formDefinition{{
+		Type: "textbox", Value: formDefinitionValue{Key: "Query", Tooltip: "i18n:ui_query_hotkeys_query_tooltip"},
+	}}, map[string]string{"Query": "keep {wox:selected_text} tail"}, true)
+	app := bindTestApp(&App{
+		formTables: formTableController{launcherEditor: &formTableEditorState{
+			definition: formDefinition{Value: formDefinitionValue{Key: "QueryHotkeys"}}, rowForm: &fields,
+		}},
+	})
+	start := strings.Index(fields.values["Query"], "selected")
+	fields.editor.SetSelection(start, start+8)
+	if !app.formTables.handleFormTableQueryVariableEditorKey(woxui.KeyEvent{Key: woxui.KeyBackspace, Down: true}) {
+		t.Fatal("deleting a partial placeholder should be handled")
+	}
+	if got := fields.values["Query"]; got != "keep  tail" {
+		t.Fatalf("partial delete text = %q, want the whole placeholder removed", got)
+	}
+}
+
+func TestQueryVariableIncompletePlaceholderStillDeletesByCharacter(t *testing.T) {
+	fields := newFormFieldsState([]formDefinition{{
+		Type: "textbox", Value: formDefinitionValue{Key: "Query", Tooltip: "i18n:ui_query_hotkeys_query_tooltip"},
+	}}, map[string]string{"Query": "open {wox:selected_"}, true)
+	app := bindTestApp(&App{
+		formTables: formTableController{launcherEditor: &formTableEditorState{
+			definition: formDefinition{Value: formDefinitionValue{Key: "QueryHotkeys"}}, rowForm: &fields,
+		}},
+	})
+	fields.editor.SetCaret(len([]rune("open {wox:selected_")))
+	if app.formTables.handleFormTableQueryVariableEditorKey(woxui.KeyEvent{Key: woxui.KeyBackspace, Down: true}) {
+		t.Fatal("incomplete placeholder should keep character-by-character editing")
+	}
+}
+
+func TestFormTableColumnDefinitionKeepsAICommandPromptType(t *testing.T) {
+	field, editable := formTableColumnDefinition(formTableColumn{
+		Key: "prompt", Type: "aiCommandPrompt", Tooltip: "translated prompt tip", TextMaxLines: 10,
+	}, nil)
+	if !editable || field.Type != "textbox" || field.Value.ColumnType != "aiCommandPrompt" {
+		t.Fatalf("ai command prompt field = type %q column %q editable %v", field.Type, field.Value.ColumnType, editable)
+	}
+	if formTableQueryVariableKind(field) != formTableQueryVariableKindAICommand {
+		t.Fatal("translated AI command prompt tooltip should still offer input_text variables")
+	}
+}
+
+func TestFormTableQueryVariableKindMatchesFieldTooltips(t *testing.T) {
+	if got := formTableQueryVariableKind(formDefinition{Value: formDefinitionValue{ColumnType: "aiCommandPrompt", Tooltip: "translated prompt tip"}}); got != formTableQueryVariableKindAICommand {
+		t.Fatalf("ai command column type = %q", got)
+	}
+	if got := formTableQueryVariableKind(formDefinition{Value: formDefinitionValue{Tooltip: "i18n:plugin_ai_command_prompt_tooltip"}}); got != formTableQueryVariableKindAICommand {
+		t.Fatalf("ai command kind = %q", got)
+	}
+	if got := formTableQueryVariableKind(formDefinition{Value: formDefinitionValue{Tooltip: "i18n:ui_query_hotkeys_query_tooltip"}}); got != formTableQueryVariableKindQueryHotkey {
+		t.Fatalf("query hotkey kind = %q", got)
+	}
+	if got := formTableQueryVariableKind(formDefinition{Value: formDefinitionValue{Tooltip: "i18n:plugin_ai_command_name_tooltip"}}); got != "" {
+		t.Fatalf("unrelated field should not offer variables, got %q", got)
+	}
+	if got := formTableQueryVariableKind(formDefinition{Value: formDefinitionValue{QueryVariableKind: formTableQueryVariableKindWebSearch, Tooltip: "translated tip"}}); got != formTableQueryVariableKindWebSearch {
+		t.Fatalf("explicit web search kind = %q", got)
+	}
+	if got := formTableQueryVariableKind(formDefinition{Value: formDefinitionValue{Tooltip: "i18n:plugin_websearch_urls_tooltip"}}); got != formTableQueryVariableKindWebSearch {
+		t.Fatalf("web search url tooltip = %q", got)
+	}
+}
+
+func TestFormTableColumnDefinitionKeepsQueryVariableListType(t *testing.T) {
+	field, editable := formTableColumnDefinition(formTableColumn{
+		Key: "Urls", Type: "queryVariableList", QueryVariableKind: formTableQueryVariableKindWebSearch, Tooltip: "translated url tip", TextMaxLines: 6,
+	}, nil)
+	if !editable || field.Type != "textbox" || field.Value.ColumnType != "queryVariableList" || field.Value.QueryVariableKind != formTableQueryVariableKindWebSearch {
+		t.Fatalf("query variable list field = %#v editable %v", field.Value, editable)
+	}
+	if formTableQueryVariableKind(field) != formTableQueryVariableKindWebSearch {
+		t.Fatal("web search URL column should offer web search variables")
+	}
+	if field.Value.MaxLines != 6 {
+		t.Fatalf("query variable list max lines = %d", field.Value.MaxLines)
+	}
+}
+
+func TestWebSearchVariablePickerInsertsParameter(t *testing.T) {
+	fields := newFormFieldsState([]formDefinition{{
+		Type: "textbox", Value: formDefinitionValue{Key: "Urls", QueryVariableKind: formTableQueryVariableKindWebSearch},
+	}}, map[string]string{"Urls": "https://www.google.com/search?q="}, true)
+	app := bindTestApp(&App{
+		formTables: formTableController{launcherEditor: &formTableEditorState{
+			definition: formDefinition{Value: formDefinitionValue{Key: "webSearches"}}, rowForm: &fields,
+		}},
+	})
+
+	app.formTables.setFormTableRowText(0, "https://www.google.com/search?q={par")
+	if app.formTables.launcherEditor.queryVariable == nil || app.formTables.launcherEditor.queryVariable.triggerStart < 0 {
+		t.Fatal("typing { in a web search URL should open the variable picker")
+	}
+	app.formTables.chooseFormTableQueryVariable(0)
+	want := "https://www.google.com/search?q=" + plugin.ParameterQueryVariable("query")
+	if got := fields.values["Urls"]; got != want {
+		t.Fatalf("typed web search variable replacement = %q", got)
+	}
+	nameStart := strings.Index(want, "query")
+	selection := fields.editor.State().Selection
+	if selection.Start() != nameStart || selection.End() != nameStart+len("query") {
+		t.Fatalf("inserted parameter should select the name, got %d-%d", selection.Start(), selection.End())
+	}
+}
+
+func TestQueryVariableEnterExitsParameterEdit(t *testing.T) {
+	value := "https://www.google.com/search?q={wox:parameter?name=query}&t={wox:parameter?name=time}"
+	fields := newFormFieldsState([]formDefinition{{
+		Type: "textbox", Value: formDefinitionValue{Key: "Urls", QueryVariableKind: formTableQueryVariableKindWebSearch, MaxLines: 6},
+	}}, map[string]string{"Urls": value}, true)
+	app := bindTestApp(&App{
+		formTables: formTableController{launcherEditor: &formTableEditorState{
+			definition: formDefinition{Value: formDefinitionValue{Key: "webSearches"}}, rowForm: &fields,
+		}},
+	})
+	nameStart := strings.Index(value, "query")
+	fields.editor.SetCaret(nameStart + len("query"))
+	app.formTables.launcherEditor.queryVariableEdit = queryVariableToken{start: strings.Index(value, "{wox:parameter?name=query}"), end: strings.Index(value, "&t=")}
+	if !app.formTables.handleFormTableQueryVariableEditorKey(woxui.KeyEvent{Key: woxui.KeyEnter, Down: true}) {
+		t.Fatal("Enter inside a parameter should finish renaming")
+	}
+	if got := fields.editor.State().Text; got != value {
+		t.Fatalf("Enter should not change the URL text, got %q", got)
+	}
+	if got := fields.editor.State().Selection.Focus; got != strings.Index(value, "&t=") {
+		t.Fatalf("caret after Enter = %d, want after the parameter", got)
+	}
+	if app.formTables.launcherEditor.queryVariableEdit != (queryVariableToken{}) {
+		t.Fatal("Enter should leave parameter edit mode")
+	}
+	runs, _ := formTableQueryVariableFieldDecorations(value, queryVariableToken{}, nil, woxcomponent.ControlTheme{}, nil)
+	if len(runs) != 2 || !runs[0].HideText || !runs[1].HideText {
+		t.Fatalf("leaving a parameter should collapse it back to a chip, runs=%#v", runs)
+	}
+}
+
+func TestQueryVariableEnterOutsidePlaceholderAllowsNewline(t *testing.T) {
+	value := "https://www.google.com/search?q={wox:parameter?name=query}"
+	fields := newFormFieldsState([]formDefinition{{
+		Type: "textbox", Value: formDefinitionValue{Key: "Urls", QueryVariableKind: formTableQueryVariableKindWebSearch, MaxLines: 6},
+	}}, map[string]string{"Urls": value}, true)
+	app := bindTestApp(&App{
+		formTables: formTableController{launcherEditor: &formTableEditorState{
+			definition: formDefinition{Value: formDefinitionValue{Key: "webSearches"}}, rowForm: &fields,
+		}},
+	})
+	fields.editor.SetCaret(len([]rune(value)))
+	if app.formTables.handleFormTableQueryVariableEditorKey(woxui.KeyEvent{Key: woxui.KeyEnter, Down: true}) {
+		t.Fatal("Enter after a parameter should stay available for a new list line")
+	}
+}
+
+func TestQueryVariableEnterOnMultilineFieldDoesNotInsertNewline(t *testing.T) {
+	definition := formDefinition{Type: "table", Value: formDefinitionValue{Key: "webSearches"}}
+	form := &formState{formFieldsState: newFormFieldsState([]formDefinition{definition}, map[string]string{"webSearches": "[]"}, true)}
+	value := "https://www.google.com/search?q={wox:parameter?name=query}"
+	rowForm := newFormFieldsState([]formDefinition{{
+		Type: "textbox", Value: formDefinitionValue{Key: "Urls", QueryVariableKind: formTableQueryVariableKindWebSearch, MaxLines: 6, ColumnType: "queryVariableList"},
+	}}, map[string]string{"Urls": value}, true)
+	deps := CommonDeps{}
+	app := bindTestApp(&App{
+		forms: formActionController{
+			form: form,
+		},
+		formTables:     formTableController{launcherEditor: &formTableEditorState{target: &form.formFieldsState, definition: definition, rowForm: &rowForm, deletePending: -1}},
+		aiSettings:     newAISettingsController(deps),
+		pluginSettings: newPluginSettingsController(deps),
+		hotkeySettings: newHotkeySettingsController(deps),
+	})
+	rowForm.editor.SetCaret(strings.Index(value, "query") + len("query"))
+	if !app.formTables.onFormTableKey(woxui.KeyEvent{Key: woxui.KeyEnter, Down: true}) {
+		t.Fatal("Enter inside a parameter on a URL list should be consumed")
+	}
+	if got := rowForm.editor.State().Text; got != value {
+		t.Fatalf("Enter should not insert a newline, got %q", got)
+	}
+	if got := rowForm.editor.State().Selection.Focus; got != len([]rune(value)) {
+		t.Fatalf("caret after Enter = %d, want the end of the parameter", got)
+	}
+}
+
+func TestQueryVariableParameterChipClickSnapsToEdge(t *testing.T) {
+	value := "q=" + plugin.ParameterQueryVariable("query123")
+	fields := newFormFieldsState([]formDefinition{{
+		Type: "textbox", Value: formDefinitionValue{Key: "Urls", QueryVariableKind: formTableQueryVariableKindWebSearch},
+	}}, map[string]string{"Urls": value}, true)
+	app := bindTestApp(&App{
+		formTables: formTableController{launcherEditor: &formTableEditorState{
+			definition: formDefinition{Value: formDefinitionValue{Key: "webSearches"}}, rowForm: &fields,
+		}},
+	})
+	nameStart := strings.Index(value, "query123")
+	tokenStart := strings.Index(value, "{wox:")
+	tokenEnd := tokenStart + len(plugin.ParameterQueryVariable("query123"))
+	fields.editor.SetCaret(nameStart + 2)
+	app.formTables.snapFormTableQueryVariableSelection()
+	selection := fields.editor.State().Selection
+	if !selection.Collapsed() || (selection.Focus != tokenStart && selection.Focus != tokenEnd) {
+		t.Fatalf("click inside a collapsed parameter should snap to an edge, got %+v", selection)
+	}
+	if app.formTables.launcherEditor.queryVariableEdit != (queryVariableToken{}) {
+		t.Fatal("clicking a collapsed parameter should not enter edit mode")
+	}
+}
+
+func TestDismissFormTableQueryVariableRemovesPlaceholder(t *testing.T) {
+	value := "https://www.google.com/search?q={wox:parameter?name=query}&t={wox:parameter?name=time}"
+	fields := newFormFieldsState([]formDefinition{{
+		Type: "textbox", Value: formDefinitionValue{Key: "Urls", QueryVariableKind: formTableQueryVariableKindWebSearch, MaxLines: 6},
+	}}, map[string]string{"Urls": value}, true)
+	app := bindTestApp(&App{
+		formTables: formTableController{launcherEditor: &formTableEditorState{
+			definition: formDefinition{Value: formDefinitionValue{Key: "webSearches"}}, rowForm: &fields,
+		}},
+	})
+	start := strings.Index(value, "{wox:parameter?name=query}")
+	end := start + len("{wox:parameter?name=query}")
+	if !app.formTables.dismissFormTableQueryVariable(0, start, end) {
+		t.Fatal("clicking a query variable close icon should remove that placeholder")
+	}
+	want := "https://www.google.com/search?q=&t={wox:parameter?name=time}"
+	if got := fields.editor.State().Text; got != want {
+		t.Fatalf("urls after dismiss = %q, want %q", got, want)
+	}
+	if got := fields.editor.State().Selection.Focus; got != start {
+		t.Fatalf("caret after dismiss = %d, want %d", got, start)
+	}
+}
+
+func TestEditFormTableQueryVariableSelectsParameterName(t *testing.T) {
+	value := "q={wox:parameter?name=query123}"
+	fields := newFormFieldsState([]formDefinition{{
+		Type: "textbox", Value: formDefinitionValue{Key: "Urls", QueryVariableKind: formTableQueryVariableKindWebSearch},
+	}}, map[string]string{"Urls": value}, true)
+	app := bindTestApp(&App{
+		formTables: formTableController{launcherEditor: &formTableEditorState{
+			definition: formDefinition{Value: formDefinitionValue{Key: "webSearches"}}, rowForm: &fields,
+		}},
+	})
+	start := strings.Index(value, "{wox:parameter?name=query123}")
+	end := start + len("{wox:parameter?name=query123}")
+	if !app.formTables.editFormTableQueryVariable(0, start, end) {
+		t.Fatal("clicking a query variable edit icon should expand that parameter")
+	}
+	nameStart := strings.Index(value, "query123")
+	selection := fields.editor.State().Selection
+	if selection.Start() != nameStart || selection.End() != nameStart+len("query123") {
+		t.Fatalf("edit selection = %d-%d, want the parameter name", selection.Start(), selection.End())
+	}
+	if app.formTables.launcherEditor.queryVariableEdit.start != start {
+		t.Fatal("edit should enter parameter edit mode")
+	}
+	fields.editor.SetCaret(nameStart + 3)
+	app.formTables.snapFormTableQueryVariableSelection()
+	if got := fields.editor.State().Selection.Focus; got != nameStart+3 || !fields.editor.State().Selection.Collapsed() {
+		t.Fatalf("caret inside an expanded parameter should stay, got %+v", fields.editor.State().Selection)
+	}
+	if app.formTables.launcherEditor.queryVariableEdit.start != start {
+		t.Fatal("caret moves inside the same parameter should keep edit mode")
+	}
+}
+
+func TestQueryVariableCollapsedParameterTokensAreAtomic(t *testing.T) {
+	value := "q={wox:parameter?name=query} {wox:selected_text}"
+	if tokens := queryVariableAtomicTokens(value, queryVariableToken{}); len(tokens) != 2 {
+		t.Fatalf("collapsed tokens should all be atomic, got %#v", tokens)
+	}
+	start := strings.Index(value, "{wox:parameter?name=query}")
+	end := start + len("{wox:parameter?name=query}")
+	editing := queryVariableToken{start: start, end: end}
+	if tokens := queryVariableAtomicTokens(value, editing); len(tokens) != 1 || tokens[0].start != strings.Index(value, "{wox:selected_text}") {
+		t.Fatalf("only the edited parameter should leave atomic tokens, got %#v", tokens)
+	}
+	runs, atomic := formTableQueryVariableFieldDecorations(value, queryVariableToken{}, nil, woxcomponent.ControlTheme{}, nil)
+	if len(atomic) != 2 || len(runs) != 2 || !runs[0].HideText || !runs[1].HideText {
+		t.Fatalf("collapsed parameters should stay chips, runs=%#v atomic=%#v", runs, atomic)
+	}
+	if !runs[0].ChipEditable || runs[1].ChipEditable {
+		t.Fatalf("only parameter chips should offer edit, runs=%#v", runs)
+	}
+	runs, atomic = formTableQueryVariableFieldDecorations(value, editing, nil, woxcomponent.ControlTheme{}, nil)
+	if len(atomic) != 1 || len(runs) != 2 || runs[0].HideText || !runs[1].HideText {
+		t.Fatalf("editing a parameter should expand it and keep environment chips, runs=%#v atomic=%#v", runs, atomic)
+	}
+	if runs[0].Dismissible || !runs[1].Dismissible {
+		t.Fatalf("only collapsed chips should offer dismiss, runs=%#v", runs)
+	}
+	if runs[0].ChipEditable || runs[1].ChipEditable {
+		t.Fatalf("environment chips should not offer edit, runs=%#v", runs)
+	}
+	collapsed := "q={wox:parameter?name=query}"
+	parameterRuns, parameterAtomic := formTableQueryVariableFieldDecorations(collapsed, queryVariableToken{}, nil, woxcomponent.ControlTheme{}, nil)
+	if len(parameterRuns) != 1 || !parameterRuns[0].ChipEditable || len(parameterAtomic) != 1 {
+		t.Fatalf("collapsed parameter chips should offer edit, runs=%#v atomic=%#v", parameterRuns, parameterAtomic)
+	}
+}
+
+func TestQueryVariableChipLabelUsesParameterName(t *testing.T) {
+	if got := queryVariableChipLabel(plugin.ParameterQueryVariable("query 123"), nil); got != "query 123" {
+		t.Fatalf("parameter chip = %q", got)
+	}
+	if got := queryVariableChipLabel("{wox:parameter?name=query&case=lower}", nil); got != "query lower" {
+		t.Fatalf("cased parameter chip = %q", got)
+	}
+	if got := queryVariableChipLabel("{wox:selected_text}", func(key string) string {
+		if key == "i18n:ui_query_variable_selected_text" {
+			return "Selected Text"
+		}
+		return key
+	}); got != "Selected Text" {
+		t.Fatalf("selected text chip = %q", got)
+	}
+}
+
+func TestValidateWebSearchTableRowRejectsUndeclaredTitleParameter(t *testing.T) {
+	fields := newFormFieldsState([]formDefinition{
+		{Type: "textbox", Value: formDefinitionValue{Key: "Title"}},
+		{Type: "textbox", Value: formDefinitionValue{Key: "Urls"}},
+	}, map[string]string{
+		"Title": "Search Google for {wox:parameter?name=query}",
+		"Urls":  "https://www.google.com/search?q={wox:parameter?name=query123}&t={wox:parameter?name=time}",
+	}, true)
+	app := bindTestApp(&App{
+		language: languageCatalog{
+			translations: map[string]string{
+				"plugin_websearch_error_unknown_title_variable": "Title can only reference parameters declared in the URLs.",
+			},
+		},
+	})
+	errors := app.formTables.validateWebSearchTableRow(formDefinition{Value: formDefinitionValue{Key: "webSearches"}}, &fields)
+	if got := errors["Title"]; got != "Title can only reference parameters declared in the URLs." {
+		t.Fatalf("title error = %#v", errors)
+	}
+}
+
+func TestReplaceQueryHotkeyVariablesForTestUsesSampleValues(t *testing.T) {
+	query := "ai translate {wox:selected_text} from {wox:active_browser_url} in {wox:file_explorer_path} file {wox:selected_file}"
+	got := replaceQueryHotkeyVariablesForTest(query)
+	want := "ai translate test text from https://example.com in /path/to/folder file /path/to/test.txt"
+	if got != want {
+		t.Fatalf("test query = %q, want %q", got, want)
+	}
+	if got := replaceQueryHotkeyVariablesForTest("x "); got != "x " {
+		t.Fatalf("trailing spaces must stay intact for query tests, got %q", got)
+	}
+}
+
+// TestQueryValuedColumnsOfferQueryTest guards the shared test button that query hotkeys,
+// query aliases and tray queries all rely on to preview the edited query.
+func TestQueryValuedColumnsOfferQueryTest(t *testing.T) {
+	forms := []formFieldsState{newHotkeySettingsForm(settingsData{}), newGeneralQuerySettingsForm(settingsData{})}
+	tables := map[string]bool{"QueryHotkeys": false, "QueryAliases": false, "TrayQueries": false}
+	for _, form := range forms {
+		for _, definition := range form.definitions {
+			if _, tracked := tables[definition.Value.Key]; !tracked {
+				continue
+			}
+			fields, _ := formTableRowFields(definition, nil)
+			for _, field := range fields.definitions {
+				if field.Value.Key == "Query" {
+					tables[definition.Value.Key] = field.Value.QueryTest
+				}
+			}
+		}
+	}
+	for table, enabled := range tables {
+		if !enabled {
+			t.Fatalf("%s query field should expose the query test button", table)
+		}
+	}
+}
+
+func TestResultBindingsTableIsEditOnly(t *testing.T) {
+	form := newHotkeySettingsForm(settingsData{})
+	var definition formDefinition
+	for _, candidate := range form.definitions {
+		if candidate.Value.Key == "ResultBindings" {
+			definition = candidate
+			break
+		}
+	}
+	if definition.Value.Key != "ResultBindings" {
+		t.Fatal("hotkey settings must include the Result Bindings table")
+	}
+	keys := map[string]bool{}
+	for _, column := range definition.Value.Columns {
+		keys[column.Key] = true
+	}
+	if !keys["Title"] || !keys["Hotkey"] || !keys["Alias"] {
+		t.Fatalf("result binding columns = %+v", definition.Value.Columns)
+	}
+}
+
+func TestQueryHotkeyVariablePickerEnterUsesFocusedHost(t *testing.T) {
+	target := newHotkeySettingsForm(settingsData{})
+	definition := formDefinition{}
+	for _, candidate := range target.definitions {
+		if candidate.Value.Key == "QueryHotkeys" {
+			definition = candidate
+			break
+		}
+	}
+	fields, _ := formTableRowFields(definition, nil)
+	queryIndex := -1
+	for index, field := range fields.definitions {
+		if field.Value.Key == "Query" {
+			queryIndex = index
+			break
+		}
+	}
+	deps := CommonDeps{}
+	hotkeys := newHotkeySettingsController(deps)
+	hotkeys.SetForm(&target)
+	app := bindTestApp(&App{
+		settingsWindow: settingsWindowController{
+			open: true,
+			tab:  "hotkey",
+		},
+		formTables:     formTableController{settingsEditor: &formTableEditorState{target: &target, definition: definition, rowForm: &fields, rowIndex: -1, deletePending: -1, queryPreset: queryHotkeyPresetNormal}},
+		hotkeySettings: hotkeys,
+		aiSettings:     newAISettingsController(deps),
+		pluginSettings: newPluginSettingsController(deps),
+		lifecycleCtx:   context.Background(),
+		imageStore: imageStore{
+			images:         map[string]*woxui.Image{},
+			imageRequested: map[string]string{},
+			imageLastUsed:  map[string]uint64{},
+			imageErrors:    map[string]string{},
+		},
+	})
+	host := woxwidget.NewHost(func(woxui.FrameInfo) woxwidget.Widget {
+		return app.formTables.buildFormTableOverlay(snapshotFormTableEditorLocked(app.formTables.settingsEditor), settingsPalette(), 900, 700, 1)
+	})
+	host.AttachServices(formTableHostServices{})
+	app.settingsWindow.host = host
+	frame := woxui.FrameInfo{Size: woxui.Size{Width: 900, Height: 700}, PixelSize: woxui.PixelSize{Width: 900, Height: 700}, Scale: 1}
+	displayList := woxui.DisplayList{}
+	host.Frame(&displayList, frame)
+	queryKey := woxwidget.Key(fmt.Sprintf("form-table-row-field-%d", queryIndex))
+	host.RequestFocus(queryKey)
+	host.Frame(&displayList, frame)
+	if !host.TextInput(woxui.TextInputEvent{Kind: woxui.TextInputCommit, Text: "{"}) {
+		t.Fatal("query field should accept the variable trigger")
+	}
+	host.Frame(&displayList, frame)
+	if !host.HasFocus(queryKey) {
+		t.Fatal("opening the variable picker after an already-focused frame should preserve query-field focus")
+	}
+	if !host.Key(woxui.KeyEvent{Key: woxui.KeyEnter, Down: true, Composing: true}) {
+		t.Fatal("Enter should be handled by the variable picker")
+	}
+	if got := fields.values["Query"]; got != "{wox:selected_text}" {
+		t.Fatalf("query after Enter = %q", got)
+	}
+	host.Frame(&displayList, frame)
+	if !host.Key(woxui.KeyEvent{Key: woxui.KeyTab, Down: true}) {
+		t.Fatal("Tab should move focus from the query field")
+	}
+	host.Frame(&displayList, frame)
+	if host.HasFocus(queryKey) {
+		t.Fatal("Tab should leave the query field")
+	}
+	if fields.active {
+		t.Fatal("query editor should stop drawing its caret after Host focus leaves the field")
+	}
+	click := func(key woxwidget.Key) {
+		bounds, ok := host.BoundsForKey(key)
+		if !ok {
+			t.Fatalf("missing bounds for %q", key)
+		}
+		position := woxui.Point{X: bounds.X + min(float32(20), bounds.Width/2), Y: bounds.Y + bounds.Height/2}
+		host.Pointer(woxui.PointerEvent{Kind: woxui.PointerDown, Button: woxui.PointerButtonPrimary, Position: position})
+		host.Frame(&displayList, frame)
+		host.Pointer(woxui.PointerEvent{Kind: woxui.PointerUp, Button: woxui.PointerButtonPrimary, Position: position})
+		host.Frame(&displayList, frame)
+	}
+	click("query-hotkey-preset-web-panel")
+	if app.formTables.settingsEditor.queryPreset != queryHotkeyPresetWebPanel {
+		t.Fatalf("web-panel preset click selected %q", app.formTables.settingsEditor.queryPreset)
+	}
+	click("query-hotkey-preset-normal")
+	if app.formTables.settingsEditor.queryPreset != queryHotkeyPresetNormal {
+		t.Fatalf("normal preset click selected %q", app.formTables.settingsEditor.queryPreset)
+	}
+	if !host.HasFocus("query-hotkey-preset-normal") {
+		t.Fatalf("normal preset should own Host focus before query click, query=%v", host.HasFocus(queryKey))
+	}
+	bounds, ok := host.BoundsForKey(queryKey)
+	if !ok {
+		t.Fatal("missing query bounds after switching presets")
+	}
+	position := woxui.Point{X: bounds.X + 20, Y: bounds.Y + bounds.Height/2}
+	host.Pointer(woxui.PointerEvent{Kind: woxui.PointerDown, Button: woxui.PointerButtonPrimary, Position: position})
+	if !host.HasFocus(queryKey) || !fields.active {
+		t.Fatalf("query pointer down focus: host=%v active=%v", host.HasFocus(queryKey), fields.active)
+	}
+	host.Frame(&displayList, frame)
+	if !fields.active {
+		t.Fatal("query focus was cleared while reconciling the pointer-down frame")
+	}
+	host.Pointer(woxui.PointerEvent{Kind: woxui.PointerUp, Button: woxui.PointerButtonPrimary, Position: position})
+	host.Frame(&displayList, frame)
+	if !host.HasFocus(queryKey) || !fields.active {
+		t.Fatalf("clicking the query field after switching presets should restore its single Host focus: host=%v active=%v focused=%d query=%d", host.HasFocus(queryKey), fields.active, fields.focused, queryIndex)
+	}
+	if !host.TextInput(woxui.TextInputEvent{Kind: woxui.TextInputCommit, Text: "x"}) {
+		t.Fatal("query field should accept text after switching presets")
+	}
+	if got := fields.values["Query"]; got != "{wox:selected_text}x" {
+		t.Fatalf("query after preset switch = %q", got)
+	}
+}
+
+func TestQueryHotkeyRowNormalizesNumericFieldsForCore(t *testing.T) {
+	definition := formDefinition{Value: formDefinitionValue{Key: "QueryHotkeys", Columns: []formTableColumn{
+		{Key: "Width", Type: "text", EmptyAsZero: true, Validators: optionalIntegerValidators(false, 0, 0, "")},
+		{Key: "MaxResultCount", Type: "text", EmptyAsZero: true, Validators: optionalIntegerValidators(true, 5, 15, "i18n:ui_query_hotkeys_max_result_count_range_error")},
+	}}}
+	fields, _ := formTableRowFields(definition, map[string]any{"Width": 500, "MaxResultCount": 12})
+	row := formTableRowFromFields(definition, &fields, nil)
+	if row["Width"] != 500 || row["MaxResultCount"] != 12 {
+		t.Fatalf("numeric query hotkey row = %#v", row)
+	}
+	fields.values["MaxResultCount"] = "16"
+	if got := validateFormTableRow(definition, &fields, nil, -1); got["MaxResultCount"] != "i18n:ui_query_hotkeys_max_result_count_range_error" {
+		t.Fatalf("range validation = %#v", got)
+	}
+}
+
+func TestQueryHotkeyOptionalMaxResultCountZeroIsValid(t *testing.T) {
+	definition := formDefinition{Value: formDefinitionValue{Key: "QueryHotkeys", Columns: []formTableColumn{
+		{Key: "Name", Type: "text"},
+		{Key: "Hotkey", Type: "hotkey"},
+		{Key: "Query", Type: "queryHotkeyQuery"},
+		{Key: "Width", Type: "text", EmptyAsZero: true, Validators: optionalIntegerValidators(false, 0, 0, "")},
+		{Key: "MaxResultCount", Type: "text", EmptyAsZero: true, Validators: optionalIntegerValidators(true, 5, 15, "i18n:ui_query_hotkeys_max_result_count_range_error")},
+		{Key: "IsSilentExecution", Type: "checkbox"},
+	}}}
+	fields, _ := formTableRowFields(definition, map[string]any{
+		"Name": "翻译并显示", "Hotkey": "CapsLock+K", "Query": "ai translate-display {wox:selected_text}",
+		"Width": 0, "MaxResultCount": 0, "IsSilentExecution": true,
+	})
+	if fields.values["Width"] != "" || fields.values["MaxResultCount"] != "" {
+		t.Fatalf("optional sizing zeros should load blank, got width=%q max=%q", fields.values["Width"], fields.values["MaxResultCount"])
+	}
+	if got := inferQueryHotkeyPreset(fields.values); got != queryHotkeyPresetSilent {
+		t.Fatalf("preset = %q, want silent", got)
+	}
+	if got := validateFormTableRow(definition, &fields, nil, 0); len(got) != 0 {
+		t.Fatalf("zero max results should mean global default, got %#v", got)
+	}
+	fields.values["MaxResultCount"] = "0"
+	if got := validateFormTableRow(definition, &fields, nil, 0); len(got) != 0 {
+		t.Fatalf("explicit zero should still mean global default, got %#v", got)
+	}
+	row := formTableRowFromFields(definition, &fields, nil)
+	if row["Width"] != 0 || row["MaxResultCount"] != 0 {
+		t.Fatalf("empty optional ints should persist as 0, got %#v", row)
+	}
+}
+
+func TestPluginTriggerKeywordRowAcceptsTextInput(t *testing.T) {
+	definition := pluginTriggerKeywordDefinition()
+	target := newFormFieldsState([]formDefinition{definition}, map[string]string{"TriggerKeywords": "[]"}, true)
+	deps := CommonDeps{}
+	plugins := newPluginSettingsController(deps)
+	plugins.SetForm(&pluginSettingsFormState{formFieldsState: target})
+	app := bindTestApp(&App{
+		settingsWindow: settingsWindowController{
+			open: true,
+			tab:  "plugins",
+		},
+		pluginSettings: plugins,
+		aiSettings:     newAISettingsController(deps),
+		hotkeySettings: newHotkeySettingsController(deps),
+	})
+	app.formTables.openFormTableLocked(&plugins.Form().formFieldsState, 0)
+	app.formTables.beginAddFormTableRowDirect()
+	host := woxwidget.NewHost(func(woxui.FrameInfo) woxwidget.Widget {
+		return app.formTables.buildFormTableOverlay(snapshotFormTableEditorLocked(app.formTables.settingsEditor), settingsPalette(), 800, 600, 1)
+	})
+	host.AttachServices(formTableHostServices{})
+	app.settingsWindow.host = host
+	displayList := woxui.DisplayList{}
+	frame := woxui.FrameInfo{Size: woxui.Size{Width: 800, Height: 600}, PixelSize: woxui.PixelSize{Width: 800, Height: 600}, Scale: 1}
+	host.Frame(&displayList, frame)
+	host.Frame(&displayList, frame)
+
+	key := woxui.KeyEvent{Key: "c", Down: true}
+	if host.Key(key) {
+		t.Fatal("printable key should continue to native text input")
+	}
+	if app.onSettingsWindowKey(key) {
+		t.Fatal("settings window should not route a table editor key to the underlying plugin form")
+	}
+	if !host.TextInput(woxui.TextInputEvent{Kind: woxui.TextInputCommit, Text: "chat"}) {
+		t.Fatal("trigger keyword input did not handle committed text")
+	}
+	if got := app.formTables.settingsEditor.rowForm.values["keyword"]; got != "chat" {
+		t.Fatalf("trigger keyword = %q, want committed input", got)
+	}
+	app.formTables.settingsEditor.fieldErrors = map[string]string{"keyword": "duplicate keyword"}
+	app.formTables.focusFormTableRowField(0)
+	if got := app.formTables.settingsEditor.fieldErrors["keyword"]; got != "duplicate keyword" {
+		t.Fatalf("validation field error = %q after refocus, want it preserved", got)
+	}
+	app.formTables.setFormTableRowText(0, "chat2")
+	if got := app.formTables.settingsEditor.fieldErrors["keyword"]; got != "" {
+		t.Fatalf("validation field error = %q after changing text, want it cleared", got)
+	}
+}
+
+func TestSaveFormTableRowEditSurfacesFieldErrorsInline(t *testing.T) {
+	definition := formDefinition{
+		Type: "table",
+		Value: formDefinitionValue{
+			Key: "WebViews",
+			Columns: []formTableColumn{
+				{Key: "Keyword", Type: "text", Validators: []formValidator{{Type: "not_empty"}}},
+				{Key: "Url", Type: "text", Validators: []formValidator{{Type: "not_empty"}}},
+			},
+		},
+	}
+	target := newFormFieldsState([]formDefinition{definition}, map[string]string{"WebViews": "[]"}, true)
+	deps := CommonDeps{}
+	plugins := newPluginSettingsController(deps)
+	plugins.SetForm(&pluginSettingsFormState{formFieldsState: target})
+	rowForm := newFormFieldsState([]formDefinition{
+		{Type: "textbox", Value: formDefinitionValue{Key: "Keyword", Validators: []formValidator{{Type: "not_empty"}}}},
+		{Type: "textbox", Value: formDefinitionValue{Key: "Url", Validators: []formValidator{{Type: "not_empty"}}}},
+	}, map[string]string{"Keyword": "", "Url": "https://example.com"}, true)
+	app := bindTestApp(&App{
+		settingsWindow: settingsWindowController{
+			open: true,
+			tab:  "plugins",
+		},
+		formTables: formTableController{settingsEditor: &formTableEditorState{
+			target: &plugins.Form().formFieldsState, definition: definition, rows: nil, rowForm: &rowForm, rowIndex: -1, deletePending: -1,
+		}},
+		pluginSettings: plugins,
+		aiSettings:     newAISettingsController(deps),
+		hotkeySettings: newHotkeySettingsController(deps),
+		language:       languageCatalog{translations: map[string]string{"ui_validator_value_can_not_be_empty": "Value cannot be empty"}},
+	})
+
+	app.formTables.saveFormTableRowEdit()
+
+	if got := app.formTables.settingsEditor.status; got != "" {
+		t.Fatalf("dialog status = %q, want field-level errors only", got)
+	}
+	if got := app.formTables.settingsEditor.fieldErrors["Keyword"]; got != "Value cannot be empty" {
+		t.Fatalf("Keyword field error = %q", got)
+	}
+	if _, exists := app.formTables.settingsEditor.fieldErrors["Url"]; exists {
+		t.Fatalf("Url should not have a field error, got %#v", app.formTables.settingsEditor.fieldErrors)
+	}
+	if app.formTables.settingsEditor.rowForm == nil {
+		t.Fatal("invalid save should keep the row editor open")
+	}
+}
+
+func TestBeginCloneFormTableRowDirectPrefillsNewRow(t *testing.T) {
+	definition := formDefinition{
+		Type: "table",
+		Value: formDefinitionValue{
+			Key: "Commands",
+			Columns: []formTableColumn{
+				{Key: "Name", Type: "text"},
+				{Key: "Query", Type: "text"},
+			},
+		},
+	}
+	target := newFormFieldsState([]formDefinition{definition}, map[string]string{"Commands": "[]"}, true)
+	deps := CommonDeps{}
+	hotkeys := newHotkeySettingsController(deps)
+	hotkeys.SetForm(&target)
+	app := bindTestApp(&App{
+		aiSettings:     newAISettingsController(deps),
+		pluginSettings: newPluginSettingsController(deps),
+		hotkeySettings: hotkeys,
+		formTables:     formTableController{settingsEditor: &formTableEditorState{target: &target, definition: definition, rows: []map[string]any{{"Name": "Clipboard", "Query": "cb"}}, selected: 0, rowIndex: -1}},
+		settingsSearch: newSettingsSearchController(deps),
+		themeSettings:  newThemeSettingsController(deps),
+		sharedEdit:     newSharedEditState(),
+	})
+
+	app.formTables.beginCloneFormTableRowDirect()
+
+	if app.formTables.settingsEditor.rowForm == nil {
+		t.Fatal("clone action did not open a row editor")
+	}
+	if app.formTables.settingsEditor.rowIndex != -1 {
+		t.Fatalf("clone row index = %d, want -1 so saving appends a new row", app.formTables.settingsEditor.rowIndex)
+	}
+	if !app.formTables.settingsEditor.rowEditorOnly {
+		t.Fatal("inline clone should close the direct row editor after saving")
+	}
+	if value := app.formTables.settingsEditor.rowForm.values["Name"]; value != "Clipboard" {
+		t.Fatalf("cloned Name = %q, want source value", value)
+	}
+	if value := app.formTables.settingsEditor.rowForm.values["Query"]; value != "cb" {
+		t.Fatalf("cloned Query = %q, want source value", value)
+	}
+	app.formTables.settingsEditor.rowBase["Name"] = "Changed"
+	if source := app.formTables.settingsEditor.rows[0]["Name"]; source != "Clipboard" {
+		t.Fatalf("cloned row shares source map; source Name changed to %v", source)
+	}
+}
+
+func TestFormTableDeleteRequiresDialogConfirmation(t *testing.T) {
+	definition := formDefinition{
+		Type: "table",
+		Value: formDefinitionValue{
+			Key:     "Commands",
+			Columns: []formTableColumn{{Key: "Name", Type: "text"}},
+		},
+	}
+	rowsJSON := `[{"Name":"First"},{"Name":"Second"}]`
+	form := &formState{formFieldsState: newFormFieldsState([]formDefinition{definition}, map[string]string{"Commands": rowsJSON}, true)}
+	deps := CommonDeps{}
+	app := bindTestApp(&App{
+		forms: formActionController{
+			form: form,
+		},
+		formTables: formTableController{launcherEditor: &formTableEditorState{
+			target: &form.formFieldsState, definition: definition,
+			rows: []map[string]any{{"Name": "First"}, {"Name": "Second"}}, selected: 0, rowIndex: -1, deletePending: -1,
+		}},
+		aiSettings:     newAISettingsController(deps),
+		pluginSettings: newPluginSettingsController(deps),
+		hotkeySettings: newHotkeySettingsController(deps),
+	})
+
+	app.formTables.deleteFormTableRow()
+	if app.formTables.launcherEditor.deletePending != 0 {
+		t.Fatalf("pending delete row = %d, want selected row 0", app.formTables.launcherEditor.deletePending)
+	}
+	if len(app.formTables.launcherEditor.rows) != 2 {
+		t.Fatal("opening the confirmation dialog must not delete a row")
+	}
+
+	app.formTables.cancelFormTableRowDelete()
+	if app.formTables.launcherEditor.deletePending != -1 || len(app.formTables.launcherEditor.rows) != 2 {
+		t.Fatal("canceling deletion must preserve all rows")
+	}
+
+	app.formTables.deleteFormTableRow()
+	app.formTables.confirmFormTableRowDelete()
+	if len(app.formTables.launcherEditor.rows) != 1 || app.formTables.launcherEditor.rows[0]["Name"] != "Second" {
+		t.Fatalf("confirmed rows = %#v, want only Second", app.formTables.launcherEditor.rows)
+	}
+	if value := form.values["Commands"]; value != `[{"Name":"Second"}]` {
+		t.Fatalf("persisted table value = %s, want the confirmed deletion only", value)
+	}
+}
+
+func TestDirectFormTableDeleteRemovesRowImmediately(t *testing.T) {
+	definition := formDefinition{Type: "table", Value: formDefinitionValue{Key: "Commands"}}
+	target := newFormFieldsState([]formDefinition{definition}, map[string]string{"Commands": `[{"Name":"First"},{"Name":"Second"}]`}, true)
+	deps := CommonDeps{}
+	hotkeys := newHotkeySettingsController(deps)
+	hotkeys.SetForm(&target)
+	app := bindTestApp(&App{
+		settingsWindow: settingsWindowController{
+			open: true,
+			tab:  "hotkey",
+		},
+		formTables: formTableController{settingsEditor: &formTableEditorState{
+			target: &target, definition: definition,
+			rows: []map[string]any{{"Name": "First"}, {"Name": "Second"}}, selected: 0, rowIndex: -1, deletePending: -1,
+		}},
+		aiSettings:     newAISettingsController(deps),
+		pluginSettings: newPluginSettingsController(deps),
+		hotkeySettings: hotkeys,
+		services:       &skillAddTestServices{},
+		lifecycleCtx:   context.Background(),
+	})
+
+	app.formTables.beginDeleteFormTableRowDirect()
+
+	if app.formTables.settingsEditor != nil {
+		t.Fatal("direct delete should close the overlay after removing the row")
+	}
+	if value := target.values["Commands"]; value != `[{"Name":"Second"}]` {
+		t.Fatalf("direct delete persisted %s, want only Second", value)
+	}
+}
+
+func TestOpenFormTableKeepsWindowOwnedEditorStateSeparate(t *testing.T) {
+	definition := formDefinition{Type: "table", Value: formDefinitionValue{Key: "Commands"}}
+	launcherForm := &formState{formFieldsState: newFormFieldsState([]formDefinition{definition}, map[string]string{"Commands": "[]"}, true)}
+	settingsForm := newFormFieldsState([]formDefinition{definition}, map[string]string{"Commands": "[]"}, true)
+	deps := CommonDeps{}
+	hotkeys := newHotkeySettingsController(deps)
+	hotkeys.SetForm(&settingsForm)
+	app := bindTestApp(&App{
+		forms:           formActionController{form: launcherForm},
+		querySession:    queryController{editor: woxui.NewTextEditor("")},
+		generalSettings: newGeneralSettingsController(deps, newSharedEditState()),
+		themeSettings:   newThemeSettingsController(deps),
+		aiSettings:      newAISettingsController(deps),
+		pluginSettings:  newPluginSettingsController(deps),
+		hotkeySettings:  hotkeys,
+	})
+
+	app.formTables.openFormTableLocked(&settingsForm, 0)
+	if app.formTables.settingsEditor == nil || app.formTables.launcherEditor != nil {
+		t.Fatal("settings table editor leaked into launcher-owned state")
+	}
+	if app.snapshot().tableEditor != nil {
+		t.Fatal("launcher snapshot rendered the settings-owned table editor")
+	}
+
+	app.formTables.settingsEditor = nil
+	app.formTables.openFormTableLocked(&launcherForm.formFieldsState, 0)
+	if app.formTables.launcherEditor == nil || app.formTables.settingsEditor != nil {
+		t.Fatal("launcher table editor leaked into settings-owned state")
+	}
+}
+
+func TestAISkillsDirectDeleteAllowsReadOnlyDiscoveredSkill(t *testing.T) {
+	definition := formDefinition{Type: "table", Value: formDefinitionValue{
+		Key: "AISkills", SortColumnKey: "Name", InlineTable: true,
+		Columns: []formTableColumn{{Key: "Name", Label: "Name", Width: 200, Type: "text"}, {Key: "Source", Label: "Source", Width: 100, Type: "aiSkillSource"}},
+	}}
+	aiForm := newFormFieldsState([]formDefinition{definition}, map[string]string{
+		"AISkills": `[{"Name":"DiscoveredSkill","Source":"local","ReadOnly":true}]`,
+	}, true)
+	deps := CommonDeps{}
+	ai := newAISettingsController(deps)
+	ai.SetForm(&aiForm)
+	app := bindTestApp(&App{
+		settingsWindow: settingsWindowController{
+			open: true,
+			tab:  "ai",
+		},
+		aiSettings:     ai,
+		pluginSettings: newPluginSettingsController(deps),
+		hotkeySettings: newHotkeySettingsController(deps),
+		services:       &skillAddTestServices{},
+		lifecycleCtx:   context.Background(),
+	})
+
+	app.formTables.openFormTableLocked(&aiForm, 0)
+	app.formTables.selectFormTableRow(0)
+	app.formTables.beginDeleteFormTableRowDirect()
+
+	if app.formTables.settingsEditor != nil {
+		t.Fatal("discovered skill delete should close the overlay after removal")
+	}
+	if value := aiForm.values["AISkills"]; value != `[]` {
+		t.Fatalf("discovered skill table = %s, want an empty table after delete", value)
+	}
+}
+
+func TestAISkillsDirectDeleteBlocksBuiltinRow(t *testing.T) {
+	definition := formDefinition{Type: "table", Value: formDefinitionValue{
+		Key: "AISkills", SortColumnKey: "Name", InlineTable: true,
+		Columns: []formTableColumn{{Key: "Name", Label: "Name", Width: 200, Type: "text"}, {Key: "Source", Label: "Source", Width: 100, Type: "aiSkillSource"}},
+	}}
+	aiForm := newFormFieldsState([]formDefinition{definition}, map[string]string{
+		"AISkills": `[{"Name":"BuiltinSkill","Source":"local","ReadOnly":true,"Builtin":true}]`,
+	}, true)
+	deps := CommonDeps{}
+	ai := newAISettingsController(deps)
+	ai.SetForm(&aiForm)
+	app := bindTestApp(&App{
+		settingsWindow: settingsWindowController{
+			open: true,
+			tab:  "ai",
+		},
+		aiSettings:     ai,
+		pluginSettings: newPluginSettingsController(deps),
+		hotkeySettings: newHotkeySettingsController(deps),
+	})
+
+	app.formTables.openFormTableLocked(&aiForm, 0)
+	app.formTables.selectFormTableRow(0)
+	app.formTables.beginDeleteFormTableRowDirect()
+
+	// A built-in skill must not start a delete. The inline path guards these
+	// rows before mutating the table.
+	if app.formTables.settingsEditor == nil {
+		t.Fatal("expected the table editor to be open")
+	}
+	if app.formTables.settingsEditor.deletePending >= 0 || app.formTables.settingsEditor.deleteDirect {
+		t.Fatalf("built-in skill direct delete = pending %d, direct %v, want no delete started", app.formTables.settingsEditor.deletePending, app.formTables.settingsEditor.deleteDirect)
+	}
+	if value := aiForm.values["AISkills"]; value != `[{"Name":"BuiltinSkill","Source":"local","ReadOnly":true,"Builtin":true}]` {
+		t.Fatalf("built-in skill table = %s, want the row preserved", value)
+	}
+}
+
+func TestAISkillsDirectDeleteDoesNotRenderOverlay(t *testing.T) {
+	definition := formDefinition{Type: "table", Value: formDefinitionValue{
+		Key: "AISkills", SortColumnKey: "Name", InlineTable: true,
+		Columns: []formTableColumn{{Key: "Name", Label: "Name", Width: 200, Type: "text"}, {Key: "Source", Label: "Source", Width: 100, Type: "aiSkillSource"}},
+	}}
+	aiForm := newFormFieldsState([]formDefinition{definition}, map[string]string{
+		"AISkills": `[{"Name":"DiscoveredSkill","Source":"local","ReadOnly":true}]`,
+	}, true)
+	deps := CommonDeps{}
+	ai := newAISettingsController(deps)
+	ai.SetForm(&aiForm)
+	app := bindTestApp(&App{
+		settingsWindow: settingsWindowController{
+			open: true,
+			tab:  "ai",
+		},
+		aiSettings:     ai,
+		pluginSettings: newPluginSettingsController(deps),
+		hotkeySettings: newHotkeySettingsController(deps),
+		services:       &skillAddTestServices{},
+		lifecycleCtx:   context.Background(),
+		imageStore: imageStore{
+			images:         map[string]*woxui.Image{},
+			imageRequested: map[string]string{},
+			imageLastUsed:  map[string]uint64{},
+			imageErrors:    map[string]string{},
+		},
+	})
+
+	app.formTables.openFormTableLocked(&aiForm, 0)
+	app.formTables.selectFormTableRow(0)
+	app.formTables.beginDeleteFormTableRowDirect()
+
+	if app.formTables.settingsEditor != nil {
+		t.Fatal("direct delete must close the overlay instead of showing a confirmation dialog")
+	}
+	if value := aiForm.values["AISkills"]; value != `[]` {
+		t.Fatalf("discovered skill table = %s, want an empty table after delete", value)
+	}
+}
+
+func TestFormTableColumnValueReadsLegacyJSONFieldName(t *testing.T) {
+	column := formTableColumn{Key: "path", Type: "dirPath"}
+	if got := formTableColumnValue(column, map[string]any{"Path": `D:\dev\plugin`}); got != `D:\dev\plugin` {
+		t.Fatalf("legacy Path cell = %q, want the stored directory", got)
+	}
+	if got := formTableColumnValue(column, map[string]any{"path": `D:\dev\plugin`}); got != `D:\dev\plugin` {
+		t.Fatalf("canonical path cell = %q, want the stored directory", got)
+	}
+}
+
+func TestFormTableRowFieldsReadLegacyJSONFieldName(t *testing.T) {
+	definition := formDefinition{Value: formDefinitionValue{Columns: []formTableColumn{{Key: "path", Type: "dirPath"}}}}
+	fields, _ := formTableRowFields(definition, map[string]any{"Path": `D:\dev\plugin`})
+	if fields.values["path"] != `D:\dev\plugin` {
+		t.Fatalf("row editor path = %q, want the stored directory", fields.values["path"])
+	}
+}
+
+func TestFormTableRowFromFieldsDropsLegacyJSONFieldName(t *testing.T) {
+	definition := formDefinition{Value: formDefinitionValue{Columns: []formTableColumn{{Key: "path", Type: "dirPath"}}}}
+	fields := newFormFieldsState([]formDefinition{{Type: "dirPath", Value: formDefinitionValue{Key: "path"}}}, map[string]string{"path": `D:\dev\plugin`}, true)
+	row := formTableRowFromFields(definition, &fields, map[string]any{"Path": `C:\old`})
+	if row["path"] != `D:\dev\plugin` {
+		t.Fatalf("saved path = %#v, want the edited directory", row["path"])
+	}
+	if _, exists := row["Path"]; exists {
+		t.Fatalf("legacy Path key was kept: %#v", row)
+	}
+}
+
+func TestQueryHotkeyHideResultsPersistsAndDeterminesPreset(t *testing.T) {
+	form := newHotkeySettingsForm(settingsData{})
+	var definition formDefinition
+	for _, candidate := range form.definitions {
+		if candidate.Value.Key == "QueryHotkeys" {
+			definition = candidate
+			break
+		}
+	}
+	values := map[string]any{"HideQueryBox": true, "HideToolbar": true, "HideResults": true}
+	fields, _ := formTableRowFields(definition, values)
+	if inferQueryHotkeyPreset(fields.values) != queryHotkeyPresetWebPanel {
+		t.Fatal("preview preset was not recognized")
+	}
+	row := formTableRowFromFields(definition, &fields, nil)
+	if row["HideResults"] != true {
+		t.Fatalf("HideResults not saved: %#v", row)
+	}
+	fields.values["HideResults"] = "false"
+	if inferQueryHotkeyPreset(fields.values) != queryHotkeyPresetCustom {
+		t.Fatal("legacy and custom combinations must remain custom")
+	}
+	fields.values["HideQueryBox"] = "false"
+	fields.values["HideToolbar"] = "false"
+	fields.values["HideResults"] = "true"
+	if inferQueryHotkeyPreset(fields.values) != queryHotkeyPresetCustom {
+		t.Fatal("HideResults alone must remain customizable")
+	}
+}

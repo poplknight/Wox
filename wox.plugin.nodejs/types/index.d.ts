@@ -1,0 +1,2256 @@
+import { MetadataCommand, PluginSettingDefinitionItem } from "./setting.js"
+import { AI } from "./ai.js"
+
+export * from "./setting.js"
+export * from "./ai.js"
+
+export interface RegisterTriggerKeywordOption {
+  Keyword: string
+  QueryHint?: QueryHint
+  /** Input-query debounce in milliseconds. Omit to inherit the metadata trigger/plugin default; 0 runs immediately. */
+  DebounceMs?: number
+}
+
+export interface RegisterTriggerKeywordResult {
+  Success: boolean
+}
+
+export interface UnregisterTriggerKeywordOption {
+  Keyword: string
+}
+
+export interface UnregisterTriggerKeywordResult {
+  Success: boolean
+}
+
+export interface PluginToolAnnotations {
+  ReadOnly: boolean
+  Destructive: boolean
+  Idempotent: boolean
+  RequiresUI: boolean
+}
+
+export interface PluginToolDescriptor {
+  Name: string
+  Description: string
+  InputSchema: Record<string, unknown>
+  OutputSchema: Record<string, unknown>
+  Annotations: PluginToolAnnotations
+}
+
+export interface PluginToolError {
+  Code: string
+  Message: string
+}
+
+export interface RegisterPluginToolOption {
+  Tool: PluginToolDescriptor
+  Handler: PluginToolHandler
+}
+
+export interface RegisterPluginToolResult {
+  Error?: PluginToolError | null
+}
+
+export interface UnregisterPluginToolOption {
+  Name: string
+}
+
+export interface UnregisterPluginToolResult {
+  Error?: PluginToolError | null
+}
+
+export interface ListPluginToolsOption {
+  PluginId?: string
+}
+
+export interface PluginToolListItem {
+  PluginId: string
+  PluginName: string
+  Tool: PluginToolDescriptor
+}
+
+export interface ListPluginToolsResult {
+  Tools: PluginToolListItem[]
+  Error?: PluginToolError | null
+}
+
+export interface InvokePluginToolOption {
+  PluginId: string
+  Name: string
+  Arguments?: Record<string, unknown>
+}
+
+export interface InvokePluginToolResult {
+  Output?: Record<string, unknown>
+  Error?: PluginToolError | null
+}
+
+export interface InvokePluginToolHandlerOption {
+  Arguments: Record<string, unknown>
+}
+
+export interface InvokePluginToolHandlerResult {
+  Output?: Record<string, unknown>
+  Error?: PluginToolError | null
+}
+
+export type PluginToolHandler = (ctx: Context, option: InvokePluginToolHandlerOption) => Promise<InvokePluginToolHandlerResult> | InvokePluginToolHandlerResult
+
+export type DragOutStatus = "success" | "cancel" | "cancel_in_source"
+
+export interface DragOutEvent {
+  ResultId: string
+  Files: string[]
+  Status: DragOutStatus
+}
+
+export interface DragOutListenOption {
+  Callback: (ctx: Context, event: DragOutEvent) => Promise<void> | void
+}
+
+export interface DragOutListenResult {
+  Success: boolean
+}
+
+/**
+ * A dictionary type for string key-value pairs.
+ *
+ * Used throughout the plugin API for passing arbitrary string data,
+ * such as context data, settings, and metadata.
+ *
+ * @example
+ * ```typescript
+ * const data: MapString = {
+ *   "userId": "12345",
+ *   "category": "documents",
+ *   "tag": "favorite"
+ * }
+ * ```
+ */
+export type MapString = { [key: string]: string }
+
+/**
+ * Operating system platform identifier.
+ *
+ * Used for platform-specific functionality and conditional behavior.
+ *
+ * - `windows`: Windows operating system
+ * - `darwin`: macOS operating system
+ * - `linux`: Linux operating system
+ *
+ * @example
+ * ```typescript
+ * if (platform === "darwin") {
+ *   // macOS-specific code
+ * }
+ * ```
+ */
+export type Platform = "windows" | "darwin" | "linux"
+
+/**
+ * Main plugin interface that all Wox plugins must implement.
+ *
+ * A plugin is a class or object that provides search functionality to Wox.
+ * It must implement the `init` and `query` methods.
+ *
+ * @example
+ * ```typescript
+ * class MyPlugin implements Plugin {
+ *   private api: PublicAPI
+ *
+ *   async init(ctx: Context, initParams: PluginInitParams): Promise<void> {
+ *     this.api = initParams.API
+ *     await this.api.Log(ctx, "Info", "Plugin initialized")
+ *   }
+ *
+ *   async query(ctx: Context, query: Query): Promise<QueryResponse> {
+ *     // QueryResponse requires Wox >= 2.0.4. Return Result[] instead when
+ *     // your plugin must keep running on older Wox releases.
+ *     return { Results: [{
+ *       Title: "Hello World",
+ *       SubTitle: "My first result",
+ *       Icon: { ImageType: "emoji", ImageData: "👋" },
+ *       Score: 100
+ *     }] }
+ *   }
+ * }
+ * ```
+ */
+export interface Plugin {
+  /**
+   * Initialize the plugin with the provided context and parameters.
+   *
+   * Called once when the plugin is first loaded. Use this to:
+   * - Store the API for later use
+   * - Load initial data
+   * - Register callbacks
+   * - Set up any required resources
+   *
+   * @param ctx - Request context with trace ID for logging
+   * @param initParams - Initialization parameters including API and plugin directory
+   *
+   * @example
+   * ```typescript
+   * async init(ctx: Context, initParams: PluginInitParams): Promise<void> {
+   *   this.api = initParams.API
+   *   this.pluginDir = initParams.PluginDirectory
+   *
+   *   // Load settings
+   *   const apiKey = await this.api.GetSetting(ctx, "apiKey")
+   *
+   *   // Register callbacks
+   *   await this.api.OnSettingChanged(ctx, (ctx, key, value) => {
+   *     console.log(`Setting changed: ${key} = ${value}`)
+   *   })
+   * }
+   * ```
+   */
+  init: (ctx: Context, initParams: PluginInitParams) => Promise<void>
+
+  /**
+   * Query handler that returns results based on user input.
+   *
+   * Called whenever the user types a query that triggers this plugin.
+   * The plugin should return matching results sorted by relevance.
+   * QueryResponse requires Wox >= 2.0.4; return Result[] directly when the
+   * plugin must support older Wox releases.
+   *
+   * @param ctx - Request context with trace ID for logging
+   * @param query - The query object containing search text, type, environment
+   * @returns QueryResponse for Wox >= 2.0.4, or Result[] for older-compatible plugins
+   *
+   * @example
+   * ```typescript
+   * async query(ctx: Context, query: Query): Promise<QueryResponse> {
+   *   if (query.Type === "selection") {
+   *     return { Results: this.handleSelection(query.Selection) }
+   *   }
+   *
+   *   const searchTerm = query.Search.toLowerCase()
+   *   const results = this.items
+   *     .filter(item => item.name.toLowerCase().includes(searchTerm))
+   *     .map(item => ({
+   *       Title: item.name,
+   *       SubTitle: item.description,
+   *       Icon: this.getIcon(item),
+   *       Score: this.calculateScore(item, searchTerm),
+   *       Actions: [
+   *         {
+   *           Name: "Open",
+   *           Icon: { ImageType: "emoji", ImageData: "🔗" },
+   *           Action: async (ctx, actionCtx) => {
+   *             await this.openItem(item)
+   *           }
+   *         }
+   *       ]
+   *     }))
+   *
+   *   return { Results: results }
+   * }
+   * ```
+   */
+  query: (ctx: Context, query: Query) => Promise<QueryReturn>
+}
+
+/**
+ * User-selected or drag-dropped data.
+ *
+ * When a plugin has the `MetadataFeatureQuerySelection` feature enabled,
+ * it can receive selection queries in addition to input queries.
+ *
+ * @example
+ * ```typescript
+ * async query(ctx: Context, query: Query): Promise<QueryResponse> {
+ *   if (query.Type === "selection") {
+ *     const selection = query.Selection
+ *     if (selection.Type === "text") {
+ *       console.log("Selected text:", selection.Text)
+ *     } else if (selection.Type === "file") {
+ *       console.log("Selected files:", selection.FilePaths)
+ *     }
+ *   }
+ *   return { Results: [] }
+ * }
+ * ```
+ */
+export interface Selection {
+  /**
+   * The type of selection data.
+   *
+   * - `text`: User has selected text content
+   * - `file`: User has selected or drag-dropped files
+   */
+  Type: "text" | "file"
+  /**
+   * The selected text content.
+   *
+   * Only available when Type is "text".
+   */
+  Text: string
+  /**
+   * Array of selected file paths.
+   *
+   * Only available when Type is "file".
+   * Contains full paths to all selected/dropped files.
+   */
+  FilePaths: string[]
+}
+
+/**
+ * Environment context for a query.
+ *
+ * Provides information about the user's current environment when the
+ * query was made, such as the active window, browser URL, etc.
+ *
+ * This allows plugins to provide context-aware results.
+ *
+ * @example
+ * ```typescript
+ * // Show different results based on active window
+ * async query(ctx: Context, query: Query): Promise<QueryResponse> {
+ *   if (query.Env.ActiveWindowTitle.includes("Visual Studio")) {
+ *     return { Results: this.getVSCodeActions() }
+ *   }
+ *   return { Results: [] }
+ * }
+ * ```
+ */
+export interface QueryEnv {
+  /**
+   * Title of the active window when the query was made.
+   *
+   * Useful for context-aware results based on what application
+   * the user is currently using.
+   */
+  ActiveWindowTitle: string
+
+  /**
+   * Process ID of the active window.
+   *
+   * Zero if the information is not available.
+   */
+  ActiveWindowPid: number
+
+  /**
+   * Icon of the active window.
+   *
+   * May be empty if no icon is available.
+   */
+  ActiveWindowIcon: WoxImage
+
+  /**
+   * URL of the active browser tab.
+   *
+   * Only available when:
+   * - The active window is a supported browser
+   * - The Wox browser extension is installed
+   *
+   * @see https://github.com/Wox-launcher/Wox.Chrome.Extension
+   */
+  ActiveBrowserUrl: string
+}
+
+/**
+ * Query object containing user input and context.
+ *
+ * Passed to the plugin's `query()` method, contains all information
+ * about the user's search query including the search text, type,
+ * trigger keyword, and environment context.
+ *
+ * @example
+ * ```typescript
+ * async query(ctx: Context, query: Query): Promise<QueryResponse> {
+ *   // Handle input query
+ *   if (query.Type === "input") {
+ *     console.log("Search:", query.Search)
+ *     console.log("Trigger:", query.TriggerKeyword)
+ *   }
+ *
+ *   // Handle selection query
+ *   if (query.Type === "selection") {
+ *     console.log("Selection:", query.Selection)
+ *   }
+ *
+ *   // Check environment
+ *   if (query.Env.ActiveBrowserUrl) {
+ *     console.log("Browser:", query.Env.ActiveBrowserUrl)
+ *   }
+ * }
+ * ```
+ */
+/** Semantic values and background input guidance, never a mandatory form.
+ * User edits take priority over retaining hints. Command templates contain suffix elements only.
+ */
+export interface QueryHint {
+  Elements: QueryElement[]
+}
+
+/** Text uses Text; arguments and atomic blocks use Value. IDs are unique per query.
+ * Suggestions are ordered literal candidates; they never restrict free input.
+ */
+export type QueryElement =
+  | { Id: string; Kind: "text"; Text: string }
+  | { Id: string; Kind: "argument"; Value?: string; Placeholder?: string; Required?: boolean; Suggestions?: string[] }
+  | { Id: string; Kind: "block"; Value: string }
+
+export interface Query {
+  QueryHint?: QueryHint
+
+  /**
+   * Unique query identifier.
+   *
+   * Used to correlate async updates with the original query.
+   * Pass this ID when calling UpdateResult or PushResults.
+   */
+  Id: string
+
+  /**
+   * UI session identifier for this query.
+   *
+   * Stable for the lifetime of the Wox UI instance that issued the query.
+   * Use this when query-scoped state must stay tied to one visible session.
+   */
+  SessionId?: string
+
+  /**
+   * Query type.
+   *
+   * - `input`: User typed a query
+   * - `selection`: User selected text or drag-dropped files
+   *
+   * Note: Selection queries require the `MetadataFeatureQuerySelection` feature.
+   */
+  Type: "input" | "selection"
+
+  /**
+   * Raw query string including trigger keyword.
+   *
+   * Not recommended for direct use. Use `Search` instead for the
+   * actual search term without the trigger keyword.
+   *
+   * Only available when Type is "input".
+   */
+  RawQuery: string
+
+  /**
+   * Trigger keyword that activated this plugin.
+   *
+   * Empty if using global trigger keyword.
+   *
+   * Only available when Type is "input".
+   *
+   * @example
+   * If user types "git status", TriggerKeyword is "git" and Search is "status"
+   */
+  TriggerKeyword?: string
+
+  /**
+   * Command part of the query (between trigger and search).
+   *
+   * Only available when Type is "input".
+   *
+   * @example
+   * If user types "myplugin cmd search", Command is "cmd" and Search is "search"
+   */
+  Command?: string
+
+  /**
+   * The actual search term.
+   *
+   * This is the text the user wants to search for, without
+   * trigger keyword or command. Use this for your search logic.
+   *
+   * Only available when Type is "input".
+   */
+  Search: string
+
+  /**
+   * User selected or drag-dropped data.
+   *
+   * Only available when Type is "selection".
+   */
+  Selection: Selection
+
+  /**
+   * Environment context when the query was made.
+   *
+   * Includes information about the active window, browser URL, etc.
+   * Use this to provide context-aware results.
+   */
+  Env: QueryEnv
+
+  /**
+   * Selected query refinement values keyed by refinement id.
+   *
+   * These values come from the QueryResponse.Refinements controls returned by
+   * the plugin on previous query updates. Wox treats them as opaque strings;
+   * the plugin owns the filtering or sorting semantics. Multi-select
+   * refinements are comma-separated.
+   */
+  Refinements?: { [key: string]: string }
+
+  /**
+   * Hidden query-scoped data.
+   *
+   * Wox does not render this as UI. Plugins can use it to keep data attached
+   * to a plugin-driven ChangeQuery flow, such as a shell working directory.
+   */
+  ContextData?: MapString
+
+  /**
+   * Check if this is a global query (no trigger keyword).
+   *
+   * @returns true if triggered globally, false if triggered by keyword
+   */
+  IsGlobalQuery(): boolean
+}
+
+export type QueryRefinementType = "singleSelect" | "multiSelect" | "toggle" | "sort"
+
+/**
+ * One selectable value inside a query refinement control.
+ */
+export interface QueryRefinementOption {
+  Value: string
+  Title: string
+  Icon?: WoxImage
+  Keywords?: string[]
+  Count?: number
+}
+
+/**
+ * Query-scoped control displayed near the query box or result list.
+ *
+ * Plugins return refinements with QueryResponse, and Wox sends selected values
+ * back through Query.Refinements on the next query.
+ */
+export interface QueryRefinement {
+  Id: string
+  Title: string
+  Type: QueryRefinementType
+  Options: QueryRefinementOption[]
+  DefaultValue?: string[]
+  Hotkey: string
+  Persist?: boolean
+}
+
+/**
+ * Optional grid presentation hints for the current query response.
+ *
+ * Prefer this QueryResponse layout field over plugin.json `gridLayout`. The
+ * metadata feature is deprecated because it only describes static plugin or
+ * command defaults, while QueryResponse can choose the layout per query.
+ */
+export interface QueryGridLayout {
+  Columns?: number
+  ImageWidth?: number
+  ImageHeight?: number
+  ItemPadding?: number
+  ItemMargin?: number
+  AspectRatio?: number
+  ShowTitle?: boolean
+  Commands?: string[]
+}
+
+/**
+ * Optional presentation hints that apply to one query response.
+ *
+ * Use this object for result preview width and grid layout. The older
+ * plugin.json `resultPreviewWidthRatio` and `gridLayout` metadata features are
+ * deprecated and remain only for compatibility with existing plugins.
+ */
+export interface QueryLayout {
+  Icon?: WoxImage
+  ResultPreviewWidthRatio?: number
+  GridLayout?: QueryGridLayout
+}
+
+/**
+ * Complete response from plugin.query().
+ *
+ * Requires Wox >= 2.0.4. Set plugin.json MinWoxVersion to at least 2.0.4 when
+ * returning this shape; return Result[] directly if the plugin must support
+ * older Wox releases.
+ */
+export interface QueryResponse {
+  Results: Result[]
+  Refinements?: QueryRefinement[]
+  Layout?: QueryLayout
+}
+
+/**
+ * @deprecated Returning Result[] from query() is still accepted by the host for
+ * compatibility. Use QueryResponse only when plugin.json MinWoxVersion is at
+ * least 2.0.4 so results, refinements, and layout hints stay in one response
+ * object.
+ */
+export type LegacyQueryReturn = Result[]
+
+export type QueryReturn = QueryResponse | LegacyQueryReturn
+
+/**
+ * A search result displayed to the user.
+ *
+ * Results are displayed in the Wox UI and can include icons, previews,
+ * actions, and tail elements for additional information.
+ *
+ * @example
+ * ```typescript
+ * const result: Result = {
+ *   Id: "result-1",
+ *   Title: "Open Calculator",
+ *   SubTitle: "Launch the system calculator app",
+ *   Icon: { ImageType: "emoji", ImageData: "🔢" },
+ *   Score: 100,
+ *   Preview: {
+ *     PreviewType: "markdown",
+ *     PreviewData: "# Calculator\n\nA simple calculator app",
+ *     PreviewTags: [{ Label: "System", Tooltip: "Source" }]
+ *   },
+ *   Tails: [
+ *     { Type: "text", Text: "⌘⏎ Quick Action" }
+ *   ],
+ *   Actions: [
+ *     {
+ *       Name: "Open",
+ *       Icon: { ImageType: "emoji", ImageData: "🚀" },
+ *       Action: async (ctx, actionCtx) => {
+ *         // Open calculator
+ *       }
+ *     }
+ *   ]
+ * }
+ * ```
+ */
+export interface Result {
+  /**
+   * Unique identifier for this result.
+   *
+   * Optional. If not provided, Wox will generate a random ID.
+   * Use this ID with UpdateResult to update the result later.
+   */
+  Id?: string
+
+  /**
+   * Main title displayed to the user.
+   *
+   * This is the primary text shown in the result list.
+   * Should be concise but descriptive.
+   */
+  Title: string
+
+  /**
+   * Secondary text shown below the title.
+   *
+   * Use for additional context like description, path, or metadata.
+   */
+  SubTitle?: string
+
+  /**
+   * Icon displayed next to the result.
+   *
+   * Can be emoji, image path, base64, etc.
+   */
+  Icon: WoxImage
+
+  /** Show a theme-aware rounded background and border around the icon. Defaults to false. */
+  IconShowContainer?: boolean
+
+  /**
+   * Preview panel content.
+   *
+   * When selected, this content is shown in the preview panel.
+   * Supports markdown, text, images, URLs, and files.
+   */
+  Preview?: WoxPreview
+
+  /**
+   * Relevance score for sorting.
+   *
+   * Higher values appear first in the result list.
+   * Default is 0.
+   */
+  Score?: number
+
+  /**
+   * Stable result identity for usage history, MRU restore, and query pins.
+   *
+   * Optional. Set this when Title or SubTitle changes over time but the result
+   * should stay the same item. ScoreKey is the older name and is still accepted.
+   */
+  IdentityKey?: string
+
+  /**
+   * @deprecated Use IdentityKey. Still accepted by Wox.
+   */
+  ScoreKey?: string
+
+  /**
+   * Group name for organizing results.
+   *
+   * Results with the same group name are displayed together
+   * with a group header.
+   */
+  Group?: string
+
+  /**
+   * Score for group sorting.
+   *
+   * Determines the order of groups in the result list.
+   */
+  GroupScore?: number
+
+  /**
+   * Additional visual elements displayed after the result.
+   *
+   * Tails are small UI elements like text labels or icons
+   * shown to the right of the result.
+   *
+   * @example
+   * ```typescript
+   * Tails: [
+   *   { Type: "text", Text: "⭐ Favorite" },
+   *   { Type: "image", Image: { ImageType: "emoji", ImageData: "🔥" } }
+   * ]
+   * ```
+   */
+  Tails?: ResultTail[]
+
+  /**
+   * User actions available for this result.
+   *
+   * Actions are shown when the result is selected and can be
+   * triggered via keyboard shortcuts or clicking.
+   */
+  Actions?: ResultAction[]
+
+  /**
+   * Optional native drag payload for this result.
+   *
+   * Wox currently supports file drags only. Use absolute file or directory
+   * paths so the desktop shell can transfer them to another app.
+   */
+  DragData?: ResultDragData
+}
+
+export interface ResultDragData {
+  /**
+   * Native drag payload type.
+   *
+   * Currently only `files` is supported.
+   */
+  Type: "files"
+
+  /**
+   * Absolute file or directory paths exported by the drag session.
+   */
+  Files: string[]
+
+  /**
+   * Keep Wox visible after the drag ends. Defaults to false.
+   */
+  PreventHideAfterDrag?: boolean
+}
+
+/**
+ * A visual element displayed after a result.
+ *
+ * Tails are small UI elements that provide additional information
+ * or quick actions. They appear to the right of the result in
+ * the list view.
+ *
+ * @example
+ * ```typescript
+ * // Text tail for status
+ * { Type: "text", Text: "✓ Verified", Id: "status-tail" }
+ *
+ * // Image tail for icon
+ * { Type: "image", Image: { ImageType: "emoji", ImageData: "🔥" }, ImageWidth: 24, ImageHeight: 24, Tooltip: "Hot" }
+ * ```
+ */
+export type ResultTailTextCategory = "default" | "danger" | "warning" | "success"
+
+export interface ResultTail {
+  /**
+   * The type of tail content.
+   *
+   * - `text`: Display text content
+   * - `image`: Display an icon or image
+   */
+  Type: "text" | "image"
+
+  /**
+   * Text content for text tails.
+   *
+   * Only used when Type is "text".
+   */
+  Text?: string
+
+  /**
+   * Semantic color category for text tails.
+   *
+   * Only used when Type is "text". If omitted, Wox uses the default text-tail style.
+   */
+  TextCategory?: ResultTailTextCategory
+
+  /**
+   * Image content for image tails.
+   *
+   * Only used when Type is "image".
+   */
+  Image?: WoxImage
+
+  /**
+   * Optional width for image tails.
+   *
+   * Only used when Type is "image". If omitted, Wox uses the default tail image width.
+   */
+  ImageWidth?: number
+
+  /**
+   * Optional height for image tails.
+   *
+   * Only used when Type is "image". If omitted, Wox uses the default tail image height.
+   */
+  ImageHeight?: number
+
+  /**
+   * Optional hover text for this tail.
+   *
+   * Use this for compact or icon-only tails so users can understand the tail
+   * without plugins replacing the visual affordance with longer text.
+   */
+  Tooltip?: string
+
+  /**
+   * Unique identifier for this tail.
+   *
+   * Optional. If not provided, Wox generates a random ID.
+   * Use this to identify specific tails for updates.
+   */
+  Id?: string
+
+  /**
+   * Additional data associated with this tail.
+   *
+   * Store arbitrary key-value pairs for identification and metadata.
+   *
+   * Note: This data is NOT passed to action callbacks.
+   * Use ResultAction.ContextData for data that needs to be available
+   * in action handlers.
+   *
+   * Tail context data is primarily used for:
+   * - Identifying specific tails (e.g., custom IDs, tags)
+   * - Storing tail metadata for UI updates
+   * - System-level tail identification (e.g., "system:favorite")
+   */
+  ContextData?: MapString
+}
+
+/**
+ * Result that can be updated directly in the UI.
+ *
+ * All fields except Id are optional. Only non-undefined fields will be updated.
+ *
+ * Example usage:
+ * ```typescript
+ * // Update only the title
+ * const success = await api.updateResult(ctx, {
+ *   Id: resultId,
+ *   Title: "Downloading... 50%"
+ * })
+ *
+ * // Update title and tails
+ * const success = await api.updateResult(ctx, {
+ *   Id: resultId,
+ *   Title: "Processing...",
+ *   Tails: [{ Type: "text", Text: "Step 1/3" }]
+ * })
+ * ```
+ */
+export interface UpdatableResult {
+  /** Required - identifies which result to update */
+  Id: string
+  /** Optional - update the title */
+  Title?: string
+  /** Optional - update the subtitle */
+  SubTitle?: string
+  /** Optional - update the icon */
+  Icon?: WoxImage
+  /** Optional - update the tails */
+  Tails?: ResultTail[]
+  /** Optional - update the preview */
+  Preview?: WoxPreview
+  /** Optional - update the actions */
+  Actions?: ResultAction[]
+  /** Optional - update or clear native drag data */
+  DragData?: ResultDragData
+}
+
+/**
+ * Type of result action.
+ *
+ * - `execute`: Immediately execute the action's callback function
+ * - `form`: Display a form to the user before executing
+ */
+export type ResultActionType = "execute" | "form"
+
+/**
+ * A user action that can be performed on a result.
+ *
+ * Actions are displayed when a result is selected and can be triggered
+ * via keyboard shortcuts or by clicking. There are two types:
+ * execute actions (run immediately) and form actions (show form first).
+ *
+ * @example
+ * ```typescript
+ * const action: ExecuteResultAction = {
+ *   Name: "Copy to Clipboard",
+ *   Icon: { ImageType: "emoji", ImageData: "📋" },
+ *   IsDefault: true,
+ *   Hotkey: "Ctrl+C",
+ *   Action: async (ctx, actionCtx) => {
+ *     await api.Copy(ctx, { type: "text", text: "Hello" })
+ *   }
+ * }
+ * ```
+ */
+export type ResultAction = ExecuteResultAction | FormResultAction
+
+/**
+ * An action that executes immediately when triggered.
+ *
+ * Execute actions run their callback function as soon as the user
+ * activates them (via keyboard shortcut or click).
+ *
+ * @example
+ * ```typescript
+ * const action: ExecuteResultAction = {
+ *   Id: "action-copy",
+ *   Name: "Copy",
+ *   Icon: { ImageType: "emoji", ImageData: "📋" },
+ *   IsDefault: true,
+ *   PreventHideAfterAction: false,
+ *   Hotkey: "Ctrl+C",
+ *   ContextData: { "copyType": "text" },
+ *   Action: async (ctx, actionCtx) => {
+ *     console.log("ResultId:", actionCtx.ResultId)
+ *     await this.copyItem(ctx, actionCtx)
+ *   }
+ * }
+ * ```
+ */
+export interface ExecuteResultAction {
+  /**
+   * Unique identifier for this action.
+   *
+   * Optional. If not provided, Wox generates a random ID.
+   * Use this to identify the action for updates or logging.
+   */
+  Id?: string
+
+  /**
+   * Action type discriminator.
+   *
+   * Set to "execute" for immediate execution actions.
+   */
+  Type?: "execute"
+
+  /**
+   * Display name for the action.
+   *
+   * This is shown to the user in the UI.
+   */
+  Name: string
+
+  /**
+   * Additional terms that can find this action in the action panel.
+   *
+   * Wox automatically includes the English translation of Name when available.
+   */
+  SearchAliases?: string[]
+
+  /**
+   * Icon displayed next to the action name.
+   */
+  Icon?: WoxImage
+
+  /**
+   * Whether this is the default action.
+   *
+   * If true, this action is triggered when the user presses Enter.
+   * Only one action per result can be the default.
+   * If not set, the first action becomes the default.
+   */
+  IsDefault?: boolean
+
+  /**
+   * Whether to keep Wox visible after executing this action.
+   *
+   * If true, Wox remains open after the action completes.
+   * Useful for actions that update the result rather than navigate away.
+   */
+  PreventHideAfterAction?: boolean
+
+  /**
+   * Show this action in the toolbar. Defaults to false; the default Enter action is always shown.
+   * The action panel and keyboard shortcut remain available regardless of this setting.
+   */
+  ShowInToolbar?: boolean
+
+  /**
+   * The callback function to execute when the action is triggered.
+   *
+   * @param ctx - Request context
+   * @param actionContext - Action context with result ID and context data
+   */
+  Action: (ctx: Context, actionContext: ActionContext) => Promise<void>
+
+  /**
+   * Keyboard shortcut to trigger this action.
+   *
+   * Examples: "Ctrl+Shift+Space", "Ctrl+1", "Command+K"
+   * Case and space insensitive.
+   *
+   * If IsDefault is true, the hotkey defaults to Enter.
+   */
+  Hotkey?: string
+
+  /**
+   * Additional data associated with this action.
+   *
+   * This data is passed to ActionContext.ContextData when
+   * the action is executed. Use it to identify which action
+   * was triggered or pass custom parameters.
+   */
+  ContextData?: MapString
+}
+
+/**
+ * An action that shows a form before executing.
+ *
+ * Form actions display a form to the user, collect input,
+ * and then execute the OnSubmit callback with the form values.
+ *
+ * @example
+ * ```typescript
+ * const action: FormResultAction = {
+ *   Name: "Create New Item",
+ *   Icon: { ImageType: "emoji", ImageData: "➕" },
+ *   Form: [
+ *     {
+ *       Key: "name",
+ *       Label: "Name",
+ *       Suffix: "",
+ *       DefaultValue: "",
+ *       Tooltip: "",
+ *       MaxLines: 1,
+ *       Validators: [],
+ *       Style: {} as PluginSettingValueStyle
+ *     } as PluginSettingValueTextBox,
+ *     {
+ *       Key: "enabled",
+ *       Label: "Enable",
+ *       DefaultValue: "true",
+ *       Tooltip: "",
+ *       Style: {} as PluginSettingValueStyle
+ *     } as PluginSettingValueCheckBox
+ *   ],
+ *   OnSubmit: async (ctx, formCtx) => {
+ *     console.log("Name:", formCtx.Values["name"])
+ *     console.log("Enabled:", formCtx.Values["enabled"])
+ *     await this.createItem(ctx, formCtx.Values)
+ *   }
+ * }
+ * ```
+ */
+export interface FormResultAction {
+  /**
+   * Unique identifier for this action.
+   *
+   * Optional. If not provided, Wox generates a random ID.
+   */
+  Id?: string
+
+  /**
+   * Action type discriminator.
+   *
+   * Must be "form" for form-based actions.
+   */
+  Type: "form"
+
+  /**
+   * Display name for the action.
+   */
+  Name: string
+
+  /**
+   * Additional terms that can find this action in the action panel.
+   *
+   * Wox automatically includes the English translation of Name when available.
+   */
+  SearchAliases?: string[]
+
+  /**
+   * Icon displayed next to the action name.
+   */
+  Icon?: WoxImage
+
+  /**
+   * Whether this is the default action.
+   *
+   * If true, this action is triggered when the user presses Enter.
+   * Only one action per result can be the default.
+   */
+  IsDefault?: boolean
+
+  /**
+   * Whether to keep Wox visible after executing this action.
+   */
+  PreventHideAfterAction?: boolean
+
+  /**
+   * Show this action in the toolbar. Defaults to false; the default Enter action is always shown.
+   * The action panel and keyboard shortcut remain available regardless of this setting.
+   */
+  ShowInToolbar?: boolean
+
+  /**
+   * Form definition to display.
+   *
+   * Array of setting items that define the form fields.
+   */
+  Form: PluginSettingDefinitionItem[]
+
+  /**
+   * Callback executed when the form is submitted.
+   *
+   * @param ctx - Request context
+   * @param actionContext - Form action context with submitted values
+   */
+  OnSubmit: (ctx: Context, actionContext: FormActionContext) => Promise<void>
+
+  /**
+   * Keyboard shortcut to trigger this action.
+   *
+   * Examples: "Ctrl+Shift+Space", "Ctrl+1", "Command+K"
+   */
+  Hotkey?: string
+
+  /**
+   * Additional data associated with this action.
+   */
+  ContextData?: MapString
+}
+
+/**
+ * Context passed to action callback functions.
+ *
+ * When a user triggers an action, Wox creates an ActionContext
+ * containing information about which result and action were triggered,
+ * along with any custom context data.
+ *
+ * @example
+ * ```typescript
+ * Action: async (ctx: Context, actionContext: ActionContext) => {
+ *   console.log("Result ID:", actionContext.ResultId)
+ *   console.log("Action ID:", actionContext.ResultActionId)
+ *   console.log("Custom data:", actionContext.ContextData)
+ *
+ *   // Update the result
+ *   await api.UpdateResult(ctx, {
+ *     Id: actionContext.ResultId,
+ *     Title: "Updated!"
+ *   })
+ * }
+ * ```
+ */
+export interface ActionContext {
+  /**
+   * The ID of the result that triggered this action.
+   *
+   * Automatically set by Wox when the action is invoked.
+   * Use this with UpdateResult to modify the result's UI.
+   */
+  ResultId: string
+  /**
+   * The ID of the action that was triggered.
+   *
+   * Automatically set by Wox when the action is invoked.
+   * Useful for identifying which action was executed.
+   */
+  ResultActionId: string
+  /**
+   * Additional data associated with this action.
+   *
+   * Contains the ContextData from the ResultAction that was triggered.
+   * Use this to pass custom parameters to your action handler.
+   */
+  ContextData: MapString
+}
+
+/**
+ * Extended action context for form submissions.
+ *
+ * In addition to the standard ActionContext fields, this includes
+ * the form values submitted by the user.
+ *
+ * @example
+ * ```typescript
+ * OnSubmit: async (ctx: Context, formContext: FormActionContext) => {
+ *   const name = formContext.Values["name"]
+ *   const email = formContext.Values["email"]
+ *   console.log("User submitted:", name, email)
+ * }
+ * ```
+ */
+export interface FormActionContext extends ActionContext {
+  /**
+   * Form field values submitted by the user.
+   *
+   * Keys are the setting keys, values are the user-submitted strings.
+   */
+  Values: Record<string, string>
+}
+
+/**
+ * Context passed back to a toolbar msg action callback.
+ */
+export interface ToolbarMsgActionContext {
+  /**
+   * Id of the toolbar msg that owns the action.
+   */
+  ToolbarMsgId: string
+  /**
+   * Id of the toolbar msg action that was invoked.
+   */
+  ToolbarMsgActionId: string
+  /**
+   * Arbitrary string data attached to the action.
+   */
+  ContextData: MapString
+}
+
+/**
+ * Action rendered on the toolbar while a toolbar msg is visible.
+ */
+export interface ToolbarMsgAction {
+  /**
+   * Unique action id. Wox will backfill one when omitted.
+   */
+  Id?: string
+  /**
+   * Action label shown in the toolbar.
+   */
+  Name: string
+  /**
+   * Optional action icon.
+   */
+  Icon?: WoxImage
+  /**
+   * Optional hotkey displayed in the toolbar.
+   */
+  Hotkey?: string
+  /**
+   * Whether this action should be treated as the default action.
+   */
+  IsDefault?: boolean
+  /**
+   * When true, Wox keeps the launcher visible after the action runs.
+   */
+  PreventHideAfterAction?: boolean
+  /**
+   * Arbitrary string data passed back through ToolbarMsgActionContext.
+   */
+  ContextData?: MapString
+  /**
+   * Action callback invoked when the user triggers the toolbar action.
+   */
+  Action: (ctx: Context, actionContext: ToolbarMsgActionContext) => Promise<void> | void
+}
+
+/**
+ * Toolbar msg payload displayed in the launcher toolbar.
+ */
+export interface ToolbarMsg {
+  /**
+   * Unique toolbar msg id within the current plugin.
+   *
+   * Reusing the same id updates the existing toolbar msg in place.
+   */
+  Id: string
+  /**
+   * Primary text shown in the toolbar.
+   */
+  Title: string
+  /**
+   * Optional icon shown before the title.
+   */
+  Icon?: WoxImage
+  /** Suppresses both an explicit icon and the default plugin icon. Defaults to false. */
+  HideIcon?: boolean
+  /**
+   * Optional 0-100 progress value for determinate progress.
+   */
+  Progress?: number
+  /**
+   * Shows an indeterminate spinner when the work is in progress but no percentage is available yet.
+   */
+  Indeterminate?: boolean
+  /**
+   * Optional toolbar actions rendered on the right side of the toolbar.
+   */
+  Actions?: ToolbarMsgAction[]
+}
+
+/**
+ * Most Recently Used (MRU) item data.
+ *
+ * Wox keeps track of recently selected items and can restore them
+ * via the OnMRURestore callback.
+ *
+ * @example
+ * ```typescript
+ * await api.OnMRURestore(ctx, async (ctx, mruData) => {
+ *   // Find the item in our data
+ *   const item = this.findById(mruData.ContextData["id"])
+ *   if (!item) {
+ *     return null  // Item no longer exists
+ *   }
+ *
+ *   // Return a result for the MRU item
+ *   return {
+ *     Title: item.name,
+ *     SubTitle: item.description,
+ *     Icon: mruData.Icon
+ *   }
+ * })
+ * ```
+ */
+export interface MRUData {
+  /**
+   * Plugin ID that owns this MRU item.
+   */
+  PluginID: string
+  /**
+   * Title of the MRU item.
+   */
+  Title: string
+  /**
+   * Subtitle of the MRU item.
+   */
+  SubTitle: string
+  /**
+   * Icon of the MRU item.
+   */
+  Icon: WoxImage
+  /**
+   * Custom data associated with this MRU item.
+   *
+   * Use this to store identifiers or metadata needed to
+   * reconstruct the item when restoring from MRU.
+   */
+  ContextData: MapString
+}
+
+/**
+ * Parameters passed to the plugin's init method.
+ *
+ * Contains the API instance and plugin directory path.
+ *
+ * @example
+ * ```typescript
+ * async init(ctx: Context, initParams: PluginInitParams): Promise<void> {
+ *   this.api = initParams.API
+ *   this.pluginDir = initParams.PluginDirectory
+ *
+ *   // Load data from plugin directory
+ *   const dataPath = `${this.pluginDir}/data.json`
+ *   this.data = JSON.parse(await fs.readFile(dataPath, 'utf-8'))
+ * }
+ * ```
+ */
+export interface PluginInitParams {
+  /**
+   * The public API for interacting with Wox.
+   *
+   * Store this for later use in your plugin methods.
+   */
+  API: PublicAPI
+  /**
+   * Absolute path to the plugin directory.
+   *
+   * Use this to load plugin-specific data files, configs, etc.
+   */
+  PluginDirectory: string
+}
+
+/**
+ * Parameters for changing the current Wox query.
+ *
+ * Used with the ChangeQuery API to programmatically change
+ * what the user is searching for.
+ *
+ * @example
+ * ```typescript
+ * // Change to input query
+ * await api.ChangeQuery(ctx, {
+ *   QueryType: "input",
+ *   QueryText: "github wox"
+ * })
+ *
+ * // Change to selection query
+ * await api.ChangeQuery(ctx, {
+ *   QueryType: "selection",
+ *   QuerySelection: {
+ *     Type: "text",
+ *     Text: "selected text"
+ *   }
+ * })
+ * ```
+ */
+/** The complete query is required; QueryHint only decorates input text; invalid or mismatching hints are ignored. */
+export type ChangeQueryParam = {
+  ContextData?: MapString
+} & ({ QueryType: "input"; QueryText: string; QueryHint?: QueryHint; QuerySelection?: never } | { QueryType: "selection"; QuerySelection: Selection; QueryText?: string; QueryHint?: never })
+
+export interface RefreshQueryParam {
+  /**
+   * Controls whether to maintain the previously selected item index after refresh.
+   * When true, the user's current selection index in the results list is preserved.
+   * When false, the selection resets to the first item (index 0).
+   * This keeps the row, so a result that moved to another index is no longer selected.
+   */
+  PreserveSelectedIndex: boolean
+  /**
+   * Reselects the result with this id after refresh.
+   * The plugin must set the same Result.Id on the rebuilt result.
+   * A non-empty id takes precedence over PreserveSelectedIndex, so the highlight
+   * follows that result when its row moves.
+   */
+  SelectedResultId?: string
+}
+
+/**
+ * Type of data to copy to clipboard.
+ *
+ * - `text`: Copy plain text
+ * - `image`: Copy image data
+ */
+export type CopyType = "text" | "image"
+
+/**
+ * Parameters for copying data to clipboard.
+ *
+ * Used with the Copy API to copy text or images.
+ *
+ * @example
+ * ```typescript
+ * // Copy text
+ * await api.Copy(ctx, {
+ *   type: "text",
+ *   text: "Hello, World!"
+ * })
+ *
+ * // Copy image
+ * await api.Copy(ctx, {
+ *   type: "image",
+ *   text: "",
+ *   woxImage: { ImageType: "base64", ImageData: "data:image/png;base64,..." }
+ * })
+ * ```
+ */
+export interface CopyParams {
+  /**
+   * Type of content to copy.
+   */
+  type: CopyType
+  /**
+   * Text content to copy.
+   *
+   * Used when type is "text".
+   */
+  text: string
+  /**
+   * Image data to copy.
+   *
+   * Used when type is "image".
+   */
+  woxImage?: WoxImage
+}
+
+export type AttentionActionType = "change_query" | "open_plugin_settings"
+
+/**
+ * Action executed when the user opens a persistent attention item.
+ */
+export interface AttentionAction {
+  type: AttentionActionType
+  query?: string
+}
+
+/**
+ * Persistent item that asks Wox to keep something visible until the user sees it.
+ *
+ * Wox stores the item, maintains unread state, and shows an unread badge near the
+ * query box like a lightweight inbox. The key is scoped to the current plugin.
+ */
+export interface PushAttentionRequest {
+  key: string
+  title: string
+  description?: string
+  icon?: WoxImage
+  action?: AttentionAction
+}
+
+/**
+ * Options for the built-in screenshot workflow.
+ */
+export interface ScreenshotOption {
+  /**
+   * Hide annotation tools and keep only caller identity, cancel, and confirm controls.
+   */
+  HideAnnotationToolbar?: boolean
+  /**
+   * Complete the screenshot automatically after the user finishes drawing a valid selection.
+   */
+  AutoConfirm?: boolean
+}
+
+/**
+ * Result of a plugin-triggered screenshot workflow.
+ * Contains the screenshot file path and any error message if the workflow failed.
+ */
+export interface ScreenshotResult {
+  Success: boolean
+  ScreenshotPath: string
+  ErrMsg: string
+}
+
+/**
+ * Controls how a plugin setting is persisted.
+ * Requires Wox >= 2.4.0.
+ */
+export interface SetSettingOption {
+  Key: string
+  Value: string
+  PlatformSpecific?: boolean
+  IsLocal?: boolean
+}
+
+/**
+ * Result of persisting a plugin setting.
+ * Requires Wox >= 2.4.0.
+ */
+export interface SetSettingResult {
+  Success: boolean
+  ErrMsg: string
+}
+
+/** An optional one-shot action for a transient notification. */
+export interface ToastMsgActionContext {
+  ContextData: MapString
+}
+
+export interface ToastMsgAction {
+  Name: string
+  ContextData?: MapString
+  Action: (ctx: Context, actionContext: ToastMsgActionContext) => Promise<void> | void
+}
+
+export interface ShowToastMsgOption {
+  Message: string
+  Title?: string
+  Action?: ToastMsgAction
+}
+
+export interface ShowToastMsgResult {
+  Success: boolean
+  ErrMsg: string
+}
+
+export interface PublicAPI {
+  /**
+   * Change Wox query
+   */
+  ChangeQuery: (ctx: Context, query: ChangeQueryParam) => Promise<void>
+
+  /**
+   * Hide Wox
+   */
+  HideApp: (ctx: Context) => Promise<void>
+
+  /**
+   * Show Wox
+   */
+  ShowApp: (ctx: Context) => Promise<void>
+
+  /**
+   * Check if Wox window is currently visible
+   */
+  IsVisible: (ctx: Context) => Promise<boolean>
+
+  /** @deprecated Use ShowToastMsg for an independent notification window. */
+  Notify: (ctx: Context, message: string) => Promise<void>
+  /** Show an independent notification window. Requires Wox >= 2.5.0. */
+  ShowToastMsg: (ctx: Context, option: ShowToastMsgOption) => Promise<ShowToastMsgResult>
+
+  /**
+   * Push a persistent attention item into Wox.
+   *
+   * Unlike Notify, this survives until the user handles it. Wox shows the unread
+   * count near the query box and opens the attention inbox when the badge is clicked.
+   */
+  PushAttention: (ctx: Context, request: PushAttentionRequest) => Promise<void>
+
+  /**
+   * Show or update a toolbar msg.
+   *
+   * Reusing the same Id updates the current status instead of creating a duplicate.
+   * Plugin-scoped status is only accepted while the user stays in this plugin query.
+   */
+  ShowToolbarMsg: (ctx: Context, status: ToolbarMsg) => Promise<void>
+
+  /**
+   * Clear a toolbar msg by Id.
+   *
+   * The toolbar msg must belong to the current plugin.
+   */
+  ClearToolbarMsg: (ctx: Context, toolbarMsgId: string) => Promise<void>
+
+  /**
+   * Write log
+   */
+  Log: (ctx: Context, level: "Info" | "Error" | "Debug" | "Warning", msg: string) => Promise<void>
+
+  /**
+   * Get translation of current language
+   */
+  GetTranslation: (ctx: Context, key: string) => Promise<string>
+
+  /**
+   * Get customized setting
+   *
+   * will try to get platform specific setting first, if not found, will try to get global setting
+   */
+  GetSetting: (ctx: Context, key: string) => Promise<string>
+
+  /**
+   * Save customized setting
+   *
+   * @isPlatformSpecific If true, setting will be only saved in current platform. If false, setting will be available in all platforms
+   * @deprecated Use SetSetting. SaveSetting remains available for plugins that support Wox before 2.4.0.
+   */
+  SaveSetting: (ctx: Context, key: string, value: string, isPlatformSpecific: boolean) => Promise<void>
+
+  /**
+   * Save a customized setting with explicit platform and device-local behavior.
+   * Requires Wox >= 2.4.0. Set plugin.json MinWoxVersion to at least 2.4.0 before using it.
+   */
+  SetSetting: (ctx: Context, option: SetSettingOption) => Promise<SetSettingResult>
+
+  /**
+   * Register setting changed callback
+   */
+  OnSettingChanged: (ctx: Context, callback: (ctx: Context, key: string, value: string) => void) => Promise<void>
+
+  /**
+   * Get dynamic setting definition
+   */
+  OnGetDynamicSetting: (ctx: Context, callback: (ctx: Context, key: string) => PluginSettingDefinitionItem) => Promise<void>
+
+  /**
+   * Register deep link callback
+   */
+  OnDeepLink: (ctx: Context, callback: (ctx: Context, arguments: MapString) => void) => Promise<void>
+
+  /**
+   * Register on load event
+   */
+  OnUnload: (ctx: Context, callback: (ctx: Context) => Promise<void>) => Promise<void>
+
+  /**
+   * Register a callback for entering this plugin query context.
+   */
+  OnEnterPluginQuery: (ctx: Context, callback: (ctx: Context) => Promise<void> | void) => Promise<void>
+
+  /**
+   * Register a callback for leaving this plugin query context.
+   */
+  OnLeavePluginQuery: (ctx: Context, callback: (ctx: Context) => Promise<void> | void) => Promise<void>
+
+  /**
+   * Register a notification after a result file drag reaches a terminal status.
+   * ResultDragData is what makes a result draggable; this callback cannot block
+   * or cancel that drag. Native result drags stay copy-only; remove this
+   * plugin's own source files only when the event status is success.
+   */
+  OnDragOut: (ctx: Context, option: DragOutListenOption) => Promise<DragOutListenResult>
+
+  /**
+   * Register query commands
+   */
+  RegisterQueryCommands: (ctx: Context, commands: MetadataCommand[]) => Promise<void>
+
+  RegisterTriggerKeyword: (ctx: Context, option: RegisterTriggerKeywordOption) => Promise<RegisterTriggerKeywordResult>
+  UnregisterTriggerKeyword: (ctx: Context, option: UnregisterTriggerKeywordOption) => Promise<UnregisterTriggerKeywordResult>
+
+  /**
+   * Register a plugin tool. Requires Wox >= 2.4.5.
+   */
+  RegisterPluginTool: (ctx: Context, option: RegisterPluginToolOption) => Promise<RegisterPluginToolResult>
+  /**
+   * Unregister a plugin tool previously registered by this plugin. Requires Wox >= 2.4.5.
+   */
+  UnregisterPluginTool: (ctx: Context, option: UnregisterPluginToolOption) => Promise<UnregisterPluginToolResult>
+  /**
+   * List currently callable plugin tools. Requires Wox >= 2.4.5.
+   */
+  ListPluginTools: (ctx: Context, option: ListPluginToolsOption) => Promise<ListPluginToolsResult>
+  /**
+   * Invoke another plugin's registered tool. Requires Wox >= 2.4.5.
+   */
+  InvokePluginTool: (ctx: Context, option: InvokePluginToolOption) => Promise<InvokePluginToolResult>
+
+  /**
+   * Stream a chat from a Wox AI model.
+   *
+   * Requires the plugin `ai` feature. `model` is the JSON stored by a
+   * `selectAIModel` setting, or an explicit provider and name. Pass `{}`
+   * when no thinking mode or loop policy is needed. Chunks arrive through
+   * `callback`, including `Status: "error"` when the stream cannot start.
+   */
+  AIChatStream: (
+    ctx: Context,
+    model: AI.AIModel,
+    conversations: AI.Conversation[],
+    options: AI.ChatOptions,
+    callback: AI.ChatStreamFunc
+  ) => Promise<void>
+
+  /**
+   * Register MRU restore callback
+   * @param ctx Context
+   * @param callback Callback function that takes MRUData and returns Result or null
+   *                 Return null if the MRU data is no longer valid
+   */
+  OnMRURestore: (ctx: Context, callback: (ctx: Context, mruData: MRUData) => Promise<Result | null>) => Promise<void>
+
+  /**
+   * Get the current state of a result that is displayed in the UI.
+   *
+   * Returns UpdatableResult with current values if the result is still visible.
+   * Returns null if the result is no longer visible.
+   *
+   * Note: System actions and tails (like favorite icon) are automatically filtered out.
+   * They will be re-added by the system when you call UpdateResult().
+   *
+   * Example:
+   * ```typescript
+   * // In an action handler
+   * Action: async (ctx, actionContext) => {
+   *   // Get current result state
+   *   const updatableResult = await api.GetUpdatableResult(ctx, actionContext.ResultId)
+   *   if (updatableResult === null) {
+   *     return  // Result no longer visible
+   *   }
+   *
+   *   // Modify the result
+   *   updatableResult.Title = "Updated title"
+   *   updatableResult.Tails?.push({ Type: "text", Text: "New tail" })
+   *
+   *   // Update the result
+   *   await api.UpdateResult(ctx, updatableResult)
+   * }
+   * ```
+   *
+   * @param ctx Context
+   * @param resultId ID of the result to get
+   * @returns Promise<UpdatableResult | null> Current result state, or null if not visible
+   */
+  GetUpdatableResult: (ctx: Context, resultId: string) => Promise<UpdatableResult | null>
+
+  /**
+   * Update a query result that is currently displayed in the UI.
+   *
+   * Returns true if the result was successfully updated (still visible in UI).
+   * Returns false if the result is no longer visible.
+   *
+   * This method is designed for long-running operations within Action handlers.
+   * Best practices:
+   * - Set PreventHideAfterAction: true in your action
+   * - Only use during action execution or in background tasks spawned by actions
+   * - For periodic updates, start a timer in init() and track result IDs
+   *
+   * Example:
+   * ```typescript
+   * // In an action handler
+   * Action: async (ctx, actionContext) => {
+   *   // Update only the title
+   *   const success = await api.UpdateResult(ctx, {
+   *     Id: actionContext.ResultId,
+   *     Title: "Downloading... 50%"
+   *   })
+   *
+   *   // Update title and tails
+   *   const success = await api.UpdateResult(ctx, {
+   *     Id: actionContext.ResultId,
+   *     Title: "Processing...",
+   *     Tails: [{ Type: "text", Text: "Step 1/3" }]
+   *   })
+   * }
+   * ```
+   *
+   * @param ctx Context
+   * @param result UpdatableResult with Id (required) and optional fields to update
+   * @returns Promise<boolean> True if updated successfully, false if result no longer visible
+   */
+  UpdateResult: (ctx: Context, result: UpdatableResult) => Promise<boolean>
+
+  /**
+   * Push additional results for the current query.
+   *
+   * Returns true if UI accepted the results (query still active),
+   * false if query is no longer active.
+   *
+   * @param ctx Context
+   * @param query Current query
+   * @param results Results to append
+   */
+  PushResults: (ctx: Context, query: Query, results: Result[]) => Promise<boolean>
+
+  /**
+   * Re-execute the current query with the existing query text.
+   * This is useful when plugin data changes and you want to update the displayed results.
+   *
+   * Example - Refresh after marking item as favorite:
+   * ```typescript
+   * Action: async (ctx, actionContext) => {
+   *   markAsFavorite(item)
+   *   // Refresh query and preserve user's current selection
+   *   await api.RefreshQuery(ctx, { PreserveSelectedIndex: true })
+   * }
+   * ```
+   *
+   * Example - Refresh after deleting item:
+   * ```typescript
+   * Action: async (ctx, actionContext) => {
+   *   deleteItem(item)
+   *   // Refresh query and reset to first item
+   *   await api.RefreshQuery(ctx, { PreserveSelectedIndex: false })
+   * }
+   * ```
+   *
+   * Example - Refresh after moving the selected item:
+   * ```typescript
+   * await api.RefreshQuery(ctx, { PreserveSelectedIndex: false, SelectedResultId: item.id })
+   * ```
+   * The rebuilt result must use the same Result.Id. The highlight follows that result when its index changes.
+   *
+   * @param ctx Context
+   * @param param RefreshQueryParam to control refresh behavior
+   */
+  RefreshQuery: (ctx: Context, param: RefreshQueryParam) => Promise<void>
+
+  /**
+   * Copy text or image to clipboard
+   * @param ctx Context
+   * @param params CopyParams
+   */
+  Copy: (ctx: Context, params: CopyParams) => Promise<void>
+
+  /**
+   * Start the built-in screenshot workflow.
+   * @param ctx Context
+   * @param option Screenshot options
+   */
+  Screenshot: (ctx: Context, option: ScreenshotOption) => Promise<ScreenshotResult>
+
+  /**
+   * Get this plugin's dedicated cache directory.
+   *
+   * The folder is `~/.wox/cache/plugins/<plugin-id>/`. Wox creates it if needed
+   * and deletes it when the plugin is uninstalled. Use it for machine-local
+   * files such as downloads and search caches. Persist user preferences with
+   * GetSetting / SetSetting instead.
+   *
+   * @param ctx Context
+   * @returns Absolute cache directory path, or an empty string on failure
+   */
+  GetCacheFolder: (ctx: Context) => Promise<string>
+
+  /**
+   * Current launcher palette as opaque #RRGGBB colors for HTML/webview previews.
+   * Requires Wox >= 2.4.5.
+   */
+  GetThemeColors: (ctx: Context, option: GetThemeColorsOption) => Promise<GetThemeColorsResult>
+}
+
+/**
+ * Reserved so later theme-color filters can be added without a new API.
+ * Requires Wox >= 2.4.5.
+ */
+export interface GetThemeColorsOption {}
+
+/**
+ * Opaque launcher colors for plugin-authored HTML.
+ * Requires Wox >= 2.4.5.
+ */
+export interface GetThemeColorsResult {
+  Background: string
+  Text: string
+  SecondaryText: string
+  Border: string
+  Accent: string
+  AccentText: string
+  Selection: string
+  Dark: boolean
+}
+
+/**
+ * Type of image data.
+ *
+ * - `absolute`: Absolute file path to an image
+ * - `relative`: Path relative to the plugin directory
+ * - `base64`: Base64 encoded image with data URI prefix (e.g., "data:image/png;base64,...")
+ * - `svg`: SVG string content
+ * - `url`: HTTP/HTTPS URL to an image
+ * - `emoji`: Emoji character
+ *
+ * @example
+ * ```typescript
+ * // Absolute path
+ * { ImageType: "absolute", ImageData: "/usr/share/icons/app.png" }
+ *
+ * // Relative path (from plugin directory)
+ * { ImageType: "relative", ImageData: "./icons/icon.png" }
+ *
+ * // Base64 with data URI prefix
+ * { ImageType: "base64", ImageData: "data:image/png;base64,iVBORw0KGgo..." }
+ *
+ * // Emoji
+ * { ImageType: "emoji", ImageData: "🔍" }
+ *
+ * // URL
+ * { ImageType: "url", ImageData: "https://example.com/icon.png" }
+ * ```
+ */
+export type WoxImageType = "absolute" | "relative" | "base64" | "svg" | "url" | "emoji"
+
+/**
+ * Image representation in Wox.
+ *
+ * Used throughout the plugin API for icons, previews, and UI elements.
+ * The ImageData format depends on the ImageType.
+ *
+ * @example
+ * ```typescript
+ * const emojiIcon: WoxImage = {
+ *   ImageType: "emoji",
+ *   ImageData: "🔍"
+ * }
+ *
+ * const base64Icon: WoxImage = {
+ *   ImageType: "base64",
+ *   ImageData: "data:image/png;base64,iVBORw0KGgoAAAA..."
+ * }
+ *
+ * const relativeIcon: WoxImage = {
+ *   ImageType: "relative",
+ *   ImageData: "./icons/my-icon.png"
+ * }
+ * ```
+ */
+export interface WoxImage {
+  /**
+   * The type of image data.
+   *
+   * Determines how ImageData should be interpreted.
+   */
+  ImageType: WoxImageType
+  /**
+   * The image data.
+   *
+   * Format depends on ImageType:
+   * - `absolute`: Absolute file path
+   * - `relative`: Path relative to plugin directory
+   * - `base64`: Data URI with base64 content (e.g., "data:image/png;base64,...")
+   * - `svg`: SVG string content
+   * - `url`: HTTP/HTTPS URL
+   * - `emoji`: Single emoji character
+   */
+  ImageData: string
+}
+
+/**
+ * Type of preview content.
+ *
+ * - `markdown`: Rendered markdown content
+ * - `text`: Plain text content
+ * - `image`: Image preview
+ * - `url`: Website URL preview
+ * - `webview`: Embedded web page or inline HTML (JSON payload)
+ * - `file`: File preview
+ * - `list`: Structured row-list preview
+ */
+export type WoxPreviewType = "markdown" | "text" | "image" | "url" | "file" | "list" | "webview"
+
+/**
+ * Embedded browser content. Set either url or html, then JSON.stringify into PreviewData.
+ * Inline HTML has no plugin-relative base URL; use inline CSS and absolute resource URLs.
+ * HTML ignores cache options and reuses a window-local instance, released after 10 seconds unused.
+ */
+export interface WoxPreviewWebviewData {
+  /** UpdateResult only: execute once in the current inline HTML document. Never combine with html/url. */
+  updateMode?: "script"
+  /** JavaScript source for script mode. Serialize embedded state with JSON.stringify. */
+  script?: string
+
+  url?: string
+  html?: string
+  injectCss?: string
+  userAgent?: string
+  /** Disables persistent session caching for URL content only. */
+  cacheDisabled?: boolean
+  /** URL session cache identity; defaults to the URL. Ignored for HTML. */
+  cacheKey?: string
+}
+
+/**
+ * One row in a `list` preview.
+ *
+ * Tails intentionally reuse ResultTail so progress/status chips render the
+ * same way in preview rows and normal result rows.
+ */
+export interface WoxPreviewListItem {
+  /**
+   * Optional row icon.
+   */
+  icon?: WoxImage
+
+  /**
+   * Primary row text.
+   */
+  title: string
+
+  /**
+   * Secondary row text.
+   */
+  subtitle?: string
+
+  /**
+   * Optional status chips or small images shown at the end of the row.
+   */
+  tails?: ResultTail[]
+}
+
+/**
+ * Structured data for `list` previews.
+ *
+ * Plugins should JSON.stringify this object into WoxPreview.PreviewData. The
+ * row-based shape replaces the old file-only preview so plugins can dynamically
+ * show progress, status, selected files, or other scannable lists.
+ */
+export interface WoxPreviewListData {
+  items: WoxPreviewListItem[]
+}
+
+/**
+ * Metadata tag shown below preview content.
+ *
+ * The preview footer now renders compact tags instead of a key/value table, so
+ * Label is the visible chip text and Tooltip provides optional hover context.
+ */
+export interface WoxPreviewTag {
+  /**
+   * Visible text shown inside the metadata tag.
+   */
+  Label: string
+
+  /**
+   * Optional hover text for the metadata tag.
+   */
+  Tooltip?: string
+}
+
+/**
+ * Preview panel content for a result.
+ *
+ * When a result is selected, the preview panel displays additional
+ * information using the specified preview type.
+ *
+ * @example
+ * ```typescript
+ * // Markdown preview
+ * {
+ *   PreviewType: "markdown",
+ *   PreviewData: "# Title\n\nDescription with **formatting**",
+ *   PreviewTags: [{ Label: "17 chars", Tooltip: "Copy characters" }]
+ * }
+ *
+ * // Image preview
+ * {
+ *   PreviewType: "image",
+ *   PreviewData: "https://example.com/image.png",
+ *   PreviewTags: [{ Label: "300 px", Tooltip: "Height" }]
+ * }
+ *
+ * // URL preview
+ * {
+ *   PreviewType: "url",
+ *   PreviewData: "https://github.com/Wox-launcher/Wox",
+ *   PreviewTags: []
+ * }
+ *
+ * // List preview
+ * {
+ *   PreviewType: "list",
+ *   PreviewData: JSON.stringify({
+ *     items: [
+ *       {
+ *         icon: { ImageType: "emoji", ImageData: "✓" },
+ *         title: "photo.jpg",
+ *         subtitle: "Saved 42 KB",
+ *         tails: [{ Type: "text", Text: "Done", TextCategory: "success" }]
+ *       }
+ *     ]
+ *   } satisfies WoxPreviewListData),
+ *   PreviewTags: [{ Label: "Done", Tooltip: "Status" }]
+ * }
+ * ```
+ */
+export interface WoxPreview {
+  /** Initially hide this preview; Ctrl/Cmd+P opens it until the next query. Defaults to false. */
+  DefaultHidden?: boolean
+  /**
+   * The type of preview content.
+   *
+   * Determines how PreviewData is rendered.
+   */
+  PreviewType: WoxPreviewType
+  /**
+   * The preview content data.
+   *
+   * Format depends on PreviewType:
+   * - `markdown`: Markdown string to render
+   * - `text`: Plain text string
+   * - `image`: Image URL, path, or base64 data
+   * - `url`: Website URL to preview
+   * - `webview`: JSON string encoded from WoxPreviewWebviewData; use { html: "..." } for static HTML
+   * - `file`: File path to preview
+   * - `list`: JSON string encoded from WoxPreviewListData
+   */
+  PreviewData: string
+  /**
+   * Metadata tags shown below the preview content.
+   */
+  PreviewTags?: WoxPreviewTag[]
+  /**
+   * @deprecated Use PreviewTags instead.
+   *
+   * The launcher still maps each legacy key/value pair to a metadata tag with
+   * the value as Label and the key as Tooltip, so existing plugins remain
+   * compatible while new plugins can use the tag contract directly.
+   */
+  PreviewProperties?: Record<string, string>
+}
+
+/**
+ * Request context for tracking and passing data.
+ *
+ * Context is passed to all plugin API calls and contains a trace ID
+ * for logging and debugging. Plugins can also store custom values
+ * in the context for passing between function calls.
+ *
+ * @example
+ * ```typescript
+ * // Create a new context
+ * const ctx = NewContext()
+ * const traceId = ctx.Get("traceId")  // Auto-generated UUID
+ *
+ * // Store custom data
+ * ctx.Set("userId", "12345")
+ * ctx.Set("requestId", "req-abc")
+ *
+ * // Check if key exists
+ * if (ctx.Exists("userId")) {
+ *   console.log("User ID:", ctx.Get("userId"))
+ * }
+ *
+ * // Create with initial value
+ * const ctxWithValue = NewContextWithValue("userId", "12345")
+ * ```
+ */
+export declare interface Context {
+  /**
+   * Key-value storage for context data.
+   *
+   * Contains auto-generated trace ID and any custom values.
+   */
+  Values: { [key: string]: string }
+  /**
+   * Get a value from the context.
+   *
+   * @param key - The key to retrieve
+   * @returns The value, or undefined if not found
+   */
+  Get: (key: string) => string | undefined
+  /**
+   * Set a value in the context.
+   *
+   * @param key - The key to set
+   * @param value - The value to store
+   */
+  Set: (key: string, value: string) => void
+  /**
+   * Check if a key exists in the context.
+   *
+   * @param key - The key to check
+   * @returns true if the key exists, false otherwise
+   */
+  Exists: (key: string) => boolean
+}
+
+/**
+ * Create a new context with auto-generated trace ID.
+ *
+ * @returns A new Context instance with a UUID in the "traceId" key
+ *
+ * @example
+ * ```typescript
+ * const ctx = NewContext()
+ * console.log(ctx.Get("traceId"))  // e.g., "550e8400-e29b-41d4-a716-446655440000"
+ * ```
+ */
+export function NewContext(): Context
+
+/**
+ * Create a new context with an initial key-value pair.
+ *
+ * @param key - The key to set
+ * @param value - The value to store
+ * @returns A new Context instance with the trace ID and custom value
+ *
+ * @example
+ * ```typescript
+ * const ctx = NewContextWithValue("userId", "12345")
+ * console.log(ctx.Get("userId"))   // "12345"
+ * console.log(ctx.Get("traceId"))  // auto-generated UUID
+ * ```
+ */
+export function NewContextWithValue(key: string, value: string): Context
+
+/**
+ * Create a base64 WoxImage from image data.
+ *
+ * @param imageData - Base64 image data with data URI prefix (e.g., "data:image/png;base64,...")
+ * @returns A WoxImage with type "base64"
+ *
+ * @example
+ * ```typescript
+ * const pngData = "data:image/png;base64,iVBORw0KGgoAAAA..."
+ * const icon = NewBase64WoxImage(pngData)
+ * ```
+ */
+export function NewBase64WoxImage(imageData: string): WoxImage

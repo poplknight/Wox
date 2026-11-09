@@ -1,0 +1,63 @@
+package component
+
+import (
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+)
+
+// SettingFieldProps describes one label, description, and control row.
+type SettingFieldProps struct {
+	Label               string
+	Description         string
+	Width               float32
+	Height              float32
+	LabelWidth          float32
+	Gap                 float32
+	Radius              float32
+	Background          woxui.Color
+	Padding             woxwidget.Insets
+	DescriptionMaxLines int
+	// LabelAccessory sits beside the title, such as a help icon. It does not replace the label.
+	LabelAccessory woxwidget.Widget
+	Child          woxwidget.Widget
+	Theme          ControlTheme
+}
+
+// WoxSettingField builds the shared horizontal settings field layout.
+func WoxSettingField(props SettingFieldProps) woxwidget.Widget {
+	height := props.Height
+	if height <= 0 {
+		height = SettingsRowHeight
+	}
+	gap := props.Gap
+	if gap <= 0 {
+		gap = 20
+	}
+	labelHeight := max(float32(0), height-props.Padding.Top-props.Padding.Bottom)
+	labelText := woxwidget.Text{Value: props.Label, Style: woxui.TextStyle{Size: props.Theme.Scaled(SettingsLabelFontSize), Weight: woxui.FontWeightSemibold}, Color: props.Theme.Text}
+	heading := woxwidget.Widget(labelText)
+	if props.LabelAccessory != nil {
+		heading = woxwidget.Flex{Axis: woxwidget.Horizontal, Gap: 5, CrossAxisAlignment: woxwidget.CrossAxisCenter, Children: []woxwidget.Widget{
+			labelText, props.LabelAccessory,
+		}}
+	}
+	var label woxwidget.Widget = woxwidget.Container{Width: props.LabelWidth, Height: labelHeight, Padding: woxwidget.Insets{Top: 6}, Child: heading}
+	if props.Description != "" {
+		// Let help text determine row height; fixed single-line labels clipped translations.
+		description := woxwidget.TextBlock{
+			Value: props.Description, Width: props.LabelWidth, MaxLines: props.DescriptionMaxLines,
+			Style: woxui.TextStyle{Size: props.Theme.Scaled(SettingsHelpFontSize)}, LineHeight: props.Theme.Scaled(16), Color: props.Theme.TextSecondary,
+		}
+		label = woxwidget.Container{Width: props.LabelWidth, Child: woxwidget.Constrained{MinHeight: labelHeight, Child: woxwidget.Flex{Axis: woxwidget.Vertical, Gap: 4, Children: []woxwidget.Widget{
+			heading, description,
+		}}}}
+		height = 0
+	}
+	labelSlot := label
+	if props.LabelWidth <= 0 {
+		labelSlot = woxwidget.Expanded{Child: label}
+	}
+	return woxwidget.Container{Width: props.Width, Height: height, Radius: props.Radius, Color: props.Background, Padding: props.Padding, Child: woxwidget.Flex{
+		Axis: woxwidget.Horizontal, Gap: gap, Children: []woxwidget.Widget{labelSlot, props.Child},
+	}}
+}

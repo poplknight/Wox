@@ -1,0 +1,1014 @@
+package view
+
+import (
+	"strings"
+
+	"wox/common"
+	woxcomponent "wox/ui/launcher/component"
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+)
+
+const ThemeListRowHeight = float32(72)
+
+const (
+	themeCatalogDemoQueryFontSize    = float32(14)
+	themeCatalogDemoTitleFontSize    = float32(13)
+	themeCatalogDemoSubtitleFontSize = float32(11)
+	themeCatalogDemoQueryHeight      = float32(40)
+	themeCatalogDemoRowHeight        = float32(48)
+	themeCatalogDemoRowGap           = float32(4)
+	themeCatalogDemoToolbarHeight    = float32(36)
+)
+
+// ThemeCatalogItem contains resolved presentation data for one theme.
+type ThemeCatalogItem struct {
+	SourceIndex       int
+	ID                string
+	Name              string
+	Author            string
+	URL               string
+	Version           string
+	Description       string
+	IsSystem          bool
+	IsInstalled       bool
+	IsUpgradable      bool
+	IsAuto            bool
+	HasSwatch         bool
+	ImageTheme        bool
+	Active            bool
+	Selected          bool
+	PreviewTheme      woxcomponent.Theme
+	LightPreviewTheme woxcomponent.Theme
+	DarkPreviewTheme  woxcomponent.Theme
+	Screenshot        *woxui.Image
+	ScreenshotLoading bool
+	OnScreenshot      func()
+}
+
+// AutoThemeEditorState is the installed-catalog create/edit canvas for one Auto theme.
+type AutoThemeEditorState struct {
+	Active       bool
+	Overwrite    bool
+	Name         woxui.TextEditingState
+	NameFocused  bool
+	LightThemeID string
+	DarkThemeID  string
+	HoverSlot    string
+	PickerSlot   string
+	Error        string
+	Saving       bool
+}
+
+// ThemeSettingsProps contains theme catalog state, localized labels, and actions.
+type ThemeSettingsProps struct {
+	Width                 float32
+	Height                float32
+	Theme                 woxcomponent.ControlTheme
+	Mode                  string
+	Message               string
+	MessageError          bool
+	Error                 string
+	Operation             string
+	UninstallArmed        string
+	Items                 []ThemeCatalogItem
+	Detail                *ThemeCatalogItem
+	Search                woxui.TextEditingState
+	SearchFocused         bool
+	SearchPlaceholder     string
+	LocateLabel           string
+	EmptyLabel            string
+	EmptyTitle            string
+	EmptyDescription      string
+	EmptyIcon             *woxui.Image
+	WebsiteLabel          string
+	InstallLabel          string
+	ApplyLabel            string
+	AppliedLabel          string
+	UninstallLabel        string
+	UpdateLabel           string
+	PreviewLabel          string
+	DescriptionLabel      string
+	SystemLabel           string
+	ImageLabel            string
+	ImageMemoryLabel      string
+	PreviewTitle          string
+	PreviewTexts          []string
+	PreviewSubtitles      []string
+	PreviewOpenLabel      string
+	PreviewMoreLabel      string
+	ActiveDetailTab       string
+	Window                *woxui.Window
+	LocateIcon            *woxui.Image
+	ExternalIcon          *woxui.Image
+	InstalledIcon         *woxui.Image
+	InstalledSelectedIcon *woxui.Image
+	Wallpaper             *woxui.Image
+	WallpaperBlurred      *woxui.Image
+	OnSelect              func(int)
+	OnSearchKey           func(woxui.KeyEvent) bool
+	OnSearchFocusChange   func(bool)
+	OnSearchChanged       func(string)
+	OnSetSearchValue      func(string) error
+	OnClear               func()
+	OnLocateCurrent       func()
+	OnTooltip             func(bool, string, woxui.Rect)
+	OnSelectDetailTab     func(string)
+	OnOpenWebsite         func()
+	OnOperation           func(string)
+	CreateAutoLabel       string
+	CreateAutoIcon        *woxui.Image
+	EditAutoLabel         string
+	ModifyAutoLabel       string
+	AutoNamePlaceholder   string
+	SaveAutoLabel         string
+	CancelAutoLabel       string
+	PickLightTitle        string
+	PickDarkTitle         string
+	AutoEditor            *AutoThemeEditorState
+	AutoPickerThemes      []ThemeCatalogItem
+	OnCreateAuto          func()
+	OnEditAuto            func()
+	OnCancelAuto          func()
+	OnSaveAuto            func()
+	OnAutoNameChanged     func(string)
+	OnSetAutoName         func(string) error
+	OnAutoNameFocusChange func(bool)
+	OnAutoEditSlot        func(string)
+	OnAutoPickTheme       func(string)
+	OnCancelAutoPicker    func()
+	// OverlayWidth and OverlayHeight size the Auto editor against the settings
+	// window. The catalog page is narrower than the window because of the rail.
+	OverlayWidth  float32
+	OverlayHeight float32
+}
+
+// ThemeSettingsView uses the shared catalog column, divider, and expanded detail pane.
+func ThemeSettingsView(props ThemeSettingsProps) woxwidget.Widget {
+	listWidth := woxcomponent.SettingsCatalogListWidth(props.Width)
+	dividerGutter := woxcomponent.SettingsCatalogDividerGutter
+	detailWidth := max(float32(0), props.Width-listWidth-dividerGutter)
+	return woxwidget.Flex{Axis: woxwidget.Horizontal, Children: []woxwidget.Widget{
+		themeList(props, listWidth, props.Height),
+		woxwidget.Container{Width: dividerGutter, Height: props.Height, Padding: woxwidget.Insets{Left: 10, Right: 10}, Child: woxwidget.Container{Width: 1, Height: props.Height, Color: props.Theme.Border}},
+		themeDetail(props, detailWidth, props.Height),
+	}}
+}
+
+func themeAutoOverlaySize(props ThemeSettingsProps) (float32, float32) {
+	width, height := props.OverlayWidth, props.OverlayHeight
+	if width <= 0 {
+		width = props.Width
+	}
+	if height <= 0 {
+		height = props.Height
+	}
+	return width, height
+}
+
+// ThemeAutoEditorOverlay centers the Auto editor on the settings window.
+func ThemeAutoEditorOverlay(props ThemeSettingsProps) woxwidget.Widget {
+	overlayWidth, overlayHeight := themeAutoOverlaySize(props)
+	layers := []woxwidget.StackChild{{Child: themeAutoEditorDialog(props, overlayWidth, overlayHeight)}}
+	if props.AutoEditor != nil && props.AutoEditor.PickerSlot != "" {
+		layers = append(layers, woxwidget.StackChild{Child: themeAutoPickerDialog(props, overlayWidth, overlayHeight)})
+	}
+	return woxwidget.Stack{Width: overlayWidth, Height: overlayHeight, Children: layers}
+}
+
+func themeList(props ThemeSettingsProps, width, height float32) woxwidget.Widget {
+	const searchHeight = woxcomponent.SettingsSearchHeight
+	const searchGap = float32(20)
+	createHeight := float32(0)
+	gaps := searchGap
+	if themeListShowsCreateAuto(props) {
+		createHeight = themeCreateAutoRowHeight + themeCreateAutoBottomGap
+		// The pinned create row is a third flex child, so it adds a second gap.
+		gaps += searchGap
+	}
+	viewportHeight := max(float32(0), height-searchHeight-gaps-createHeight)
+	items := props.Items
+
+	var list woxwidget.Widget
+	if props.Message != "" {
+		color := props.Theme.TextSecondary
+		if props.MessageError {
+			color = props.Theme.Error
+		}
+		list = woxwidget.Container{Width: width, Height: viewportHeight, Padding: woxwidget.Insets{Top: 18}, Child: woxwidget.TextBlock{
+			Value: props.Message, Width: width, Height: min(float32(80), viewportHeight), MaxLines: 3, Style: woxui.TextStyle{Size: props.Theme.Scaled(12)}, LineHeight: 18, Color: color,
+		}}
+	} else if len(items) == 0 {
+		list = themeEmptyState(props, width, viewportHeight)
+	} else {
+		var keepVisible *woxwidget.ScrollRange
+		for index, item := range items {
+			if item.Selected {
+				start := float32(index) * ThemeListRowHeight
+				keepVisible = &woxwidget.ScrollRange{Start: start, End: start + ThemeListRowHeight}
+				break
+			}
+		}
+		list = woxcomponent.WoxScrollView(woxcomponent.ScrollViewProps{
+			Key: "theme-list-scroll", Content: woxwidget.LazyList{
+				Width: width, Viewport: viewportHeight, ItemCount: len(items), ItemExtent: ThemeListRowHeight,
+				ItemKey:     func(index int) woxwidget.Key { return woxwidget.Key("theme-list-" + items[index].ID) },
+				ItemBuilder: func(index int) woxwidget.Widget { return themeListRow(props, items[index], width) },
+			}, Width: width, Height: viewportHeight,
+			KeepVisible: keepVisible, Theme: props.Theme, ThumbColor: props.Theme.Text,
+		})
+	}
+
+	actions := make([]woxcomponent.SearchFieldAction, 0, 1)
+	if props.Mode != "store" {
+		actions = append(actions, woxcomponent.SearchFieldAction{
+			ID: "theme-locate-current", Label: props.LocateLabel, Icon: props.LocateIcon, Width: 32, IconSize: 18,
+			OnTap: props.OnLocateCurrent, OnHoverAt: themeLocateTooltip(props),
+		})
+	}
+	searchTheme := props.Theme
+	// Catalog search chrome sits with theme titles. Keep the placeholder and field
+	// outline on Text so TextSecondary cannot restyle this box.
+	searchTheme.TextSecondary = props.Theme.Text
+	searchField := woxcomponent.WoxSearchField(woxcomponent.SearchFieldProps{
+		ID: "theme-search", Label: props.SearchPlaceholder, Width: width, Value: props.Search.Text, Focused: props.SearchFocused, Autofocus: true,
+		Actions: actions, Window: props.Window, Theme: searchTheme, OnClear: props.OnClear,
+		OnKey: props.OnSearchKey, OnFocusChange: props.OnSearchFocusChange, OnChanged: props.OnSearchChanged, OnSetValue: props.OnSetSearchValue,
+	})
+	children := []woxwidget.Widget{searchField, list}
+	if themeListShowsCreateAuto(props) {
+		children = append(children, themeCreateAutoRow(props, width))
+	}
+	return woxwidget.Flex{Axis: woxwidget.Vertical, Gap: searchGap, Children: children}
+}
+
+func themeListShowsCreateAuto(props ThemeSettingsProps) bool {
+	return props.Mode == "installed" && props.OnCreateAuto != nil
+}
+
+const (
+	themeCreateAutoRowHeight = woxcomponent.SettingsSearchHeight
+	themeCreateAutoBottomGap = float32(8)
+)
+
+func themeCreateAutoRow(props ThemeSettingsProps, width float32) woxwidget.Widget {
+	// Lift the full-width create action above the native window resize grip.
+	return woxwidget.Container{Width: width, Height: themeCreateAutoRowHeight + themeCreateAutoBottomGap, Padding: woxwidget.Insets{Bottom: themeCreateAutoBottomGap}, Child: woxcomponent.WoxButton(woxcomponent.ButtonProps{
+		ID: "theme-create-auto", Label: props.CreateAutoLabel, Width: width, Height: themeCreateAutoRowHeight, Icon: props.CreateAutoIcon, IconSize: 16, IconGap: 8,
+		AlignLeading: true, Variant: woxcomponent.ButtonSecondary, OnTap: props.OnCreateAuto, Theme: props.Theme,
+	})}
+}
+
+// themeLocateTooltip shows the shared settings overlay so the icon-only locate action has a label.
+func themeLocateTooltip(props ThemeSettingsProps) func(bool, woxui.Rect) {
+	if props.OnTooltip == nil || strings.TrimSpace(props.LocateLabel) == "" {
+		return nil
+	}
+	return func(inside bool, bounds woxui.Rect) {
+		props.OnTooltip(inside, props.LocateLabel, bounds)
+	}
+}
+
+// themeEmptyState keeps the catalog list and detail pane visually consistent when no theme is available.
+func themeEmptyState(props ThemeSettingsProps, width, height float32) woxwidget.Widget {
+	title := props.EmptyTitle
+	if title == "" && props.EmptyDescription == "" {
+		title = props.EmptyLabel
+	}
+	return CatalogListEmptyState(CatalogListEmptyProps{
+		Width: width, Height: height, Title: title, Description: props.EmptyDescription,
+		Icon: props.EmptyIcon, Window: props.Window, Theme: props.Theme,
+	})
+}
+
+// themeListRow builds one catalog entry so LazyList can keep offscreen theme rows unbuilt.
+func themeListRow(props ThemeSettingsProps, item ThemeCatalogItem, width float32) woxwidget.Widget {
+	background := woxui.Color{}
+	titleColor := props.Theme.Text
+	subtitleColor := props.Theme.TextSecondary
+	if item.Selected {
+		background = props.Theme.SelectionBackground
+		titleColor = props.Theme.SelectionText
+		subtitleColor = props.Theme.SelectionText
+	}
+	trailing := themeListTrailing(props, item)
+	status := strings.TrimSpace(item.Version + "  " + item.Author)
+	swatch := themeListSwatch(props, item)
+	rowChildren := []woxwidget.Widget{
+		swatch,
+		woxwidget.Expanded{Child: woxwidget.LayoutBuilder{Build: func(size woxui.Size) woxwidget.Widget {
+			return woxwidget.Clip{Width: size.Width, Height: 44, Child: woxwidget.Flex{Axis: woxwidget.Vertical, Gap: 3, Children: []woxwidget.Widget{
+				woxwidget.Text{Value: item.Name, Style: woxui.TextStyle{Size: props.Theme.Scaled(15)}, Color: titleColor},
+				woxwidget.Text{Value: status, Style: woxui.TextStyle{Size: props.Theme.Scaled(12)}, Color: subtitleColor},
+			}}}
+		}}},
+	}
+	if item.ImageTheme && props.ImageLabel != "" {
+		rowChildren = append(rowChildren, woxcomponent.WoxTag(props.ImageLabel, props.Theme.TextSecondary, props.Theme))
+	}
+	if trailing != nil {
+		rowChildren = append(rowChildren, trailing)
+	}
+	radius := float32(4)
+	rowHeight := ThemeListRowHeight - 8
+	return woxwidget.Container{Width: width, Height: ThemeListRowHeight, Padding: woxwidget.Insets{Bottom: 8}, Child: woxcomponent.WoxListItem(woxcomponent.ListItemProps{
+		ID: "theme-list-" + item.ID, Label: item.Name, Width: width, Height: rowHeight, Radius: &radius,
+		Background: &background, Selected: item.Selected, Padding: woxwidget.Insets{Left: 6, Right: 6}, Theme: props.Theme,
+		OnTap: func() {
+			if props.OnSelect != nil {
+				props.OnSelect(item.SourceIndex)
+			}
+		}, Child: woxwidget.Align{Height: rowHeight, Vertical: 0.5, Child: woxwidget.Flex{Axis: woxwidget.Horizontal, Gap: 10, CrossAxisAlignment: woxwidget.CrossAxisCenter, Children: rowChildren}},
+	})}
+}
+
+// themeListSwatch uses the store icon when the catalog entry is not an installed document.
+func themeListSwatch(props ThemeSettingsProps, item ThemeCatalogItem) woxwidget.Widget {
+	if item.IsAuto {
+		return themeAutoSwatch(item.LightPreviewTheme, item.DarkPreviewTheme, common.ThemeSwatchSize)
+	}
+	if item.HasSwatch {
+		return themeSwatch(item.PreviewTheme, common.ThemeSwatchSize)
+	}
+	if props.Mode == "store" {
+		return woxwidget.Container{Width: common.ThemeSwatchSize, Height: common.ThemeSwatchSize, Radius: common.ThemeSwatchRadius, Color: props.Theme.InputBackground}
+	}
+	return themeSwatch(item.PreviewTheme, common.ThemeSwatchSize)
+}
+
+// themeStoreScreenshot shows the catalog preview image instead of a live color mock.
+func themeStoreScreenshot(props ThemeSettingsProps, theme ThemeCatalogItem, width, height float32) woxwidget.Widget {
+	const pad = float32(20)
+	contentWidth := max(float32(0), width-pad*2)
+	contentHeight := max(float32(0), height-pad*2)
+	if theme.Screenshot != nil && theme.Screenshot.Width > 0 && theme.Screenshot.Height > 0 {
+		shotWidth := contentWidth
+		shotHeight := shotWidth * float32(theme.Screenshot.Height) / float32(theme.Screenshot.Width)
+		if contentHeight > 0 && shotHeight > contentHeight {
+			shotHeight = contentHeight
+			shotWidth = shotHeight * float32(theme.Screenshot.Width) / float32(theme.Screenshot.Height)
+		}
+		image := woxwidget.Image{Source: theme.Screenshot, Width: shotWidth, Height: shotHeight, Radius: 8, Fit: woxwidget.ImageFitContain}
+		var child woxwidget.Widget = image
+		if theme.OnScreenshot != nil {
+			child = woxwidget.Gesture{ID: "theme-store-screenshot", OnTap: theme.OnScreenshot, Child: image}
+		}
+		return woxwidget.Align{Width: width, Height: height, Horizontal: 0.5, Vertical: 0.5, Child: child}
+	}
+	if theme.ScreenshotLoading {
+		return woxwidget.Align{Width: width, Height: height, Horizontal: 0.5, Vertical: 0.5, Child: woxcomponent.WoxLoadingIndicator(24, props.Theme.Focus)}
+	}
+	return woxwidget.Container{Width: width, Height: height}
+}
+
+// themeDetailMeta keeps metadata within its share of the row instead of letting Align consume the website slot.
+func themeDetailMeta(props ThemeSettingsProps, theme ThemeCatalogItem, website woxwidget.Widget) []woxwidget.Widget {
+	meta := []woxwidget.Widget{
+		woxwidget.Flexible{Child: woxwidget.Text{Value: theme.Author, Style: woxui.TextStyle{Size: props.Theme.Scaled(woxcomponent.SettingsSecondaryFontSize)}, Color: props.Theme.TextSecondary}},
+	}
+	if theme.ImageTheme && props.ImageLabel != "" {
+		meta = append(meta, woxcomponent.WoxTag(props.ImageLabel, props.Theme.TextSecondary, props.Theme))
+	}
+	return []woxwidget.Widget{woxwidget.Expanded{Child: woxwidget.Flex{Axis: woxwidget.Horizontal, Gap: 8, CrossAxisAlignment: woxwidget.CrossAxisCenter, Children: meta}}, website}
+}
+
+// themeListTrailing builds natural-width metadata beside the theme title.
+func themeListTrailing(props ThemeSettingsProps, item ThemeCatalogItem) woxwidget.Widget {
+	if props.Mode == "store" && item.IsInstalled {
+		icon := props.InstalledIcon
+		if item.Selected {
+			icon = props.InstalledSelectedIcon
+		}
+		return woxwidget.Align{Width: 26, Height: 44, Horizontal: 0.5, Vertical: 0.5, Child: woxwidget.Image{Source: icon, Width: 20, Height: 20}}
+	}
+	if props.Mode != "store" && item.IsSystem {
+		// Keep the System badge on secondary text so a selected row cannot invert it.
+		return woxcomponent.WoxTag(props.SystemLabel, props.Theme.TextSecondary, props.Theme)
+	}
+	return nil
+}
+
+func themeDetail(props ThemeSettingsProps, width, height float32) woxwidget.Widget {
+	if props.Detail == nil {
+		return themeEmptyState(props, width, height)
+	}
+	theme := *props.Detail
+	const headerHeight = float32(80)
+	innerWidth := max(float32(0), width-40)
+	var website woxwidget.Widget = woxwidget.Container{Width: 104, Height: 32}
+	if strings.TrimSpace(theme.URL) != "" && props.OnOpenWebsite != nil {
+		website = woxwidget.Align{Width: 104, Height: 32, Horizontal: 1, Vertical: 0.5, Child: woxcomponent.WoxButton(woxcomponent.ButtonProps{
+			ID: "theme-website", Label: props.WebsiteLabel, Icon: props.ExternalIcon, IconSize: 13, IconGap: 7,
+			FontSize: 11, Padding: woxwidget.Insets{Left: 6, Right: 4},
+			Variant: woxcomponent.ButtonText, OnTap: props.OnOpenWebsite, Theme: props.Theme,
+		})}
+	}
+	header := woxwidget.Container{Width: width, Height: headerHeight, Padding: woxwidget.Insets{Left: 20, Right: 20}, Child: woxwidget.Flex{Axis: woxwidget.Vertical, Children: []woxwidget.Widget{
+		woxwidget.Container{Width: innerWidth, Height: 40, Child: woxwidget.Flex{Axis: woxwidget.Horizontal, Gap: 12, CrossAxisAlignment: woxwidget.CrossAxisCenter, Children: []woxwidget.Widget{
+			woxwidget.Expanded{Child: woxwidget.LayoutBuilder{Build: func(size woxui.Size) woxwidget.Widget {
+				return woxwidget.Clip{Width: size.Width, Height: 40, Child: woxwidget.Flex{Axis: woxwidget.Horizontal, Gap: 10, CrossAxisAlignment: woxwidget.CrossAxisCenter, Children: []woxwidget.Widget{
+					woxwidget.Text{Value: theme.Name, Style: woxui.TextStyle{Size: props.Theme.Scaled(20)}, Color: props.Theme.InputText},
+					woxwidget.Text{Value: theme.Version, Style: woxui.TextStyle{Size: props.Theme.Scaled(13)}, Color: props.Theme.TextSecondary},
+				}}}
+			}}},
+			woxwidget.Flex{Axis: woxwidget.Horizontal, Gap: 8, CrossAxisAlignment: woxwidget.CrossAxisCenter, Children: themeActions(props, theme)},
+		}}},
+		woxwidget.Flex{Axis: woxwidget.Horizontal, Gap: 8, CrossAxisAlignment: woxwidget.CrossAxisCenter, Children: themeDetailMeta(props, theme, website)},
+	}}}
+	bodyHeight := max(float32(0), height-headerHeight)
+	preview := func(previewHeight float32) woxwidget.Widget {
+		if props.Mode == "store" {
+			return themeStoreScreenshot(props, theme, width, previewHeight)
+		}
+		return themePreviewTab(props, theme, width, previewHeight)
+	}
+	var body woxwidget.Widget
+	description := strings.TrimSpace(theme.Description)
+	var details []woxwidget.Widget
+	if description != "" {
+		details = append(details, woxwidget.Container{Width: width, Padding: woxwidget.Insets{Left: 20, Right: 20, Bottom: 8}, Child: woxwidget.TextBlock{
+			Value: description, Width: innerWidth, LineHeight: 20,
+			Style: woxui.TextStyle{Size: props.Theme.Scaled(13)}, Color: props.Theme.TextSecondary,
+		}})
+	}
+	if theme.ImageTheme && props.ImageMemoryLabel != "" {
+		details = append(details, woxwidget.Container{Width: width, Padding: woxwidget.Insets{Left: 20, Right: 20, Bottom: 8}, Child: woxwidget.TextBlock{
+			Value: props.ImageMemoryLabel, Width: innerWidth, LineHeight: 20,
+			Style: woxui.TextStyle{Size: props.Theme.Scaled(13)}, Color: props.Theme.Warning,
+		}})
+	}
+	if len(details) > 0 {
+		// Size the preview to the leftover pane. Giving it the full body height
+		// inside a scroll view made the description overflow and wheel away.
+		body = woxwidget.Flex{Axis: woxwidget.Vertical, Children: append(details,
+			woxwidget.Expanded{Child: woxwidget.LayoutBuilder{Build: func(size woxui.Size) woxwidget.Widget {
+				return preview(size.Height)
+			}}},
+		)}
+	} else {
+		body = preview(bodyHeight)
+	}
+	body = woxwidget.Container{Width: width, Height: bodyHeight, Child: body}
+	if props.Error != "" {
+		body = woxwidget.Stack{Width: width, Height: bodyHeight, Children: []woxwidget.StackChild{
+			{Child: body},
+			{Left: 16, Right: 16, Bottom: 4, AnchorBottom: true, StretchWidth: true, Child: woxwidget.TextBlock{Value: props.Error, Height: 44, MaxLines: 2, Style: woxui.TextStyle{Size: props.Theme.Scaled(11)}, Color: props.Theme.Error}},
+		}}
+	}
+	return woxwidget.Flex{Axis: woxwidget.Vertical, Children: []woxwidget.Widget{header, body}}
+}
+
+func themePreviewTab(props ThemeSettingsProps, theme ThemeCatalogItem, width, height float32) woxwidget.Widget {
+	const horizontalPadding = float32(20)
+	const topPadding = float32(12)
+	const bottomPadding = float32(24)
+	const previewInset = float32(20)
+	children := make([]woxwidget.Widget, 0, 1)
+	stageSlotHeight := max(float32(0), height-topPadding-bottomPadding)
+	stageSlotWidth := max(float32(0), width-horizontalPadding*2)
+	stageWidth := stageSlotWidth
+	// Taller than the wallpaper's 420/900 strip so the launcher card can sit high and show a full result list.
+	stageHeight := stageWidth * 620 / 900
+	if stageHeight > stageSlotHeight {
+		stageHeight = stageSlotHeight
+		stageWidth = stageHeight * 900 / 620
+	}
+	stageRadius := 29 * stageWidth / 1440
+	previewWidth := min(float32(780), max(float32(0), stageWidth-previewInset*2))
+	previewHeight := max(float32(0), stageHeight-previewInset*2)
+	preview := themeCatalogPreview(props, theme.PreviewTheme, previewWidth, previewHeight)
+	if theme.IsAuto {
+		preview = themeAutoCatalogPreview(props, theme.LightPreviewTheme, theme.DarkPreviewTheme, previewWidth, previewHeight)
+		inEditor := props.AutoEditor != nil && props.AutoEditor.Active
+		onEditorCanvas := inEditor && theme.ID == ""
+		if !theme.IsSystem && props.OnAutoEditSlot != nil && onEditorCanvas == inEditor {
+			preview = themeAutoSlotEditOverlay(props, preview, previewWidth, previewHeight, theme.LightPreviewTheme, theme.DarkPreviewTheme)
+		}
+	}
+	stageChildren := []woxwidget.StackChild{{Child: woxwidget.Container{Width: stageWidth, Height: stageHeight, Radius: stageRadius, Color: props.Theme.InputBackground}}}
+	if props.Wallpaper != nil {
+		// Clip the wallpaper to the stage radius. A square blit leaves dark
+		// corners outside the rounded border, even when the cache is pre-masked.
+		stageChildren = append(stageChildren, woxwidget.StackChild{Child: woxwidget.Image{Source: props.Wallpaper, Width: stageWidth, Height: stageHeight, Radius: stageRadius}})
+	}
+	stageChildren = append(stageChildren,
+		woxwidget.StackChild{Left: (stageWidth - previewWidth) / 2, Top: previewInset, Child: preview},
+		woxwidget.StackChild{Child: woxwidget.Container{Width: stageWidth, Height: stageHeight, Radius: stageRadius, BorderColor: props.Theme.Border, BorderWidth: 1}},
+	)
+	children = append(children, woxwidget.Align{Width: stageSlotWidth, Height: stageSlotHeight, Horizontal: 0.5, Vertical: 0, Child: woxwidget.Stack{Width: stageWidth, Height: stageHeight, Children: stageChildren}})
+	return woxwidget.Container{Width: width, Height: height, Padding: woxwidget.Insets{Left: horizontalPadding, Top: topPadding, Right: horizontalPadding, Bottom: bottomPadding}, Child: woxwidget.Flex{
+		Axis: woxwidget.Vertical, Gap: 12, Children: children,
+	}}
+}
+
+// themeCatalogPreview reuses the shared launcher demo so catalog cards show v2 chrome.
+func themeCatalogPreview(props ThemeSettingsProps, theme woxcomponent.Theme, width, height float32) woxwidget.Widget {
+	if width <= 0 || height <= 0 {
+		return woxwidget.Container{Width: max(float32(0), width), Height: max(float32(0), height)}
+	}
+	return woxwidget.Align{Width: width, Height: height, Horizontal: 0.5, Vertical: 0, Child: woxcomponent.WoxLauncherDemo(woxcomponent.LauncherDemoProps{
+		Width: width, Height: height, Backdrop: props.WallpaperBlurred, Background: theme.Background, Theme: theme, Opacity: 1,
+		Query: props.PreviewTitle, Results: themeCatalogDemoResults(props, theme), ShowQuery: true, ShowToolbar: true,
+		PrimaryAction: props.PreviewOpenLabel, ActionCopy: props.PreviewOpenLabel, ActionMore: props.PreviewMoreLabel,
+		QueryFontSize: props.Theme.Scaled(themeCatalogDemoQueryFontSize), ResultTitleFontSize: props.Theme.Scaled(themeCatalogDemoTitleFontSize), ResultSubtitleFontSize: props.Theme.Scaled(themeCatalogDemoSubtitleFontSize),
+		QueryHeight: themeCatalogDemoQueryHeight, RowHeight: themeCatalogDemoRowHeight, RowGap: themeCatalogDemoRowGap, ToolbarHeight: themeCatalogDemoToolbarHeight,
+	})}
+}
+
+// themeCatalogDemoResults maps localized catalog copy onto the shared launcher demo rows.
+func themeCatalogDemoResults(props ThemeSettingsProps, theme woxcomponent.Theme) []woxcomponent.LauncherDemoResult {
+	results := make([]woxcomponent.LauncherDemoResult, 0, len(props.PreviewTexts))
+	for index, title := range props.PreviewTexts {
+		subtitle := ""
+		if index < len(props.PreviewSubtitles) {
+			subtitle = props.PreviewSubtitles[index]
+		}
+		results = append(results, woxcomponent.LauncherDemoResult{
+			Title: title, Subtitle: subtitle, Glyph: "📁", GlyphColor: theme.ResultTitle, Selected: index == 1,
+		})
+	}
+	return results
+}
+
+// themeAutoCatalogPreview layers shared preview content over diagonally split light and dark surfaces.
+func themeAutoCatalogPreview(props ThemeSettingsProps, light, dark woxcomponent.Theme, width, height float32) woxwidget.Widget {
+	if width <= 0 || height <= 0 {
+		return woxwidget.Container{Width: max(float32(0), width), Height: max(float32(0), height)}
+	}
+	const queryAreaHeight = float32(60)
+	const toolbarHeight = float32(40)
+	windowRadius, borderColor, borderWidth := themePreviewWindowChrome(dark, width, height)
+	rowsHeight := max(float32(0), height-queryAreaHeight-toolbarHeight)
+	rowHeight := themeCatalogRowHeight(rowsHeight, len(props.PreviewTexts))
+	background := woxwidget.Painter{Width: width, Height: height, Paint: func(displayList *woxui.DisplayList, bounds woxui.Rect) {
+		fillThemeDiagonalPolygon(displayList, themeRoundedRectPoints(bounds, windowRadius), bounds, light.Background, dark.Background)
+		query := woxui.Rect{X: bounds.X + 10, Y: bounds.Y + 10, Width: max(float32(0), bounds.Width-20), Height: 40}
+		fillThemeDiagonalRect(displayList, query, bounds, light.QueryBackground, dark.QueryBackground)
+		for index := range props.PreviewTexts {
+			row := woxui.Rect{X: bounds.X + 10, Y: bounds.Y + queryAreaHeight + float32(index)*rowHeight, Width: max(float32(0), bounds.Width-20), Height: rowHeight}
+			lightColor, darkColor := light.Background, dark.Background
+			if index == 1 {
+				lightColor, darkColor = light.SelectedBackground, dark.SelectedBackground
+			}
+			fillThemeDiagonalRect(displayList, row, bounds, lightColor, darkColor)
+		}
+		toolbar := woxui.Rect{X: bounds.X, Y: bounds.Y + bounds.Height - toolbarHeight, Width: bounds.Width, Height: toolbarHeight}
+		fillThemeDiagonalPolygon(displayList, themeRoundedRectPoints(toolbar, windowRadius), bounds, light.ToolbarBackground, dark.ToolbarBackground)
+		fillThemeDiagonalRect(displayList, woxui.Rect{X: toolbar.X, Y: toolbar.Y, Width: toolbar.Width, Height: 1}, bounds, themeAlpha(light.ToolbarText, 26), themeAlpha(dark.ToolbarText, 26))
+		drawThemeDiagonalLine(displayList, bounds, 2)
+	}}
+	rows := make([]woxwidget.Widget, 0, len(props.PreviewTexts))
+	for index, title := range props.PreviewTexts {
+		selected := index == 1
+		titleColor := light.ResultTitle
+		if selected {
+			titleColor = light.SelectedTitle
+		}
+		rows = append(rows, woxwidget.Constrained{FillWidth: true, Child: woxwidget.Container{Height: rowHeight, Padding: woxwidget.Insets{Left: 12, Right: 10}, Child: woxwidget.Align{Height: rowHeight, Vertical: 0.5, Child: woxwidget.Flex{
+			Axis: woxwidget.Horizontal, Gap: 12, Children: []woxwidget.Widget{
+				woxwidget.Align{Width: 30, Height: 42, Vertical: 0.5, Child: woxwidget.Text{Value: "📁", Style: woxui.TextStyle{Size: props.Theme.Scaled(22)}, Color: titleColor}},
+				woxwidget.Expanded{Child: woxwidget.LayoutBuilder{Build: func(size woxui.Size) woxwidget.Widget {
+					return themeCatalogRowText(size.Width, title, titleColor, props.Theme)
+				}}},
+			},
+		}}}})
+	}
+	query := woxwidget.Constrained{FillWidth: true, Child: woxwidget.Container{Height: 40, Padding: woxwidget.Insets{Left: 10}, Child: woxwidget.Align{Height: 40, Vertical: 0.5, Child: woxwidget.Text{
+		Value: props.PreviewTitle, Style: woxui.TextStyle{Size: props.Theme.Scaled(13)}, Color: light.QueryText,
+	}}}}
+	rowList := woxcomponent.WoxScrollView(woxcomponent.ScrollViewProps{Key: "theme-auto-preview-results", FillWidth: true, Height: rowsHeight, Content: woxwidget.Flex{Axis: woxwidget.Vertical, Children: rows}, ThumbColor: dark.ResultTitle})
+	toolbar := themeCatalogToolbar(props, dark, width, false)
+	content := woxwidget.Flex{Axis: woxwidget.Vertical, Children: []woxwidget.Widget{
+		woxwidget.Container{Width: width, Height: queryAreaHeight, Padding: woxwidget.UniformInsets(10), Child: query},
+		woxwidget.Container{Width: width, Height: rowsHeight, Padding: woxwidget.Insets{Left: 10, Right: 10}, Child: rowList},
+		toolbar,
+	}}
+	children := make([]woxwidget.StackChild, 0, 4)
+	if props.WallpaperBlurred != nil {
+		children = append(children, woxwidget.StackChild{Child: woxwidget.Image{Source: props.WallpaperBlurred, Width: width, Height: height, Radius: windowRadius}})
+	}
+	children = append(children, woxwidget.StackChild{Child: background}, woxwidget.StackChild{Child: content}, woxwidget.StackChild{Child: woxwidget.Container{
+		Width: width, Height: height, Radius: windowRadius, BorderColor: borderColor, BorderWidth: borderWidth,
+	}})
+	return woxwidget.Stack{Width: width, Height: height, Children: children}
+}
+
+// themePreviewWindowChrome mirrors the shared launcher demo's authored outline and corners.
+func themePreviewWindowChrome(theme woxcomponent.Theme, width, height float32) (float32, woxui.Color, float32) {
+	radius := float32(12)
+	if theme.AppBorderRadius != nil {
+		radius = float32(*theme.AppBorderRadius)
+	}
+	radius = min(max(float32(0), radius), min(width, height)/2)
+	color, borderWidth := theme.PreviewSplit, float32(1)
+	if theme.AppBorderColor != nil {
+		color = *theme.AppBorderColor
+	}
+	if theme.AppBorderWidth != nil {
+		borderWidth = float32(*theme.AppBorderWidth)
+	}
+	return radius, color, borderWidth
+}
+
+// themeCatalogRowText keeps every preview result title vertically centered.
+func themeCatalogRowText(width float32, title string, titleColor woxui.Color, theme woxcomponent.ControlTheme) woxwidget.Widget {
+	return woxwidget.Clip{Width: width, Height: 42, Child: woxwidget.Align{Width: width, Height: 42, Vertical: 0.5, Child: woxwidget.Text{Value: title, Style: woxui.TextStyle{Size: theme.Scaled(13)}, Color: titleColor}}}
+}
+
+// themeCatalogToolbar mirrors Flutter's installed-theme preview footer.
+func themeCatalogToolbar(props ThemeSettingsProps, theme woxcomponent.Theme, width float32, paintBackground bool) woxwidget.Widget {
+	const height = float32(40)
+	const horizontalPadding = float32(10)
+	labelStyle := woxui.TextStyle{Size: props.Theme.Scaled(14)}
+	keycap, _ := woxcomponent.WoxHotkey(woxcomponent.HotkeyProps{
+		Theme: &theme, Toolbar: true, Primary: true, Labels: []string{"Enter"}, Foreground: theme.ToolbarText, Background: theme.ToolbarBackground,
+		Border: theme.ToolbarText, FontSize: woxcomponent.TailFontSize, Window: props.Window,
+	})
+	labelColor := theme.ToolbarText
+	if theme.ToolbarPrimaryFontColor != nil {
+		labelColor = *theme.ToolbarPrimaryFontColor
+	}
+
+	action := woxwidget.Container{Height: 28, Child: woxwidget.Flex{Axis: woxwidget.Horizontal, Gap: 8, CrossAxisAlignment: woxwidget.CrossAxisCenter, Children: []woxwidget.Widget{
+		woxwidget.Text{Value: props.PreviewOpenLabel, Style: labelStyle, Color: labelColor},
+		keycap,
+	}}}
+	background := woxui.Color{}
+	if paintBackground {
+		background = theme.ToolbarBackground
+	}
+	body := woxwidget.Container{Width: width, Height: height, Radius: 8, Color: background, Padding: woxwidget.Insets{Left: horizontalPadding, Top: 6, Right: horizontalPadding, Bottom: 6}, Child: woxwidget.Flex{
+		Axis: woxwidget.Horizontal, MainAxisAlignment: woxwidget.MainAxisEnd, Children: []woxwidget.Widget{action},
+	}}
+	if !paintBackground {
+		return body
+	}
+	return woxwidget.Stack{Width: width, Height: height, Children: []woxwidget.StackChild{
+		{Child: body},
+		{Child: woxwidget.Container{Width: width, Height: 1, Color: themeAlpha(theme.ToolbarText, 26)}},
+	}}
+}
+
+func themeCatalogRowHeight(available float32, count int) float32 {
+	if count == 0 {
+		return 0
+	}
+	return min(float32(60), max(float32(42), available/float32(count)))
+}
+
+// themeAutoSwatch mirrors Flutter's compact diagonal AUTO theme icon.
+func themeAutoSwatch(light, dark woxcomponent.Theme, size float32) woxwidget.Widget {
+	return woxwidget.Painter{Width: size, Height: size, Paint: func(displayList *woxui.DisplayList, bounds woxui.Rect) {
+		fillThemeDiagonalPolygon(displayList, themeRoundedRectPoints(bounds, common.ThemeSwatchRadius), bounds, light.Background, dark.Background)
+		query := woxui.Rect{X: bounds.X + common.ThemeSwatchInset, Y: bounds.Y + common.ThemeSwatchAutoQueryTop, Width: max(float32(0), bounds.Width-common.ThemeSwatchInset*2), Height: common.ThemeSwatchQueryHeight}
+		result := woxui.Rect{X: bounds.X + common.ThemeSwatchInset, Y: bounds.Y + common.ThemeSwatchResultTop, Width: max(float32(0), bounds.Width-common.ThemeSwatchInset*2), Height: common.ThemeSwatchResultHeight}
+		fillThemeDiagonalRect(displayList, query, bounds, light.QueryBackground, dark.QueryBackground)
+		fillThemeDiagonalRect(displayList, result, bounds, light.SelectedBackground, dark.SelectedBackground)
+		separator := woxui.Rect{X: bounds.X + common.ThemeSwatchInset, Y: bounds.Y + common.ThemeSwatchSeparatorTop, Width: max(float32(0), bounds.Width-common.ThemeSwatchInset*2), Height: common.ThemeSwatchSeparatorHeight}
+		indicator := woxui.Rect{X: result.X, Y: result.Y, Width: common.ThemeSwatchIndicatorWidth, Height: result.Height}
+		lightSeparator, lightThickness, _, _ := light.QuerySeparator()
+		darkSeparator, darkThickness, _, _ := dark.QuerySeparator()
+		if lightThickness <= 0 {
+			lightSeparator = woxui.Color{}
+		}
+		if darkThickness <= 0 {
+			darkSeparator = woxui.Color{}
+		}
+		fillThemeDiagonalRect(displayList, separator, bounds, lightSeparator, darkSeparator)
+		lightIndicator, darkIndicator := light.ResultIndicator(), dark.ResultIndicator()
+		if lightIndicator.Width <= 0 {
+			lightIndicator.Color = woxui.Color{}
+		}
+		if darkIndicator.Width <= 0 {
+			darkIndicator.Color = woxui.Color{}
+		}
+		fillThemeDiagonalRect(displayList, indicator, bounds, lightIndicator.Color, darkIndicator.Color)
+		drawThemeDiagonalLine(displayList, bounds, common.ThemeSwatchAutoLineWidth)
+		if color, width := themeSwatchOutline(dark); width > 0 {
+			displayList.StrokeRoundedRect(bounds, common.ThemeSwatchRadius, width, color)
+		} else if color, width := themeSwatchOutline(light); width > 0 {
+			displayList.StrokeRoundedRect(bounds, common.ThemeSwatchRadius, width, color)
+		}
+	}}
+}
+
+// themeRoundedRectPoints approximates Flutter's clipped 8px swatch corners with one portable convex path.
+func themeRoundedRectPoints(bounds woxui.Rect, radius float32) []woxui.Point {
+	radius = min(max(float32(0), radius), min(bounds.Width, bounds.Height)/2)
+	if radius == 0 {
+		return []woxui.Point{{X: bounds.X, Y: bounds.Y}, {X: bounds.X + bounds.Width, Y: bounds.Y}, {X: bounds.X + bounds.Width, Y: bounds.Y + bounds.Height}, {X: bounds.X, Y: bounds.Y + bounds.Height}}
+	}
+	const half = float32(0.5)
+	const near = float32(0.134)
+	const far = float32(0.866)
+	left, top := bounds.X, bounds.Y
+	right, bottom := bounds.X+bounds.Width, bounds.Y+bounds.Height
+	return []woxui.Point{
+		{X: right - radius, Y: top}, {X: right - radius*half, Y: top + radius*near}, {X: right - radius*near, Y: top + radius*half}, {X: right, Y: top + radius},
+		{X: right, Y: bottom - radius}, {X: right - radius*near, Y: bottom - radius*half}, {X: right - radius*half, Y: bottom - radius*near}, {X: right - radius, Y: bottom},
+		{X: left + radius, Y: bottom}, {X: left + radius*half, Y: bottom - radius*near}, {X: left + radius*near, Y: bottom - radius*half}, {X: left, Y: bottom - radius},
+		{X: left, Y: top + radius}, {X: left + radius*near, Y: top + radius*half}, {X: left + radius*half, Y: top + radius*near}, {X: left + radius, Y: top},
+	}
+}
+
+// fillThemeDiagonalRect clips one surface against both halves of the AUTO preview diagonal.
+func fillThemeDiagonalRect(displayList *woxui.DisplayList, rect, splitBounds woxui.Rect, light, dark woxui.Color) {
+	fillThemeDiagonalPolygon(displayList, themeDiagonalRectPoints(rect, splitBounds), splitBounds, light, dark)
+}
+
+// fillThemeDiagonalPolygon paints both AUTO colors inside one convex surface.
+func fillThemeDiagonalPolygon(displayList *woxui.DisplayList, points []woxui.Point, splitBounds woxui.Rect, light, dark woxui.Color) {
+	if points := themeDiagonalPolygon(points, splitBounds, true); len(points) >= 3 {
+		displayList.FillConvexPolygon(points, light)
+	}
+	if points := themeDiagonalPolygon(points, splitBounds, false); len(points) >= 3 {
+		displayList.FillConvexPolygon(points, dark)
+	}
+}
+
+// themeDiagonalRectPoints limits a rectangular preview surface to its visible bounds.
+func themeDiagonalRectPoints(rect, splitBounds woxui.Rect) []woxui.Point {
+	if rect.Width <= 0 || rect.Height <= 0 || splitBounds.Width <= 0 || splitBounds.Height <= 0 {
+		return nil
+	}
+	left := max(rect.X, splitBounds.X)
+	top := max(rect.Y, splitBounds.Y)
+	right := min(rect.X+rect.Width, splitBounds.X+splitBounds.Width)
+	bottom := min(rect.Y+rect.Height, splitBounds.Y+splitBounds.Height)
+	if right <= left || bottom <= top {
+		return nil
+	}
+	rect = woxui.Rect{X: left, Y: top, Width: right - left, Height: bottom - top}
+	return []woxui.Point{{X: rect.X, Y: rect.Y}, {X: rect.X + rect.Width, Y: rect.Y}, {X: rect.X + rect.Width, Y: rect.Y + rect.Height}, {X: rect.X, Y: rect.Y + rect.Height}}
+}
+
+// themeDiagonalPolygon clips a convex surface to one AUTO preview half-plane.
+func themeDiagonalPolygon(points []woxui.Point, splitBounds woxui.Rect, light bool) []woxui.Point {
+	if len(points) < 3 || splitBounds.Width <= 0 || splitBounds.Height <= 0 {
+		return nil
+	}
+	value := func(point woxui.Point) float32 {
+		return (point.X-splitBounds.X)*splitBounds.Height + (point.Y-splitBounds.Y)*splitBounds.Width - splitBounds.Width*splitBounds.Height
+	}
+	inside := func(v float32) bool {
+		if light {
+			return v <= 0
+		}
+		return v >= 0
+	}
+	clipped := make([]woxui.Point, 0, 5)
+	appendPoint := func(point woxui.Point) {
+		if len(clipped) == 0 || clipped[len(clipped)-1] != point {
+			clipped = append(clipped, point)
+		}
+	}
+	for index, current := range points {
+		next := points[(index+1)%len(points)]
+		currentValue, nextValue := value(current), value(next)
+		currentInside, nextInside := inside(currentValue), inside(nextValue)
+		if currentInside {
+			appendPoint(current)
+		}
+		if currentInside != nextInside {
+			t := currentValue / (currentValue - nextValue)
+			appendPoint(woxui.Point{X: current.X + (next.X-current.X)*t, Y: current.Y + (next.Y-current.Y)*t})
+		}
+	}
+	if len(clipped) > 1 && clipped[0] == clipped[len(clipped)-1] {
+		clipped = clipped[:len(clipped)-1]
+	}
+	return clipped
+}
+
+// themeDiagonalRectPolygon retains the rectangle helper used by focused geometry checks.
+func themeDiagonalRectPolygon(rect, splitBounds woxui.Rect, light bool) []woxui.Point {
+	return themeDiagonalPolygon(themeDiagonalRectPoints(rect, splitBounds), splitBounds, light)
+}
+
+// drawThemeDiagonalLine separates the light and dark preview halves with Flutter's subtle dark rule.
+func drawThemeDiagonalLine(displayList *woxui.DisplayList, bounds woxui.Rect, width float32) {
+	half := width / 2
+	displayList.FillConvexPolygon([]woxui.Point{
+		{X: bounds.X + bounds.Width - half, Y: bounds.Y},
+		{X: bounds.X + bounds.Width + half, Y: bounds.Y},
+		{X: bounds.X + half, Y: bounds.Y + bounds.Height},
+		{X: bounds.X - half, Y: bounds.Y + bounds.Height},
+	}, woxui.Color{A: 38})
+}
+
+func themeActions(props ThemeSettingsProps, theme ThemeCatalogItem) []woxwidget.Widget {
+	busy := props.Operation != ""
+	button := func(id, label, operation string, disabled bool) woxwidget.Widget {
+		if props.Operation == operation+":"+theme.ID {
+			label += "…"
+		}
+		variant := woxcomponent.ButtonSecondary
+		if operation == "install" || operation == "apply" || operation == "upgrade" {
+			variant = woxcomponent.ButtonPrimary
+		}
+		return woxcomponent.WoxButton(woxcomponent.ButtonProps{ID: id, Label: label, IntrinsicWidth: true, Height: woxcomponent.SettingsControlHeight, Disabled: busy || disabled, Variant: variant, OnTap: func() {
+			if props.OnOperation != nil {
+				props.OnOperation(operation)
+			}
+		}, Theme: props.Theme})
+	}
+	if !theme.IsInstalled {
+		return []woxwidget.Widget{button("theme-install", props.InstallLabel, "install", false)}
+	}
+	buttons := make([]woxwidget.Widget, 0, 3)
+	if theme.IsUpgradable {
+		buttons = append(buttons, button("theme-upgrade", props.UpdateLabel, "upgrade", false))
+	}
+	label := props.ApplyLabel
+	if theme.Active {
+		label = props.AppliedLabel
+	}
+	buttons = append(buttons, button("theme-apply", label, "apply", theme.Active))
+	if theme.IsAuto && !theme.IsSystem && props.OnEditAuto != nil {
+		buttons = append(buttons, woxcomponent.WoxButton(woxcomponent.ButtonProps{
+			ID: "theme-edit-auto", Label: props.EditAutoLabel, IntrinsicWidth: true, Height: woxcomponent.SettingsControlHeight, Disabled: busy,
+			Variant: woxcomponent.ButtonSecondary, OnTap: props.OnEditAuto, Theme: props.Theme,
+		}))
+	}
+	if !theme.IsSystem {
+		label := props.UninstallLabel
+		if props.UninstallArmed == theme.ID {
+			label = "Confirm " + props.UninstallLabel
+		}
+		buttons = append(buttons, button("theme-uninstall", label, "uninstall", false))
+	}
+	return buttons
+}
+
+func themeSwatch(theme woxcomponent.Theme, size float32) woxwidget.Widget {
+	innerWidth := max(float32(0), size-common.ThemeSwatchInset*2)
+	borderColor, borderWidth := themeSwatchOutline(theme)
+	resultTop := common.ThemeSwatchResultTop
+	children := []woxwidget.StackChild{
+		{Left: common.ThemeSwatchInset, Top: common.ThemeSwatchAutoQueryTop, Child: woxwidget.Container{Width: innerWidth, Height: common.ThemeSwatchQueryHeight, Radius: common.ThemeSwatchQueryRadius, Color: theme.QueryBackground}},
+		{Left: common.ThemeSwatchInset, Top: resultTop, Child: woxwidget.Container{Width: innerWidth, Height: common.ThemeSwatchResultHeight, Radius: common.ThemeSwatchResultRadius, Color: theme.SelectedBackground}},
+	}
+	separator, thickness, _, _ := theme.QuerySeparator()
+	if thickness > 0 && separator.A > 0 {
+		children = append(children, woxwidget.StackChild{Left: common.ThemeSwatchInset, Top: common.ThemeSwatchSeparatorTop, Child: woxwidget.Container{Width: innerWidth, Height: common.ThemeSwatchSeparatorHeight, Color: separator}})
+	}
+	indicator := theme.ResultIndicator()
+	if indicator.Width > 0 && indicator.Color.A > 0 {
+		children = append(children, woxwidget.StackChild{Left: common.ThemeSwatchInset, Top: resultTop, Child: woxwidget.Container{Width: common.ThemeSwatchIndicatorWidth, Height: common.ThemeSwatchResultHeight, Color: indicator.Color}})
+	}
+	return woxwidget.Container{Width: size, Height: size, Radius: common.ThemeSwatchRadius, Color: theme.Background, BorderColor: borderColor, BorderWidth: borderWidth, Child: woxwidget.Stack{Width: size, Height: size, Children: children}}
+}
+
+func themeSwatchOutline(theme woxcomponent.Theme) (woxui.Color, float32) {
+	if !theme.AppWindowChrome || theme.AppBorderColor == nil || theme.AppBorderColor.A == 0 {
+		return woxui.Color{}, 0
+	}
+	if theme.AppBorderWidth != nil && *theme.AppBorderWidth <= 0 {
+		return woxui.Color{}, 0
+	}
+	if theme.AppBorderWidth == nil && theme.AppBorderColor.A < 200 {
+		return woxui.Color{}, 0
+	}
+	width := common.ThemeSwatchOutlineWidthDefault
+	if theme.AppBorderWidth != nil {
+		width = common.ThemeSwatchOutlineWidth(*theme.AppBorderWidth)
+	}
+	return *theme.AppBorderColor, width
+}
+
+func themeAutoEditorDialog(props ThemeSettingsProps, overlayWidth, overlayHeight float32) woxwidget.Widget {
+	panelWidth := min(float32(720), max(float32(0), overlayWidth-64))
+	panelHeight := min(float32(640), max(float32(0), overlayHeight-56))
+	title := props.CreateAutoLabel
+	if props.AutoEditor != nil && props.AutoEditor.Overwrite {
+		title = props.EditAutoLabel
+	}
+	innerWidth := max(float32(0), panelWidth-48)
+	innerHeight := max(float32(0), panelHeight-48)
+	return woxcomponent.WoxDialog(woxcomponent.DialogProps{
+		ID: "theme-auto-editor-dialog", Label: title, Width: panelWidth, Height: panelHeight,
+		OverlayWidth: overlayWidth, OverlayHeight: overlayHeight, BackdropID: "theme-auto-editor-backdrop", BackdropAlpha: 210,
+		Solid: true, Radius: 16, Padding: woxwidget.UniformInsets(24), Theme: props.Theme, InitialFocus: "theme-auto-name", OnEscape: props.OnCancelAuto,
+		Child: themeAutoEditor(props, innerWidth, innerHeight),
+	})
+}
+
+func themeAutoEditor(props ThemeSettingsProps, width, height float32) woxwidget.Widget {
+	editor := props.AutoEditor
+	const headerHeight = float32(80)
+	innerWidth := max(float32(0), width-40)
+	name := woxcomponent.WoxSettingTextField(woxcomponent.TextFieldProps{
+		ID: "theme-auto-name", Label: props.AutoNamePlaceholder, Hint: props.AutoNamePlaceholder, Width: max(float32(0), innerWidth-180),
+		Value: editor.Name.Text, Focused: editor.NameFocused, Window: props.Window, Theme: props.Theme,
+		OnChanged: props.OnAutoNameChanged, OnSetValue: props.OnSetAutoName, OnFocusChange: props.OnAutoNameFocusChange,
+	})
+	busy := editor.Saving || props.Operation != ""
+	actions := woxwidget.Flex{Axis: woxwidget.Horizontal, Gap: 8, Children: []woxwidget.Widget{
+		woxcomponent.WoxButton(woxcomponent.ButtonProps{ID: "theme-auto-cancel", Label: props.CancelAutoLabel, IntrinsicWidth: true, Disabled: editor.Saving, Variant: woxcomponent.ButtonSecondary, OnTap: props.OnCancelAuto, Theme: props.Theme}),
+		woxcomponent.WoxButton(woxcomponent.ButtonProps{ID: "theme-auto-save", Label: props.SaveAutoLabel, IntrinsicWidth: true, Disabled: busy, Variant: woxcomponent.ButtonPrimary, OnTap: props.OnSaveAuto, Theme: props.Theme}),
+	}}
+	header := woxwidget.Container{Width: width, Height: headerHeight, Padding: woxwidget.Insets{Left: 20, Right: 20}, Child: woxwidget.Align{Height: headerHeight, Vertical: 0.5, Child: woxwidget.Flex{
+		Axis: woxwidget.Horizontal, Gap: 12, CrossAxisAlignment: woxwidget.CrossAxisCenter, Children: []woxwidget.Widget{
+			woxwidget.Expanded{Child: name},
+			actions,
+		},
+	}}}
+	bodyHeight := max(float32(0), height-headerHeight)
+	light := themeAutoEditorVariant(props, editor.LightThemeID, true)
+	dark := themeAutoEditorVariant(props, editor.DarkThemeID, false)
+	preview := themePreviewTab(props, ThemeCatalogItem{IsAuto: true, LightPreviewTheme: light, DarkPreviewTheme: dark}, width, bodyHeight)
+	var body woxwidget.Widget = preview
+	if editor.Error != "" {
+		body = woxwidget.Stack{Width: width, Height: bodyHeight, Children: []woxwidget.StackChild{
+			{Child: body},
+			{Left: 16, Right: 16, Bottom: 4, AnchorBottom: true, StretchWidth: true, Child: woxwidget.TextBlock{Value: editor.Error, Height: 44, MaxLines: 2, Style: woxui.TextStyle{Size: props.Theme.Scaled(11)}, Color: props.Theme.Error}},
+		}}
+	}
+	return woxwidget.Flex{Axis: woxwidget.Vertical, Children: []woxwidget.Widget{header, woxwidget.Container{Width: width, Height: bodyHeight, Child: body}}}
+}
+
+func themeAutoEditorVariant(props ThemeSettingsProps, id string, light bool) woxcomponent.Theme {
+	for _, item := range props.Items {
+		if item.ID == id {
+			if item.IsAuto {
+				break
+			}
+			return item.PreviewTheme
+		}
+	}
+	for _, item := range props.AutoPickerThemes {
+		if item.ID == id {
+			return item.PreviewTheme
+		}
+	}
+	if light {
+		return woxcomponent.Theme{Background: woxui.Color{R: 245, G: 245, B: 245, A: 255}, QueryBackground: woxui.Color{R: 232, G: 232, B: 232, A: 255}, QueryText: woxui.Color{A: 255}, ResultTitle: woxui.Color{A: 255}}
+	}
+	return woxcomponent.Theme{Background: woxui.Color{R: 43, G: 43, B: 43, A: 255}, QueryBackground: woxui.Color{R: 61, G: 61, B: 61, A: 255}, QueryText: woxui.Color{R: 255, G: 255, B: 255, A: 255}, ResultTitle: woxui.Color{R: 255, G: 255, B: 255, A: 255}}
+}
+
+func themeAutoSlotEditOverlay(props ThemeSettingsProps, preview woxwidget.Widget, width, height float32, lightTheme, darkTheme woxcomponent.Theme) woxwidget.Widget {
+	busy := props.AutoEditor != nil && props.AutoEditor.Saving
+	button := func(id string, horizontal, vertical float32, slot string, previewTheme woxcomponent.Theme) woxwidget.StackChild {
+		return woxwidget.StackChild{Child: woxwidget.Align{Width: width, Height: height, Horizontal: horizontal, Vertical: vertical, Child: woxcomponent.WoxButton(woxcomponent.ButtonProps{
+			ID: id, Label: props.ModifyAutoLabel, IntrinsicWidth: true, Disabled: busy, FontWeight: woxui.FontWeightSemibold,
+			Variant: woxcomponent.ButtonOutlinedSurface, OnTap: func() {
+				if props.OnAutoEditSlot != nil {
+					props.OnAutoEditSlot(slot)
+				}
+			}, Theme: themeAutoEditButtonTheme(previewTheme, props.Theme),
+		})}}
+	}
+	return woxwidget.Stack{Width: width, Height: height, Children: []woxwidget.StackChild{
+		{Child: preview},
+		button("theme-auto-edit-light", 0.22, 0.22, "light", lightTheme),
+		button("theme-auto-edit-dark", 0.78, 0.78, "dark", darkTheme),
+	}}
+}
+
+// themeAutoEditButtonTheme paints a solid Modify chip with a hairline in that half's text color.
+func themeAutoEditButtonTheme(preview woxcomponent.Theme, base woxcomponent.ControlTheme) woxcomponent.ControlTheme {
+	theme := base
+	fill := preview.Background
+	if fill.A == 0 {
+		fill = preview.QueryBackground
+	}
+	fill.A = 255
+	text := preview.ResultTitle
+	if text.A == 0 {
+		text = preview.QueryText
+	}
+	if text.A == 0 {
+		text = woxui.Color{A: 255}
+	}
+	text.A = 255
+	theme.Surface = fill
+	theme.BodyText = text
+	theme.InputBackground = fill
+	theme.Text = text
+	theme.ControlText = text
+	return theme
+}
+
+func themeAutoSlotAt(point woxui.Point, size woxui.Size) string {
+	if size.Width <= 0 || size.Height <= 0 {
+		return ""
+	}
+	value := point.X*size.Height + point.Y*size.Width - size.Width*size.Height
+	if value <= 0 {
+		return "light"
+	}
+	return "dark"
+}
+
+func themeAutoPickerDialog(props ThemeSettingsProps, overlayWidth, overlayHeight float32) woxwidget.Widget {
+	title := props.PickLightTitle
+	if props.AutoEditor != nil && props.AutoEditor.PickerSlot == "dark" {
+		title = props.PickDarkTitle
+	}
+	return ThemeAutoPickerView(ThemeAutoPickerProps{
+		OverlayWidth: overlayWidth, OverlayHeight: overlayHeight, Window: props.Window, Theme: props.Theme,
+		Title: title, SearchPlaceholder: props.SearchPlaceholder, CancelLabel: props.CancelAutoLabel,
+		Themes: props.AutoPickerThemes, OnChoose: props.OnAutoPickTheme, OnCancel: props.OnCancelAutoPicker,
+	})
+}

@@ -1,0 +1,544 @@
+from .result_actions import ResultActions
+import asyncio
+import json
+import uuid
+from typing import Any, Awaitable, Callable, Dict, Optional
+
+from websockets.asyncio.server import ServerConnection
+from wox_plugin import (
+    AIModel,
+    ChatOptions,
+    PushAttentionRequest,
+    ChangeQueryParam,
+    ChatStreamCallback,
+    Context,
+    Conversation,
+    LogLevel,
+    MetadataCommand,
+    MRUData,
+    PluginSettingDefinitionItem,
+    PublicAPI,
+    Query,
+    RefreshQueryParam,
+    Result,
+    ResultActionType,
+    ScreenshotOption,
+    ScreenshotResult,
+    GetThemeColorsOption,
+    GetThemeColorsResult,
+    RegisterTriggerKeywordOption,
+    RegisterTriggerKeywordResult,
+    DragOutEvent,
+    DragOutListenOption,
+    DragOutListenResult,
+    UnregisterTriggerKeywordOption,
+    UnregisterTriggerKeywordResult,
+    InvokePluginToolOption,
+    InvokePluginToolResult,
+    ListPluginToolsOption,
+    ListPluginToolsResult,
+    PluginToolHandler,
+    RegisterPluginToolOption,
+    RegisterPluginToolResult,
+    UnregisterPluginToolOption,
+    UnregisterPluginToolResult,
+    SetSettingOption,
+    SetSettingResult,
+    ShowToastMsgOption,
+    ShowToastMsgResult,
+    ToastMsgActionContext,
+    ToolbarMsg,
+    UpdatableResult,
+    WoxImage,
+)
+
+from . import logger
+from .constants import PLUGIN_JSONRPC_TYPE_REQUEST
+from . import plugin_manager
+from .plugin_manager import set_current_connection, waiting_for_response
+
+
+class PluginAPI(PublicAPI):
+    def __init__(self, ws: ServerConnection, plugin_id: str, plugin_name: str, result_actions: ResultActions | None = None):
+        # Init receives the socket that is current at load. Later reconnects replace it.
+        set_current_connection(ws)
+        self.result_actions = result_actions if result_actions is not None else ResultActions()
+        self.plugin_id = plugin_id
+        self.plugin_name = plugin_name
+        self.setting_change_callbacks: Dict[str, Callable[[Context, str, str], Awaitable[None] | None]] = {}
+        self.get_dynamic_setting_callbacks: Dict[
+            str, Callable[[Context, str], PluginSettingDefinitionItem | Awaitable[PluginSettingDefinitionItem]]
+        ] = {}
+        self.deep_link_callbacks: Dict[str, Callable[[Context, Dict[str, str]], Awaitable[None] | None]] = {}
+        self.unload_callbacks: Dict[str, Callable[[Context], Awaitable[None] | None]] = {}
+        self.enter_plugin_query_callbacks: Dict[str, Callable[[Context], Awaitable[None] | None]] = {}
+        self.leave_plugin_query_callbacks: Dict[str, Callable[[Context], Awaitable[None] | None]] = {}
+        self.drag_out_callbacks: Dict[str, Callable[[Context, DragOutEvent], Awaitable[None] | None]] = {}
+        self.llm_stream_callbacks: Dict[str, ChatStreamCallback] = {}
+        self.mru_restore_callbacks: Dict[str, Callable[[Context, MRUData], Optional[Result] | Awaitable[Optional[Result]]]] = {}
+        self.plugin_tool_callbacks: Dict[str, PluginToolHandler] = {}
+        self.plugin_tool_callback_ids: Dict[str, str] = {}
+        self.plugin_tool_calls: set[asyncio.Task[Any]] = set()
+        self.plugin_tools_stopping = False
+        self.toast_callbacks: Dict[str, Callable[[Context, ToastMsgActionContext], Awaitable[None] | None]] = {}
+
+    async def invoke_method(self, ctx: Context, method: str, params: Dict[str, Any]) -> Any:
+        """Invoke a method on Wox"""
+        request_id = str(uuid.uuid4())
+        trace_id = ctx.get_trace_id()
+
+        if method != "Log":
+            await logger.info(
+                trace_id,
+                f"<{self.plugin_name}> start invoke method to Wox: {method}, id: {request_id}",
+            )
+
+        # Core expects all params as strings; serialize non-string values to JSON strings.
+        serialized_params: Dict[str, str] = {}
+        for key, value in params.items():
+            if value is None:
+                continue
+            if isinstance(value, str):
+                serialized_params[key] = value
+            else:
+                serialized_params[key] = json.dumps(value)
+
+        request = {
+            "TraceId": trace_id,
+            "SessionId": ctx.values.get("SessionId", ""),
+            "QueryId": ctx.values.get("QueryId", ""),
+            "Id": request_id,
+            "Method": method,
+            "Type": PLUGIN_JSONRPC_TYPE_REQUEST,
+            "Params": serialized_params,
+            "PluginId": self.plugin_id,
+            "PluginName": self.plugin_name,
+        }
+
+        ws = plugin_manager.current_connection
+        if ws is None:
+            raise RuntimeError("host websocket is not connected")
+
+        # Register before send so a response that arrives immediately is not missed.
+        future: asyncio.Future[Any] = asyncio.Future()
+        waiting_for_response[request_id] = future
+        try:
+            await ws.send(json.dumps(request))
+            return await future
+        except Exception as e:
+            waiting_for_response.pop(request_id, None)
+            if not future.done():
+                future.cancel()
+            await logger.error(trace_id, f"invoke method failed: {str(e)}")
+            raise e
+
+    async def change_query(self, ctx: Context, query: ChangeQueryParam) -> None:
+        """Change the query in Wox"""
+        params = {
+            "queryType": query.query_type,
+            "queryHint": json.dumps(query.query_hint.to_dict() if query.query_hint else None),
+            "queryText": query.query_text,
+            "querySelection": (query.query_selection.__dict__ if query.query_selection else None),
+            "queryContextData": json.dumps(query.context_data or {}),
+        }
+        await self.invoke_method(ctx, "ChangeQuery", params)
+
+    async def hide_app(self, ctx: Context) -> None:
+        """Hide the Wox window"""
+        await self.invoke_method(ctx, "HideApp", {})
+
+    async def show_app(self, ctx: Context) -> None:
+        """Show the Wox window"""
+        await self.invoke_method(ctx, "ShowApp", {})
+
+    async def is_visible(self, ctx: Context) -> bool:
+        """Check if Wox window is currently visible"""
+        result = await self.invoke_method(ctx, "IsVisible", {})
+        return bool(result) if result is not None else False
+
+    async def notify(self, ctx: Context, message: str) -> None:
+        """Show a notification message"""
+        await self.invoke_method(ctx, "Notify", {"message": message})
+
+    async def show_toast_msg(self, ctx: Context, option: ShowToastMsgOption) -> ShowToastMsgResult:
+        """Register a one-shot action and show a transient notification."""
+        if option.action and not callable(option.action.action):
+            return ShowToastMsgResult(err_msg="action callback is required")
+        callback_id = str(uuid.uuid4()) if option.action else ""
+        action = None
+        if option.action:
+            self.toast_callbacks[callback_id] = option.action.action
+            action = {"Name": option.action.name, "ContextData": option.action.context_data, "CallbackId": callback_id}
+        try:
+            result = await self.invoke_method(
+                ctx, "ShowToastMsg", {"option": {"Message": option.message, "Title": option.title, "Action": action}}
+            )
+            parsed = ShowToastMsgResult(success=result.get("Success", False), err_msg=result.get("ErrMsg", ""))
+            if not parsed.success:
+                self.toast_callbacks.pop(callback_id, None)
+            return parsed
+        except Exception:
+            self.toast_callbacks.pop(callback_id, None)
+            raise
+
+    async def push_attention(self, ctx: Context, request: PushAttentionRequest) -> None:
+        """Push a persistent attention item into Wox."""
+        await self.invoke_method(ctx, "PushAttention", {"request": request.to_json()})
+
+    async def show_toolbar_msg(self, ctx: Context, msg: ToolbarMsg) -> None:
+        from .plugin_manager import plugin_instances
+
+        plugin_instance = plugin_instances.get(self.plugin_id)
+        if plugin_instance:
+            for action in msg.actions:
+                action_id = action.id or str(uuid.uuid4())
+                action.id = action_id
+                callback = action.action
+                if callable(callback):
+                    plugin_instance.toolbar_msg_actions[action_id] = callback
+
+        await self.invoke_method(ctx, "ShowToolbarMsg", {"msg": json.loads(msg.to_json())})
+
+    async def clear_toolbar_msg(self, ctx: Context, toolbar_msg_id: str) -> None:
+        await self.invoke_method(ctx, "ClearToolbarMsg", {"toolbarMsgId": toolbar_msg_id})
+
+    async def log(self, ctx: Context, level: LogLevel, msg: str) -> None:
+        """Write log"""
+        await self.invoke_method(ctx, "Log", {"level": level, "msg": msg})
+
+    async def get_translation(self, ctx: Context, key: str) -> str:
+        """Get a translation for a key"""
+        result = await self.invoke_method(ctx, "GetTranslation", {"key": key})
+        return str(result) if result is not None else key
+
+    async def get_setting(self, ctx: Context, key: str) -> str:
+        """Get a setting value"""
+        result = await self.invoke_method(ctx, "GetSetting", {"key": key})
+        return str(result) if result is not None else ""
+
+    async def save_setting(self, ctx: Context, key: str, value: str, is_platform_specific: bool) -> None:
+        """Save a setting value"""
+        await self.invoke_method(
+            ctx,
+            "SaveSetting",
+            {"key": key, "value": value, "isPlatformSpecific": is_platform_specific},
+        )
+
+    async def set_setting(self, ctx: Context, option: SetSettingOption) -> SetSettingResult:
+        """Save a setting value with explicit persistence options."""
+        response = await self.invoke_method(ctx, "SetSetting", {"option": json.dumps(option.to_dict())})
+        if not isinstance(response, dict):
+            return SetSettingResult(success=False, errmsg="invalid SetSetting response")
+
+        return SetSettingResult(
+            success=bool(response.get("Success", False)),
+            errmsg=str(response.get("ErrMsg", "") or ""),
+        )
+
+    async def on_setting_changed(
+        self,
+        ctx: Context,
+        callback: Callable[[Context, str, str], Awaitable[None] | None],
+    ) -> None:
+        """Register setting changed callback"""
+        callback_id = str(uuid.uuid4())
+        self.setting_change_callbacks[callback_id] = callback
+        await self.invoke_method(ctx, "OnPluginSettingChanged", {"callbackId": callback_id})
+
+    async def on_get_dynamic_setting(
+        self,
+        ctx: Context,
+        callback: Callable[[Context, str], PluginSettingDefinitionItem | Awaitable[PluginSettingDefinitionItem]],
+    ) -> None:
+        """Register dynamic setting callback"""
+        callback_id = str(uuid.uuid4())
+        self.get_dynamic_setting_callbacks[callback_id] = callback
+        await self.invoke_method(ctx, "OnGetDynamicSetting", {"callbackId": callback_id})
+
+    async def on_deep_link(
+        self,
+        ctx: Context,
+        callback: Callable[[Context, Dict[str, str]], Awaitable[None] | None],
+    ) -> None:
+        """Register deep link callback"""
+        callback_id = str(uuid.uuid4())
+        self.deep_link_callbacks[callback_id] = callback
+        await self.invoke_method(ctx, "OnDeepLink", {"callbackId": callback_id})
+
+    async def on_unload(self, ctx: Context, callback: Callable[[Context], Awaitable[None] | None]) -> None:
+        """Register unload callback"""
+        callback_id = str(uuid.uuid4())
+        self.unload_callbacks[callback_id] = callback
+        await self.invoke_method(ctx, "OnUnload", {"callbackId": callback_id})
+
+    async def on_enter_plugin_query(self, ctx: Context, callback: Callable[[Context], Awaitable[None] | None]) -> None:
+        callback_id = str(uuid.uuid4())
+        self.enter_plugin_query_callbacks[callback_id] = callback
+        await self.invoke_method(ctx, "OnEnterPluginQuery", {"callbackId": callback_id})
+
+    async def on_leave_plugin_query(self, ctx: Context, callback: Callable[[Context], Awaitable[None] | None]) -> None:
+        callback_id = str(uuid.uuid4())
+        self.leave_plugin_query_callbacks[callback_id] = callback
+        await self.invoke_method(ctx, "OnLeavePluginQuery", {"callbackId": callback_id})
+
+    async def on_drag_out(self, ctx: Context, option: DragOutListenOption) -> DragOutListenResult:
+        if option is None or option.callback is None:
+            return DragOutListenResult(success=False)
+        callback_id = str(uuid.uuid4())
+        self.drag_out_callbacks[callback_id] = option.callback
+        result = await self.invoke_method(ctx, "OnDragOut", {"callbackId": callback_id})
+        return DragOutListenResult(success=isinstance(result, dict) and result.get("Success") is True)
+
+    async def register_query_commands(self, ctx: Context, commands: list[MetadataCommand]) -> None:
+        """Register query commands"""
+        await self.invoke_method(
+            ctx,
+            "RegisterQueryCommands",
+            {"commands": json.dumps([json.loads(command.to_json()) for command in commands])},
+        )
+
+    async def register_trigger_keyword(self, ctx: Context, option: RegisterTriggerKeywordOption) -> RegisterTriggerKeywordResult:
+        """Forward a typed trigger declaration and decode registration success."""
+        result = await self.invoke_method(ctx, "RegisterTriggerKeyword", {"option": json.dumps(option.to_dict())})
+        return RegisterTriggerKeywordResult(success=isinstance(result, dict) and result.get("Success") is True)
+
+    async def unregister_trigger_keyword(self, ctx: Context, option: UnregisterTriggerKeywordOption) -> UnregisterTriggerKeywordResult:
+        """Release this plugin's runtime trigger and its hint."""
+        result = await self.invoke_method(ctx, "UnregisterTriggerKeyword", {"option": json.dumps(option.to_dict())})
+        return UnregisterTriggerKeywordResult(success=isinstance(result, dict) and result.get("Success") is True)
+
+    async def register_plugin_tool(self, ctx: Context, option: RegisterPluginToolOption) -> RegisterPluginToolResult:
+        callback_id = str(uuid.uuid4())
+        self.plugin_tool_callbacks[callback_id] = option.handler
+        try:
+            result = await self.invoke_method(
+                ctx,
+                "RegisterPluginTool",
+                {"option": json.dumps({"Tool": option.tool.to_dict(), "CallbackId": callback_id})},
+            )
+            parsed = RegisterPluginToolResult.from_dict(result)
+            if parsed.error:
+                self.drop_plugin_tool_callback(option.tool.name, callback_id)
+            else:
+                self.plugin_tool_callback_ids[option.tool.name] = callback_id
+            return parsed
+        except Exception:
+            self.drop_plugin_tool_callback(option.tool.name, callback_id)
+            raise
+
+    async def unregister_plugin_tool(self, ctx: Context, option: UnregisterPluginToolOption) -> UnregisterPluginToolResult:
+        result = await self.invoke_method(ctx, "UnregisterPluginTool", {"option": json.dumps(option.to_dict())})
+        parsed = UnregisterPluginToolResult.from_dict(result)
+        callback_id = self.plugin_tool_callback_ids.get(option.name)
+        if not parsed.error and callback_id:
+            self.drop_plugin_tool_callback(option.name, callback_id)
+        return parsed
+
+    async def list_plugin_tools(self, ctx: Context, option: ListPluginToolsOption) -> ListPluginToolsResult:
+        result = await self.invoke_method(ctx, "ListPluginTools", {"option": json.dumps(option.to_dict() if option else {})})
+        return ListPluginToolsResult.from_dict(result)
+
+    async def invoke_plugin_tool(self, ctx: Context, option: InvokePluginToolOption) -> InvokePluginToolResult:
+        result = await self.invoke_method(
+            ctx,
+            "InvokePluginTool",
+            {
+                "option": json.dumps(option.to_dict()),
+                "PluginToolCallId": ctx.values.get("PluginToolCallId", ""),
+            },
+        )
+        return InvokePluginToolResult.from_dict(result)
+
+    def drop_plugin_tool_callback(self, name: str, callback_id: str) -> None:
+        self.plugin_tool_callbacks.pop(callback_id, None)
+        if self.plugin_tool_callback_ids.get(name) == callback_id:
+            self.plugin_tool_callback_ids.pop(name, None)
+
+    async def stop_plugin_tools(self) -> None:
+        """Drain real handlers before unload, even when Core already stopped waiting."""
+        self.plugin_tools_stopping = True
+        if self.plugin_tool_calls:
+            await asyncio.gather(*tuple(self.plugin_tool_calls), return_exceptions=True)
+
+    async def ai_chat_stream(
+        self,
+        ctx: Context,
+        model: AIModel,
+        conversations: list[Conversation],
+        callback: ChatStreamCallback,
+        options: ChatOptions | None = None,
+    ) -> None:
+        """Stream a chat from a Wox AI model. The model is required."""
+        if model is None or not model.provider or not model.name:
+            raise ValueError("ai_chat_stream requires a model with provider and name")
+        callback_id = str(uuid.uuid4())
+        self.llm_stream_callbacks[callback_id] = callback
+        try:
+            await self.invoke_method(
+                ctx,
+                "AIChatStream",
+                {
+                    "callbackId": callback_id,
+                    "model": {
+                        "Name": model.name,
+                        "Provider": model.provider,
+                        "ProviderAlias": model.provider_alias,
+                    },
+                    "conversations": [conversation.to_core_dict() for conversation in conversations],
+                    "options": options.to_core_dict() if options is not None else {},
+                },
+            )
+        except (Exception, asyncio.CancelledError):
+            # Failed or cancelled requests may never receive a terminal stream event.
+            self.llm_stream_callbacks.pop(callback_id, None)
+            raise
+
+    async def on_mru_restore(
+        self,
+        ctx: Context,
+        callback: Callable[[Context, MRUData], Optional[Result] | Awaitable[Optional[Result]]],
+    ) -> None:
+        """Register MRU restore callback"""
+        callback_id = str(uuid.uuid4())
+        self.mru_restore_callbacks[callback_id] = callback
+        await self.invoke_method(ctx, "OnMRURestore", {"callbackId": callback_id})
+
+    async def get_updatable_result(self, ctx: Context, result_id: str) -> Optional[UpdatableResult]:
+        """Get the current state of a result that is displayed in the UI"""
+        response = await self.invoke_method(ctx, "GetUpdatableResult", {"resultId": result_id})
+        if response is None:
+            return None
+
+        if isinstance(response, str):
+            response = json.loads(response)
+
+        # Parse the response into UpdatableResult
+        # The response is a dict with optional fields
+        updatable_result = UpdatableResult(id=result_id)
+
+        if "Title" in response:
+            updatable_result.title = response["Title"]
+        if "SubTitle" in response:
+            updatable_result.sub_title = response["SubTitle"]
+        if "Icon" in response:
+            updatable_result.icon = WoxImage.from_json(json.dumps(response["Icon"]))
+        if "Tails" in response:
+            from wox_plugin import ResultTail
+
+            updatable_result.tails = [ResultTail.from_json(json.dumps(tail)) for tail in response["Tails"]]
+        if "Preview" in response:
+            from wox_plugin import WoxPreview
+
+            updatable_result.preview = WoxPreview.from_json(json.dumps(response["Preview"]))
+        if "Actions" in response:
+            from wox_plugin import ResultAction
+
+            actions = [ResultAction.from_json(json.dumps(action)) for action in response["Actions"]]
+            bucket = self.result_actions.for_context(ctx, result_id)
+            callbacks = bucket.results.get(result_id, {}) if bucket is not None else {}
+            for action in actions:
+                cached = callbacks.get(action.id)
+                if action.type == ResultActionType.FORM:
+                    action.on_submit = (
+                        getattr(cached, "on_submit", None) if getattr(cached, "type", None) == ResultActionType.FORM else None
+                    )
+                else:
+                    action.action = getattr(cached, "action", None) if getattr(cached, "type", None) != ResultActionType.FORM else None
+            updatable_result.actions = actions
+
+        return updatable_result
+
+    async def update_result(self, ctx: Context, result: UpdatableResult) -> bool:
+        """Update a query result that is currently displayed in the UI"""
+        callbacks = self.result_actions.for_context(ctx, result.id)
+        if callbacks is not None:
+            callbacks.cache(result, preserve_callbacks=True)
+        elif result.actions:
+            await logger.warning(
+                ctx.get_trace_id(),
+                f"<{self.plugin_name}> UpdateResult could not cache actions for result {result.id}: "
+                "query scope is missing, ambiguous or released; preserve the original query Context (SessionId/QueryId)",
+            )
+
+        response = await self.invoke_method(ctx, "UpdateResult", {"result": result.to_json()})
+        return bool(response) if response is not None else False
+
+    async def push_results(self, ctx: Context, query: Query, results: list[Result]) -> bool:
+        """Push additional results for the current query"""
+        callbacks = self.result_actions.find(query.session_id, query.id, "")
+        if callbacks is not None:
+            for result in results:
+                callbacks.cache(result)
+
+        results_payload = [json.loads(result.to_json()) for result in results]
+        response = await self.invoke_method(
+            ctx,
+            "PushResults",
+            {
+                "query": query.to_json(),
+                "results": results_payload,
+            },
+        )
+        return bool(response) if response is not None else False
+
+    async def refresh_query(self, ctx: Context, param: RefreshQueryParam) -> None:
+        """Re-execute the current query with the existing query text"""
+        params: Dict[str, bool | str] = {
+            "PreserveSelectedIndex": param.preserve_selected_index,
+        }
+        if param.selected_result_id:
+            params["selectedResultId"] = param.selected_result_id
+        await self.invoke_method(ctx, "RefreshQuery", params)
+
+    async def copy(self, ctx: Context, params: Any) -> None:
+        """Copy text or image to system clipboard"""
+        await self.invoke_method(
+            ctx,
+            "Copy",
+            {
+                "type": params.type,
+                "text": params.text,
+                "woxImage": (json.dumps(params.wox_image) if params.wox_image else ""),
+            },
+        )
+
+    async def screenshot(self, ctx: Context, option: ScreenshotOption) -> ScreenshotResult:
+        """Start the built-in screenshot workflow."""
+        # The Python SDK exposes snake_case dataclass fields, while core accepts the public JSON
+        # option names. Serializing through to_dict keeps future screenshot fields explicit instead
+        # of silently dropping everything at the host boundary.
+        option_payload = option.to_dict() if hasattr(option, "to_dict") else {}
+        response = await self.invoke_method(
+            ctx,
+            "Screenshot",
+            {
+                # Keep options as one JSON object so future fields do not change the method signature.
+                "option": json.dumps(option_payload),
+            },
+        )
+
+        if not isinstance(response, dict):
+            return ScreenshotResult(success=False, errmsg="invalid screenshot response")
+
+        return ScreenshotResult(
+            success=bool(response.get("Success", False)),
+            screenshot_path=str(response.get("ScreenshotPath", "") or ""),
+            errmsg=str(response.get("ErrMsg", "") or ""),
+        )
+
+    async def get_cache_folder(self, ctx: Context) -> str:
+        """Get this plugin's dedicated cache directory."""
+        result = await self.invoke_method(ctx, "GetCacheFolder", {})
+        return str(result) if result is not None else ""
+
+    async def get_theme_colors(self, ctx: Context, option: Optional[GetThemeColorsOption] = None) -> GetThemeColorsResult:
+        """Current launcher palette as opaque #RRGGBB colors."""
+        option_payload = option.to_dict() if option is not None and hasattr(option, "to_dict") else {}
+        response = await self.invoke_method(
+            ctx,
+            "GetThemeColors",
+            {"option": json.dumps(option_payload)},
+        )
+        if not isinstance(response, dict):
+            return GetThemeColorsResult()
+        return GetThemeColorsResult.from_dict(response)

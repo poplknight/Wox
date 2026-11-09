@@ -1,0 +1,499 @@
+package clipboard
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"image"
+	"image/png"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"wox/util"
+)
+
+var noDataErr = errors.New("no such data")
+var notImplement = errors.New("not implemented")
+var watchMutex sync.Mutex
+var watchList = make(map[uint64]*watchSubscription)
+var nextWatchID uint64
+var isWatching bool
+var WatchIntervalMillisecond = 250
+var nativeImageFileWriterMu sync.RWMutex
+var nativeImageFileWriter func(context.Context, string) error
+
+// selfWriteWindow is how long the watcher stays away from the clipboard around a
+// Wox write. It only has to cover the gap until the platform write has landed,
+// so a poll cannot read a half-published clipboard.
+const selfWriteWindow = 200 * time.Millisecond
+
+// lastWriteTimestamp tracks the last time Wox wrote to the clipboard (UnixMilli).
+// Used to keep the polling loop away from the clipboard while Wox owns the write.
+var lastWriteTimestamp atomic.Int64
+
+// pendingOwnChange remembers a finished Wox write until history can observe it.
+// Windows advances its sequence baseline inside the write, and the Linux portal
+// ignores selections Wox itself owns, so the platform edge alone drops those copies.
+var pendingOwnChange atomic.Bool
+
+// detectClipboardChange reports whether the clipboard changed and consumes the edge
+// it reports, so only the first caller after a change ever sees it. It is a variable
+// so tests can exercise that contract without a real clipboard.
+var detectClipboardChange = isClipboardChanged
+
+// beginSelfWrite opens the settle window before the platform write so a watcher
+// tick cannot read the clipboard while the write is still landing.
+func beginSelfWrite() {
+	lastWriteTimestamp.Store(time.Now().UnixMilli())
+}
+
+// endSelfWrite marks a write that landed. The settle window still keeps the
+// watcher away, but the copy stays pending so clipboard history records searches,
+// previews, and other copies Wox itself puts on the clipboard.
+func endSelfWrite() {
+	pendingOwnChange.Store(true)
+	lastWriteTimestamp.Store(time.Now().UnixMilli())
+}
+
+// withinSelfWriteWindow reports whether Wox is still settling its own write.
+func withinSelfWriteWindow() bool {
+	return time.Since(time.UnixMilli(lastWriteTimestamp.Load())) < selfWriteWindow
+}
+
+// claimClipboardChange reports whether this tick should read the clipboard.
+// Skipping while the settle window is open must not consume either the platform
+// edge or the pending Wox copy. A later tick reads whichever content is current.
+func claimClipboardChange() bool {
+	if withinSelfWriteWindow() {
+		util.GetLogger().Info(context.Background(), "clipboard: watcher tick skipped while Wox owns the write")
+		return false
+	}
+	ownCopy := pendingOwnChange.Swap(false)
+	return detectClipboardChange() || ownCopy
+}
+
+// NoDataErr returns the sentinel error reported when the clipboard contains no recognizable data.
+func NoDataErr() error { return noDataErr }
+
+// SequenceNumber is a cheap clipboard generation counter. It changes when another
+// app copies, including copies of the same text. Zero means the platform cannot
+// expose a counter and callers should use another change signal.
+func SequenceNumber() uint64 {
+	return readClipboardSequenceNumber()
+}
+
+// SetNativeImageFileWriter registers a window-thread adapter for platforms where
+// background clipboard ownership is restricted by the compositor.
+func SetNativeImageFileWriter(writer func(context.Context, string) error) {
+	nativeImageFileWriterMu.Lock()
+	defer nativeImageFileWriterMu.Unlock()
+	nativeImageFileWriter = writer
+}
+
+// writeNativeImageFile dispatches through the registered window-thread adapter.
+func writeNativeImageFile(ctx context.Context, filePath string) error {
+	nativeImageFileWriterMu.RLock()
+	writer := nativeImageFileWriter
+	nativeImageFileWriterMu.RUnlock()
+	if writer == nil {
+		return errors.New("clipboard: native image file writer is not registered")
+	}
+	return writer(ctx, filePath)
+}
+
+type Type string
+
+const (
+	ClipboardTypeText  Type = "text"
+	ClipboardTypeImage Type = "image"
+	ClipboardTypeFile  Type = "file"
+)
+
+type Data interface {
+	GetType() Type
+	String() string
+	MarshalJSON() ([]byte, error)
+	UnmarshalJSON([]byte) error
+}
+
+type watchSubscription struct {
+	mutex    sync.Mutex
+	callback func(Data)
+	closed   bool
+}
+
+// call serializes one subscriber so unsubscribe can wait for an active callback.
+func (s *watchSubscription) call(data Data) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if !s.closed {
+		s.callback(data)
+	}
+}
+
+// close prevents future callbacks after the current callback returns.
+func (s *watchSubscription) close() {
+	s.mutex.Lock()
+	s.closed = true
+	s.mutex.Unlock()
+}
+
+func Read() (Data, error) {
+	contentType := readClipboardContentType()
+	switch contentType {
+	case ClipboardTypeText:
+		text, err := readText()
+		if err != nil {
+			return nil, err
+		}
+		return &TextData{Text: text}, nil
+	case ClipboardTypeImage:
+		img, err := readImage()
+		if err != nil {
+			return nil, err
+		}
+		return &ImageData{Image: img}, nil
+	case ClipboardTypeFile:
+		paths, err := readFilePaths()
+		if err != nil {
+			return nil, err
+		}
+		return &FilePathData{FilePaths: paths}, nil
+	default:
+		return nil, noDataErr
+	}
+}
+
+func ReadFilesAndText() (Data, error) {
+	filePaths, fileErr := readFilePaths()
+	if fileErr == nil {
+		return &FilePathData{
+			FilePaths: filePaths,
+		}, nil
+	}
+
+	textData, txtErr := readText()
+	if txtErr == nil {
+		return &TextData{
+			Text: textData,
+		}, nil
+	}
+
+	return nil, noDataErr
+}
+
+func Write(data Data) error {
+	beginSelfWrite()
+	switch data.GetType() {
+	case ClipboardTypeText:
+		if err := writeTextData(data.String()); err != nil {
+			util.GetLogger().Error(context.Background(), fmt.Sprintf("clipboard: write text failed: %v", err))
+			return err
+		}
+	case ClipboardTypeImage:
+		if err := writeImageData(data.(*ImageData).Image); err != nil {
+			util.GetLogger().Error(context.Background(), fmt.Sprintf("clipboard: write image failed: %v", err))
+			return err
+		}
+	case ClipboardTypeFile:
+		if err := writeFilePaths(data.(*FilePathData).FilePaths); err != nil {
+			util.GetLogger().Error(context.Background(), fmt.Sprintf("clipboard: write file paths failed: %v", err))
+			return err
+		}
+	default:
+		return errors.New("not implemented")
+	}
+
+	// A failed write leaves the clipboard untouched, so only a write that landed
+	// may stay pending for history.
+	endSelfWrite()
+	return nil
+}
+
+func WriteImageBytes(pngData []byte, dibData []byte) error {
+	beginSelfWrite()
+	if err := writeImageBytes(pngData, dibData); err != nil {
+		util.GetLogger().Error(context.Background(), fmt.Sprintf("clipboard: write image bytes failed: %v", err))
+		return err
+	}
+	endSelfWrite()
+	return nil
+}
+
+// WriteAnimatedGIF copies a local GIF file to the clipboard while preserving
+// animation. Static CopyTypeImage writes decode to PNG/DIB and drop frames.
+func WriteAnimatedGIF(filePath string) error {
+	beginSelfWrite()
+	if err := writeAnimatedGIFFile(filePath); err != nil {
+		util.GetLogger().Error(context.Background(), fmt.Sprintf("clipboard: write animated gif failed: %v", err))
+		return err
+	}
+	endSelfWrite()
+	return nil
+}
+
+func isGIFBytes(data []byte) bool {
+	if len(data) < 6 {
+		return false
+	}
+	header := string(data[:6])
+	return header == "GIF87a" || header == "GIF89a"
+}
+
+// Watch subscribes to clipboard changes and returns a function that waits for any active callback before unsubscribing.
+func Watch(cb func(Data)) func() {
+	watchMutex.Lock()
+	nextWatchID++
+	id := nextWatchID
+	subscription := &watchSubscription{callback: cb}
+	watchList[id] = subscription
+	if !isWatching {
+		isWatching = true
+		go func() {
+			for {
+				time.Sleep(time.Millisecond * time.Duration(WatchIntervalMillisecond))
+				watchChange()
+			}
+		}()
+	}
+	watchMutex.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			watchMutex.Lock()
+			delete(watchList, id)
+			watchMutex.Unlock()
+			subscription.close()
+		})
+	}
+}
+
+func watchChange() {
+	defer func() {
+		if err := recover(); err != nil {
+			util.GetLogger().Error(context.Background(), fmt.Sprintf("clipboard: watchChange panic: %v", err))
+		}
+	}()
+
+	if !claimClipboardChange() {
+		return
+	}
+
+	// Debounce: wait briefly to let the clipboard settle.
+	// When the user rapidly copies items, this avoids opening the clipboard
+	// while the source application is still writing, reducing lock contention.
+	settleStart := time.Now()
+	settleChanges := 0
+	for {
+		time.Sleep(50 * time.Millisecond)
+		// If the clipboard changed during the sleep, it means the user is still copying or the source app is still writing.
+		// We loop until it settles (no sequence number change for 50ms).
+		if !detectClipboardChange() {
+			break
+		}
+		settleChanges++
+
+		// Unblock after maximum 1 second to prevent permanent deadlocks
+		// from badly behaving apps that continuously update the clipboard.
+		if time.Since(settleStart) > time.Second {
+			util.GetLogger().Warn(context.Background(), "clipboard: debounce timeout exceeded, reading anyway")
+			break
+		}
+	}
+	if settleChanges > 0 {
+		util.GetLogger().Warn(
+			context.Background(),
+			fmt.Sprintf("clipboard: debounce observed %d additional changes before read (elapsed=%s)", settleChanges, time.Since(settleStart).String()),
+		)
+	}
+
+	start := time.Now()
+	data, err := Read()
+	if err != nil {
+		snapshot := buildWatchSnapshot()
+		if snapshot != "" {
+			util.GetLogger().Warn(context.Background(), fmt.Sprintf("clipboard: changed but failed to read: %v %s", err, snapshot))
+		} else {
+			util.GetLogger().Warn(context.Background(), fmt.Sprintf("clipboard: changed but failed to read: %v", err))
+		}
+		return
+	}
+
+	if d := time.Since(start); d > 200*time.Millisecond {
+		util.GetLogger().Warn(context.Background(), fmt.Sprintf("clipboard: Read took %s (type=%s)", d.String(), data.GetType()))
+	}
+
+	watchMutex.Lock()
+	subscriptions := make([]*watchSubscription, 0, len(watchList))
+	for _, subscription := range watchList {
+		subscriptions = append(subscriptions, subscription)
+	}
+	watchMutex.Unlock()
+
+	for _, subscription := range subscriptions {
+		go func(subscription *watchSubscription) {
+			defer func() {
+				if err1 := recover(); err1 != nil {
+					util.GetLogger().Error(context.Background(), fmt.Sprintf("clipboard: callback panic: %v", err1))
+				}
+			}()
+
+			subscription.call(data)
+		}(subscription)
+	}
+}
+
+func WriteText(text string) error {
+	return Write(&TextData{
+		Text: text,
+	})
+}
+
+// ReadText returns clipboard text when a text format is present.
+// Office and browser copies often also advertise a bitmap preview; those must
+// not hide the text, so this reads CF_UNICODETEXT / equivalent directly.
+// An empty clipboard or a text-less image/file payload returns "" + nil.
+func ReadText() (string, error) {
+	text, err := readText()
+	if err != nil {
+		if errors.Is(err, noDataErr) {
+			return "", nil
+		}
+		return "", err
+	}
+	return text, nil
+}
+
+// ReadFilePaths returns copied filesystem paths, or nil when the clipboard has none.
+func ReadFilePaths() ([]string, error) {
+	paths, err := readFilePaths()
+	if err != nil {
+		if errors.Is(err, noDataErr) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return paths, nil
+}
+
+// ReadImage returns a clipboard bitmap when PNG/DIB data is present.
+// Text or file formats that travel with a screenshot do not hide the image.
+func ReadImage() (image.Image, error) {
+	img, err := readImage()
+	if err != nil {
+		if errors.Is(err, noDataErr) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return img, nil
+}
+
+type TextData struct {
+	Text string
+}
+
+func (t *TextData) GetType() Type {
+	return ClipboardTypeText
+}
+
+func (t *TextData) String() string {
+	return t.Text
+}
+
+func (t *TextData) MarshalJSON() ([]byte, error) {
+	var mapData = make(map[string]string)
+	mapData["text"] = t.Text
+	mapData["type"] = string(t.GetType())
+	return json.Marshal(mapData)
+}
+
+func (t *TextData) UnmarshalJSON(data []byte) error {
+	var mapData = make(map[string]string)
+	err := json.Unmarshal(data, &mapData)
+	if err != nil {
+		return err
+	}
+
+	t.Text = mapData["text"]
+	return nil
+}
+
+type FilePathData struct {
+	FilePaths []string
+}
+
+func (f *FilePathData) GetType() Type {
+	return ClipboardTypeFile
+}
+
+func (f *FilePathData) String() string {
+	return strings.Join(f.FilePaths, ";")
+}
+
+func (f *FilePathData) MarshalJSON() ([]byte, error) {
+	var mapData = make(map[string]string)
+	mapData["filePaths"] = strings.Join(f.FilePaths, "``")
+	mapData["type"] = string(f.GetType())
+	return json.Marshal(mapData)
+}
+
+func (f *FilePathData) UnmarshalJSON(data []byte) error {
+	var mapData = make(map[string]string)
+	err := json.Unmarshal(data, &mapData)
+	if err != nil {
+		return err
+	}
+
+	f.FilePaths = strings.Split(mapData["filePaths"], "``")
+	return nil
+}
+
+type ImageData struct {
+	Image image.Image
+}
+
+func (i *ImageData) GetType() Type {
+	return ClipboardTypeImage
+}
+
+func (i *ImageData) String() string {
+	b := i.Image.Bounds()
+	return fmt.Sprintf("image(%dx%d)", b.Dx(), b.Dy())
+}
+
+func (i *ImageData) MarshalJSON() ([]byte, error) {
+	buf := new(bytes.Buffer)
+	err := png.Encode(buf, i.Image)
+	if err != nil {
+		return nil, err
+	}
+
+	return json.Marshal(base64.StdEncoding.EncodeToString(buf.Bytes()))
+}
+
+func (i *ImageData) UnmarshalJSON(data []byte) error {
+	var base64ImgData string
+	unmarshalErr := json.Unmarshal(data, &base64ImgData)
+	if unmarshalErr != nil {
+		return unmarshalErr
+	}
+
+	decodeBytes, err := base64.StdEncoding.DecodeString(base64ImgData)
+	if err != nil {
+		return err
+	}
+
+	img, decodeErr := png.Decode(bytes.NewReader(decodeBytes))
+	if decodeErr != nil {
+		return decodeErr
+	}
+
+	i.Image = img
+	return nil
+}

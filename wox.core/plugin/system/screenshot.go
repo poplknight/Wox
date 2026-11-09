@@ -1,0 +1,1116 @@
+package system
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"image/png"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+	"wox/common"
+	"wox/common/icons"
+	"wox/plugin"
+	chatplugin "wox/plugin/system/chat"
+	notesplugin "wox/plugin/system/notes"
+	"wox/setting"
+	"wox/setting/definition"
+	"wox/setting/validator"
+	"wox/util"
+	"wox/util/ocr"
+	"wox/util/overlay/imageoverlay"
+	"wox/util/screenshotedit"
+	"wox/util/shell"
+
+	"github.com/disintegration/imaging"
+)
+
+var screenshotIcon = icons.Get(icons.PluginScreenshot)
+var screenshotCommandNew = "new"
+var screenshotHistoryPreviewWidth = 1024
+
+var screenshotPinnedOverlayPrefix = "wox_screenshot_pin_"
+var screenshotRetentionDaysSettingKey = "retention_days"
+var screenshotOCREnabledSettingKey = "ocr_enabled"
+var screenshotOCRModelSettingKey = "ocr_model"
+var screenshotAIToolbarEnabledSettingKey = "ai_toolbar_enabled"
+var screenshotAIExtraActionID = "ai"
+var screenshotDefaultRetentionDays = 15
+var screenshotOCRSidecarVersion = 1
+
+const screenshotPermissionDeniedErrorCode = "permission_denied"
+const screenshotPluginID = common.ScreenshotPluginID
+
+func init() {
+	plugin.AllSystemPlugin = append(plugin.AllSystemPlugin, &ScreenshotPlugin{})
+}
+
+type ScreenshotPlugin struct {
+	api                plugin.API
+	thumbnailM         sync.Mutex
+	backgroundM        sync.Mutex
+	backgroundWG       sync.WaitGroup
+	backgroundCtx      context.Context
+	backgroundCancel   context.CancelFunc
+	backgroundStopping bool
+	storageM           sync.Mutex
+	storage            screenshotStorageState
+	storageJobs        *sync.WaitGroup
+}
+
+func (p *ScreenshotPlugin) GetMetadata() plugin.Metadata {
+	return plugin.Metadata{
+		Id:            screenshotPluginID,
+		Name:          "i18n:plugin_screenshot_plugin_name",
+		Author:        "Wox Launcher",
+		Website:       "https://github.com/Wox-launcher/Wox",
+		Version:       "1.0.0",
+		MinWoxVersion: "2.0.0",
+		Runtime:       "Go",
+		Description:   "i18n:plugin_screenshot_plugin_description",
+		Icon:          screenshotIcon.String(),
+		TriggerKeywords: []string{
+			"screenshot",
+			"截图",
+		},
+		Commands: []plugin.MetadataCommand{
+			{
+				Command:     screenshotCommandNew,
+				Description: "i18n:plugin_screenshot_command_new_description",
+			},
+		},
+		SupportedOS: []string{
+			"Windows",
+			"Macos",
+			"Linux",
+		},
+		SettingDefinitions: []definition.PluginSettingDefinitionItem{
+			{
+				Type:  definition.PluginSettingDefinitionTypeDynamic,
+				Value: &definition.PluginSettingValueDynamic{Key: screenshotSaveDirectorySettingKey},
+			},
+			{
+				Type: definition.PluginSettingDefinitionTypeCheckBox,
+				Value: &definition.PluginSettingValueCheckBox{
+					Key:          screenshotOCREnabledSettingKey,
+					Label:        "i18n:plugin_screenshot_ocr_enabled",
+					Tooltip:      "i18n:plugin_screenshot_ocr_enabled_tooltip",
+					DefaultValue: "true",
+				},
+			},
+			{
+				Type: definition.PluginSettingDefinitionTypeDynamic,
+				Value: &definition.PluginSettingValueDynamic{
+					Key: screenshotOCRModelSettingKey,
+				},
+			},
+			{
+				Type: definition.PluginSettingDefinitionTypeTextBox,
+				Value: &definition.PluginSettingValueTextBox{
+					Key:          screenshotRetentionDaysSettingKey,
+					Label:        "i18n:plugin_screenshot_retention_days",
+					Tooltip:      "i18n:plugin_screenshot_retention_days_tooltip",
+					Suffix:       "i18n:plugin_screenshot_days",
+					DefaultValue: strconv.Itoa(screenshotDefaultRetentionDays),
+					Validators: []validator.PluginSettingValidator{
+						{
+							Type:  validator.PluginSettingValidatorTypeNotEmpty,
+							Value: &validator.PluginSettingValidatorNotEmpty{},
+						},
+						{
+							Type: validator.PluginSettingValidatorTypeIsNumber,
+							Value: &validator.PluginSettingValidatorIsNumber{
+								IsInteger: true,
+							},
+						},
+					},
+				},
+			},
+			{
+				Type: definition.PluginSettingDefinitionTypeHead,
+				Value: &definition.PluginSettingValueHead{
+					Content: "i18n:plugin_screenshot_ai_head",
+				},
+			},
+			{
+				Type: definition.PluginSettingDefinitionTypeCheckBox,
+				Value: &definition.PluginSettingValueCheckBox{
+					Key:          screenshotAIToolbarEnabledSettingKey,
+					Label:        "i18n:plugin_screenshot_ai_toolbar",
+					Tooltip:      "i18n:plugin_screenshot_ai_toolbar_tooltip",
+					DefaultValue: "false",
+				},
+			},
+		},
+	}
+}
+
+func (p *ScreenshotPlugin) Init(ctx context.Context, initParams plugin.InitParams) {
+	p.api = initParams.API
+	p.backgroundM.Lock()
+	p.backgroundCtx, p.backgroundCancel = context.WithCancel(util.NewTraceContext())
+	p.backgroundWG = sync.WaitGroup{}
+	p.backgroundStopping = false
+	p.backgroundM.Unlock()
+	p.initScreenshotStorage(ctx)
+	p.api.OnGetDynamicSetting(ctx, func(ctx context.Context, key string) definition.PluginSettingDefinitionItem {
+		if key == screenshotSaveDirectorySettingKey {
+			return p.screenshotDirectorySetting()
+		}
+		if key != screenshotOCRModelSettingKey || !p.isScreenshotOCREnabled(ctx) {
+			return definition.PluginSettingDefinitionItem{}
+		}
+		return BuildOCRModelSetting(ctx, screenshotOCRModelSettingKey, "i18n:plugin_screenshot_ocr_model", "i18n:plugin_screenshot_ocr_model_tooltip")
+	})
+	p.syncPaddleWorkflowConsumer(ctx)
+	p.api.OnSettingChanged(ctx, func(callbackCtx context.Context, key string, _ string) {
+		if key == screenshotOCREnabledSettingKey || key == screenshotOCRModelSettingKey {
+			p.syncPaddleWorkflowConsumer(callbackCtx)
+		}
+	})
+
+	// Remove expired captures before warming thumbnails so startup never generates caches for files
+	// that the retention policy is about to delete.
+	_, jobs := p.beginScreenshotStorageUse()
+	p.runScreenshotStorageTask(jobs, "initialize screenshot history", func(runtimeCtx context.Context) {
+		p.cleanupExpiredScreenshots(runtimeCtx)
+		p.indexScreenshotScenes(runtimeCtx)
+		p.warmScreenshotHistoryThumbnails(runtimeCtx)
+	})
+	jobs.Done()
+	// Screenshot retention uses one scheduled owner instead of tying deletion to capture or query
+	// flows. Keeping cleanup periodic avoids surprising file removal during user-driven actions.
+	p.runScreenshotBackgroundTask("cleanup screenshot history", func(runtimeCtx context.Context) {
+		p.startScreenshotCleanupRoutine(runtimeCtx)
+	})
+	p.api.OnUnload(ctx, func(ctx context.Context) {
+		p.stopScreenshotBackgroundTasks()
+		ocr.SetPaddleWorkflowConsumer(ctx, p.GetMetadata().Id, false)
+	})
+}
+
+func (p *ScreenshotPlugin) syncPaddleWorkflowConsumer(ctx context.Context) {
+	needed := p.isScreenshotOCREnabled(ctx) && p.screenshotOCRModel(ctx) == ocr.ModelPaddlePPOCRv6Small
+	ocr.SetPaddleWorkflowConsumer(ctx, p.GetMetadata().Id, needed)
+}
+
+// runScreenshotBackgroundTask starts work only while the current plugin lifecycle accepts new tasks.
+func (p *ScreenshotPlugin) runScreenshotBackgroundTask(message string, job func(context.Context)) bool {
+	p.backgroundM.Lock()
+	if p.backgroundStopping || p.backgroundCtx == nil || p.backgroundCtx.Err() != nil {
+		p.backgroundM.Unlock()
+		return false
+	}
+	runtimeCtx := p.backgroundCtx
+	p.backgroundWG.Add(1)
+	p.backgroundM.Unlock()
+
+	util.Go(runtimeCtx, message, func() {
+		defer p.backgroundWG.Done()
+		job(runtimeCtx)
+	})
+	return true
+}
+
+// stopScreenshotBackgroundTasks prevents new work and waits for active file operations before unload completes.
+func (p *ScreenshotPlugin) stopScreenshotBackgroundTasks() {
+	p.backgroundM.Lock()
+	p.backgroundStopping = true
+	cancel := p.backgroundCancel
+	p.backgroundM.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	p.backgroundWG.Wait()
+}
+
+func (p *ScreenshotPlugin) Query(ctx context.Context, query plugin.Query) plugin.QueryResponse {
+	if query.Command == screenshotCommandNew {
+		return plugin.NewQueryResponse([]plugin.QueryResult{p.newScreenshotResult()})
+	}
+
+	if query.Command != "" {
+		return plugin.QueryResponse{}
+	}
+
+	// The default screenshot query now lists saved captures instead of starting a capture directly.
+	// Starting a new capture moved to the explicit "new" command so history browsing and capture
+	// creation do not compete for the same default result.
+	results, err := p.queryScreenshotHistory(ctx, query)
+	if err != nil {
+		p.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("failed to query screenshot history: %s", err.Error()))
+		return plugin.QueryResponse{}
+	}
+
+	if len(results) > 0 {
+		return plugin.NewQueryResponse(results)
+	}
+	if strings.TrimSpace(query.Search) != "" {
+		return plugin.QueryResponse{}
+	}
+
+	return plugin.NewQueryResponse([]plugin.QueryResult{
+		{
+			Title:    "i18n:plugin_screenshot_history_empty_title",
+			SubTitle: "i18n:plugin_screenshot_history_empty_subtitle",
+			Icon:     screenshotIcon,
+		},
+	})
+}
+
+type screenshotHistoryItem struct {
+	path      string
+	fileName  string
+	size      int64
+	timestamp int64
+	ocrText   string
+}
+
+type screenshotOCRSidecar struct {
+	Version          int    `json:"version"`
+	Platform         string `json:"platform"`
+	Engine           string `json:"engine"`
+	Text             string `json:"text"`
+	RecognizedAt     int64  `json:"recognizedAt"`
+	SourceSize       int64  `json:"sourceSize"`
+	SourceModifiedAt int64  `json:"sourceModifiedAt"`
+}
+
+func (p *ScreenshotPlugin) newScreenshotResult() plugin.QueryResult {
+	return plugin.QueryResult{
+		Title:       "i18n:plugin_screenshot_capture_title",
+		SubTitle:    "i18n:plugin_screenshot_capture_subtitle",
+		IdentityKey: "screenshot:capture",
+		Icon:        screenshotIcon,
+		Actions: []plugin.QueryResultAction{
+			{
+				Name:      "i18n:plugin_screenshot_capture_action",
+				Icon:      icons.Get(icons.ActionRun),
+				IsDefault: true,
+				Action:    p.captureScreenshot,
+			},
+		},
+	}
+}
+
+func (p *ScreenshotPlugin) queryScreenshotHistory(ctx context.Context, query plugin.Query) ([]plugin.QueryResult, error) {
+	items, err := p.listScreenshotHistory()
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]plugin.QueryResult, 0, len(items))
+	search := strings.TrimSpace(query.Search)
+	for _, item := range items {
+		if !screenshotHistoryItemMatchesSearch(ctx, item, search) {
+			continue
+		}
+
+		results = append(results, p.screenshotHistoryResult(item))
+	}
+
+	return results, nil
+}
+
+func screenshotHistoryItemMatchesSearch(ctx context.Context, item screenshotHistoryItem, search string) bool {
+	search = strings.TrimSpace(search)
+	if search == "" {
+		return true
+	}
+
+	// Feature fix: OCR search must use the same fuzzy matcher as normal plugin
+	// results so the global pinyin option also applies to text recognized from
+	// screenshots. Plain substring checks cannot match Chinese text by pinyin.
+	for _, candidate := range []string{item.fileName, util.FormatTimestamp(item.timestamp), item.ocrText} {
+		if matched, _ := plugin.IsStringMatchScore(ctx, candidate, search); matched {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *ScreenshotPlugin) listScreenshotHistory() ([]screenshotHistoryItem, error) {
+	var items []screenshotHistoryItem
+	for _, directory := range p.screenshotHistoryDirectories() {
+		directoryItems, err := p.listScreenshotHistoryDirectory(directory)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, directoryItems...)
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].timestamp > items[j].timestamp })
+	return items, nil
+}
+
+// listScreenshotHistoryDirectory also serves the pending source while files move in the background.
+func (p *ScreenshotPlugin) listScreenshotHistoryDirectory(screenshotDirectory string) ([]screenshotHistoryItem, error) {
+	entries, err := os.ReadDir(screenshotDirectory)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []screenshotHistoryItem{}, nil
+		}
+		return nil, fmt.Errorf("failed to read screenshot directory: %w", err)
+	}
+
+	items := make([]screenshotHistoryItem, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !isScreenshotStorageImage(screenshotDirectory, entry.Name()) {
+			continue
+		}
+
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			if os.IsNotExist(infoErr) {
+				continue
+			}
+			return nil, fmt.Errorf("failed to read screenshot file info: %w", infoErr)
+		}
+		if info.Size() == 0 {
+			continue
+		}
+
+		// Reusing the existing screenshot export directory keeps the history feature storage-free.
+		// The file modification time is the simplest durable ordering signal for captures already
+		// written by UI, and zero-byte reservation files are skipped above.
+		ocrText := ""
+		if sidecar, sidecarErr := p.readScreenshotOCRSidecar(filepath.Join(screenshotDirectory, entry.Name()), info); sidecarErr == nil {
+			ocrText = sidecar.Text
+		}
+		items = append(items, screenshotHistoryItem{
+			path:      filepath.Join(screenshotDirectory, entry.Name()),
+			fileName:  entry.Name(),
+			size:      info.Size(),
+			timestamp: info.ModTime().UnixMilli(),
+			ocrText:   ocrText,
+		})
+	}
+
+	return items, nil
+}
+
+func (p *ScreenshotPlugin) getScreenshotDirectory() string {
+	p.storageM.Lock()
+	defer p.storageM.Unlock()
+	return p.screenshotDirectoryLocked()
+}
+
+// isScreenshotAIToolbarEnabled follows the checkbox default of off when the value is missing.
+func (p *ScreenshotPlugin) isScreenshotAIToolbarEnabled(ctx context.Context) bool {
+	value := strings.TrimSpace(p.api.GetSetting(ctx, screenshotAIToolbarEnabledSettingKey))
+	if value == "" {
+		return false
+	}
+	enabled, err := strconv.ParseBool(value)
+	if err != nil {
+		return false
+	}
+	return enabled
+}
+
+// screenshotAIToolbarActions returns the AI toolbar button only when the user wants it and Chat is usable.
+func screenshotAIToolbarActions(enabled bool, hasProvider bool, tooltip string) []common.ScreenshotExtraAction {
+	if !enabled || !hasProvider {
+		return nil
+	}
+	return []common.ScreenshotExtraAction{{
+		ID:      screenshotAIExtraActionID,
+		Icon:    icons.ControlSparkles,
+		Tooltip: tooltip,
+	}}
+}
+
+func hasConfiguredAIProvider(providers []setting.AIProvider) bool {
+	return len(providers) > 0
+}
+
+func (p *ScreenshotPlugin) isScreenshotOCREnabled(ctx context.Context) bool {
+	value := strings.TrimSpace(p.api.GetSetting(ctx, screenshotOCREnabledSettingKey))
+	if value == "" {
+		return true
+	}
+	enabled, err := strconv.ParseBool(value)
+	if err != nil {
+		// OCR should default to enabled when the stored checkbox value is missing or malformed. The
+		// previous screenshot history only searched filenames, and treating bad state as disabled
+		// would silently hide the new text-search capability until the user discovers the setting.
+		return true
+	}
+	return enabled
+}
+
+func (p *ScreenshotPlugin) screenshotOCRModel(ctx context.Context) string {
+	return NormalizeOCRModelID(p.api.GetSetting(ctx, screenshotOCRModelSettingKey))
+}
+
+func (p *ScreenshotPlugin) getScreenshotRetentionDays(ctx context.Context) int {
+	value := strings.TrimSpace(p.api.GetSetting(ctx, screenshotRetentionDaysSettingKey))
+	if value == "" {
+		return screenshotDefaultRetentionDays
+	}
+
+	retentionDays, err := strconv.Atoi(value)
+	if err != nil || retentionDays <= 0 {
+		// Retention controls deletion, so invalid or non-positive values fall back to the default
+		// instead of accidentally treating a bad setting as "delete everything immediately".
+		return screenshotDefaultRetentionDays
+	}
+	return retentionDays
+}
+
+func (p *ScreenshotPlugin) startScreenshotCleanupRoutine(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.cleanupExpiredScreenshots(ctx)
+		}
+	}
+}
+
+func (p *ScreenshotPlugin) cleanupExpiredScreenshots(ctx context.Context) {
+	// Keep cleanup out of a transfer so it cannot remove half of an image/sidecar bundle.
+	p.storageM.Lock()
+	if p.storage.Source != "" {
+		p.storageM.Unlock()
+		return
+	}
+	screenshotDirectory, jobs := p.beginScreenshotStorageUseLocked()
+	p.storageM.Unlock()
+	defer jobs.Done()
+	retentionDays := p.getScreenshotRetentionDays(ctx)
+	cutoff := time.Now().AddDate(0, 0, -retentionDays)
+
+	entries, err := os.ReadDir(screenshotDirectory)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
+		p.api.Log(ctx, plugin.LogLevelWarning, fmt.Sprintf("failed to read screenshot directory for cleanup: %s", err.Error()))
+		return
+	}
+
+	removedCount := 0
+	for _, entry := range entries {
+		if ctx.Err() != nil {
+			return
+		}
+		if entry.IsDir() || !isScreenshotStorageImage(screenshotDirectory, entry.Name()) {
+			continue
+		}
+
+		screenshotPath := filepath.Join(screenshotDirectory, entry.Name())
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			p.api.Log(ctx, plugin.LogLevelWarning, fmt.Sprintf("failed to read screenshot file info for cleanup: path=%s err=%s", screenshotPath, infoErr.Error()))
+			continue
+		}
+		if !info.ModTime().Before(cutoff) {
+			continue
+		}
+
+		// Cleanup follows the same file-modified timestamp used by history ordering. That keeps the
+		// retention rule easy to audit and avoids introducing a separate metadata store just to decide
+		// whether an exported screenshot is old enough to delete.
+		item := screenshotHistoryItem{
+			path:      screenshotPath,
+			fileName:  entry.Name(),
+			size:      info.Size(),
+			timestamp: info.ModTime().UnixMilli(),
+		}
+		if removeErr := os.Remove(screenshotPath); removeErr != nil {
+			if os.IsNotExist(removeErr) {
+				continue
+			}
+			p.api.Log(ctx, plugin.LogLevelWarning, fmt.Sprintf("failed to remove expired screenshot: path=%s err=%s", screenshotPath, removeErr.Error()))
+			continue
+		}
+		removedCount++
+		p.removeScreenshotHistoryThumbnails(ctx, item)
+		p.removeScreenshotOCRSidecar(ctx, item.path)
+		if err := screenshotedit.Remove(item.path); err != nil {
+			util.GetLogger().Warn(ctx, err.Error())
+		}
+	}
+
+	if removedCount > 0 {
+		p.api.Log(ctx, plugin.LogLevelInfo, fmt.Sprintf("removed %d expired screenshots older than %d days", removedCount, retentionDays))
+	}
+}
+
+func (p *ScreenshotPlugin) warmScreenshotHistoryThumbnails(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+	items, err := p.listScreenshotHistory()
+	if err != nil {
+		p.api.Log(ctx, plugin.LogLevelWarning, fmt.Sprintf("failed to warm screenshot history thumbnails: %s", err.Error()))
+		return
+	}
+
+	for _, item := range items {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := p.ensureScreenshotHistoryThumbnails(ctx, item); err != nil {
+			p.api.Log(ctx, plugin.LogLevelWarning, fmt.Sprintf("failed to warm screenshot history thumbnail: path=%s err=%s", item.path, err.Error()))
+		}
+	}
+}
+
+func (p *ScreenshotPlugin) ensureScreenshotHistoryThumbnailsForPath(ctx context.Context, screenshotPath string) error {
+	item, err := p.screenshotHistoryItemFromPath(screenshotPath)
+	if err != nil {
+		return err
+	}
+
+	return p.ensureScreenshotHistoryThumbnails(ctx, item)
+}
+
+func (p *ScreenshotPlugin) screenshotHistoryItemFromPath(screenshotPath string) (screenshotHistoryItem, error) {
+	info, err := os.Stat(screenshotPath)
+	if err != nil {
+		return screenshotHistoryItem{}, fmt.Errorf("failed to read screenshot file info: %w", err)
+	}
+	if info.IsDir() {
+		return screenshotHistoryItem{}, fmt.Errorf("screenshot path is a directory")
+	}
+	if !isScreenshotHistoryImage(screenshotPath) {
+		return screenshotHistoryItem{}, fmt.Errorf("screenshot path is not a supported image")
+	}
+	if info.Size() == 0 {
+		return screenshotHistoryItem{}, fmt.Errorf("screenshot file is empty")
+	}
+
+	return screenshotHistoryItem{
+		path:      screenshotPath,
+		fileName:  filepath.Base(screenshotPath),
+		size:      info.Size(),
+		timestamp: info.ModTime().UnixMilli(),
+	}, nil
+}
+
+func isScreenshotHistoryImage(path string) bool {
+	extension := strings.ToLower(filepath.Ext(path))
+	// Existing JPEG history remains readable even though new captures always use PNG.
+	return extension == ".png" || extension == ".jpg" || extension == ".jpeg"
+}
+
+func (p *ScreenshotPlugin) ensureScreenshotHistoryThumbnails(ctx context.Context, item screenshotHistoryItem) error {
+	previewPath, iconPath := p.screenshotHistoryThumbnailPaths(item)
+	if screenshotHistoryThumbnailHasWidth(previewPath, screenshotHistoryPreviewWidth) && util.IsFileExists(iconPath) {
+		p.warmScreenshotHistoryManagerIconCache(ctx, iconPath)
+		return nil
+	}
+
+	p.thumbnailM.Lock()
+	defer p.thumbnailM.Unlock()
+
+	if screenshotHistoryThumbnailHasWidth(previewPath, screenshotHistoryPreviewWidth) && util.IsFileExists(iconPath) {
+		p.warmScreenshotHistoryManagerIconCache(ctx, iconPath)
+		return nil
+	}
+	if err := util.GetLocation().EnsureDirectoryExist(util.GetLocation().GetImageCacheDirectory()); err != nil {
+		return fmt.Errorf("failed to ensure image cache directory: %w", err)
+	}
+
+	sourceImage, err := imaging.Open(item.path)
+	if err != nil {
+		return fmt.Errorf("failed to decode screenshot image: %w", err)
+	}
+
+	// Screenshot history now owns its thumbnails instead of relying on Manager.ConvertIcon.
+	// The old path decoded full-size screenshots during query polishing; generating bounded
+	// cache files here moves that work to init/capture time and keeps query latency stable.
+	previewImage := imaging.Resize(sourceImage, screenshotHistoryPreviewWidth, 0, imaging.Lanczos)
+	if err := imaging.Save(previewImage, previewPath); err != nil {
+		return fmt.Errorf("failed to save screenshot preview thumbnail: %w", err)
+	}
+
+	iconImage := common.NewImageThumbnail(sourceImage)
+	if err := imaging.Save(iconImage, iconPath); err != nil {
+		return fmt.Errorf("failed to save screenshot icon thumbnail: %w", err)
+	}
+
+	p.warmScreenshotHistoryManagerIconCache(ctx, iconPath)
+	return nil
+}
+
+// screenshotHistoryThumbnailHasWidth invalidates cached thumbnails when their target size changes.
+func screenshotHistoryThumbnailHasWidth(path string, width int) bool {
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	config, err := png.DecodeConfig(file)
+	return err == nil && config.Width == width
+}
+
+func (p *ScreenshotPlugin) warmScreenshotHistoryManagerIconCache(ctx context.Context, iconPath string) {
+	// Manager.PolishResult always normalizes result icons with ConvertIcon. Running the same
+	// conversion on the already-small screenshot icon during warm-up prevents query-time cache
+	// generation while keeping the normal UI icon contract unchanged.
+	common.ConvertIcon(ctx, common.NewWoxImageAbsolutePath(iconPath), "")
+}
+
+func (p *ScreenshotPlugin) getScreenshotHistoryThumbnails(item screenshotHistoryItem) (previewImage common.WoxImage, iconImage common.WoxImage, ok bool) {
+	previewPath, iconPath := p.screenshotHistoryThumbnailPaths(item)
+	if !util.IsFileExists(previewPath) || !util.IsFileExists(iconPath) {
+		return common.WoxImage{}, common.WoxImage{}, false
+	}
+
+	return common.NewWoxImageAbsolutePath(previewPath), common.NewWoxImageAbsolutePath(iconPath), true
+}
+
+func (p *ScreenshotPlugin) screenshotHistoryThumbnailPaths(item screenshotHistoryItem) (previewPath string, iconPath string) {
+	cacheKey := util.Md5([]byte(fmt.Sprintf("%s:%d:%d", item.path, item.size, item.timestamp)))
+	cacheDirectory := util.GetLocation().GetImageCacheDirectory()
+	return filepath.Join(cacheDirectory, fmt.Sprintf("screenshot_%s_preview.png", cacheKey)),
+		filepath.Join(cacheDirectory, fmt.Sprintf("screenshot_%s_icon_plain.png", cacheKey))
+}
+
+func (p *ScreenshotPlugin) removeScreenshotHistoryThumbnails(ctx context.Context, item screenshotHistoryItem) {
+	previewPath, iconPath := p.screenshotHistoryThumbnailPaths(item)
+	for _, thumbnailPath := range []string{previewPath, iconPath, strings.Replace(iconPath, "_icon_plain.png", "_icon_rounded.png", 1), strings.Replace(iconPath, "_icon_plain.png", "_icon.png", 1)} {
+		if !util.IsFileExists(thumbnailPath) {
+			continue
+		}
+		// Expired screenshots own their generated thumbnails. Removing both avoids shifting storage
+		// growth from the screenshot directory into the shared image cache.
+		if err := os.Remove(thumbnailPath); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			p.api.Log(ctx, plugin.LogLevelWarning, fmt.Sprintf("failed to remove expired screenshot thumbnail: path=%s err=%s", thumbnailPath, err.Error()))
+		}
+	}
+}
+
+func (p *ScreenshotPlugin) screenshotOCRSidecarPath(screenshotPath string) string {
+	return screenshotPath + ".ocr.json"
+}
+
+func (p *ScreenshotPlugin) readScreenshotOCRSidecar(screenshotPath string, info os.FileInfo) (screenshotOCRSidecar, error) {
+	sidecarPath := p.screenshotOCRSidecarPath(screenshotPath)
+	data, err := os.ReadFile(sidecarPath)
+	if err != nil {
+		return screenshotOCRSidecar{}, err
+	}
+
+	var sidecar screenshotOCRSidecar
+	if err := json.Unmarshal(data, &sidecar); err != nil {
+		return screenshotOCRSidecar{}, fmt.Errorf("failed to parse screenshot ocr sidecar: %w", err)
+	}
+	if sidecar.Version != screenshotOCRSidecarVersion {
+		return screenshotOCRSidecar{}, fmt.Errorf("unsupported screenshot ocr sidecar version: %d", sidecar.Version)
+	}
+	if sidecar.SourceSize != info.Size() || sidecar.SourceModifiedAt != info.ModTime().UnixMilli() {
+		// Sidecars are intentionally file-adjacent instead of stored in a database. Matching size
+		// and mtime prevents an old OCR result from being reused if an image is replaced at the same path.
+		return screenshotOCRSidecar{}, fmt.Errorf("screenshot ocr sidecar is stale")
+	}
+	sidecar.Text = strings.TrimSpace(sidecar.Text)
+	return sidecar, nil
+}
+
+func (p *ScreenshotPlugin) removeScreenshotOCRSidecar(ctx context.Context, screenshotPath string) {
+	sidecarPath := p.screenshotOCRSidecarPath(screenshotPath)
+	if !util.IsFileExists(sidecarPath) {
+		return
+	}
+	if err := os.Remove(sidecarPath); err != nil && !os.IsNotExist(err) {
+		p.api.Log(ctx, plugin.LogLevelWarning, fmt.Sprintf("failed to remove expired screenshot ocr sidecar: path=%s err=%s", sidecarPath, err.Error()))
+	}
+}
+
+func (p *ScreenshotPlugin) scheduleScreenshotOCR(screenshotPath string, jobs *sync.WaitGroup) {
+	// OCR runs after the screenshot file is already durable. The old history path had no text index,
+	// but blocking screenshot completion on platform OCR would make capture feel unreliable on
+	// machines where Windows/macOS OCR models are missing or still warming up.
+	p.runScreenshotStorageTask(jobs, "recognize screenshot text", func(runtimeCtx context.Context) {
+		if !p.isScreenshotOCREnabled(runtimeCtx) {
+			return
+		}
+		if err := p.writeScreenshotOCRSidecar(runtimeCtx, screenshotPath); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			if errors.Is(err, ocr.ErrUnsupported) || errors.Is(err, ocr.ErrUnavailable) {
+				p.api.Log(runtimeCtx, plugin.LogLevelDebug, fmt.Sprintf("screenshot ocr skipped: path=%s err=%s", screenshotPath, err.Error()))
+				return
+			}
+			p.api.Log(runtimeCtx, plugin.LogLevelWarning, fmt.Sprintf("failed to recognize screenshot text: path=%s err=%s", screenshotPath, err.Error()))
+		}
+	})
+}
+
+func (p *ScreenshotPlugin) writeScreenshotOCRSidecar(ctx context.Context, screenshotPath string) error {
+	info, err := os.Stat(screenshotPath)
+	if err != nil {
+		return fmt.Errorf("failed to stat screenshot for ocr: %w", err)
+	}
+
+	result, err := ocr.Recognize(ctx, ocr.Request{ImagePath: screenshotPath, ModelID: p.screenshotOCRModel(ctx)})
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(result.Text) == "" {
+		return nil
+	}
+
+	sidecar := screenshotOCRSidecar{
+		Version:          screenshotOCRSidecarVersion,
+		Platform:         runtime.GOOS,
+		Engine:           result.Engine,
+		Text:             result.Text,
+		RecognizedAt:     time.Now().UnixMilli(),
+		SourceSize:       info.Size(),
+		SourceModifiedAt: info.ModTime().UnixMilli(),
+	}
+	data, err := json.Marshal(sidecar)
+	if err != nil {
+		return fmt.Errorf("failed to encode screenshot ocr sidecar: %w", err)
+	}
+
+	sidecarPath := p.screenshotOCRSidecarPath(screenshotPath)
+	tmpPath := sidecarPath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+		return fmt.Errorf("failed to write screenshot ocr sidecar: %w", err)
+	}
+	if err := os.Rename(tmpPath, sidecarPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to replace screenshot ocr sidecar: %w", err)
+	}
+	p.api.Log(ctx, plugin.LogLevelDebug, fmt.Sprintf("screenshot ocr sidecar written: path=%s engine=%s", sidecarPath, result.Engine))
+	return nil
+}
+
+func (p *ScreenshotPlugin) screenshotHistoryResult(item screenshotHistoryItem) plugin.QueryResult {
+	group, groupScore := p.screenshotHistoryGroup(item.timestamp)
+	previewImage, iconImage, thumbnailsReady := p.getScreenshotHistoryThumbnails(item)
+	overlayImage := common.NewWoxImageAbsolutePath(item.path)
+	if !thumbnailsReady {
+		// Query must never generate thumbnails: doing image decode/write work here made the first
+		// screenshot search slow. A default icon keeps listing responsive while init/new-capture
+		// warm-up finishes; preview can still open the original file on explicit selection.
+		previewImage = common.NewWoxImageAbsolutePath(item.path)
+		iconImage = screenshotIcon
+	}
+
+	previewTags := []plugin.WoxPreviewTag{
+		{Label: util.FormatTimestamp(item.timestamp), Tooltip: "i18n:plugin_screenshot_history_date"},
+		{Label: p.formatFileSize(item.size), Tooltip: "i18n:plugin_screenshot_history_size"},
+	}
+	if strings.TrimSpace(item.ocrText) != "" {
+		// Feature addition: OCR uses an explicit tag so the visible footer says
+		// "OCR" while the tooltip carries the full recognized text. Legacy
+		// PreviewProperties would show a truncated value as the tag label.
+		previewTags = append(previewTags, plugin.WoxPreviewTag{Label: "OCR", Tooltip: strings.TrimSpace(item.ocrText)})
+	}
+
+	result := plugin.QueryResult{
+		Title:             item.fileName,
+		SubTitle:          util.FormatTimestamp(item.timestamp),
+		IdentityKey:       item.path,
+		Icon:              iconImage,
+		IconShowContainer: thumbnailsReady,
+		Group:             group,
+		GroupScore:        groupScore,
+		DragData: &plugin.QueryResultDragData{
+			Type:  plugin.QueryResultDragDataTypeFiles,
+			Files: []string{item.path},
+		},
+		Preview: plugin.WoxPreview{
+			PreviewType: plugin.WoxPreviewTypeImage,
+			PreviewData: previewImage.String(),
+			// Thumbnail previews keep screenshot search responsive, while the overlay click should
+			// reuse the original screenshot file so users can inspect it at full available size.
+			PreviewOverlayData: overlayImage.String(),
+			PreviewTags:        previewTags,
+		},
+		Score: item.timestamp,
+		Actions: []plugin.QueryResultAction{
+			{
+				Name:      "i18n:plugin_screenshot_history_copy",
+				Icon:      icons.Get(icons.ActionCopy),
+				IsDefault: true,
+				Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+					p.copyScreenshotHistoryItem(ctx, item.path)
+				},
+			},
+			{
+				Name: "i18n:plugin_screenshot_history_open",
+				Icon: icons.Get(icons.ActionOpen),
+				Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+					if err := shell.Open(item.path); err != nil {
+						p.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("failed to open screenshot history item: path=%s err=%s", item.path, err.Error()))
+						p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(p.api.GetTranslation(ctx, "plugin_app_open_failed_description"), err.Error())})
+					}
+				},
+			},
+			{
+				Name: "i18n:plugin_screenshot_history_open_folder",
+				Icon: icons.Get(icons.ActionOpenContainingFolder),
+				Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+					if err := shell.OpenFileInFolder(item.path); err != nil {
+						p.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("failed to open screenshot history item folder: path=%s err=%s", item.path, err.Error()))
+						p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(p.api.GetTranslation(ctx, "plugin_app_open_failed_description"), err.Error())})
+					}
+				},
+			},
+			notesplugin.CreateNoteAction(p.api, "", "", item.path),
+		},
+	}
+	if ocrText := strings.TrimSpace(item.ocrText); ocrText != "" {
+		actions := []plugin.QueryResultAction{result.Actions[0], NewCopyOCRTextAction(p.api, ocrText)}
+		result.Actions = append(actions, result.Actions[1:]...)
+	}
+	if screenshotedit.Available(item.path) {
+		result.Actions = append(result.Actions, p.screenshotEditAction(item.path))
+	}
+	return result
+}
+
+func (p *ScreenshotPlugin) screenshotHistoryGroup(timestamp int64) (string, int64) {
+	now := time.Now()
+	itemTime := time.UnixMilli(timestamp)
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	yesterday := today.AddDate(0, 0, -1)
+
+	// Screenshot history now owns the default query surface, so grouping by local calendar day keeps
+	// older captures browsable without mixing "start new screenshot" into the history list.
+	if !itemTime.Before(today) {
+		return "i18n:plugin_screenshot_group_today", 90
+	}
+	if !itemTime.Before(yesterday) {
+		return "i18n:plugin_screenshot_group_yesterday", 80
+	}
+
+	return "i18n:plugin_screenshot_group_history", 10
+}
+
+// copyScreenshotHistoryItem uses the native writer so clipboard history observes the copied pixels too.
+// The generic clipboard writer consumes Wox's own change edge and would suppress this new entry.
+func (p *ScreenshotPlugin) copyScreenshotHistoryItem(ctx context.Context, screenshotPath string) {
+	if err := plugin.GetPluginManager().GetUI().WriteClipboardImageFile(ctx, screenshotPath); err != nil {
+		p.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("failed to copy screenshot history item: path=%s err=%s", screenshotPath, err.Error()))
+		p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_screenshot_capture_clipboard_warning"})
+	}
+}
+
+func (p *ScreenshotPlugin) formatFileSize(size int64) string {
+	if size < 1024 {
+		return fmt.Sprintf("%d B", size)
+	}
+	if size < 1024*1024 {
+		return fmt.Sprintf("%.1f KB", float64(size)/1024)
+	}
+	return fmt.Sprintf("%.1f MB", float64(size)/(1024*1024))
+}
+
+func (p *ScreenshotPlugin) pinScreenshotToScreen(ctx context.Context, screenshotPath string, selectionRect *common.ScreenshotRect) error {
+	width := 0.0
+	height := 0.0
+	offsetX := 0.0
+	offsetY := 0.0
+	if selectionRect != nil {
+		// The PNG may be device-pixel sized on high-DPI screens, while the overlay API positions and
+		// sizes windows in logical desktop coordinates. Use UI's selection rect for the pinned
+		// window so the image appears at the same desktop size the user selected.
+		if selectionRect.Width >= 1 {
+			width = selectionRect.Width
+		}
+		if selectionRect.Height >= 1 {
+			height = selectionRect.Height
+		}
+		offsetX = selectionRect.X
+		offsetY = selectionRect.Y
+	}
+
+	name := screenshotPinnedOverlayPrefix + util.Md5([]byte(fmt.Sprintf("%s:%d", screenshotPath, time.Now().UnixNano())))
+	err := imageoverlay.ShowPin(ctx, imageoverlay.PinOptions{
+		ID:      name,
+		Path:    screenshotPath,
+		Width:   width,
+		Height:  height,
+		OffsetX: offsetX,
+		OffsetY: offsetY,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to show pinned screenshot overlay: %w", err)
+	}
+	return nil
+}
+
+// isScreenshotPermissionDeniedFailure keeps permission guidance visible even if the UI bridge loses
+// the structured error code and only returns the raw PlatformException text.
+func isScreenshotPermissionDeniedFailure(errorCode string, errorMessage string) bool {
+	if errorCode == screenshotPermissionDeniedErrorCode {
+		return true
+	}
+
+	normalizedMessage := strings.ToLower(errorMessage)
+	return strings.Contains(normalizedMessage, screenshotPermissionDeniedErrorCode) ||
+		strings.Contains(normalizedMessage, "screen recording permission")
+}
+
+// notifyCaptureFailure maps screenshot bridge errors to the clearest user-visible notification.
+func (p *ScreenshotPlugin) notifyCaptureFailure(ctx context.Context, errorCode string, errorMessage string) {
+	if isScreenshotPermissionDeniedFailure(errorCode, errorMessage) {
+		p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_screenshot_permission_denied"})
+		return
+	}
+	p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_screenshot_capture_failed"})
+}
+
+func (p *ScreenshotPlugin) captureScreenshot(ctx context.Context, actionContext plugin.ActionContext) {
+	p.runScreenshot(ctx, "")
+}
+
+// runScreenshot keeps capture and history editing on the same export, OCR, pin, and AI completion path.
+func (p *ScreenshotPlugin) runScreenshot(ctx context.Context, editPath string) {
+	request := common.DefaultCaptureScreenshotRequest()
+	request.AllowVideoRecording = editPath == ""
+	request.SaveEditableScene = true
+	request.EditScreenshotPath = editPath
+	request.ExtraActions = screenshotAIToolbarActions(
+		p.isScreenshotAIToolbarEnabled(ctx),
+		hasConfiguredAIProvider(setting.GetSettingManager().GetWoxSetting(ctx).AIProviders.Get()),
+		p.api.GetTranslation(ctx, "ui_screenshot_tool_ai"),
+	)
+	p.runScreenshotRequest(ctx, editPath, request, plugin.GetPluginManager().GetUI())
+}
+
+// runScreenshotRequest notifies as soon as pixels become pasteable; the capture worker then finishes history and scene preparation.
+func (p *ScreenshotPlugin) runScreenshotRequest(ctx context.Context, editPath string, request common.CaptureScreenshotRequest, ui common.UI) {
+	directory, jobs := p.beginScreenshotStorageUse()
+	defer jobs.Done()
+	request.ExportDirectory = directory
+	clipboardNotified := false
+	request.OnClipboardReady = func() {
+		if !clipboardNotified {
+			clipboardNotified = true
+			p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_screenshot_capture_clipboard_success"})
+		}
+	}
+	result, err := ui.CaptureScreenshot(ctx, request)
+	if clipboardNotified && (err != nil || result.Status == common.CaptureScreenshotStatusFailed) {
+		// A failed history write cannot undo the clipboard image already delivered to the user.
+		detail := result.ErrorMessage
+		if err != nil {
+			detail = err.Error()
+		}
+		util.GetLogger().Warn(ctx, "failed to save screenshot history after clipboard publication: "+detail)
+		p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_screenshot_capture_history_save_failed"})
+		return
+	}
+	if err != nil {
+		// The screenshot session spans Go, UI, and the native bridge, so transport failures need a local
+		// notification here instead of silently falling through to keep the action predictable for the user.
+		p.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("capture screenshot request failed: %s", err.Error()))
+		if editPath != "" {
+			p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_screenshot_edit_failed"})
+			return
+		}
+		p.notifyCaptureFailure(ctx, "", err.Error())
+		return
+	}
+
+	switch result.Status {
+	case common.CaptureScreenshotStatusCompleted:
+		defer p.saveScreenshotSceneInBackground(result.ScreenshotPath, result.SaveEditableScene, jobs)
+		if result.EditableSceneWarning != "" {
+			util.GetLogger().Warn(ctx, "failed to save screenshot scene: "+result.EditableSceneWarning)
+			defer p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_screenshot_edit_save_failed"})
+		}
+		// Animation exports are saved artifacts, not still screenshots for OCR and history thumbnails.
+		if result.ArtifactKind == common.CaptureArtifactKindVideo || (result.ArtifactPath != "" && result.ScreenshotPath == "") {
+			if result.ArtifactPath == "" {
+				p.api.Log(ctx, plugin.LogLevelError, "recording completed without an artifact path")
+				p.notifyCaptureFailure(ctx, "", "")
+				return
+			}
+			p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: result.ArtifactPath})
+			return
+		}
+		// Screenshot export and clipboard write now complete inside UI plus the platform runner.
+		// Go treats a completed export as success and only surfaces clipboard warnings separately.
+		if result.ScreenshotPath == "" {
+			p.api.Log(ctx, plugin.LogLevelError, "screenshot completed without an export path")
+			p.notifyCaptureFailure(ctx, "", "")
+			return
+		}
+		screenshotPath := result.ScreenshotPath
+		p.runScreenshotStorageTask(jobs, "generate screenshot history thumbnails", func(runtimeCtx context.Context) {
+			if err := p.ensureScreenshotHistoryThumbnailsForPath(runtimeCtx, screenshotPath); err != nil {
+				p.api.Log(runtimeCtx, plugin.LogLevelWarning, fmt.Sprintf("failed to generate screenshot history thumbnails: path=%s err=%s", screenshotPath, err.Error()))
+			}
+		})
+		p.scheduleScreenshotOCR(result.ScreenshotPath, jobs)
+		if result.ExtraActionID == screenshotAIExtraActionID {
+			plugin.InvokePluginToolAndNotify(ctx, p.api, plugin.InvokePluginToolOption{
+				PluginId:  common.AIChatPluginID,
+				Name:      chatplugin.ToolOpenChatWithAttachments,
+				Arguments: map[string]any{"paths": []any{result.ScreenshotPath}},
+			})
+			return
+		}
+		if result.PinToScreen {
+			// Capture pin now opens the overlay from the composited pixels before the PNG
+			// write returns. Retry from the saved file only when that in-memory show failed.
+			if !result.PinOverlayShown {
+				if err := p.pinScreenshotToScreen(ctx, result.ScreenshotPath, result.LogicalSelectionRect); err != nil {
+					p.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("failed to pin screenshot: path=%s err=%s", result.ScreenshotPath, err.Error()))
+					p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "plugin_screenshot_pin_failed"})
+				}
+			}
+			return
+		}
+
+		if !clipboardNotified {
+			p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "plugin_screenshot_capture_success"})
+		}
+		if result.ClipboardWarningMessage != "" {
+			p.api.Log(ctx, plugin.LogLevelWarning, fmt.Sprintf("screenshot clipboard warning: %s", result.ClipboardWarningMessage))
+			p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "plugin_screenshot_capture_clipboard_warning"})
+		}
+	case common.CaptureScreenshotStatusFailed:
+		if editPath != "" {
+			util.GetLogger().Warn(ctx, "failed to restore screenshot scene: "+result.ErrorMessage)
+			if result.ErrorCode == "display_layout_changed" {
+				p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_screenshot_edit_display_layout_changed"})
+				return
+			}
+			p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: "i18n:plugin_screenshot_edit_failed"})
+			return
+		}
+		errText := result.ErrorMessage
+		if errText == "" {
+			errText = "screenshot session failed"
+		}
+		p.api.Log(ctx, plugin.LogLevelError, errText)
+		p.notifyCaptureFailure(ctx, result.ErrorCode, errText)
+	case common.CaptureScreenshotStatusCancelled:
+		if result.CopiedColor != "" {
+			p.api.ShowToastMsg(ctx, plugin.ShowToastMsgOption{Message: fmt.Sprintf(p.api.GetTranslation(ctx, "plugin_screenshot_color_copy_success"), result.CopiedColor)})
+		}
+		return
+	default:
+		p.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("unexpected screenshot status: %s", result.Status))
+		p.notifyCaptureFailure(ctx, "", "")
+	}
+}

@@ -1,0 +1,259 @@
+package resource
+
+import (
+	"bytes"
+	"context"
+	"embed"
+	"fmt"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"wox/internal/assetfs"
+	"wox/util"
+)
+
+//go:embed hosts
+var rawHostFS embed.FS
+
+var HostFS = assetfs.New(rawHostFS)
+
+//go:embed lang
+var rawLangFS embed.FS
+
+var LangFS = assetfs.New(rawLangFS)
+
+//go:embed themes
+var rawThemeFS embed.FS
+
+var ThemeFS = assetfs.New(rawThemeFS)
+
+//go:embed app.png app.ico
+var rawIconFS embed.FS
+
+var iconFS = assetfs.New(rawIconFS)
+var appIcon = iconFS.MustReadFile("app.png")
+var appIconWindows = iconFS.MustReadFile("app.ico")
+
+//go:embed others
+var rawOthersFS embed.FS
+
+var OthersFS = assetfs.New(rawOthersFS)
+
+//go:embed ai
+var rawAIFS embed.FS
+
+var AIFS = assetfs.New(rawAIFS)
+
+var embedThemes = []string{}
+
+func Extract(ctx context.Context) error {
+	start := util.GetSystemTimestamp()
+
+	// hosts
+	hostDirectory := util.GetLocation().GetHostDirectory()
+	if util.IsDirExists(hostDirectory) {
+		rmErr := os.RemoveAll(hostDirectory)
+		if rmErr != nil {
+			return rmErr
+		}
+	}
+
+	extractHostErr := extractFiles(ctx, HostFS, hostDirectory, "hosts", true)
+	if extractHostErr != nil {
+		return extractHostErr
+	}
+
+	// others
+	othersDirectory := util.GetLocation().GetOthersDirectory()
+	if util.IsDirExists(othersDirectory) {
+		rmErr := os.RemoveAll(othersDirectory)
+		if rmErr != nil {
+			return rmErr
+		}
+	}
+	// Enable recursive extraction for nested directories such as others/dictation and others/woxmr.
+	othersErr := extractFiles(ctx, OthersFS, othersDirectory, "others", true)
+	if othersErr != nil {
+		return othersErr
+	}
+
+	// Built-in skills must be available in installed builds, not only in the source tree.
+	for _, name := range []string{"wox-plugin-creator", "wox-theme-creator"} {
+		if _, err := AIFS.ReadFile("ai/skills/" + name + "/SKILL.md"); err != nil {
+			return fmt.Errorf("embedded %s skill is missing; run make sync-ai-skills: %w", name, err)
+		}
+		builtinSkillDirectory := path.Join(util.GetLocation().GetAISkillsDirectory(), name)
+		if err := os.RemoveAll(builtinSkillDirectory); err != nil {
+			return err
+		}
+	}
+	aiErr := extractFiles(ctx, AIFS, filepath.Dir(util.GetLocation().GetAISkillsDirectory()), "ai", true)
+	if aiErr != nil {
+		return aiErr
+	}
+
+	// themes
+	themeErr := parseThemes(ctx)
+	if themeErr != nil {
+		return themeErr
+	}
+
+	util.GetLogger().Info(ctx, fmt.Sprintf("extracted embed files, cost: %dms", util.GetSystemTimestamp()-start))
+	return nil
+}
+
+func extractFiles(ctx context.Context, fs assetfs.FS, extractDirectory string, filePath string, recursive bool) error {
+	dir, err := fs.ReadDir(filePath)
+	if err != nil {
+		return err
+	}
+	if len(dir) == 0 {
+		return fmt.Errorf("no host file found")
+	}
+
+	extractDirectoryPath := path.Join(extractDirectory, strings.Join(strings.Split(filePath, "/")[1:], "/"))
+	createDirErr := util.GetLocation().EnsureDirectoryExist(extractDirectoryPath)
+	if createDirErr != nil {
+		return createDirErr
+	}
+
+	for _, entry := range dir {
+		if entry.IsDir() && recursive {
+			extractErr := extractFiles(ctx, fs, extractDirectory, path.Join(filePath, entry.Name()), recursive)
+			if extractErr != nil {
+				return extractErr
+			}
+			continue
+		}
+
+		fileData, readErr := fs.ReadFile(path.Join(filePath, entry.Name()))
+		if readErr != nil {
+			return readErr
+		}
+
+		var subFilePath = path.Join(extractDirectoryPath, entry.Name())
+		mode := os.FileMode(0644)
+		if runtime.GOOS != "windows" && strings.HasPrefix(filepath.ToSlash(filePath), "others/recording/") && (entry.Name() == "ffmpeg" || entry.Name() == "gst-launch-1.0") {
+			mode = 0755
+		}
+		writeErr := os.WriteFile(subFilePath, fileData, mode)
+		if writeErr != nil {
+			return writeErr
+		}
+	}
+
+	return nil
+}
+
+func parseThemes(ctx context.Context) error {
+	dir, err := ThemeFS.ReadDir("themes")
+	if err != nil {
+		return err
+	}
+	if len(dir) == 0 {
+		return fmt.Errorf("no theme file found")
+	}
+
+	for _, entry := range dir {
+		if entry.IsDir() {
+			continue
+		}
+
+		start := util.GetSystemTimestamp()
+		themeData, readErr := ThemeFS.ReadFile("themes/" + entry.Name())
+		if readErr != nil {
+			return readErr
+		}
+
+		embedThemes = append(embedThemes, string(themeData))
+		util.GetLogger().Info(ctx, fmt.Sprintf("extracted theme file: %s, cost: %dms", entry.Name(), util.GetSystemTimestamp()-start))
+	}
+
+	return nil
+}
+
+func GetLangJson(ctx context.Context, langCode string) ([]byte, error) {
+	var langJsonPath = path.Join("lang", fmt.Sprintf("%s.json", langCode))
+	return LangFS.ReadFile(langJsonPath)
+}
+
+func GetEmbedThemes(ctx context.Context) []string {
+	return embedThemes
+}
+
+// GetDictationFile returns the embedded dictation resource bytes by name.
+func GetDictationFile(name string) ([]byte, error) {
+	return OthersFS.ReadFile(path.Join("others", "dictation", name))
+}
+
+// GetDictationResourcePath returns the extracted path for a dictation resource.
+func GetDictationResourcePath(name string) string {
+	return filepath.Join(util.GetLocation().GetOthersDirectory(), "dictation", filepath.FromSlash(name))
+}
+
+func GetAppIcon() []byte {
+	if util.IsWindows() {
+		return appIconWindows
+	}
+
+	return appIcon
+}
+
+// GetAppIconPNG returns the cross-platform PNG used by application UI surfaces.
+func GetAppIconPNG() []byte {
+	return appIcon
+}
+
+// InstallLinuxDesktopIcon writes the user icon before GTK starts. gtk_init loads
+// this path and prints a warning when the file is missing, and the production
+// bootstrap process exits before EnsureLinuxDesktopIcon can run. This write does
+// not refresh the icon cache or open the process logger.
+func InstallLinuxDesktopIcon() {
+	_ = installLinuxDesktopIconFile()
+}
+
+// EnsureLinuxDesktopIcon installs Wox's icon into the user icon theme so the
+// generated desktop entry resolves correctly for AppImage and manual binaries.
+func EnsureLinuxDesktopIcon(ctx context.Context) {
+	if err := installLinuxDesktopIconFile(); err != nil {
+		util.GetLogger().Warn(ctx, fmt.Sprintf("failed to install Linux desktop icon: %s", err.Error()))
+		return
+	}
+	if !util.IsLinux() {
+		return
+	}
+
+	iconThemePath, err := util.LinuxIconThemePath()
+	if err != nil {
+		util.GetLogger().Warn(ctx, fmt.Sprintf("failed to get Linux icon theme path: %s", err.Error()))
+		return
+	}
+	if err := exec.Command("gtk-update-icon-cache", "-q", "-t", "-f", iconThemePath).Run(); err != nil {
+		util.GetLogger().Warn(ctx, fmt.Sprintf("failed to update Linux icon cache: %s", err.Error()))
+	}
+}
+
+// installLinuxDesktopIconFile writes the hicolor PNG when it is missing or stale.
+func installLinuxDesktopIconFile() error {
+	if !util.IsLinux() {
+		return nil
+	}
+
+	iconPath, err := util.LinuxDesktopIconPath()
+	if err != nil {
+		return fmt.Errorf("failed to get Linux desktop icon path: %w", err)
+	}
+	if existing, readErr := os.ReadFile(iconPath); readErr == nil && bytes.Equal(existing, appIcon) {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(iconPath), 0755); err != nil {
+		return fmt.Errorf("failed to create Linux desktop icon directory: %w", err)
+	}
+	if err := os.WriteFile(iconPath, appIcon, 0644); err != nil {
+		return fmt.Errorf("failed to write Linux desktop icon: %w", err)
+	}
+	return nil
+}

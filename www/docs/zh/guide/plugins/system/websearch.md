@@ -1,0 +1,82 @@
+# 网页搜索插件
+
+网页搜索插件会从 Wox 打开搜索 URL。它可以作为普通文本的 fallback 结果，也可以通过明确的搜索引擎关键字触发。
+
+![用查询提示填写网页搜索的具名参数](/images/guide/plugin_websearch.jpg)
+
+## 快速开始
+
+```text
+Wox Launcher
+g Wox Launcher
+```
+
+默认配置包含 Google，关键字为 `g`。你可以在插件设置中添加更多搜索引擎。
+
+## 搜索引擎设置
+
+| 字段 | 用途 |
+| --- | --- |
+| Keyword | 查询前使用的快捷关键字，例如 `g` |
+| Title | Wox 中显示的结果标题 |
+| URL(s) | 搜索 URL 模板 |
+| Browser | 打开该搜索的浏览器 |
+| Incognito | 在浏览器支持时用无痕/隐私窗口打开。默认不勾选。放在「高级」分组。 |
+| Disabled | 勾选后隐藏该搜索引擎。新建行默认启用。 |
+| Default | 是否用于 fallback 搜索。放在「高级」分组。 |
+| 预览宽度 | 可选。**在 WebView 中打开** 时启动器窗口的像素宽度。放在 WebView 分组。 |
+| 预览高度 | 可选。**在 WebView 中打开** 时启动器窗口的像素高度。放在 WebView 分组。 |
+| 注入 CSS | 可选，注入到该搜索应用内 WebView 预览。放在 WebView 分组。 |
+| 默认使用 WebView | 单个搜索结果直接在 Wox 中展示。放在 WebView 分组。 |
+| User Agent | 内嵌网页使用的桌面或移动浏览器预设。自动模式使用原生引擎默认值。 |
+| 后台运行 | 隐藏 Wox 后保留已加载的网页。默认关闭。 |
+
+## URL 变量
+
+| 变量 | 值 |
+| --- | --- |
+| `{wox:parameter?name=query}` | 命名输入参数 |
+| `{wox:parameter?name=query&case=lower}` | 参数值的小写形式 |
+| `{wox:selected_text}` | 唤起 Wox 前的选中文本 |
+| `{wox:clipboard_text}` | 唤起 Wox 前获取的剪贴板文本 |
+
+示例 URL：
+
+```text
+https://www.google.com/search?q={wox:parameter?name=query}
+```
+
+如果一个搜索引擎配置了多个 URL，Wox 会按顺序打开。
+
+启用 **默认使用 WebView** 后，单个搜索结果直接在 Wox 内展示。默认操作为 **聚焦网页**，按 Enter 将键盘焦点交给当前页面，不重新加载。未启用时，Enter 打开浏览器，`Ctrl+Enter`（macOS 上为 `Cmd+Enter`）打开第一条 URL 的内嵌预览。Windows、macOS 和 Linux 均支持 WebView；Linux 需要安装 WebKitGTK 4.1 或 4.0。
+
+Windows 和 macOS 的预览操作面板提供刷新、后退、前进、在浏览器中打开和关闭网页。启用 **后台运行** 后，隐藏 Wox 会保留页面；显式关闭网页会释放它。通过快捷键打开的全预览面板在启用后台运行时还提供 **隐藏网页**。Linux 支持 WebView 预览，但目前操作面板没有这些页面控制动作；网页搜索结果仍可以提供自己的“在浏览器中打开”动作。
+
+## 固定网站
+
+URL 不必包含参数。例如添加关键词 `x`、标题 `X`、URL `https://x.com`，并启用 **默认使用 WebView**。输入 `x` 后加一个空格即可打开。固定网站直接聚焦网页；带参数槽位的搜索继续保留查询框焦点。
+
+要通过快捷键查询直接打开网站，使用网页搜索的触发关键词加空格即可。参见[快捷键](../../usage/hotkeys.md)。
+
+已有标题和 URL 中的 `{query}`、`{lower_query}`、`{upper_query}` 会自动迁移为
+`{wox:parameter?name=query}` 以及带 `case=lower` / `case=upper` 的形式。
+
+多参数示例：
+`https://example.com/search?text={wox:parameter?name=text}&language={wox:parameter?name=language}`。
+输入关键词和空格后进入专属搜索范围，并显示参数槽位。按 Tab / Shift+Tab 切换槽位，
+每个参数的值都可以包含空格。参数按其在 URL 列表中首次出现的顺序排列，同名参数只输入一次。
+名称可用任意语言的文字、数字、下划线和空格，不能以数字或空格开头。标题只能引用 URL 中声明的输入参数。
+在标题和 URL 编辑框中输入 `{` 或点击 `{}` 可插入变量，完整的 `{wox:...}` 会显示为芯片。
+如果标题引用了 URL 中不存在的参数，保存会被拒绝。
+
+单参数搜索仍接收关键词后的整段文本。粘贴多参数的纯文本查询时，会提供填写参数操作，
+并将整段文本保留在第一个槽位中，不猜测参数边界。
+变量只替换一次，按所在的 URL 路径、查询或片段编码，不支持替换协议或主机名。
+环境文本不可用时会显示原因，不打开不完整的搜索。
+
+## 选中文本
+
+当你对选中文本触发 Wox 时，网页搜索可以为这段选中文本显示 fallback 搜索引擎。它适合快速搜索错误信息、符号名或其他应用里的短语。
+
+Fallback 和选中文本搜索都要求恰好一个不同的输入参数。环境变量不计入参数数量；
+零参数和多参数搜索即使勾选 fallback，也不会参与。

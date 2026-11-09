@@ -1,0 +1,694 @@
+package component
+
+import (
+	"fmt"
+	"slices"
+	"strings"
+
+	"wox/common"
+	woxui "wox/ui/runtime"
+	woxwidget "wox/ui/widget"
+)
+
+const noteEditorSegmentGap = float32(8)
+
+// NoteEditorProps describes the Notes document surface hosted by the utility window.
+type NoteEditorProps struct {
+	FindReveal           bool
+	FindQuery            string
+	FindTarget           *NoteFindTarget
+	EdgeFade             float32
+	ID                   string
+	Document             common.NoteDocument
+	Width                float32
+	Height               float32
+	Padding              woxwidget.Insets
+	Style                woxui.TextStyle
+	LineHeight           float32
+	Zoom                 float32
+	TextColor            woxui.Color
+	Theme                ControlTheme
+	Window               *woxui.Window
+	ReadOnly             bool
+	Autofocus            bool
+	Controller           *woxwidget.TextEditingController
+	FocusNode            *woxwidget.FocusNode
+	Focused              bool
+	Selection            woxui.TextSelection
+	Label                string
+	OnChanged            func(segmentStart int, value string)
+	OnSelectionChanged   func(woxui.TextSelection)
+	OnTapOffset          func(int) bool
+	OnTapBelowText       func() bool
+	CursorAtOffset       func(int) woxui.PointerCursor
+	OnKey                func(woxui.KeyEvent) bool
+	OnUndo               func() bool
+	OnRedo               func() bool
+	OnPaste              func(string) bool
+	TransformPaste       func(string) string
+	OnTableChange        func(block int, table common.NoteTable)
+	OnTableFocus         func(block, row, column int)
+	OnTableKey           func(block, row, column int, event woxui.KeyEvent) bool
+	OnTablePaste         func(block, row, column int, value string) bool
+	OnTableInsertRow     func(block int)
+	OnTableInsertColumn  func(block int)
+	OnTableDeleteRow     func(block int)
+	OnTableDeleteColumn  func(block int)
+	OnTableDelete        func(block int)
+	OnTableActionHover   func(inside bool, label string, bounds woxui.Rect)
+	OnDeleteEmptySegment func(segmentStart int) bool
+	TableActionLabels    NoteTableActionLabels
+	FocusedTableBlock    int
+	FocusedTableRow      int
+	FocusedTableCol      int
+	ResolveImage         func(common.NoteImage) *woxui.Image
+	ReleaseImage         func(common.NoteImage)
+	MissingImageLabel    string
+	ActiveSegmentStart   int
+	FocusedImageBlock    int
+	OnImageFocus         func(block int)
+	OnImageLeave         func(block int, after bool)
+	OnImageScale         func(block, delta int)
+	OnImageDelete        func(block int)
+	OnImageActionHover   func(inside bool, label string, bounds woxui.Rect)
+	OnTextFocus          func(segmentStart int)
+	ImageActionLabels    NoteImageActionLabels
+	ReorderTaskLabel     string
+	ReorderingTask       int
+	HoveredTask          int
+	ReorderDest          int
+	OnHoverTask          func(block int)
+	OnReorderTaskStart   func(block int)
+	OnReorderTaskDrag    func(block int, contentY float32)
+	OnReorderTaskEnd     func()
+	// RevealCaret scrolls the document so the text caret is inside the viewport.
+	RevealCaret bool
+	// DocumentSelected highlights every text run and image because select-all spans structural blocks.
+	DocumentSelected bool
+	OnSelectAll      func() bool
+	OnCopy           func() bool
+	OnCut            func() bool
+}
+
+// WoxNoteEditor renders linear Notes text segments and structural table and image blocks.
+func WoxNoteEditor(props NoteEditorProps) woxwidget.Widget {
+	if props.FocusedTableBlock < 0 {
+		props.FocusedTableBlock = -1
+	}
+	if props.FocusedImageBlock < 0 {
+		props.FocusedImageBlock = -1
+	}
+	if props.ActiveSegmentStart < 0 {
+		props.ActiveSegmentStart = -1
+	}
+	if props.ReorderingTask < 0 {
+		props.ReorderingTask = -1
+		props.ReorderDest = -1
+	}
+	if props.HoveredTask < 0 {
+		props.HoveredTask = -1
+	}
+	segments := noteDocumentSegments(props.Document)
+	children := make([]woxwidget.Widget, 0, len(segments))
+	textIndex := 0
+	contentHeight := float32(0)
+	var caretVisible *woxwidget.ScrollRange
+	for _, segment := range segments {
+		if len(children) > 0 {
+			contentHeight += noteEditorSegmentGap
+		}
+		if segment.Image {
+			block := props.Document.Blocks[segment.Start]
+			padding := noteEditorEdgePadding(props.Padding, len(children) == 0)
+			width := max(float32(0), props.Width-props.Padding.Left-props.Padding.Right)
+			child, height := noteEditorImage(props, segment.Start, block, width)
+			children = append(children, woxwidget.Container{Width: props.Width, Padding: padding, Child: child})
+			contentHeight += padding.Top + height
+			continue
+		}
+		if segment.Table {
+			block := props.Document.Blocks[segment.Start]
+			table := common.NoteTable{}
+			if block.Table != nil {
+				table = *block.Table
+			}
+			height := noteTableBlockHeight(table, props.Zoom, !props.ReadOnly && props.OnTableInsertRow != nil)
+			if target := props.FindTarget; props.FindReveal && target != nil && target.Block == segment.Start {
+				top := contentHeight + noteEditorEdgePadding(props.Padding, len(children) == 0).Top + float32(target.Row)*noteTableRowHeight(props.Zoom)
+				caretVisible = &woxwidget.ScrollRange{Start: max(float32(0), top-props.Theme.Scaled(44)), End: top + noteTableRowHeight(props.Zoom) + noteTableToolbarHeight + noteTableToolbarGap}
+			}
+			padding := noteEditorEdgePadding(props.Padding, len(children) == 0)
+			children = append(children, woxwidget.Container{Width: props.Width, Padding: padding, Child: WoxNoteTable(NoteTableProps{
+				ID: fmt.Sprintf("%s.table.%s", props.ID, block.ID), Block: segment.Start, Table: table,
+				Width: max(float32(0), props.Width-props.Padding.Left-props.Padding.Right), ReadOnly: props.ReadOnly,
+				Theme: props.Theme, Window: props.Window, Zoom: props.Zoom, Style: props.Style,
+				FindQuery: props.FindQuery, FindTarget: props.FindTarget,
+				Focused: props.FocusedTableBlock == segment.Start, FocusRow: props.FocusedTableRow, FocusCol: props.FocusedTableCol,
+				OnChange: func(updated common.NoteTable) {
+					if props.OnTableChange != nil {
+						props.OnTableChange(segment.Start, updated)
+					}
+				},
+				OnFocus: func(row, column int) {
+					if props.OnTableFocus != nil {
+						props.OnTableFocus(segment.Start, row, column)
+					}
+				},
+				OnKey: func(row, column int, event woxui.KeyEvent) bool {
+					if props.OnTableKey != nil {
+						return props.OnTableKey(segment.Start, row, column, event)
+					}
+					return false
+				},
+				OnPaste: func(row, column int, value string) bool {
+					if props.OnTablePaste != nil {
+						return props.OnTablePaste(segment.Start, row, column, value)
+					}
+					return false
+				},
+				OnUndo: props.OnUndo, OnRedo: props.OnRedo,
+				OnSelectAll: props.OnSelectAll, OnCopy: props.OnCopy, OnCut: props.OnCut,
+				Actions: noteEditorTableActions(props, segment.Start),
+			})})
+			contentHeight += padding.Top + height
+			continue
+		}
+		fieldID := props.ID
+		if textIndex > 0 {
+			fieldID = fmt.Sprintf("%s.%d", props.ID, textIndex)
+		}
+		primary := textIndex == 0
+		if props.ActiveSegmentStart >= 0 {
+			primary = segment.Start == props.ActiveSegmentStart
+		}
+		padding := noteEditorEdgePadding(props.Padding, len(children) == 0)
+		height := noteEditorTextHeight(props, segment, primary, padding)
+		if segment.End == len(props.Document.Blocks) {
+			height = max(height, props.Height-contentHeight-props.Padding.Bottom)
+		}
+		if props.RevealCaret && primary && caretVisible == nil {
+			caretVisible = noteEditorTextCaretRange(props, segment, primary, padding, contentHeight)
+		}
+		if target := props.FindTarget; props.FindReveal && target != nil && target.Block == segment.Start && target.Row < 0 {
+			value, runs, _ := ProjectNoteSegment(props.Document, segment, props.Style, props.Theme)
+			lines := textFieldVisualLines(value, props.Window, props.Style, max(float32(0), props.Width-padding.Left-padding.Right), NoteFieldRuns(runs))
+			line := textFieldLineIndex(lines, target.Offset)
+			top := contentHeight + padding.Top + textFieldLayoutLines(lines, props.LineHeight).top(line)
+			caretVisible = &woxwidget.ScrollRange{Start: max(float32(0), top-props.Theme.Scaled(44)), End: top + props.LineHeight}
+		}
+		children = append(children, noteEditorTextField(props, segment, fieldID, height, primary, padding))
+		contentHeight += height
+		textIndex++
+	}
+	// Omit ContentHeight so the shared scroller measures the document and can show a vertical thumb.
+	var content woxwidget.Widget = woxwidget.Flex{Axis: woxwidget.Vertical, Gap: noteEditorSegmentGap, Children: children}
+	if props.Padding.Bottom > 0 {
+		// Tables sit outside the text field, so the document scroller must own the trailing inset.
+		content = woxwidget.Container{Width: props.Width, Padding: woxwidget.Insets{Bottom: props.Padding.Bottom}, Child: content}
+	}
+	return WoxScrollView(ScrollViewProps{
+		EdgeFade: props.EdgeFade,
+		Key:      "notes.editor.scroll", AutomationID: "notes.editor.scroll", Label: props.Label,
+		Width: props.Width, Height: props.Height, Content: content, KeepVisible: caretVisible,
+		Theme: props.Theme, ThumbColor: props.Theme.TextSecondary,
+	})
+}
+
+// noteEditorTextCaretRange is the scroller interval that contains the active text caret.
+func noteEditorTextCaretRange(props NoteEditorProps, segment NoteDocumentSegment, primary bool, padding woxwidget.Insets, start float32) *woxwidget.ScrollRange {
+	if props.LineHeight <= 0 {
+		return nil
+	}
+	value, runs, _ := ProjectNoteSegment(props.Document, segment, props.Style, props.Theme)
+	if primary && props.Controller != nil {
+		value = props.Controller.Text()
+	}
+	caret := props.Selection.Focus
+	if primary && props.Controller != nil {
+		caret = props.Controller.State().Selection.Focus
+	}
+	innerWidth := max(float32(0), props.Width-padding.Left-padding.Right)
+	fieldRuns := NoteFieldRuns(runs)
+	lines := textFieldVisualLines(value, props.Window, props.Style, innerWidth, fieldRuns)
+	line := textFieldLineIndex(lines, caret)
+	top := start + padding.Top + textFieldLayoutLines(lines, props.LineHeight).top(line)
+	return &woxwidget.ScrollRange{Start: top, End: top + props.LineHeight}
+}
+
+// noteEditorTextHeight sizes a text segment to its wrapped lines so the outer
+// scroller, not the field, owns overflow and can show a scrollbar thumb.
+func noteEditorTextHeight(props NoteEditorProps, segment NoteDocumentSegment, primary bool, padding woxwidget.Insets) float32 {
+	value, runs, _ := ProjectNoteSegment(props.Document, segment, props.Style, props.Theme)
+	if primary && props.Controller != nil {
+		value = props.Controller.Text()
+	}
+	return TextFieldVisualHeight(value, props.Window, props.Style, props.Width, props.LineHeight, padding, NoteFieldRuns(runs))
+}
+
+func noteEditorTextField(props NoteEditorProps, segment NoteDocumentSegment, id string, height float32, primary bool, padding woxwidget.Insets) woxwidget.Widget {
+	value, runs, ranges := ProjectNoteSegment(props.Document, segment, props.Style, props.Theme)
+	controller := (*woxwidget.TextEditingController)(nil)
+	focus := (*woxwidget.FocusNode)(nil)
+	focused := false
+	autofocus := false
+	if primary {
+		controller = props.Controller
+		focus = props.FocusNode
+		focused = props.Focused
+		// Reclaiming focus after a structural selection would clear it through OnTextFocus.
+		autofocus = props.Autofocus && props.FocusedImageBlock < 0 && props.FocusedTableBlock < 0
+		if controller != nil {
+			value = controller.Text()
+		}
+	}
+	start := segment.Start
+	empty := strings.TrimSpace(value) == ""
+	var onTapBelowText func() bool
+	if segment.End == len(props.Document.Blocks) {
+		onTapBelowText = props.OnTapBelowText
+	}
+	return WoxTextField(TextFieldProps{
+		ID: id, Label: props.Label, Width: props.Width, Height: height, Padding: padding,
+		Find:        noteFieldFind(props.FindQuery, props.FindTarget, segment.Start, -1, -1),
+		Transparent: true, DisableHover: true, Style: props.Style, RichRuns: NoteFieldRuns(runs),
+		LineHeight: props.LineHeight, TextAlignmentY: 0.5, TextColor: props.TextColor, Value: value,
+		Controller: controller, FocusNode: focus, Focused: focused, Autofocus: autofocus,
+		ReadOnly: props.ReadOnly, MaxLines: 10000, ExposeVisualLines: true, Window: props.Window, Theme: props.Theme,
+		TrailingHandle: noteEditorTaskReorderHandle(props, segment, ranges),
+		OnHoverOffset:  noteEditorHoverTask(props, ranges),
+		OnChanged: func(text string) {
+			if props.OnChanged != nil {
+				props.OnChanged(start, text)
+			}
+		},
+		OnSelectionChanged: props.OnSelectionChanged,
+		OnFocusChange: func(focused bool) {
+			if focused && props.OnTextFocus != nil {
+				props.OnTextFocus(start)
+			}
+		},
+		OnTapOffset:    props.OnTapOffset,
+		OnTapBelowText: onTapBelowText,
+		CursorAtOffset: props.CursorAtOffset,
+		OnKey: func(event woxui.KeyEvent) bool {
+			if noteEditorEmptyBoundaryKey(event) && empty && props.OnDeleteEmptySegment != nil && props.OnDeleteEmptySegment(start) {
+				return true
+			}
+			if props.OnKey != nil {
+				return props.OnKey(event)
+			}
+			return false
+		},
+		OnUndo:         props.OnUndo,
+		OnRedo:         props.OnRedo,
+		OnPaste:        props.OnPaste,
+		TransformPaste: props.TransformPaste,
+		OnSelectAll:    props.OnSelectAll,
+		OnCopy:         props.OnCopy,
+		OnCut:          props.OnCut,
+		PaintSelection: props.DocumentSelected && !primary,
+	})
+}
+
+// noteEditorHoverTask maps pointer offsets onto the hovered checklist item.
+func noteEditorHoverTask(props NoteEditorProps, ranges []NoteBlockRange) func(int, bool) {
+	if props.OnHoverTask == nil || props.ReadOnly {
+		return nil
+	}
+	return func(offset int, inside bool) {
+		if !inside {
+			props.OnHoverTask(-1)
+			return
+		}
+		index := NoteBlockAt(ranges, offset)
+		if index < 0 || index >= len(props.Document.Blocks) || props.Document.Blocks[index].Type != common.NoteBlockTask {
+			props.OnHoverTask(-1)
+			return
+		}
+		props.OnHoverTask(index)
+	}
+}
+
+// noteEditorTaskReorderHandle shows a left-gutter move handle for the hovered or focused task.
+func noteEditorTaskReorderHandle(props NoteEditorProps, segment NoteDocumentSegment, ranges []NoteBlockRange) *TextFieldTrailingHandle {
+	if props.ReadOnly || props.OnReorderTaskStart == nil || props.OnReorderTaskDrag == nil {
+		return nil
+	}
+	index := props.ReorderingTask
+	if index < 0 && props.OnHoverTask != nil && props.HoveredTask >= 0 {
+		index = props.HoveredTask
+	}
+	if index < 0 {
+		if !props.Focused {
+			return nil
+		}
+		index = NoteTaskAtCaret(props.Document, ranges, props.Selection)
+	}
+	if index < segment.Start || index >= segment.End || index >= len(props.Document.Blocks) || props.Document.Blocks[index].Type != common.NoteBlockTask {
+		return nil
+	}
+	blockRange := NoteRangeForBlock(ranges, index)
+	start, onStart, onDrag, onEnd := index, props.OnReorderTaskStart, props.OnReorderTaskDrag, props.OnReorderTaskEnd
+	handle := &TextFieldTrailingHandle{
+		Start: blockRange.Start, End: blockRange.End, Size: 16, Label: props.ReorderTaskLabel,
+		Preview: noteTaskReorderPreview(props.Document.Blocks[index].Text),
+		Active:  props.ReorderingTask >= 0,
+		OnPanStart: func() {
+			if onStart != nil {
+				onStart(start)
+			}
+		},
+		OnPanUpdate: func(contentY float32) {
+			if onDrag != nil {
+				onDrag(start, contentY)
+			}
+		},
+		OnPanEnd: onEnd,
+	}
+	if props.ReorderingTask >= 0 {
+		groupStart, groupEnd := NoteTaskGroup(props.Document, props.ReorderingTask)
+		if dest := props.ReorderDest; dest < groupStart || dest > groupEnd {
+			if y, ok := noteEditorInsertLineY(props, segment, ranges, dest); ok {
+				handle.ShowDropLine = true
+				handle.DropLineY = y
+			}
+		}
+	}
+	return handle
+}
+
+// noteTaskReorderPreview is the short label that follows the pointer while dragging.
+func noteTaskReorderPreview(value string) string {
+	runes := []rune(strings.Join(strings.Fields(value), " "))
+	if len(runes) > 24 {
+		return string(runes[:24]) + "…"
+	}
+	return string(runes)
+}
+
+// noteEditorInsertLineY maps an insert-before block index onto document Y in this text segment.
+func noteEditorInsertLineY(props NoteEditorProps, segment NoteDocumentSegment, ranges []NoteBlockRange, dest int) (float32, bool) {
+	if props.LineHeight <= 0 {
+		return 0, false
+	}
+	value, runs, _ := ProjectNoteSegment(props.Document, segment, props.Style, props.Theme)
+	if props.Controller != nil && props.ActiveSegmentStart == segment.Start && props.Controller.Text() != "" {
+		value = props.Controller.Text()
+	}
+	innerWidth := max(float32(0), props.Width-props.Padding.Left-props.Padding.Right)
+	var measurer textFieldMeasurer
+	if props.Window != nil {
+		measurer = props.Window
+	}
+	lines := textFieldRichLines(value, measurer, props.Style, innerWidth, true, NoteFieldRuns(runs))
+	return noteTaskInsertLineY(props.Document, ranges, dest, props.LineHeight, lines)
+}
+
+const (
+	NoteEditorImageMaxHeight         = float32(360)
+	noteEditorImagePlaceholderHeight = float32(52)
+	noteEditorImageToolbarHeight     = float32(28)
+	noteEditorImageToolbarGap        = float32(4)
+	noteEditorImageScaleStep         = 10
+	noteEditorImageHighlightPad      = float32(2)
+)
+
+// NoteImageActionLabels holds already-translated image structure commands.
+type NoteImageActionLabels struct {
+	Smaller, Larger, Delete string
+}
+
+// DeleteNoteImage removes one image block and keeps a text block when the document would be empty.
+func DeleteNoteImage(document common.NoteDocument, block int) common.NoteDocument {
+	if block < 0 || block >= len(document.Blocks) || document.Blocks[block].Type != common.NoteBlockImage {
+		return document
+	}
+	updated := CloneNoteDocument(document)
+	updated.Blocks = slices.Delete(updated.Blocks, block, block+1)
+	return ensureNoteDocumentHasTextBlock(updated)
+}
+
+// noteEditorImage renders one attachment with the same reserved toolbar slot as tables.
+// The bitmap is decoded only while the block intersects the editor viewport.
+func noteEditorImage(props NoteEditorProps, blockIndex int, block common.NoteBlock, width float32) (woxwidget.Widget, float32) {
+	focused := props.FocusedImageBlock == blockIndex
+	highlight := focused || props.DocumentSelected
+	_, pictureHeight, _ := noteEditorImagePicture(props, block, width, highlight, false, 0)
+	height := pictureHeight
+	if !props.ReadOnly && props.OnImageScale != nil && props.OnImageDelete != nil {
+		height += noteEditorImageToolbarGap + noteEditorImageToolbarHeight
+	}
+	id := block.ID
+	if id == "" {
+		id = fmt.Sprintf("%d", blockIndex)
+	}
+	return woxwidget.ViewportSlot{
+		Key: woxwidget.Key(props.ID + ".image." + id + ".viewport"),
+		Release: func() {
+			if props.ReleaseImage != nil && block.Image != nil {
+				props.ReleaseImage(*block.Image)
+			}
+		},
+		Build: func(visible bool, aspect float32) (woxwidget.Widget, float32) {
+			return noteEditorImageBlock(props, blockIndex, block, width, highlight, focused && !props.DocumentSelected, visible, aspect)
+		},
+	}, height
+}
+
+// noteEditorImageBlock is the toolbar plus picture for one visibility pass.
+func noteEditorImageBlock(props NoteEditorProps, blockIndex int, block common.NoteBlock, width float32, highlight, showActions, visible bool, knownAspect float32) (woxwidget.Widget, float32) {
+	picture, pictureHeight, image := noteEditorImagePicture(props, block, width, highlight, visible, knownAspect)
+	drawWidth, drawHeight := noteEditorImageSize(image, block.Image, width, props.Zoom, knownAspect)
+	aspect := float32(0)
+	if image != nil && image.Width > 0 && image.Height > 0 {
+		aspect = float32(image.Width) / float32(image.Height)
+	} else if block.Image != nil && block.Image.Width > 0 && block.Image.Height > 0 {
+		aspect = float32(block.Image.Width) / float32(block.Image.Height)
+	}
+	if !props.ReadOnly && props.OnImageFocus != nil {
+		id := fmt.Sprintf("%s.image.%s", props.ID, block.ID)
+		bitmap := "deferred"
+		if visible {
+			bitmap = "pending"
+		}
+		if image != nil && image.Width > 0 && image.Height > 0 {
+			bitmap = "loaded"
+		}
+		picture = woxwidget.Semantics{
+			Key: woxwidget.Key(id), AutomationID: id, Role: woxui.AccessibilityRoleImage,
+			Label: noteEditorImageLabel(props, block), Value: bitmap, Actions: []woxui.AccessibilityAction{woxui.AccessibilityActionActivate},
+			OnAction: func(action woxui.AccessibilityAction, _ string) error {
+				if action == woxui.AccessibilityActionActivate && props.OnImageFocus != nil {
+					props.OnImageFocus(blockIndex)
+				}
+				return nil
+			},
+			Child: woxwidget.Gesture{ID: id, OnTapAt: func(position woxui.Point) {
+				if noteEditorImageTapHitsPicture(position, width, drawWidth, drawHeight) {
+					if props.OnImageFocus != nil {
+						props.OnImageFocus(blockIndex)
+					}
+					return
+				}
+				if props.OnImageLeave != nil {
+					props.OnImageLeave(blockIndex, position.Y >= pictureHeight/2)
+				}
+			}, Child: picture},
+		}
+	}
+	toolbar := noteEditorImageToolbar(props, blockIndex, width, showActions)
+	if toolbar != nil && !showActions && !props.ReadOnly && props.OnImageLeave != nil {
+		toolbar = woxwidget.Gesture{ID: fmt.Sprintf("%s.image.%s.chrome", props.ID, block.ID), OnTap: func() {
+			props.OnImageLeave(blockIndex, false)
+		}, Child: toolbar}
+	}
+	if toolbar != nil {
+		return woxwidget.Flex{Axis: woxwidget.Vertical, Gap: noteEditorImageToolbarGap, Children: []woxwidget.Widget{toolbar, picture}}, aspect
+	}
+	return picture, aspect
+}
+
+// noteEditorImageTapHitsPicture reports taps on the centered bitmap, not the full-width chrome.
+func noteEditorImageTapHitsPicture(local woxui.Point, rowWidth, drawWidth, drawHeight float32) bool {
+	left := max(float32(0), (rowWidth-drawWidth)/2)
+	top := noteEditorImageHighlightPad
+	return local.X >= left && local.X <= left+drawWidth && local.Y >= top && local.Y <= top+drawHeight
+}
+
+func noteEditorImagePicture(props NoteEditorProps, block common.NoteBlock, width float32, focused, load bool, knownAspect float32) (woxwidget.Widget, float32, *woxui.Image) {
+	var image *woxui.Image
+	if load && props.ResolveImage != nil && block.Image != nil {
+		image = props.ResolveImage(*block.Image)
+	}
+	drawWidth, drawHeight := noteEditorImageSize(image, block.Image, width, props.Zoom, knownAspect)
+	var child woxwidget.Widget
+	if image == nil || image.Width <= 0 || image.Height <= 0 {
+		child = woxwidget.Container{Width: drawWidth, Height: drawHeight, Color: withAlpha(props.Theme.BodyText, 10)}
+		if knownAspect <= 0 && (block.Image == nil || block.Image.Width <= 0 || block.Image.Height <= 0) {
+			child = woxwidget.Container{
+				Width: drawWidth, Height: drawHeight, Padding: woxwidget.UniformInsets(10),
+				Color: withAlpha(props.Theme.BodyText, 10),
+				Child: woxwidget.TextBlock{
+					Value: noteEditorImageMissingLabel(props), Width: max(float32(0), drawWidth-20), Height: 32, MaxLines: 2,
+					Style: woxui.TextStyle{Size: 12}, Color: props.Theme.BodyText,
+				},
+			}
+		}
+	} else {
+		child = woxwidget.Image{Source: image, Width: drawWidth, Height: drawHeight, Fit: woxwidget.ImageFitContain}
+	}
+	border := woxui.Color{}
+	borderWidth := float32(0)
+	if focused {
+		border = props.Theme.Focus
+		if border.A == 0 {
+			border = props.Theme.BodyText
+		}
+		borderWidth = 2
+	}
+	return woxwidget.Container{
+		Width: width, Height: drawHeight + noteEditorImageHighlightPad*2, Padding: woxwidget.UniformInsets(noteEditorImageHighlightPad),
+		BorderWidth: borderWidth, BorderColor: border, Radius: 6,
+		Child: woxwidget.Align{Width: width - noteEditorImageHighlightPad*2, Height: drawHeight, Horizontal: 0.5, Child: child},
+	}, drawHeight + noteEditorImageHighlightPad*2, image
+}
+
+func noteEditorImageLabel(props NoteEditorProps, block common.NoteBlock) string {
+	if block.Image != nil {
+		if name := strings.TrimSpace(block.Image.FileName); name != "" {
+			return name
+		}
+		if id := strings.TrimSpace(block.Image.ID); id != "" {
+			return id
+		}
+		if remote := strings.TrimSpace(block.Image.URL); remote != "" {
+			return remote
+		}
+	}
+	return noteEditorImageMissingLabel(props)
+}
+
+// noteEditorImageMissingLabel is shown only when the attachment cannot be sized or found.
+func noteEditorImageMissingLabel(props NoteEditorProps) string {
+	if props.MissingImageLabel != "" {
+		return props.MissingImageLabel
+	}
+	return "Image"
+}
+
+func noteEditorImageToolbar(props NoteEditorProps, block int, width float32, focused bool) woxwidget.Widget {
+	if props.ReadOnly || props.OnImageScale == nil || props.OnImageDelete == nil {
+		return nil
+	}
+	if !focused {
+		return woxwidget.Container{Width: width, Height: noteEditorImageToolbarHeight}
+	}
+	color := props.Theme.TextSecondary
+	if color.A == 0 {
+		color = props.Theme.BodyText
+	}
+	id := fmt.Sprintf("%s.image.%s", props.ID, props.Document.Blocks[block].ID)
+	button := func(kind, label string, action func()) woxwidget.Widget {
+		return WoxIconButton(IconButtonProps{
+			ID: id + "." + kind, Label: label, Icon: FormatGlyph(kind, 16, color),
+			Width: noteEditorImageToolbarHeight, Height: noteEditorImageToolbarHeight, Radius: 6,
+			HoverBackground: TitleBarAlpha(color, 20), FocusRingColor: props.Theme.Focus, OnTap: action,
+			OnHoverAt: func(inside bool, bounds woxui.Rect) {
+				if props.OnImageActionHover != nil {
+					props.OnImageActionHover(inside, label, bounds)
+				}
+			},
+		})
+	}
+	labels := props.ImageActionLabels
+	return woxwidget.Container{Width: width, Height: noteEditorImageToolbarHeight, Child: woxwidget.Flex{
+		Axis: woxwidget.Horizontal, MainAxisAlignment: woxwidget.MainAxisSpaceBetween, CrossAxisAlignment: woxwidget.CrossAxisCenter,
+		Children: []woxwidget.Widget{
+			woxwidget.Flex{Axis: woxwidget.Horizontal, Gap: 4, CrossAxisAlignment: woxwidget.CrossAxisCenter, Children: []woxwidget.Widget{
+				button("image-smaller", labels.Smaller, func() { props.OnImageScale(block, -noteEditorImageScaleStep) }),
+				button("image-larger", labels.Larger, func() { props.OnImageScale(block, noteEditorImageScaleStep) }),
+			}},
+			button("image-delete", labels.Delete, func() { props.OnImageDelete(block) }),
+		},
+	}}
+}
+
+// noteEditorImageSize keeps remote images at the same height after their bitmap leaves the viewport.
+func noteEditorImageSize(image *woxui.Image, meta *common.NoteImage, availableWidth, zoom, knownAspect float32) (float32, float32) {
+	srcWidth, srcHeight := 0, 0
+	if image != nil && image.Width > 0 && image.Height > 0 {
+		srcWidth, srcHeight = image.Width, image.Height
+	} else if meta != nil && meta.Width > 0 && meta.Height > 0 {
+		srcWidth, srcHeight = meta.Width, meta.Height
+	} else if knownAspect > 0 {
+		return noteEditorImageFit(availableWidth, 1/knownAspect, zoom, meta)
+	}
+	if srcWidth <= 0 || srcHeight <= 0 {
+		scale := float32(1)
+		if meta != nil {
+			scale = float32(notespluginScale(meta.Scale)) / 100
+		}
+		return max(availableWidth*scale, 80), noteEditorImagePlaceholderHeight
+	}
+	return noteEditorImageFit(availableWidth, float32(srcHeight)/float32(srcWidth), zoom, meta)
+}
+
+func noteEditorImageFit(availableWidth, heightPerWidth, zoom float32, meta *common.NoteImage) (float32, float32) {
+	scale := float32(1)
+	if meta != nil {
+		scale = float32(notespluginScale(meta.Scale)) / 100
+	}
+	maxHeight := NoteEditorImageMaxHeight * max(zoom, 1)
+	// Fit 100% into the editor box first, then apply the user's percent.
+	// Scaling width before the height cap made +/- a no-op for tall pictures.
+	fitWidth := availableWidth
+	fitHeight := fitWidth * heightPerWidth
+	if fitHeight > maxHeight {
+		fitHeight = maxHeight
+		fitWidth = fitHeight / heightPerWidth
+	}
+	return fitWidth * scale, fitHeight * scale
+}
+
+func notespluginScale(scale int) int {
+	if scale <= 0 {
+		return 100
+	}
+	if scale < 20 {
+		return 20
+	}
+	if scale > 100 {
+		return 100
+	}
+	return scale
+}
+
+func noteEditorTableActions(props NoteEditorProps, block int) NoteTableActions {
+	if props.ReadOnly || props.OnTableInsertRow == nil || props.OnTableInsertColumn == nil ||
+		props.OnTableDeleteRow == nil || props.OnTableDeleteColumn == nil || props.OnTableDelete == nil {
+		return NoteTableActions{}
+	}
+	return NoteTableActions{
+		Labels:         props.TableActionLabels,
+		OnInsertRow:    func() { props.OnTableInsertRow(block) },
+		OnInsertColumn: func() { props.OnTableInsertColumn(block) },
+		OnDeleteRow:    func() { props.OnTableDeleteRow(block) },
+		OnDeleteColumn: func() { props.OnTableDeleteColumn(block) },
+		OnDeleteTable:  func() { props.OnTableDelete(block) },
+		OnHover:        props.OnTableActionHover,
+	}
+}
+
+// noteEditorEdgePadding keeps the document top inset on the first segment only.
+// The scroller owns the trailing inset so text-above-table does not inherit Bottom: 24.
+func noteEditorEdgePadding(padding woxwidget.Insets, first bool) woxwidget.Insets {
+	edge := woxwidget.Insets{Left: padding.Left, Right: padding.Right}
+	if first {
+		edge.Top = padding.Top
+	}
+	return edge
+}
+
+func noteEditorEmptyBoundaryKey(event woxui.KeyEvent) bool {
+	return event.Down && !event.Composing && event.Modifiers == 0 && (event.Key == woxui.KeyBackspace || event.Key == woxui.KeyDelete)
+}
