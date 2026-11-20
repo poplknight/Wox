@@ -1330,6 +1330,7 @@
   "plugin_browser_bookmark_index_browsers": "인덱싱할 브라우저",
   "plugin_browser_bookmark_index_browsers_all": "모든 브라우저",
   "plugin_browser_bookmark_index_browsers_tooltip": "북마크를 인덱싱할 브라우저를 선택하세요. 기본적으로 모두 활성화됩니다.",
+  "plugin_browser_bookmark_reload_command": "북마크 새로고침",
   "plugin_websearch_user_agent": "User Agent",
   "plugin_websearch_user_agent_tooltip": "이 사이트에 사용할 User-Agent 프리셋을 선택하세요. Auto는 현재 플랫폼의 데스크톱 기본값을 사용합니다.",
   "plugin_websearch_user_agent_auto": "Auto",

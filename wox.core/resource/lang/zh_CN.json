@@ -1330,6 +1330,7 @@
   "plugin_browser_bookmark_index_browsers": "需要索引的浏览器",
   "plugin_browser_bookmark_index_browsers_all": "所有浏览器",
   "plugin_browser_bookmark_index_browsers_tooltip": "选择要索引书签的浏览器。默认全部启用。",
+  "plugin_browser_bookmark_reload_command": "重新加载书签",
   "plugin_websearch_user_agent": "User Agent",
   "plugin_websearch_user_agent_tooltip": "为此网站选择 User-Agent 预设。Auto 使用当前平台的桌面默认值。",
   "plugin_websearch_user_agent_auto": "Auto",

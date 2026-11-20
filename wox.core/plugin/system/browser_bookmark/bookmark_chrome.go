@@ -2,6 +2,7 @@ package browserbookmark
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -96,31 +97,52 @@ func (c *BrowserBookmarkPlugin) loadBookmarkFromFile(ctx context.Context, bookma
 		return []Bookmark{}
 	}
 
-	// Use a more robust regex pattern that works for both Chrome and Edge bookmark formats
+	results, parseErr := parseChromiumBookmarkFile(file)
+	if parseErr != nil {
+		c.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("error parsing %s bookmark file: %s", browserName, parseErr.Error()))
+		return []Bookmark{}
+	}
+	for index := range results {
+		icon := browserBookmarkIcon
+		if cachedIcon, ok := system.GetWebsiteIconFromCacheOnly(ctx, results[index].Url); ok {
+			icon = cachedIcon
+		}
+		results[index].Icon = icon
+	}
+	return results
+}
+
+type chromiumBookmarkNode struct {
+	Name     string                 `json:"name"`
+	Type     string                 `json:"type"`
+	URL      string                 `json:"url"`
+	Children []chromiumBookmarkNode `json:"children"`
+}
+
+type chromiumBookmarkFile struct {
+	Roots map[string]chromiumBookmarkNode `json:"roots"`
+}
+
+// parseChromiumBookmarkFile walks the bookmark tree. Chrome writes a folder's name after its
+// children, so a regex that skips ahead to the next "type": "url" attaches that folder name to
+// the following bookmark and drops the real title.
+func parseChromiumBookmarkFile(file []byte) ([]Bookmark, error) {
+	var parsed chromiumBookmarkFile
+	if err := json.Unmarshal(file, &parsed); err != nil {
+		return nil, err
+	}
 	var results []Bookmark
-	groups := util.FindRegexGroups(`(?ms)"name": "(?P<name>[^"]*)",.*?"type": "url",.*?"url": "(?P<url>[^"]*)"`, string(file))
-
-	for _, group := range groups {
-		if name, nameOk := group["name"]; nameOk {
-			if url, urlOk := group["url"]; urlOk {
-				// Do not block on network here; show cached favicon if exists
-				icon := browserBookmarkIcon
-				if cachedIcon, ok := system.GetWebsiteIconFromCacheOnly(ctx, url); ok {
-					icon = cachedIcon
-				}
-
-				// Regex captures share the complete bookmark JSON string unless copied.
-				// Keep only the small fields after this file has been parsed.
-				name = strings.Clone(name)
-				url = strings.Clone(url)
-				results = append(results, Bookmark{
-					Name: name,
-					Url:  url,
-					Icon: icon,
-				})
-			}
+	var walk func(node chromiumBookmarkNode)
+	walk = func(node chromiumBookmarkNode) {
+		if node.Type == "url" && strings.TrimSpace(node.URL) != "" {
+			results = append(results, Bookmark{Name: strings.Clone(node.Name), Url: strings.Clone(node.URL)})
+		}
+		for _, child := range node.Children {
+			walk(child)
 		}
 	}
-
-	return results
+	for _, root := range parsed.Roots {
+		walk(root)
+	}
+	return results, nil
 }

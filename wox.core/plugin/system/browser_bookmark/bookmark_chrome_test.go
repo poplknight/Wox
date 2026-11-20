@@ -42,6 +42,35 @@ func TestLoadChromiumBookmarkFiles_MergesLocalAndAccountBookmarks(t *testing.T) 
 	assert.ElementsMatch(t, []string{"Local Docs", "Account Docs"}, bookmarkNames(bookmarks))
 }
 
+func TestParseChromiumBookmarkFile_KeepsBookmarkAfterFolder(t *testing.T) {
+	raw := []byte(`{
+      "roots": {
+        "bookmark_bar": {
+          "children": [ {
+            "children": [ {
+              "name": "Inside",
+              "type": "url",
+              "url": "https://inside.example"
+            } ],
+            "name": "前端",
+            "type": "folder"
+          }, {
+            "name": "测试-未来云容器",
+            "type": "url",
+            "url": "https://cloud-test.example"
+          } ],
+          "name": "书签栏",
+          "type": "folder"
+        }
+      }
+    }`)
+
+	bookmarks, err := parseChromiumBookmarkFile(raw)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"Inside", "测试-未来云容器"}, bookmarkNames(bookmarks))
+	assert.Equal(t, "https://cloud-test.example", bookmarks[1].Url)
+}
+
 func TestLoadChromiumBookmarkFiles_IgnoresMissingAccountBookmarks(t *testing.T) {
 	profileDir := t.TempDir()
 	writeChromiumBookmarkJSON(t, filepath.Join(profileDir, "Bookmarks"),

@@ -1326,6 +1326,7 @@
   "plugin_browser_bookmark_index_browsers": "Браузеры для индексации",
   "plugin_browser_bookmark_index_browsers_all": "Все браузеры",
   "plugin_browser_bookmark_index_browsers_tooltip": "Выберите браузеры для индексации закладок. По умолчанию включены все.",
+  "plugin_browser_bookmark_reload_command": "Перезагрузить закладки",
   "plugin_websearch_user_agent": "User Agent",
   "plugin_websearch_user_agent_tooltip": "Выберите пресет User-Agent для этого сайта. Auto использует настольное значение по умолчанию для текущей платформы.",
   "plugin_websearch_user_agent_auto": "Auto",

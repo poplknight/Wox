@@ -1330,6 +1330,7 @@
   "plugin_browser_bookmark_index_browsers": "Browsers to index",
   "plugin_browser_bookmark_index_browsers_all": "All browsers",
   "plugin_browser_bookmark_index_browsers_tooltip": "Select which browsers should be indexed for bookmarks. By default all are enabled.",
+  "plugin_browser_bookmark_reload_command": "Reload bookmarks",
   "plugin_websearch_user_agent": "User Agent",
   "plugin_websearch_user_agent_tooltip": "Choose a User-Agent preset for this site. Auto uses the current platform's desktop default.",
   "plugin_websearch_user_agent_auto": "Auto",

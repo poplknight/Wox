@@ -7,9 +7,14 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
+	"github.com/mitchellh/go-homedir"
+
 	"wox/common"
 	"wox/common/icons"
 	"wox/plugin"
@@ -29,6 +34,8 @@ var browserBookmarkIcon = icons.Get(icons.PluginBookmark)
 
 const (
 	browserBookmarkIndexBrowsersSettingKey = "indexBrowsers"
+	browserBookmarkReloadCommand           = "reload"
+	browserBookmarkReloadResultID          = "bookmark-reload"
 )
 
 var browserBookmarkLoaders = map[string]func(*BrowserBookmarkPlugin, context.Context) []Bookmark{}
@@ -50,6 +57,11 @@ type BrowserBookmarkPlugin struct {
 	api         plugin.API
 	bookmarks   []Bookmark
 	bookmarksMu sync.RWMutex
+
+	// watchMu guards the profile directory watches and the debounced reload timer.
+	watchMu     sync.Mutex
+	watches     map[string]*util.DirectoryWatch
+	reloadTimer *time.Timer
 }
 
 func (c *BrowserBookmarkPlugin) GetMetadata() plugin.Metadata {
@@ -68,7 +80,12 @@ func (c *BrowserBookmarkPlugin) GetMetadata() plugin.Metadata {
 			"*",
 			"b",
 		},
-		Commands: []plugin.MetadataCommand{},
+		Commands: []plugin.MetadataCommand{
+			{
+				Command:     browserBookmarkReloadCommand,
+				Description: "i18n:plugin_browser_bookmark_reload_command",
+			},
+		},
 		SupportedOS: []string{
 			"Windows",
 			"Macos",
@@ -77,6 +94,9 @@ func (c *BrowserBookmarkPlugin) GetMetadata() plugin.Metadata {
 		Features: []plugin.MetadataFeature{
 			{
 				Name: plugin.MetadataFeatureMRU,
+			},
+			{
+				Name: plugin.MetadataFeatureDisableAutoCommandHint,
 			},
 		},
 		SettingDefinitions: c.getBrowserBookmarkSettingDefinitions(),
@@ -87,6 +107,7 @@ func (c *BrowserBookmarkPlugin) Init(ctx context.Context, initParams plugin.Init
 	c.api = initParams.API
 
 	c.reloadBookmarks(ctx)
+	c.watchBookmarkProfiles(ctx)
 
 	c.api.OnSettingChanged(ctx, func(callbackCtx context.Context, key string, value string) {
 		if key == browserBookmarkIndexBrowsersSettingKey {
@@ -98,6 +119,10 @@ func (c *BrowserBookmarkPlugin) Init(ctx context.Context, initParams plugin.Init
 }
 
 func (c *BrowserBookmarkPlugin) Query(ctx context.Context, query plugin.Query) plugin.QueryResponse {
+	if isBookmarkReloadQuery(query) {
+		return plugin.NewQueryResponse([]plugin.QueryResult{c.reloadResult()})
+	}
+
 	var results []plugin.QueryResult
 	bookmarks := c.getBookmarksSnapshot()
 	loose := !query.IsGlobalQuery()
@@ -177,6 +202,33 @@ func matchBookmark(ctx context.Context, bookmark Bookmark, search string, loose 
 	return true, urlScore
 }
 
+// isBookmarkReloadQuery reports whether the query is the "reload" command, which shows a
+// single result that reloads bookmarks on activation instead of bookmark search results.
+func isBookmarkReloadQuery(query plugin.Query) bool {
+	return query.Command == browserBookmarkReloadCommand
+}
+
+// reloadResult builds the command result that reloads bookmarks when the user activates it.
+func (c *BrowserBookmarkPlugin) reloadResult() plugin.QueryResult {
+	title := "i18n:plugin_browser_bookmark_reload_command"
+	return plugin.QueryResult{
+		Title:       title,
+		IdentityKey: browserBookmarkReloadResultID,
+		Icon:        browserBookmarkIcon,
+		Actions: []plugin.QueryResultAction{
+			{
+				Name:                   title,
+				Icon:                   icons.Get(icons.ActionExecute),
+				IsDefault:              true,
+				PreventHideAfterAction: true,
+				Action: func(ctx context.Context, actionContext plugin.ActionContext) {
+					c.reloadBookmarks(ctx)
+				},
+			},
+		},
+	}
+}
+
 func (c *BrowserBookmarkPlugin) reloadBookmarks(ctx context.Context) {
 	bookmarks := c.loadBookmarks(ctx)
 	bookmarks = c.removeDuplicateBookmarks(bookmarks)
@@ -193,6 +245,69 @@ func (c *BrowserBookmarkPlugin) reloadBookmarks(ctx context.Context) {
 		urls = append(urls, b.Url)
 	}
 	util.Go(ctx, "prefetch bookmark favicons", func() { c.prefetchWebsiteIcons(ctx, urls) })
+}
+
+func (c *BrowserBookmarkPlugin) watchBookmarkProfiles(ctx context.Context) {
+	for _, dir := range bookmarkProfileDirs() {
+		expanded, err := homedir.Expand(dir)
+		if err != nil {
+			continue
+		}
+		if _, statErr := os.Stat(expanded); statErr != nil {
+			continue
+		}
+		c.watchMu.Lock()
+		if c.watches == nil {
+			c.watches = map[string]*util.DirectoryWatch{}
+		}
+		if _, ok := c.watches[expanded]; ok {
+			c.watchMu.Unlock()
+			continue
+		}
+		watch, watchErr := util.WatchDirectory(expanded, func(event fsnotify.Event) {
+			switch filepath.Base(event.Name) {
+			case "Bookmarks", "AccountBookmarks", "places.sqlite":
+				c.scheduleReload(ctx)
+			}
+		}, nil)
+		if watchErr != nil {
+			c.watchMu.Unlock()
+			c.api.Log(ctx, plugin.LogLevelError, fmt.Sprintf("bookmark watch failed for %s: %s", expanded, watchErr.Error()))
+			continue
+		}
+		c.watches[expanded] = watch
+		c.watchMu.Unlock()
+	}
+}
+
+func (c *BrowserBookmarkPlugin) scheduleReload(ctx context.Context) {
+	c.watchMu.Lock()
+	defer c.watchMu.Unlock()
+	if c.reloadTimer != nil {
+		c.reloadTimer.Stop()
+	}
+	c.reloadTimer = time.AfterFunc(800*time.Millisecond, func() {
+		c.reloadBookmarks(ctx)
+	})
+}
+
+func bookmarkProfileDirs() []string {
+	var dirs []string
+	for _, profile := range chromeBookmarkProfiles {
+		dirs = append(dirs, fmt.Sprintf("~/Library/Application Support/Google/Chrome/%s", profile))
+		dirs = append(dirs, fmt.Sprintf("~/.config/google-chrome/%s", profile))
+		if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
+			dirs = append(dirs, filepath.Join(localAppData, "Google", "Chrome", "User Data", profile))
+		}
+	}
+	for _, profile := range edgeBookmarkProfiles {
+		dirs = append(dirs, fmt.Sprintf("~/Library/Application Support/Microsoft Edge/%s", profile))
+		dirs = append(dirs, fmt.Sprintf("~/.config/microsoft-edge/%s", profile))
+		if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
+			dirs = append(dirs, filepath.Join(localAppData, "Microsoft", "Edge", "User Data", profile))
+		}
+	}
+	return dirs
 }
 
 // PrefetchWebsiteIcons downloads favicons for given URLs in background using Google's service.

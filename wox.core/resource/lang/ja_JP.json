@@ -1330,6 +1330,7 @@
   "plugin_browser_bookmark_index_browsers": "インデックスを作成するブラウザ",
   "plugin_browser_bookmark_index_browsers_all": "すべてのブラウザ",
   "plugin_browser_bookmark_index_browsers_tooltip": "ブックマークのインデックスを作成するブラウザを選択します。デフォルトではすべて有効です。",
+  "plugin_browser_bookmark_reload_command": "ブックマークを再読み込み",
   "plugin_websearch_user_agent": "ユーザーエージェント",
   "plugin_websearch_user_agent_tooltip": "このサイトの User-Agent プリセットを選択します。自動 は現在のプラットフォームのデスクトップデフォルトを使用します。",
   "plugin_websearch_user_agent_auto": "自動",

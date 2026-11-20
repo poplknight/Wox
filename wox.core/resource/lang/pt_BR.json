@@ -1326,6 +1326,7 @@
   "plugin_browser_bookmark_index_browsers": "Navegadores para indexar",
   "plugin_browser_bookmark_index_browsers_all": "Todos os navegadores",
   "plugin_browser_bookmark_index_browsers_tooltip": "Selecione quais navegadores devem ser indexados para favoritos. Por padrão, todos estão habilitados.",
+  "plugin_browser_bookmark_reload_command": "Recarregar favoritos",
   "plugin_websearch_user_agent": "User Agent",
   "plugin_websearch_user_agent_tooltip": "Escolha uma predefinição de User-Agent para este site. Auto usa o padrão de desktop da plataforma atual.",
   "plugin_websearch_user_agent_auto": "Auto",
