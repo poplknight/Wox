@@ -350,8 +350,8 @@ Plugins must declare metadata in a `plugin.json` file:
 
 ## For More Information
 
-- Wox Documentation: https://github.com/Wox-launcher/Wox
-- Plugin Examples: https://github.com/Wox-launcher/Wox.Plugin.Nodejs
+- Wox Documentation: https://github.com/poplknight/Wox
+- Plugin Examples: https://github.com/poplknight/Wox.Plugin.Nodejs
 
 ## Static HTML preview
 

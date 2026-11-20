@@ -302,7 +302,7 @@ ifeq ($(PLATFORM),linux)
 			'Section: utils' \
 			'Priority: optional' \
 			'Maintainer: Wox Contributors <wox-launcher@users.noreply.github.com>' \
-			'Homepage: https://github.com/Wox-launcher/Wox' \
+			'Homepage: https://github.com/poplknight/Wox' \
 			"Installed-Size: $$installed_size" \
 			'Depends: libgtk-3-0, libepoxy0, libx11-6, libxtst6, libgtk-layer-shell0' \
 			'Recommends: libpipewire-0.3-0, libwebkit2gtk-4.1-0 | libwebkit2gtk-4.0-37' \
@@ -348,7 +348,7 @@ ifeq ($(PLATFORM),linux)
 			'Release: 1' \
 			'Summary: A launcher that stays out of your way' \
 			'License: GPL-3.0-or-later' \
-			'URL: https://github.com/Wox-launcher/Wox' \
+			'URL: https://github.com/poplknight/Wox' \
 			'BuildArch: $(RPM_ARCH)' \
 			'AutoReqProv: no' \
 			'' \

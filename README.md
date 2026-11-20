@@ -14,7 +14,7 @@
 
 **Wox** is a free, open-source **cross-platform launcher** for Windows, macOS, and Linux — a fast, keyboard-driven alternative to Alfred, Launchy, Raycast, and PowerToys Run. Summon it with a hotkey, start typing, and instantly search your apps, files, folders, browser bookmarks, the web, and more. It ships with a rich plugin and theme ecosystem, so you can extend it with JavaScript, Python, C#, and other languages.
 
-This repository is a **fork of [Wox](https://github.com/Wox-launcher/Wox)** with a curated set of modifications — see [Changes in this fork](#changes-in-this-fork).
+This repository is a **fork of [Wox](https://github.com/poplknight/Wox)** with a curated set of modifications — see [Changes in this fork](#changes-in-this-fork).
 
 ## Key features
 
@@ -25,7 +25,7 @@ This repository is a **fork of [Wox](https://github.com/Wox-launcher/Wox)** with
 
 ## Changes in this fork
 
-Compared with the upstream [Wox](https://github.com/Wox-launcher/Wox), this fork:
+Compared with the upstream [Wox](https://github.com/poplknight/Wox), this fork:
 
 - Disables color, calculator, timer, emoji, notes, quick jump, preview, selection, update, dictation, reminder, feedback, unit converter, menu, theme, and cloud sync. The code remains; it is simply no longer registered.
 - Keeps the plugin indicator, plugin installer, and automation test plugins loading, but hides them from the installed-plugin list.
@@ -63,12 +63,12 @@ make -C wox.core build     # build the core binary into release/
 
 ## Documentation & community
 
-- Upstream project: [Wox-launcher/Wox](https://github.com/Wox-launcher/Wox)
+- Upstream project: [Wox-launcher/Wox](https://github.com/poplknight/Wox)
 - Official site: [woxlauncher.com](https://www.woxlauncher.com/)
 
 ## License
 
-[GPL-3.0](LICENSE) — fork of [Wox](https://github.com/Wox-launcher/Wox).
+[GPL-3.0](LICENSE) — fork of [Wox](https://github.com/poplknight/Wox).
 
 ---
 
@@ -76,7 +76,7 @@ make -C wox.core build     # build the core binary into release/
 
 **Wox** 是一款免费、开源的**跨平台启动器**，支持 Windows、macOS 和 Linux，是 Alfred、Launchy、Raycast 和 PowerToys Run 的快速键盘流替代品。按下快捷键唤起，输入即搜，即可在应用、文件、文件夹、浏览器书签、网页等之间快速查找。它拥有丰富的插件与主题生态，可以用 JavaScript、Python、C# 等语言扩展。
 
-本仓库是 [Wox](https://github.com/Wox-launcher/Wox) 的一个**分支（fork）**，带有一套经过裁剪的改动，详见[本分支的改动](#本分支的改动)。
+本仓库是 [Wox](https://github.com/poplknight/Wox) 的一个**分支（fork）**，带有一套经过裁剪的改动，详见[本分支的改动](#本分支的改动)。
 
 ## 主要特性
 
@@ -87,7 +87,7 @@ make -C wox.core build     # build the core binary into release/
 
 ## 本分支的改动
 
-与上游 [Wox](https://github.com/Wox-launcher/Wox) 相比，本分支：
+与上游 [Wox](https://github.com/poplknight/Wox) 相比，本分支：
 
 - 停用了颜色、计算器、计时器、表情符号、笔记、快速跳转、速览、划词、更新、听写、提醒、反馈、单位转换、菜单、主题和云同步。代码还在，只是不再注册。
 - 插件指示器、插件安装器和自动化测试插件仍会加载，但已安装插件列表里不显示。
@@ -125,9 +125,9 @@ make -C wox.core build     # 只构建核心二进制到 release/
 
 ## 文档与社区
 
-- 上游项目：[Wox-launcher/Wox](https://github.com/Wox-launcher/Wox)
+- 上游项目：[Wox-launcher/Wox](https://github.com/poplknight/Wox)
 - 官网：[woxlauncher.com](https://www.woxlauncher.com/)
 
 ## 许可证
 
-[GPL-3.0](LICENSE) —— [Wox](https://github.com/Wox-launcher/Wox) 的分支。
+[GPL-3.0](LICENSE) —— [Wox](https://github.com/poplknight/Wox) 的分支。

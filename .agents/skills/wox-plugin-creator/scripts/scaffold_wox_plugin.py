@@ -19,8 +19,8 @@ AUTO_RUNTIME_TYPES = {
     "singlefile": {"nodejs": "singlefile-nodejs", "python": "singlefile-python"},
 }
 TEMPLATE_REPOS = {
-    "nodejs": "https://github.com/Wox-launcher/Wox.Plugin.Template.Nodejs",
-    "python": "https://github.com/Wox-launcher/Wox.Plugin.Template.Python",
+    "nodejs": "https://github.com/poplknight/Wox.Plugin.Template.Nodejs",
+    "python": "https://github.com/poplknight/Wox.Plugin.Template.Python",
 }
 SINGLE_FILE_MIN_WOX_VERSION = "2.4.2"
 

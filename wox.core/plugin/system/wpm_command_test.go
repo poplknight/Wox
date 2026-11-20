@@ -32,7 +32,7 @@ func TestWPMCreateAIPrompt(t *testing.T) {
 			format := translations["plugin_wpm_ai_prompt"]
 			require.Equal(t, 1, strings.Count(format, "%s"))
 			prompt := fmt.Sprintf(format, "My Plugin")
-			for _, text := range []string{"My Plugin", "single-file SDK", "SKILL.md", "https://github.com/Wox-launcher/Wox/tree/master/.agents/skills/wox-plugin-creator", "https://github.com/Wox-launcher/Wox/tree/master/.agents/skills/wox-plugin-submit2store"} {
+			for _, text := range []string{"My Plugin", "single-file SDK", "SKILL.md", "https://github.com/poplknight/Wox/tree/master/.agents/skills/wox-plugin-creator", "https://github.com/poplknight/Wox/tree/master/.agents/skills/wox-plugin-submit2store"} {
 				require.Contains(t, prompt, text)
 			}
 			require.NotContains(t, prompt, "%!")

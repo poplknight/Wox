@@ -43,8 +43,8 @@ One `.py` or CommonJS `.js` file that loads into the existing Python or Node.js 
 
 1. **Scaffold**:
    - **Node.js/Python packages**: Clone the official template repos.
-     - https://github.com/Wox-launcher/Wox.Plugin.Template.Nodejs
-     - https://github.com/Wox-launcher/Wox.Plugin.Template.Python
+     - https://github.com/poplknight/Wox.Plugin.Template.Nodejs
+     - https://github.com/poplknight/Wox.Plugin.Template.Python
    - **Single-file SDK plugins**: Write one `.js` or `.py` file into `~/.wox/wox-user/plugins/single-file/` from `assets/single_file_plugin_templates/`, the scaffold (omit `--output-dir`), or `wpm create`. Do not also create a copy in the current repository.
 2. **Configure**:
    - SDK plugins: edit `plugin.json` to define metadata, trigger keywords, supported OS, features, i18n, and `SettingDefinitions`.

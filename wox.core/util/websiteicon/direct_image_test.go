@@ -27,7 +27,7 @@ func TestIsDirectImageURL(t *testing.T) {
 	if !IsDirectImageURL("https://private-user-images.githubusercontent.com/1/a.png?jwt=token") {
 		t.Fatal("signed png URL should be treated as a direct image")
 	}
-	if IsDirectImageURL("https://github.com/Wox-launcher/Wox") {
+	if IsDirectImageURL("https://github.com/poplknight/Wox") {
 		t.Fatal("website URL should not be treated as a direct image")
 	}
 }

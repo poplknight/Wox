@@ -29,7 +29,7 @@ const NativeLibVersion = "v1.13.4-wox.1"
 const ONNXRuntimeVersion = "1.27.0"
 
 const (
-	nativeLibReleaseBaseURL           = "https://github.com/Wox-launcher/Wox.Dictation.Native.Dependecies/releases/download/" + NativeLibVersion
+	nativeLibReleaseBaseURL           = "https://github.com/poplknight/Wox.Dictation.Native.Dependecies/releases/download/" + NativeLibVersion
 	nativeLibReleaseManifestURL       = nativeLibReleaseBaseURL + "/manifest.json"
 	nativeLibReleaseManifestSignature = nativeLibReleaseBaseURL + "/manifest.sig"
 	nativeLibManifestPublicKeyDER     = "MCowBQYDK2VwAyEAEGuDVKMKBl3z0BFqbZJpOLraySwug7wCdH0FqCKgEp8="

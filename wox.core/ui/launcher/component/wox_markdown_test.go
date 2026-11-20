@@ -95,7 +95,7 @@ func TestMarkdownListUsesCompactNestedGutters(t *testing.T) {
 }
 
 func TestParseMarkdownNestsUnderIndentedOrderedLists(t *testing.T) {
-	document := ParseMarkdown("Create an app:\n1. **App Name**: Wox\n2. **App description**: Wox spotify plugin\n3. **Website**: https://github.com/Wox-launcher/Wox\n4. **Redirect URIs**:\n  1. wox://plugin/aeb94d3d-9c39-4917-9cd0-a4cde95433a2?action=spotify-access-token\n  2. wox://plugin/aeb94d3d-9c39-4917-9cd0-a4cde95433a2?action=spotify-auth\n5. **Which API/SDKs are you planning to use**: Web API")
+	document := ParseMarkdown("Create an app:\n1. **App Name**: Wox\n2. **App description**: Wox spotify plugin\n3. **Website**: https://github.com/poplknight/Wox\n4. **Redirect URIs**:\n  1. wox://plugin/aeb94d3d-9c39-4917-9cd0-a4cde95433a2?action=spotify-access-token\n  2. wox://plugin/aeb94d3d-9c39-4917-9cd0-a4cde95433a2?action=spotify-auth\n5. **Which API/SDKs are you planning to use**: Web API")
 	if len(document.blocks) != 2 || document.blocks[1].kind != markdownList {
 		t.Fatalf("blocks = %#v, want an intro paragraph and one list", document.blocks)
 	}
@@ -238,7 +238,7 @@ func TestParseMarkdownRejectsUnsafeLinksWithoutDroppingText(t *testing.T) {
 }
 
 func TestMarkdownLinkOpensFromPointerAction(t *testing.T) {
-	document := ParseMarkdown(`[#4497](https://github.com/Wox-launcher/Wox/issues/4497)`)
+	document := ParseMarkdown(`[#4497](https://github.com/poplknight/Wox/issues/4497)`)
 	opened := ""
 	widget := renderMarkdownBlock(document.blocks[0], MarkdownProps{
 		ID: "preview", Theme: ControlTheme{Focus: woxui.Color{R: 255, G: 255, B: 255, A: 255}}, OnOpenLink: func(target string) { opened = target },
@@ -250,7 +250,7 @@ func TestMarkdownLinkOpensFromPointerAction(t *testing.T) {
 	gesture := focusable.Child.(woxwidget.Gesture)
 	gesture.OnTap()
 
-	if opened != "https://github.com/Wox-launcher/Wox/issues/4497" {
+	if opened != "https://github.com/poplknight/Wox/issues/4497" {
 		t.Fatalf("opened link = %q, want the Wox issue URL", opened)
 	}
 	if gesture.Cursor != woxui.PointerCursorHand {
@@ -261,7 +261,7 @@ func TestMarkdownLinkOpensFromPointerAction(t *testing.T) {
 		t.Fatalf("link style = %#v, want the issue label with document accent and underline", text)
 	}
 	opened = ""
-	if !focusable.OnKey(woxui.KeyEvent{Key: woxui.KeyEnter, Down: true}) || opened != "https://github.com/Wox-launcher/Wox/issues/4497" {
+	if !focusable.OnKey(woxui.KeyEvent{Key: woxui.KeyEnter, Down: true}) || opened != "https://github.com/poplknight/Wox/issues/4497" {
 		t.Fatalf("keyboard activation opened %q, want the Wox issue URL", opened)
 	}
 }

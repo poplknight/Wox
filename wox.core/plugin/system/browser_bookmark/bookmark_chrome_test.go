@@ -17,7 +17,7 @@ func TestLoadChromiumBookmarkFiles_ReadsAccountBookmarksWhenBookmarksIsEmpty(t *
 	writeChromiumBookmarkJSON(t, filepath.Join(profileDir, "Bookmarks"))
 	writeChromiumBookmarkJSON(t, filepath.Join(profileDir, "AccountBookmarks"),
 		chromiumBookmarkEntry{Name: "GitHub", URL: "https://github.com"},
-		chromiumBookmarkEntry{Name: "Wox", URL: "https://github.com/Wox-launcher/Wox"},
+		chromiumBookmarkEntry{Name: "Wox", URL: "https://github.com/poplknight/Wox"},
 	)
 	require.NoError(t, os.WriteFile(filepath.Join(profileDir, "EncryptedBookmarks"), []byte("not-json"), 0o600))
 

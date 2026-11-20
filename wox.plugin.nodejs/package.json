@@ -4,7 +4,7 @@
   "description": "All nodejs plugin for Wox should use types in this package",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Wox-launcher/Wox.git"
+    "url": "https://github.com/poplknight/Wox.git"
   },
   "type": "module",
   "main": "./dist/index.js",

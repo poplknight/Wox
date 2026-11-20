@@ -16,7 +16,7 @@ For **single-file SDK plugins**, host the plugin on a public GitHub gist. That i
 1. Ensure the user already has a fork of `Wox-launcher/Wox`, or create one.
 2. Read the current plugin (packaged repo, or the single-file `.js`/`.py` header) before touching the store repo.
 3. Validate that the plugin has enough public metadata and release assets for a store entry, including at least one public screenshot of the plugin running in Wox.
-4. Clone the user's fork into a temporary directory and add `upstream` for `https://github.com/Wox-launcher/Wox`.
+4. Clone the user's fork into a temporary directory and add `upstream` for `https://github.com/poplknight/Wox`.
 5. Check upstream `store-plugin.json` for the current plugin ID.
 6. Stop and tell the user not to submit when the ID already exists.
 7. Add the new store entry when the ID is absent.
@@ -43,7 +43,7 @@ For CLI-driven fork handling:
 
 For web fallback:
 
-- direct the user to `https://github.com/Wox-launcher/Wox/fork`
+- direct the user to `https://github.com/poplknight/Wox/fork`
 - wait for the user to confirm the fork is ready
 - continue by cloning the fork repository, not the upstream repository
 

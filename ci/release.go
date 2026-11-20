@@ -289,11 +289,11 @@ func updateUpdaterJson(version string) error {
 	tag := "v" + version
 	content := fmt.Sprintf(`{
   "Version": "%s",
-  "MacArm64DownloadUrl": "https://github.com/Wox-launcher/Wox/releases/download/%s/wox-mac-arm64.dmg",
+  "MacArm64DownloadUrl": "https://github.com/poplknight/Wox/releases/download/%s/wox-mac-arm64.dmg",
   "MacArm64Checksum": "",
-  "WindowsDownloadUrl": "https://github.com/Wox-launcher/Wox/releases/download/%s/wox-windows-amd64.exe",
+  "WindowsDownloadUrl": "https://github.com/poplknight/Wox/releases/download/%s/wox-windows-amd64.exe",
   "WindowsChecksum": "",
-  "LinuxDownloadUrl": "https://github.com/Wox-launcher/Wox/releases/download/%s/wox-linux-amd64",
+  "LinuxDownloadUrl": "https://github.com/poplknight/Wox/releases/download/%s/wox-linux-amd64",
   "LinuxChecksum": "",
   "ReleaseNotes": ""
 }

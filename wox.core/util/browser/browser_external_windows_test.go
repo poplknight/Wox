@@ -21,7 +21,7 @@ func TestExternalURLLaunchPreservesRawLink(t *testing.T) {
 		wantDetect bool
 		wantShell  bool
 	}{
-		{name: "https ignores stale browser", url: "https://github.com/Wox-launcher/Wox", browserID: BrowserIDChrome, wantShell: true},
+		{name: "https ignores stale browser", url: "https://github.com/poplknight/Wox", browserID: BrowserIDChrome, wantShell: true},
 		{name: "http ignores stale browser", url: "http://www.wox.one", browserID: BrowserIDChrome, wantShell: true},
 		{name: "short checkout", url: "https://checkout.stripe.com/c/pay/cs_live_abc#fidk+Unmodified%2Fpart", browserID: BrowserIDChrome, wantShell: true},
 		{name: "shell length boundary", url: webPrefix + strings.Repeat("a", 2048-len(webPrefix)), browserID: BrowserIDChrome, wantShell: true},

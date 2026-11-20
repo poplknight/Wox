@@ -15,27 +15,27 @@
   - [`Notes`] 在侧边栏整理和置顶笔记，搜索笔记，并在打开的笔记中查找文字。
   - [`AI Chat`] 搜索对话历史，并在设置中测试服务商连接。并支持项目分组。
   - [`Linux`] 在 Hyprland 上唤起已运行的应用窗口，包括切换到其他工作区，并可选择窗口截图。应用结果可显示 CPU 和内存占用。Omarchy 上可使用选中的文字搜索。
-  - [`Web Search`] 可直接在 Wox 中打开保存的网站和搜索，并选择让页面在后台运行。**已有 WebView 网站会迁移到 Web Search**。查询热键可打开不带结果列表的预览。 [#4659](https://github.com/Wox-launcher/Wox/issues/4659)
-  - [`Hotkey`] 可选择使用 Emacs 或 Vim 风格按键浏览结果和操作面板，并自定义筛选快捷键。 [#4682](https://github.com/Wox-launcher/Wox/issues/4682)
+  - [`Web Search`] 可直接在 Wox 中打开保存的网站和搜索，并选择让页面在后台运行。**已有 WebView 网站会迁移到 Web Search**。查询热键可打开不带结果列表的预览。 [#4659](https://github.com/poplknight/Wox/issues/4659)
+  - [`Hotkey`] 可选择使用 Emacs 或 Vim 风格按键浏览结果和操作面板，并自定义筛选快捷键。 [#4682](https://github.com/poplknight/Wox/issues/4682)
   - [`Screenshot`] 压缩 MP4 录制文件，并在保存时显示进度。
-  - [`Quick Jump`] 切换文件对话框到已打开的文件夹时，支持使用 Directory Opus。 [#4670](https://github.com/Wox-launcher/Wox/pull/4670) [@momadacoding](https://github.com/momadacoding)
+  - [`Quick Jump`] 切换文件对话框到已打开的文件夹时，支持使用 Directory Opus。 [#4670](https://github.com/poplknight/Wox/pull/4670) [@momadacoding](https://github.com/momadacoding)
   - [`Plugin`] 可使用 `wpm update` 更新命令更新已安装的插件。
 
 - Fix
   - [`Clipboard`] 修复剪贴板历史较大时搜索响应缓慢，包括含有大量图片或长文本的历史。
   - [`Query`] 修复零散字母匹配排在紧密匹配之前，以及不相关的历史搜索影响结果排序。
-  - [`Launcher`] 修复显示器缩放比例不同时启动器出现在错误屏幕，并更可靠地恢复窗口位置。 [#4680](https://github.com/Wox-launcher/Wox/issues/4680)
+  - [`Launcher`] 修复显示器缩放比例不同时启动器出现在错误屏幕，并更可靠地恢复窗口位置。 [#4680](https://github.com/poplknight/Wox/issues/4680)
   - [`Screenshot`] 修复编辑工具栏出现在其他屏幕，以及 Linux 录制画面包含录制边框。
-  - [`Windows`] 恢复可调整大小的 Wox 窗口的贴靠功能，并修复启用软件渲染时隐藏 Wox 导致卡死。 [#4637](https://github.com/Wox-launcher/Wox/issues/4637)
-  - [`Browser`] 修复 Windows 上 Wox 链接未使用默认浏览器打开。 [#4674](https://github.com/Wox-launcher/Wox/issues/4674)
+  - [`Windows`] 恢复可调整大小的 Wox 窗口的贴靠功能，并修复启用软件渲染时隐藏 Wox 导致卡死。 [#4637](https://github.com/poplknight/Wox/issues/4637)
+  - [`Browser`] 修复 Windows 上 Wox 链接未使用默认浏览器打开。 [#4674](https://github.com/poplknight/Wox/issues/4674)
 
 - Store
   - Plugin
-    - [Asyntai AI Chatbot](https://asyntai.com/documentation/integrations/wox/) Read your website chats, leads and tickets, and ask your Asyntai AI chatbot, right from Wox. [#4672](https://github.com/Wox-launcher/Wox/pull/4672) [@asyntai](https://github.com/asyntai)
-    - [TOTP Codes](https://github.com/sqlwwx/Wox.Plugin.Totp) TOTP 验证码查询/复制，本地存储，支持 otpauth:// 添加 [#4676](https://github.com/Wox-launcher/Wox/pull/4676) [@sqlwwx](https://github.com/sqlwwx)
+    - [Asyntai AI Chatbot](https://asyntai.com/documentation/integrations/wox/) Read your website chats, leads and tickets, and ask your Asyntai AI chatbot, right from Wox. [#4672](https://github.com/poplknight/Wox/pull/4672) [@asyntai](https://github.com/asyntai)
+    - [TOTP Codes](https://github.com/sqlwwx/Wox.Plugin.Totp) TOTP 验证码查询/复制，本地存储，支持 otpauth:// 添加 [#4676](https://github.com/poplknight/Wox/pull/4676) [@sqlwwx](https://github.com/sqlwwx)
     - [Window Pin](https://gist.github.com/qianlifeng/03c57db33077eda40b352dc6aa67c039) Keep Windows applications above other windows [@qianlifeng](https://github.com/qianlifeng)
   - Theme
-    - [西方油画](https://github.com/dragonish/Wox.Theme.WesternOilPainting) 鼠尾草绿、赭金与天青笔触的油画外框，配暖白画布内容区、粉色搜索框、金色工具栏与深焦茶选中。 [#4678](https://github.com/Wox-launcher/Wox/pull/4678) [@dragonish](https://github.com/dragonish)
+    - [西方油画](https://github.com/dragonish/Wox.Theme.WesternOilPainting) 鼠尾草绿、赭金与天青笔触的油画外框，配暖白画布内容区、粉色搜索框、金色工具栏与深焦茶选中。 [#4678](https://github.com/poplknight/Wox/pull/4678) [@dragonish](https://github.com/dragonish)
 
 ## v2.4.8 - 2026-10-25
 
@@ -44,11 +44,11 @@
 
 - Improve
   - [`File Search`] 加快文件名和路径搜索，整理文件列表时更省内存。改进拼音匹配，匹配程度相同时优先显示较短名称，回收站中的文件排在最后。可设置不带 `f` 关键词搜索时显示的文件数量。
-  - [`App`] 支持用 Ctrl/Cmd+Enter 请求打开应用新窗口 [#4657](https://github.com/Wox-launcher/Wox/issues/4657)。Windows 上可搜索并打开控制面板项目和任务。减少扫描，同时保持应用列表及时更新。
+  - [`App`] 支持用 Ctrl/Cmd+Enter 请求打开应用新窗口 [#4657](https://github.com/poplknight/Wox/issues/4657)。Windows 上可搜索并打开控制面板项目和任务。减少扫描，同时保持应用列表及时更新。
   - [`Folder`] 支持用 `cd` 或自定义的 Folder 关键词浏览文件夹，从文件搜索按 Shift+Enter 进入时也会沿用该关键词。预览默认收起，需要时再打开。
   - [`Screenshot`] 可将截图保存到自选文件夹，包括 OneDrive 文件夹。已有截图会自动迁移，迁移期间仍可搜索。Windows 上支持使用通过 Scoop 安装的 FFmpeg 录制，且不会弹出控制台窗口。
   - [`Preview`] 支持插件预览实时更新，同时保留滚动位置、选中文字和动画。重新唤起 Wox 时刷新预览内容。
-  - [`Settings`] 支持使用软件渲染来绕过显卡驱动问题，并提供「重启 Wox」按钮使更改生效。也可直接搜索「重启 Wox」命令 [#4637](https://github.com/Wox-launcher/Wox/issues/4637)。
+  - [`Settings`] 支持使用软件渲染来绕过显卡驱动问题，并提供「重启 Wox」按钮使更改生效。也可直接搜索「重启 Wox」命令 [#4637](https://github.com/poplknight/Wox/issues/4637)。
   - [`Feedback`] 可重启进入调试模式，收集更详细的崩溃和卡顿信息。开启时会显示调试模式标签。
   - [`Linux`] 改善设置中输入和滚动时的响应速度。
 
@@ -56,21 +56,21 @@
   - [`File Search`] 修复文件变化后结果缺失或未及时更新。macOS 系统最近文件列表为空或不可用时，改为显示最近修改的文件。
   - [`Quick Jump`] 确保当前文件夹中的文件排在其他位置的匹配结果之前。
   - [`Query`] 备用搜索始终排在普通匹配结果之后，即使经常使用也不会抢占前排。
-  - [`App`] 修复 Windows 应用图标缺失，以及快捷方式未显示自定义图标 [#4665](https://github.com/Wox-launcher/Wox/issues/4665)。Linux 上，修复其他应用启动项不可用时，新安装的应用迟迟不出现。
-  - [`Plugin`] 修复上级文件夹中的无关文件导致 Node.js 插件无法启动。启动失败时及时显示实际原因，避免长时间等待连接超时 [#4651](https://github.com/Wox-launcher/Wox/issues/4651)。
-  - [`Settings`] 修复插件多选设置丢失已有选项、插件提供的设置未显示，以及设置实时刷新时丢失编辑内容或按钮失效。 [#4644](https://github.com/Wox-launcher/Wox/pull/4644) [@stmluyuer](https://github.com/stmluyuer) [#4647](https://github.com/Wox-launcher/Wox/pull/4647) [@dragonish](https://github.com/dragonish)
-  - [`AI Chat`] 修复 Windows 上启动器隐藏时，对话窗口有时不显示回答 [#4646](https://github.com/Wox-launcher/Wox/issues/4646)。
-  - [`Windows`] 修复启用软件渲染时隐藏 Wox 导致卡死 [#4637](https://github.com/Wox-launcher/Wox/issues/4637)。修复长时间使用后窗口空白、图标缺失和文件选择器无法打开 [#4639](https://github.com/Wox-launcher/Wox/issues/4639)。
+  - [`App`] 修复 Windows 应用图标缺失，以及快捷方式未显示自定义图标 [#4665](https://github.com/poplknight/Wox/issues/4665)。Linux 上，修复其他应用启动项不可用时，新安装的应用迟迟不出现。
+  - [`Plugin`] 修复上级文件夹中的无关文件导致 Node.js 插件无法启动。启动失败时及时显示实际原因，避免长时间等待连接超时 [#4651](https://github.com/poplknight/Wox/issues/4651)。
+  - [`Settings`] 修复插件多选设置丢失已有选项、插件提供的设置未显示，以及设置实时刷新时丢失编辑内容或按钮失效。 [#4644](https://github.com/poplknight/Wox/pull/4644) [@stmluyuer](https://github.com/stmluyuer) [#4647](https://github.com/poplknight/Wox/pull/4647) [@dragonish](https://github.com/dragonish)
+  - [`AI Chat`] 修复 Windows 上启动器隐藏时，对话窗口有时不显示回答 [#4646](https://github.com/poplknight/Wox/issues/4646)。
+  - [`Windows`] 修复启用软件渲染时隐藏 Wox 导致卡死 [#4637](https://github.com/poplknight/Wox/issues/4637)。修复长时间使用后窗口空白、图标缺失和文件选择器无法打开 [#4639](https://github.com/poplknight/Wox/issues/4639)。
 
 - Store
   - Plugin
-    - [端口生成器](https://github.com/dragonish/Wox.Plugin.PortGenerator) 检查端口占用 / 生成随机可用端口。 [#4635](https://github.com/Wox-launcher/Wox/pull/4635) [@dragonish](https://github.com/dragonish)
-    - [ASCII 艺术字生成器](https://github.com/dragonish/Wox.Plugin.ASCIIArtGenerator) 生成 ASCII 艺术字符串。 [#4655](https://github.com/Wox-launcher/Wox/pull/4655) [@dragonish](https://github.com/dragonish)
-    - [颜文字](https://github.com/dragonish/Wox.Plugin.Kaomoji) 搜索并复制颜文字。 [#4662](https://github.com/Wox-launcher/Wox/pull/4662) [@dragonish](https://github.com/dragonish)
+    - [端口生成器](https://github.com/dragonish/Wox.Plugin.PortGenerator) 检查端口占用 / 生成随机可用端口。 [#4635](https://github.com/poplknight/Wox/pull/4635) [@dragonish](https://github.com/dragonish)
+    - [ASCII 艺术字生成器](https://github.com/dragonish/Wox.Plugin.ASCIIArtGenerator) 生成 ASCII 艺术字符串。 [#4655](https://github.com/poplknight/Wox/pull/4655) [@dragonish](https://github.com/dragonish)
+    - [颜文字](https://github.com/dragonish/Wox.Plugin.Kaomoji) 搜索并复制颜文字。 [#4662](https://github.com/poplknight/Wox/pull/4662) [@dragonish](https://github.com/dragonish)
   - Theme
-    - [Dracula](https://gist.github.com/dragonish/c6118868fc93e7519ef1d11b2a5b0248) A dark theme inspired by the Dracula palette: near-black background, soft-white text, purple selection and cyan accents. Unofficial, not affiliated with Dracula Theme. [#4640](https://github.com/Wox-launcher/Wox/pull/4640) [@dragonish](https://github.com/dragonish)
-    - [墨分五色](https://gist.github.com/dragonish/2cf9d018af5fd48991be9de497128d81) 宣纸背景，配以五种墨色——焦墨、浓墨、重墨、淡墨和清墨——并以一枚朱砂印章作为点缀。 [#4641](https://github.com/Wox-launcher/Wox/pull/4641) [@dragonish](https://github.com/dragonish)
-    - [黛](https://gist.github.com/dragonish/9278791e2a2e09ee4281f97a45545730) 深邃的蓝黑色黛底，月白色的文字，矿物淡石青的点缀，以及一道朱砂印章笔触。 [#4642](https://github.com/Wox-launcher/Wox/pull/4642) [@dragonish](https://github.com/dragonish)
+    - [Dracula](https://gist.github.com/dragonish/c6118868fc93e7519ef1d11b2a5b0248) A dark theme inspired by the Dracula palette: near-black background, soft-white text, purple selection and cyan accents. Unofficial, not affiliated with Dracula Theme. [#4640](https://github.com/poplknight/Wox/pull/4640) [@dragonish](https://github.com/dragonish)
+    - [墨分五色](https://gist.github.com/dragonish/2cf9d018af5fd48991be9de497128d81) 宣纸背景，配以五种墨色——焦墨、浓墨、重墨、淡墨和清墨——并以一枚朱砂印章作为点缀。 [#4641](https://github.com/poplknight/Wox/pull/4641) [@dragonish](https://github.com/dragonish)
+    - [黛](https://gist.github.com/dragonish/9278791e2a2e09ee4281f97a45545730) 深邃的蓝黑色黛底，月白色的文字，矿物淡石青的点缀，以及一道朱砂印章笔触。 [#4642](https://github.com/poplknight/Wox/pull/4642) [@dragonish](https://github.com/dragonish)
 
 ## v2.4.7 - 2026-10-15
 
@@ -87,7 +87,7 @@
   - [`Screenshot`] 可选中指针下的按钮或窗口内其他区域，用滚轮选择更大的上层区域。可拖动编辑工具栏，更快粘贴截图，保存的截图也会跟随自定义用户数据目录。
   - [`App`] 支持将 macOS 应用移到废纸篓来卸载。更新应用列表时更省 CPU，Windows 应用网格的列表更简洁，图标更清晰。
   - [`File Search`] 无需输入 `f` 关键词，也能在搜索中找到文件。
-  - [`Converter`] 可选择默认显示货币，或跟随系统地区，货币计算时不必再指定目标货币。 [#4619](https://github.com/Wox-launcher/Wox/pull/4619) [@mtsgsr](https://github.com/mtsgsr)
+  - [`Converter`] 可选择默认显示货币，或跟随系统地区，货币计算时不必再指定目标货币。 [#4619](https://github.com/poplknight/Wox/pull/4619) [@mtsgsr](https://github.com/mtsgsr)
   - [`Notes`] 可在结果旁预览笔记及其中的图片，并查看最后更新时间。
   - [`Hotkey`] 用 Ctrl/Cmd+, 打开设置，用 Ctrl/Cmd+W 关闭当前窗口或内嵌网页。从笔记或 AI 对话中打开设置时，会直接进入对应插件的设置页。
   - [`Query`] 撤销或重做查询时，恢复之前选中的结果。
@@ -97,20 +97,20 @@
 
 - Fix
   - [`Query`] 置顶结果显示在所有分组之前，且仅对保存置顶时的查询生效。刷新时保留可见结果，备用搜索也不再等待响应较慢的插件。
-  - [`Clipboard`] 修复从 Wox 复制的文字和图片没有出现在剪贴板历史中 [#4620](https://github.com/Wox-launcher/Wox/issues/4620)。
-  - [`Plugin`] 修复使用相同入口文件名的 Python 插件互相干扰 [#4628](https://github.com/Wox-launcher/Wox/issues/4628)。
+  - [`Clipboard`] 修复从 Wox 复制的文字和图片没有出现在剪贴板历史中 [#4620](https://github.com/poplknight/Wox/issues/4620)。
+  - [`Plugin`] 修复使用相同入口文件名的 Python 插件互相干扰 [#4628](https://github.com/poplknight/Wox/issues/4628)。
   - [`Backup`] 修复恢复备份时文件仍被占用的问题，并防止恢复的数据被较旧的云端数据覆盖。跳过无法读取的插件文件，避免整个备份中断。
-  - [`Notes`] 修复输入 `- [ ] ` 没有创建待办事项。 [#4618](https://github.com/Wox-launcher/Wox/pull/4618) [@lmgarret](https://github.com/lmgarret)
+  - [`Notes`] 修复输入 `- [ ] ` 没有创建待办事项。 [#4618](https://github.com/poplknight/Wox/pull/4618) [@lmgarret](https://github.com/lmgarret)
   - [`Settings`] 文本输入框在焦点移开后保存，关闭代理后正确应用更改，并恢复 macOS 设置窗口的拖动。
   - [`Theme`] 修复主题包含其他 Wox 版本的选项时无法加载。
   - [`Windows`] 修复关闭网页预览并隐藏 Wox 后，内存仍未释放。
 
 - Store
   - Plugin
-    - [Wox.Plugin.Manasikāra](https://github.com/Archetype444/Wox.Plugin.Manasikara) Continuous focus and deep focus, three Pomodoro variants, meditation and countdown timers with configurable singing-bowl chimes and activity prompts. [#4621](https://github.com/Wox-launcher/Wox/pull/4621) [@Archetype444](https://github.com/Archetype444)
-    - [Nbnhhsh](https://github.com/dragonish/Wox.Plugin.Nbnhhsh) 「能不能好好说话？」拼音首字母缩写翻译工具 [#4624](https://github.com/Wox-launcher/Wox/pull/4624) [@dragonish](https://github.com/dragonish)
-    - [PowerToys](https://github.com/dragonish/Wox.Plugin.PowerToys) 允许用户从 Wox 启动某些 PowerToys 程序。 [#4626](https://github.com/Wox-launcher/Wox/pull/4626) [@dragonish](https://github.com/dragonish)
-    - [QRCode](https://github.com/dragonish/Wox.Plugin.QRCode) 生成二维码 / 截图识别二维码。 [#4630](https://github.com/Wox-launcher/Wox/pull/4630) [@dragonish](https://github.com/dragonish)
+    - [Wox.Plugin.Manasikāra](https://github.com/Archetype444/Wox.Plugin.Manasikara) Continuous focus and deep focus, three Pomodoro variants, meditation and countdown timers with configurable singing-bowl chimes and activity prompts. [#4621](https://github.com/poplknight/Wox/pull/4621) [@Archetype444](https://github.com/Archetype444)
+    - [Nbnhhsh](https://github.com/dragonish/Wox.Plugin.Nbnhhsh) 「能不能好好说话？」拼音首字母缩写翻译工具 [#4624](https://github.com/poplknight/Wox/pull/4624) [@dragonish](https://github.com/dragonish)
+    - [PowerToys](https://github.com/dragonish/Wox.Plugin.PowerToys) 允许用户从 Wox 启动某些 PowerToys 程序。 [#4626](https://github.com/poplknight/Wox/pull/4626) [@dragonish](https://github.com/dragonish)
+    - [QRCode](https://github.com/dragonish/Wox.Plugin.QRCode) 生成二维码 / 截图识别二维码。 [#4630](https://github.com/poplknight/Wox/pull/4630) [@dragonish](https://github.com/dragonish)
 
 ## v2.4.6 - 2026-10-06
 
@@ -120,12 +120,12 @@
 - Improve
   - [`Screenshot`] 可截取窗口或任意区域，在图上涂写，并保存为 PNG 或 GIF、WebP、MP4 短动画。按 Space 把壁纸铺在选区后面，也可从历史或剪贴板再次编辑。
   - [`Folder`] 文件夹列表以 `..` 开头，Enter 返回上一级。Shift+Enter 在 Wox 里打开文件夹，或文件所在的文件夹。
-  - [`Clipboard`] 再次复制链接后，搜索时显示网页标题和图片。Hyprland、X11 和 Plasma 上，复制的文字可以显示来源应用。未开启「默认显示收藏项」时，普通列表不显示收藏，`cb fav` 按使用次数排序 [#4592](https://github.com/Wox-launcher/Wox/issues/4592)。
+  - [`Clipboard`] 再次复制链接后，搜索时显示网页标题和图片。Hyprland、X11 和 Plasma 上，复制的文字可以显示来源应用。未开启「默认显示收藏项」时，普通列表不显示收藏，`cb fav` 按使用次数排序 [#4592](https://github.com/poplknight/Wox/issues/4592)。
   - [`Converter`] 支持 156 种货币，并区分 Mbps 和 MBps。
   - [`Calculator`] 计算时可使用数字分隔符，例如 `1,000` 或 `1_000`。
   - [`Preview`] 可用 Ctrl/Cmd+P 打开收起的预览，源代码文件显示为带颜色的代码。
-  - [`Launcher`] 界面大小也用于聊天、设置和其他窗口 [#4586](https://github.com/Wox-launcher/Wox/issues/4586)。可选择启动器出现在哪块屏幕 [#4597](https://github.com/Wox-launcher/Wox/issues/4597)。工具栏只保留主要操作。
-  - [`Hotkey`] 可单独用 Windows 键唤起启动器，开始菜单保持关闭 [#4595](https://github.com/Wox-launcher/Wox/issues/4595)。
+  - [`Launcher`] 界面大小也用于聊天、设置和其他窗口 [#4586](https://github.com/poplknight/Wox/issues/4586)。可选择启动器出现在哪块屏幕 [#4597](https://github.com/poplknight/Wox/issues/4597)。工具栏只保留主要操作。
+  - [`Hotkey`] 可单独用 Windows 键唤起启动器，开始菜单保持关闭 [#4595](https://github.com/poplknight/Wox/issues/4595)。
   - [`Theme`] 在桌面支持时模糊启动器背景，并可调节工具栏的磨砂程度。
   - [`Cloud Sync`] 同步状态显示 Free 或 Pro、等待同步的数量，以及每次同步的大小。
   - [`AI Chat`] 可跨段落、列表和代码选中并复制回答。
@@ -133,16 +133,16 @@
   - [`Feedback`] 可只用内置插件重启来排查问题。提示会一直显示，直到正常启动并恢复其他插件。
 
 - Fix
-  - [`Query`] 修复没有结果时搜索一直转圈：已禁用的插件仍会被询问 [#4615](https://github.com/Wox-launcher/Wox/issues/4615)。粘贴的查询会去掉开头和结尾的空行。
-  - [`AI Chat`] 修复从选中内容、文件或历史打开聊天时，自定义关键词不生效 [#4611](https://github.com/Wox-launcher/Wox/issues/4611)。
-  - [`App`] 修复同一个 Windows 程序同时以快捷方式和可执行文件出现时列出多条 [#4599](https://github.com/Wox-launcher/Wox/issues/4599)。
+  - [`Query`] 修复没有结果时搜索一直转圈：已禁用的插件仍会被询问 [#4615](https://github.com/poplknight/Wox/issues/4615)。粘贴的查询会去掉开头和结尾的空行。
+  - [`AI Chat`] 修复从选中内容、文件或历史打开聊天时，自定义关键词不生效 [#4611](https://github.com/poplknight/Wox/issues/4611)。
+  - [`App`] 修复同一个 Windows 程序同时以快捷方式和可执行文件出现时列出多条 [#4599](https://github.com/poplknight/Wox/issues/4599)。
   - [`Screenshot`] 修复钉住的截图被其他窗口挡住。
   - [`Launcher`] 修复从开始页移除一项后启动器关闭，以及清空热键或链接带入的查询后不回到最近使用。
   - [`Notes`] 修复在预览中插入文字后标题级别跑到别的行，以及图片滚出屏幕后高度变化。
   - [`Color`] 修复搜索过的颜色没有记入历史。
-  - [`Hotkey`] 修复 Wox 无法接管的 Windows 键组合，Win+L 仍会锁定电脑 [#4604](https://github.com/Wox-launcher/Wox/issues/4604)。GNOME 上，Wox 注册热键后，残留的自定义快捷键不再抢走按键。
-  - [`Onboarding`] 修复 macOS 首次引导跳过权限步骤 [#4603](https://github.com/Wox-launcher/Wox/issues/4603)。
-  - [`Plugin`] 修复插件重新连接后操作没有反应 [#4588](https://github.com/Wox-launcher/Wox/issues/4588)。修复 Windows 上插件文件解压到错误目录，以及从开始页打开插件时使用了 `*` 而不是关键词。
+  - [`Hotkey`] 修复 Wox 无法接管的 Windows 键组合，Win+L 仍会锁定电脑 [#4604](https://github.com/poplknight/Wox/issues/4604)。GNOME 上，Wox 注册热键后，残留的自定义快捷键不再抢走按键。
+  - [`Onboarding`] 修复 macOS 首次引导跳过权限步骤 [#4603](https://github.com/poplknight/Wox/issues/4603)。
+  - [`Plugin`] 修复插件重新连接后操作没有反应 [#4588](https://github.com/poplknight/Wox/issues/4588)。修复 Windows 上插件文件解压到错误目录，以及从开始页打开插件时使用了 `*` 而不是关键词。
   - [`Icon`] 修复部分应用图标变成纯黑，例如 Code - OSS。
 
 - Store
@@ -151,7 +151,7 @@
     - [Stopwatch](https://github.com/lmgarret/wox-stopwatch-plugin) Stopwatch with laps, live in the launcher [@lmgarret](https://github.com/lmgarret)
     - [天气](https://gist.github.com/qianlifeng/25d66a91de168cb7e210f2cf756960c2) 用 wttr.in 查看当前天气和未来几天。 [@qianlifeng](https://github.com/qianlifeng)
     - [词数统计](https://gist.github.com/qianlifeng/bf1b14e74b6cbecd6fcc8fc6ede94f7f) 统计查询文本或选中文本中的词数及文本信息 [@qianlifeng](https://github.com/qianlifeng)
-    - [游戏](https://github.com/Wox-launcher/Wox.Plugin.Games) 搜索 Steam、Epic、GOG、Ubisoft Connect、EA、Battle.net、Xbox 和 itch.io 里已安装的游戏。 [@Wox-launcher](https://github.com/Wox-launcher)
+    - [游戏](https://github.com/poplknight/Wox.Plugin.Games) 搜索 Steam、Epic、GOG、Ubisoft Connect、EA、Battle.net、Xbox 和 itch.io 里已安装的游戏。 [@Wox-launcher](https://github.com/Wox-launcher)
     - [IMDB](https://gist.github.com/qianlifeng/dc6511115bdde92b3976369c4b675ebe) Search TMDB movies and TV, with posters and ratings [@qianlifeng](https://github.com/qianlifeng)
     - [Clash Verge](https://gist.github.com/qianlifeng/db55c71d2bef5359af515f309be4d23d) 查看本机 Clash Verge 运行状态，并切换代理节点。 [@qianlifeng](https://github.com/qianlifeng)
 
@@ -162,13 +162,13 @@
 
 - Improve
   - [`Theme`] 新增 `.wox-theme`主题格式
-  - [`Web Search`] 用 Ctrl/Cmd+Enter 在启动器里打开搜到的网页 [#4574](https://github.com/Wox-launcher/Wox/issues/4574)。
+  - [`Web Search`] 用 Ctrl/Cmd+Enter 在启动器里打开搜到的网页 [#4574](https://github.com/poplknight/Wox/issues/4574)。
   - [`Launcher`] 可从工具栏或 Ctrl/Cmd+Shift+K 打开关于菜单。
     ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/about_panel.png)
   - [`AI Chat`] 在对话里用 @ 提及插件。
     ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/ai_chat_ask_plugin.png)
   - [`Shell`] 用 Ctrl/Cmd+T 在系统终端打开当前命令。
-  - [`Hotkey`] 全屏时忽略启动器热键 [#4573](https://github.com/Wox-launcher/Wox/issues/4573)，COSMIC 支持全局快捷键 [#4576](https://github.com/Wox-launcher/Wox/issues/4576)。
+  - [`Hotkey`] 全屏时忽略启动器热键 [#4573](https://github.com/poplknight/Wox/issues/4573)，COSMIC 支持全局快捷键 [#4576](https://github.com/poplknight/Wox/issues/4576)。
   - [`Folder`] 可预览文件夹内容，并复制路径或名称。
   - [`Screenshot`] 可将截图发送到 AI 对话，便于你快速向AI询问/总结图片内容
   - [`Clipboard`] 用 `cb fav` 筛选收藏。
@@ -178,9 +178,9 @@
   - [`Confetti`] 用 `wox://confetti` 播放彩纸。
 
 - Fix
-  - [`Shell`] 修复命令输出无法选中复制 [#4581](https://github.com/Wox-launcher/Wox/issues/4581)。
-  - [`App`] 修复 `.exe` 忽略规则隐藏快捷方式 [#4580](https://github.com/Wox-launcher/Wox/issues/4580)。
-  - [`Launcher`] 修复拖入文件被最近列表替换，多屏缩放时位置错误 [#4572](https://github.com/Wox-launcher/Wox/issues/4572)。
+  - [`Shell`] 修复命令输出无法选中复制 [#4581](https://github.com/poplknight/Wox/issues/4581)。
+  - [`App`] 修复 `.exe` 忽略规则隐藏快捷方式 [#4580](https://github.com/poplknight/Wox/issues/4580)。
+  - [`Launcher`] 修复拖入文件被最近列表替换，多屏缩放时位置错误 [#4572](https://github.com/poplknight/Wox/issues/4572)。
   - [`Query`] 修复 `wox://` 链接打开空白启动器。
   - [`Clipboard`] 修复收藏不出现在开始页。
   - [`Settings`] 修复错误提示错位、下拉标签截断和插件路径空白。
@@ -217,18 +217,18 @@
   - [`Converter`] 能理解更多日常计算说法，可解码粘贴的 Base64 或把文本编码为 Base64，支持 `now` / `now in` 问时间，并更可靠地处理播放速度、四舍五入、计圈时间
   ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/converter_now_in_JP.jpg)
   - [`AI`] 支持将 SiliconFlow 作为聊天提供商
-  - [`AI Chat`] 可把文件和图片粘贴或拖进对话 [#4566](https://github.com/Wox-launcher/Wox/issues/4566)，模型和技能列表打开更快，弹出的聊天窗口可用 Escape 关闭，流式回复更顺畅
-  - [`File Search`] 文件名需要包含你输入的每个词才会匹配 [#4560](https://github.com/Wox-launcher/Wox/issues/4560)，并更可靠地搜索 PDF 里的文字 [#4564](https://github.com/Wox-launcher/Wox/issues/4564)
-  - [`App`] 能找到 Windows 商店和「应用」文件夹里的应用，并更快发现新安装的应用 [#4565](https://github.com/Wox-launcher/Wox/issues/4565)
+  - [`AI Chat`] 可把文件和图片粘贴或拖进对话 [#4566](https://github.com/poplknight/Wox/issues/4566)，模型和技能列表打开更快，弹出的聊天窗口可用 Escape 关闭，流式回复更顺畅
+  - [`File Search`] 文件名需要包含你输入的每个词才会匹配 [#4560](https://github.com/poplknight/Wox/issues/4560)，并更可靠地搜索 PDF 里的文字 [#4564](https://github.com/poplknight/Wox/issues/4564)
+  - [`App`] 能找到 Windows 商店和「应用」文件夹里的应用，并更快发现新安装的应用 [#4565](https://github.com/poplknight/Wox/issues/4565)
   - [`Web Search`] 支持在隐私/无痕窗口中打开搜索
-  - [`Plugin`] 打开 `.wox` 文件即可安装插件，能找到 mise 安装的 Node.js 和 Python 且不必重启 Wox [#4569](https://github.com/Wox-launcher/Wox/issues/4569)，从结果里拖出文件后启动器保持打开，Attention 未读数重新显示，并可从通知打开对应插件设置
+  - [`Plugin`] 打开 `.wox` 文件即可安装插件，能找到 mise 安装的 Node.js 和 Python 且不必重启 Wox [#4569](https://github.com/poplknight/Wox/issues/4569)，从结果里拖出文件后启动器保持打开，Attention 未读数重新显示，并可从通知打开对应插件设置
   - [`Notes`] 在预览和 Markdown 之间切换时不再跑掉光标，粘贴图片和文本更可靠，并显示字数
   - [`Launcher`] 可用 Ctrl（macOS 上为 Option）加上下方向键在结果分组间跳转，列表滚动时仍能看到底部工具栏，收藏用星标、置顶用图钉，操作列表会先显示最匹配的项
   - [`Hotkey`] Windows 上可以把 Win+Space 录成 Wox 热键
   - [`Browser Bookmark`] 可用 `b` 搜索书签，在该命令下标题和网址匹配更宽松
   - [`Folder`] 可从文件夹结果打开上一级文件夹
-  - [`Selection`] 更可靠地读取当前选中的文本和文件，包括 Wox 自己的窗口 [#4561](https://github.com/Wox-launcher/Wox/issues/4561) [#4558](https://github.com/Wox-launcher/Wox/issues/4558)
-  - [`Font`] 字体选择器能列出已安装的 Windows 字体 [#4554](https://github.com/Wox-launcher/Wox/issues/4554)
+  - [`Selection`] 更可靠地读取当前选中的文本和文件，包括 Wox 自己的窗口 [#4561](https://github.com/poplknight/Wox/issues/4561) [#4558](https://github.com/poplknight/Wox/issues/4558)
+  - [`Font`] 字体选择器能列出已安装的 Windows 字体 [#4554](https://github.com/poplknight/Wox/issues/4554)
   - [`Updater`] 更新预览显示中文发布说明，更新成功后播放彩纸
 
 - Fix
@@ -248,7 +248,7 @@
   - Theme
     - [Omarchy](https://github.com/basecamp/omarchy) Omarchy 默认 Walker 菜单风格：炭灰卡片、米色描边、整行灰色选中，以及柔和青绿的激活图标。 [@qianlifeng](https://github.com/qianlifeng)
     - Ocean Glass 蓝灰内容面板、原生材质边框和暖黄色强调色。 [@qianlifeng](https://github.com/qianlifeng)
-    - [Wox Saffron](https://github.com/Wox-launcher/Wox) 暖象牙色浅色主题，青绿文字，查询框底部有一条藏红花色下划线。 [@qianlifeng](https://github.com/qianlifeng)
+    - [Wox Saffron](https://github.com/poplknight/Wox) 暖象牙色浅色主题，青绿文字，查询框底部有一条藏红花色下划线。 [@qianlifeng](https://github.com/qianlifeng)
 
 ## v2.4.3 - 2026-09-09
 
@@ -264,16 +264,16 @@
 
 - Improve
   - [`AI`] 将提供商下拉框分为 API 和已安装 CLI，为本地 CLI 提供商品牌图标，并支持搜索列表
-  - [`AI Chat`] 支持把对话弹出到独立窗口，启动器隐藏后仍保留未发送草稿；可附加选中文本、文件和图片且不混入指令；将 `{wox:...}` 占位符作为 token 编辑 [#4543](https://github.com/Wox-launcher/Wox/issues/4543)，并将输入框从一行扩展到最多五行自动换行
+  - [`AI Chat`] 支持把对话弹出到独立窗口，启动器隐藏后仍保留未发送草稿；可附加选中文本、文件和图片且不混入指令；将 `{wox:...}` 占位符作为 token 编辑 [#4543](https://github.com/poplknight/Wox/issues/4543)，并将输入框从一行扩展到最多五行自动换行
   - [`File Search`] 空查询时显示操作系统最近文件，使用 Windows Jump Lists、macOS Spotlight 最近使用日期和 Linux recently-used.xbel
-  - [`Quick Jump`] 将文件资源管理器搜索重命名为 Quick Jump（`jump`），按操作系统保存路径，跳过已忽略应用，可在 Wox 自己的 Windows 选择器中导航，并注入 32 位窗口钩子，使 Foxmail、Office 等 32 位宿主可用 [#4511](https://github.com/Wox-launcher/Wox/issues/4511)
-  - [`App`] 支持从搜索中隐藏，可用通配符或已选应用的忽略规则，并提供匹配预览 [#4537](https://github.com/Wox-launcher/Wox/issues/4537)，同时支持日语（ja_JP）
-  - [`Clipboard`] 支持将剪贴板图片和 emoji 粘贴到当前窗口 [#4538](https://github.com/Wox-launcher/Wox/issues/4538)
+  - [`Quick Jump`] 将文件资源管理器搜索重命名为 Quick Jump（`jump`），按操作系统保存路径，跳过已忽略应用，可在 Wox 自己的 Windows 选择器中导航，并注入 32 位窗口钩子，使 Foxmail、Office 等 32 位宿主可用 [#4511](https://github.com/poplknight/Wox/issues/4511)
+  - [`App`] 支持从搜索中隐藏，可用通配符或已选应用的忽略规则，并提供匹配预览 [#4537](https://github.com/poplknight/Wox/issues/4537)，同时支持日语（ja_JP）
+  - [`Clipboard`] 支持将剪贴板图片和 emoji 粘贴到当前窗口 [#4538](https://github.com/poplknight/Wox/issues/4538)
   - [`Plugin`] 支持查询精炼和静态 HTML 预览、运行时注册触发关键词，以及在 WPM 中复制用于创建插件的 AI 提示
   - [`Launcher`] 支持从操作面板重置结果的使用排名，对系统操作分组，并校验查询需求表单的必填字段
-  - [`Hotkey`] 改进 macOS 热键录制，在缺少辅助功能权限时提示授权，并在全局录制不可用时回退到本地录制 [#4548](https://github.com/Wox-launcher/Wox/issues/4548)
+  - [`Hotkey`] 改进 macOS 热键录制，在缺少辅助功能权限时提示授权，并在全局录制不可用时回退到本地录制 [#4548](https://github.com/poplknight/Wox/issues/4548)
   - [`Preview`] 将大型文本、Office 和 PDF 预览推迟到先显示详情之后，避免快速选择时触发沉重读取
-  - [`Browser`] 改进浏览器窗口识别，使标签页结果始终限定在当前浏览器 [#4542](https://github.com/Wox-launcher/Wox/issues/4542)
+  - [`Browser`] 改进浏览器窗口识别，使标签页结果始终限定在当前浏览器 [#4542](https://github.com/poplknight/Wox/issues/4542)
   - [`Converter`] 将单位、货币、日期和百分比查询扩展为类型化表达式，让嵌套换算、小费、工作日和时区句子可以在一条查询中组合，并提供格式化、原始和问答结果的复制操作
     ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/converter_time.jpg)
   - [`Query`] 支持从操作面板将当前查询保存为快捷方式，并在设置中为查询热键、快捷方式和托盘查询增加查询测试按钮
@@ -282,15 +282,15 @@
 
 - Fix
   - [`App`] 修复图标直接放在 XDG 数据图标目录中的 Linux 应用显示默认图标的问题
-  - [`Quick Jump`] 修复 Windows「移动项目」文件夹选择器，并缩短卡住的窗口钩子等待，避免拖慢对话框导航 [#4511](https://github.com/Wox-launcher/Wox/issues/4511)
+  - [`Quick Jump`] 修复 Windows「移动项目」文件夹选择器，并缩短卡住的窗口钩子等待，避免拖慢对话框导航 [#4511](https://github.com/poplknight/Wox/issues/4511)
   - [`UI`] 修复 Windows 内存压缩时销毁已隐藏 WebView 渲染器的问题，并裁剪覆盖层下的原生文件预览以匹配圆角
   - [`Launcher`] 修复长查询文本的光标位置
-  - [`AI Chat`] 修复应用目录扫描刷新查询时对话大约每 30 秒重置的问题 [#4551](https://github.com/Wox-launcher/Wox/issues/4551)，并在隐藏/显示后保持全屏聊天
+  - [`AI Chat`] 修复应用目录扫描刷新查询时对话大约每 30 秒重置的问题 [#4551](https://github.com/poplknight/Wox/issues/4551)，并在隐藏/显示后保持全屏聊天
 
 - Store
   - Plugin
     - [Linkding](https://github.com/Myraxion/Wox.Plugin.Linkding) 在 Linkding 中搜索、保存和管理书签 [@Myraxion](https://github.com/Myraxion)
-    - [GitHub](https://github.com/Wox-launcher/Wox.Plugin.Github) 管理 GitHub 的 issues 和通知 [@Wox-launcher](https://github.com/Wox-launcher)
+    - [GitHub](https://github.com/poplknight/Wox.Plugin.Github) 管理 GitHub 的 issues 和通知 [@Wox-launcher](https://github.com/Wox-launcher)
     - [Notion](https://github.com/lmgarret/wox-notion-plugin) 在启动器中搜索 Notion 页面和数据库、跳转到最近页面，并快速记录笔记 [@lmgarret](https://github.com/lmgarret)
 
 ## v2.4.2 - 2026-09-03
@@ -303,13 +303,13 @@
   - [`File Search`] 支持在 Windows 上安装服务，通过 MFT 和 USN 为 NTFS 卷建立可选的快速索引；内容搜索目录可与文件名搜索根目录分开配置；全局查询中的文件结果会分组，并支持只显示内容匹配
   - [`Confetti`] 通过 Confetti 命令显示全屏彩纸动画，可尝试查询 `confetti`
     ![](https://raw.githubusercontent.com/Wox-launcher/Wox/refs/heads/master/screenshots/confetti.png)
-  - [`AI Chat`] 支持在设置中用服务器表格配置 MCP 服务器，可导入完整 mcpServers JSON、使用 OAuth，以及按服务器查看工具 [#4529](https://github.com/Wox-launcher/Wox/issues/4529)
+  - [`AI Chat`] 支持在设置中用服务器表格配置 MCP 服务器，可导入完整 mcpServers JSON、使用 OAuth，以及按服务器查看工具 [#4529](https://github.com/poplknight/Wox/issues/4529)
   - [`Wox Memory`] 增加内置内存诊断，可查看 Wox 进程组成，包括 Go 堆、原生和按进程分解，以及实时 Glance
-  - [`Clipboard`] 支持按 OCR 文本搜索剪贴板图片 [#4525](https://github.com/Wox-launcher/Wox/issues/4525)，并改进 macOS 对远程文件 URL 的处理 [#4532](https://github.com/Wox-launcher/Wox/issues/4532)
+  - [`Clipboard`] 支持按 OCR 文本搜索剪贴板图片 [#4525](https://github.com/poplknight/Wox/issues/4525)，并改进 macOS 对远程文件 URL 的处理 [#4532](https://github.com/poplknight/Wox/issues/4532)
   - [`Folder`] 支持对子名称模糊匹配，并在输入时补全父目录路径
   - [`Shell`] 在历史记录中为正在运行的命令显示运行指示
   - [`Launcher`] 改进操作面板搜索别名，使本地化操作仍可通过英文名称和额外词找到
-  - [`Explorer`] 在输入搜索时优先匹配当前目录 [#4527](https://github.com/Wox-launcher/Wox/issues/4527)
+  - [`Explorer`] 在输入搜索时优先匹配当前目录 [#4527](https://github.com/poplknight/Wox/issues/4527)
   - [`Indicator`] 支持按描述和名称匹配插件
   - [`Settings`] 支持从插件设置帮助文本打开链接
   - [`Screenshot`] 将默认截图历史保留天数从 30 天降为 15 天
@@ -320,7 +320,7 @@
 - Fix
   - [`Notes`] 修复新笔记默认不被置顶的问题
   - [`Explorer`] 修复输入搜索对话框提示在焦点交接时过早关闭
-  - [`Launcher`] 将启动器高度限制在显示器工作区内 [#4527](https://github.com/Wox-launcher/Wox/issues/4527)
+  - [`Launcher`] 将启动器高度限制在显示器工作区内 [#4527](https://github.com/poplknight/Wox/issues/4527)
   - [`Clipboard`] 修复 Wox 自己的剪贴板写入被记为新历史条目
   - [`Linux`] 通过超时剪贴板命令，修复 X11 剪贴板读取卡住
   - [`App`] 在 Wox 隐藏后释放 GPU 和数据库缓存，并改进诊断中的原生内存统计

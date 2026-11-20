@@ -20,7 +20,7 @@ coverAlt: 绿色手写 Wox v1 图标通过箭头过渡到白底黑色 W 的 Wox 
 
 WinAlfred 这个名字，意思很直白，就是 Windows 上的 Alfred。后来收到了 Alfred 关于名称的警告信，需要换个名字。在社区朋友 [@Sylv 的建议](https://v2ex.com/t/98605#r_939722)下，最终选了 Wox，取的是 “it just works” 的意思。
 
-2013 到 2015 年，我主要负责 Wox 的开发。2015 年开始，我转向使用 Mac，也把项目从个人账号转到了 Wox-launcher 组织，交由社区继续维护。[bao-qian](https://github.com/bao-qian) 接过了后续的主要维护工作，还有许多[贡献者](https://github.com/Wox-launcher/Wox/graphs/contributors?all=1)一起帮它走了下来。没有他们，Wox 走不到今天，再次感谢。
+2013 到 2015 年，我主要负责 Wox 的开发。2015 年开始，我转向使用 Mac，也把项目从个人账号转到了 Wox-launcher 组织，交由社区继续维护。[bao-qian](https://github.com/bao-qian) 接过了后续的主要维护工作，还有许多[贡献者](https://github.com/poplknight/Wox/graphs/contributors?all=1)一起帮它走了下来。没有他们，Wox 走不到今天，再次感谢。
 
 Wox 曾经是很多 Windows 用户认识启动器的起点。后来维护逐渐跟不上，问题和反馈积压，用户也开始寻找别的选择，社区里有了 Flow Launcher。对于一直留在 Wox 的用户来说，那段等待并不好受。
 
@@ -28,7 +28,7 @@ Wox 曾经是很多 Windows 用户认识启动器的起点。后来维护逐渐�
 
 2023 年，我的空闲时间多了一些，重新注意到这些问题，想把 Wox 拾起来。但有一个很实际的障碍：我的主力电脑仍然是 MacBook Pro，而 Wox v1 是用 .NET 开发、面向 Windows 的应用。
 
-如果我自己都没办法每天使用它，就很难有信心长期维护下去。跨平台的想法是这么来的。2023 年 10 月，我写下了 [Wox v2 的计划](https://github.com/Wox-launcher/Wox/discussions/3937)，开始重写。
+如果我自己都没办法每天使用它，就很难有信心长期维护下去。跨平台的想法是这么来的。2023 年 10 月，我写下了 [Wox v2 的计划](https://github.com/poplknight/Wox/discussions/3937)，开始重写。
 
 这时候，启动器已经有了很多选择。除了 Alfred，还有 Raycast、uTools、Flow Launcher，每个工具都有自己的用户。我也反复想过，既然已经有这么多好用的产品，再做一个 Wox，应该把力气花在哪里？
 
@@ -76,11 +76,11 @@ Wox 曾经是很多 Windows 用户认识启动器的起点。后来维护逐渐�
 
 ## 插件与扩展
 
-内置功能覆盖不了所有人的需要。[插件商店](/zh/store/plugins)里已经有社区贡献的第三方插件，也可以用 Node.js 或 Python 写自己的插件。仓库还提供了 [wox-plugin-creator skill](https://github.com/Wox-launcher/Wox/tree/master/.agents/skills/wox-plugin-creator)，可以把一个具体需求交给支持 skill 的 AI 编程工具，帮助创建插件，再在本机调试。
+内置功能覆盖不了所有人的需要。[插件商店](/zh/store/plugins)里已经有社区贡献的第三方插件，也可以用 Node.js 或 Python 写自己的插件。仓库还提供了 [wox-plugin-creator skill](https://github.com/poplknight/Wox/tree/master/.agents/skills/wox-plugin-creator)，可以把一个具体需求交给支持 skill 的 AI 编程工具，帮助创建插件，再在本机调试。
 
 我一直喜欢启动器的这种可定制性：只用它打开应用也可以，想多做一点，就把自己的脚本和常用工具接进来。
 
-如果你很久没用过 Wox，可以从[安装当前稳定版](/zh/guide/installation)开始，先拿一个每天都要做的操作试试。代码和问题反馈都在 [GitHub](https://github.com/Wox-launcher/Wox)，具体用法也会继续写在这个博客里。
+如果你很久没用过 Wox，可以从[安装当前稳定版](/zh/guide/installation)开始，先拿一个每天都要做的操作试试。代码和问题反馈都在 [GitHub](https://github.com/poplknight/Wox)，具体用法也会继续写在这个博客里。
 
 从 WinAlfred 到 Wox，十三年比当时想象的长很多。谢谢这些年参与维护、提交插件、报告问题，以及一直在用它的人。希望 Wox 还有下一个十三年。
 

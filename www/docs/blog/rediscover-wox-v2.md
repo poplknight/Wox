@@ -20,7 +20,7 @@ Over those thirteen years, it had busy periods and long stretches when maintenan
 
 The original name was straightforward: Alfred for Windows. After receiving a warning from Alfred about the name, I needed to change it. A community member, [@Sylv, suggested Wox](https://v2ex.com/t/98605#r_939722), with the idea of “it just works.” That was the name we kept.
 
-I was the main developer from 2013 to 2015. When I moved to a Mac in 2015, I transferred the project from my personal account to the Wox-launcher organization so the community could continue maintaining it. [bao-qian](https://github.com/bao-qian) took on the main maintenance work, alongside many other [contributors](https://github.com/Wox-launcher/Wox/graphs/contributors?all=1). Wox would not be here today without them. Thank you again.
+I was the main developer from 2013 to 2015. When I moved to a Mac in 2015, I transferred the project from my personal account to the Wox-launcher organization so the community could continue maintaining it. [bao-qian](https://github.com/bao-qian) took on the main maintenance work, alongside many other [contributors](https://github.com/poplknight/Wox/graphs/contributors?all=1). Wox would not be here today without them. Thank you again.
 
 For many Windows users, Wox was their introduction to launchers. Later, maintenance slowed, issues accumulated, and people looked for alternatives. Flow Launcher emerged from the community. For the people who stayed with Wox, that was a long wait.
 
@@ -28,7 +28,7 @@ For many Windows users, Wox was their introduction to launchers. Later, maintena
 
 In 2023, I had a little more spare time and started looking at Wox again. There was an immediate problem: my main machine was still a MacBook Pro, while Wox v1 was a .NET application built for Windows.
 
-I did not feel confident about maintaining an app long term if I could not use it every day. That was where the idea of a cross-platform Wox began. In October 2023, I published the [Wox v2 plan](https://github.com/Wox-launcher/Wox/discussions/3937) and started the rewrite.
+I did not feel confident about maintaining an app long term if I could not use it every day. That was where the idea of a cross-platform Wox began. In October 2023, I published the [Wox v2 plan](https://github.com/poplknight/Wox/discussions/3937) and started the rewrite.
 
 By then, there were plenty of good launchers. Alfred had been joined by Raycast, uTools, Flow Launcher, and others, each with its own users. I kept asking myself where another version of Wox should put its effort.
 
@@ -76,11 +76,11 @@ Enter `sync` to check the current sync status and history, or start a manual syn
 
 ## Plugins
 
-Built-in tools cannot cover every need. The [plugin store](/store/plugins) has community contributions, and you can write your own plugins in Node.js or Python. The repository also includes a [wox-plugin-creator skill](https://github.com/Wox-launcher/Wox/tree/master/.agents/skills/wox-plugin-creator): give a concrete requirement to an AI coding tool that supports skills, let it help create the plugin, then try and debug it locally.
+Built-in tools cannot cover every need. The [plugin store](/store/plugins) has community contributions, and you can write your own plugins in Node.js or Python. The repository also includes a [wox-plugin-creator skill](https://github.com/poplknight/Wox/tree/master/.agents/skills/wox-plugin-creator): give a concrete requirement to an AI coding tool that supports skills, let it help create the plugin, then try and debug it locally.
 
 I have always liked being able to customize a launcher this way. You can use it just to open apps, or connect your own scripts and tools when you want it to do more.
 
-If you have not used Wox for a while, [install the current stable version](/guide/installation) and give it one task you do every day. The code and issue tracker are on [GitHub](https://github.com/Wox-launcher/Wox), and I will keep sharing practical examples on this blog.
+If you have not used Wox for a while, [install the current stable version](/guide/installation) and give it one task you do every day. The code and issue tracker are on [GitHub](https://github.com/poplknight/Wox), and I will keep sharing practical examples on this blog.
 
 Thirteen years is a longer journey than I imagined when I first posted WinAlfred. Thank you to everyone who maintained it, made plugins, reported problems, or kept using it. I hope Wox has another thirteen years ahead.
 

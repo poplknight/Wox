@@ -5,7 +5,7 @@ Wox requires **Node.js 20 or later**. Store install and plugin load fail on olde
 Best practice: clone the official template repo instead of hardcoding a scaffold.
 
 ```bash
-git clone https://github.com/Wox-launcher/Wox.Plugin.Template.Nodejs my-plugin
+git clone https://github.com/poplknight/Wox.Plugin.Template.Nodejs my-plugin
 ```
 
 Before editing a new project, run `make init` in the project root when initialization has not been done yet.

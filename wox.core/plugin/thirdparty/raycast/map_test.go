@@ -293,7 +293,7 @@ func TestMapShortcutTargets(t *testing.T) {
 	}
 	payload := Payload{}
 	payload.Quicklinks.Quicklinks = []Quicklink{
-		{Name: "wox", Link: "https://github.com/Wox-launcher/Wox"},
+		{Name: "wox", Link: "https://github.com/poplknight/Wox"},
 		{Name: "notes", Link: filePath},
 	}
 	payload.Settings.Commands = []Command{
@@ -380,7 +380,7 @@ func TestMapExportedCommandIDs(t *testing.T) {
 
 	payload := Payload{}
 	payload.Quicklinks.Quicklinks = []Quicklink{{
-		ID: "01M1VBS91J2HW3SRPW8Y46WGFN", Name: "wox", Link: "https://github.com/Wox-launcher/Wox",
+		ID: "01M1VBS91J2HW3SRPW8Y46WGFN", Name: "wox", Link: "https://github.com/poplknight/Wox",
 	}}
 	payload.Settings.Commands = []Command{
 		{ExtensionID: "e:r:applications", ID: "c:r:applications::*::application::=::/Applications/94f60fda-9dce-5346-8267-287b6affb1c0", Alias: "wp"},

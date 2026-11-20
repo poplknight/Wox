@@ -22,8 +22,8 @@ jobs:
       build_macos_amd64: true
       build_windows_amd64: true
       build_linux_amd64: true
-      require_macos_notarize: true
-      require_windows_signpath: true
+      require_macos_notarize: false
+      require_windows_signpath: false
       artifact_retention_days: 10
     secrets: inherit
 

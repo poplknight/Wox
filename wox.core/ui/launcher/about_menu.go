@@ -26,8 +26,8 @@ const (
 	aboutMenuPluginStoreQuery = "wpm install "
 	aboutMenuGuideURL         = "https://www.woxlauncher.com/guide/introduction.html"
 	aboutMenuGuideURLZh       = "https://www.woxlauncher.com/zh/guide/introduction.html"
-	aboutMenuChangelogURL     = "https://github.com/Wox-launcher/Wox/releases"
-	aboutMenuGithubURL        = "https://github.com/Wox-launcher/Wox"
+	aboutMenuChangelogURL     = "https://github.com/poplknight/Wox/releases"
+	aboutMenuGithubURL        = "https://github.com/poplknight/Wox"
 	aboutMenuRedditURL        = "https://www.reddit.com/r/WoxLauncher/"
 	aboutMenuDiscordURL       = "https://discord.gg/WcPAXtY6h"
 

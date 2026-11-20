@@ -9,8 +9,8 @@ authors = [{ name = "Wox Team" }]
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/Wox-launcher/Wox"
-Repository = "https://github.com/Wox-launcher/Wox"
+Homepage = "https://github.com/poplknight/Wox"
+Repository = "https://github.com/poplknight/Wox"
 
 [project.optional-dependencies]
 dev = ["hatchling", "twine", "ruff", "mypy"]

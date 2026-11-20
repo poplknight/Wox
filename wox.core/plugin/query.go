@@ -135,7 +135,7 @@ type QueryEnv struct {
 	ActiveWindowIcon  common.WoxImage // active window icon when user query, empty if not available
 
 	// active browser url when user query
-	// Only available when active window is browser and https://github.com/Wox-launcher/Wox.Chrome.Extension is installed
+	// Only available when active window is browser and https://github.com/poplknight/Wox.Chrome.Extension is installed
 	ActiveBrowserUrl string
 
 	// These fields are core-only. Do not add them to SDK models or public plugin

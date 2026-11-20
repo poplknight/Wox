@@ -218,8 +218,8 @@ settings = [
 
 ## For More Information
 
-- Wox Documentation: https://github.com/Wox-launcher/Wox
-- Plugin Examples: https://github.com/Wox-launcher/Wox.Plugin.Python
+- Wox Documentation: https://github.com/poplknight/Wox
+- Plugin Examples: https://github.com/poplknight/Wox.Plugin.Python
 """
 
 from typing import List

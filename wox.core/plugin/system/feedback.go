@@ -27,7 +27,7 @@ type FeedbackPlugin struct {
 }
 
 const (
-	feedbackGitHubNewIssueURL  = "https://github.com/Wox-launcher/Wox/issues/new"
+	feedbackGitHubNewIssueURL  = "https://github.com/poplknight/Wox/issues/new"
 	feedbackBugTemplate        = "bug_report.yml"
 	feedbackFeatureTemplate    = "feature_request.yml"
 	feedbackBugTitlePrefix     = "[Bug]: "
@@ -40,7 +40,7 @@ func (p *FeedbackPlugin) GetMetadata() plugin.Metadata {
 		Id:            common.FeedbackPluginID,
 		Name:          "i18n:plugin_feedback_plugin_name",
 		Author:        "Wox Launcher",
-		Website:       "https://github.com/Wox-launcher/Wox",
+		Website:       "https://github.com/poplknight/Wox",
 		Version:       "1.0.0",
 		MinWoxVersion: "2.0.0",
 		Runtime:       "Go",

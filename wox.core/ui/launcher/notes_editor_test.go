@@ -296,7 +296,7 @@ func TestNotesListIndentSupportsThreeLevels(t *testing.T) {
 }
 
 func TestDocumentFromEditorKeepsLinkWhenEditingInsideLabel(t *testing.T) {
-	const markdown = "一转眼13年过去了，在这些年里，Wox经历过[两届主要维护者](https://github.com/Wox-launcher/Wox/graphs/contributors?all=1)。我从2013-2015，并在2015年因为开始转向使用Mac，将Wox从[我名下](https://github.com/qianlifeng/winalfred)转到github的组织(wox-launcher), 并交由社区维护。然后第二届主要维护者 [bao-qian](https://github.com/bao-qian) 继续接棒维护Wox。\n在这13年里，Wox有过辉煌"
+	const markdown = "一转眼13年过去了，在这些年里，Wox经历过[两届主要维护者](https://github.com/poplknight/Wox/graphs/contributors?all=1)。我从2013-2015，并在2015年因为开始转向使用Mac，将Wox从[我名下](https://github.com/qianlifeng/winalfred)转到github的组织(wox-launcher), 并交由社区维护。然后第二届主要维护者 [bao-qian](https://github.com/bao-qian) 继续接棒维护Wox。\n在这13年里，Wox有过辉煌"
 	document := notesplugin.ParseMarkdown(markdown)
 	projected, _, _ := projectNoteDocument(document, woxui.TextStyle{Size: 14}, woxcomponent.ControlTheme{})
 	edited := strings.Replace(projected, "两届主要维护者", "两轮主要维护者", 1)
@@ -306,7 +306,7 @@ func TestDocumentFromEditorKeepsLinkWhenEditingInsideLabel(t *testing.T) {
 	end := start + utf8.RuneCountInString("两轮主要维护者")
 	found := false
 	for _, span := range block.Spans {
-		if span.Link != "https://github.com/Wox-launcher/Wox/graphs/contributors?all=1" {
+		if span.Link != "https://github.com/poplknight/Wox/graphs/contributors?all=1" {
 			continue
 		}
 		found = true

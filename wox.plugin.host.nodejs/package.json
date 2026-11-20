@@ -4,7 +4,7 @@
   "description": "Wox nodejs host",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Wox-launcher/Wox.git"
+    "url": "https://github.com/poplknight/Wox.git"
   },
     "scripts": {
       "build": "node ./scripts/clean.mjs && ncc build src/index.ts -o dist && babel dist --out-dir dist",

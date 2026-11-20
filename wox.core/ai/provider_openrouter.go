@@ -32,7 +32,7 @@ func NewOpenRouterProvider(ctx context.Context, connectContext setting.AIProvide
 	return &OpenRouterProvider{
 		OpenAIBaseProvider: NewOpenAIBaseProviderWithOptions(connectContext, OpenAIBaseProviderOptions{
 			Headers: map[string]string{
-				"HTTP-Referer": "https://github.com/Wox-launcher/Wox",
+				"HTTP-Referer": "https://github.com/poplknight/Wox",
 				"X-Title":      "Wox",
 			},
 		}),

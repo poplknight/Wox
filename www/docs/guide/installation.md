@@ -10,15 +10,15 @@ Choose the installer that matches how you normally manage desktop apps. Package 
 | Windows | Winget | `winget install -e --id Wox.Wox` |
 | Windows | Scoop | `scoop install extras/wox` |
 | Arch Linux | AUR | `yay -S wox-bin` |
-| Debian / Ubuntu | `.deb` | Download `wox-linux-amd64.deb` from [Releases](https://github.com/Wox-launcher/Wox/releases), then `sudo apt install ./wox-linux-amd64.deb` |
-| Fedora / RHEL | `.rpm` | Download `wox-linux-amd64.rpm` from [Releases](https://github.com/Wox-launcher/Wox/releases), then `sudo dnf install ./wox-linux-amd64.rpm` |
-| openSUSE | `.rpm` | Download `wox-linux-amd64.rpm` from [Releases](https://github.com/Wox-launcher/Wox/releases), then `sudo zypper install ./wox-linux-amd64.rpm` |
+| Debian / Ubuntu | `.deb` | Download `wox-linux-amd64.deb` from [Releases](https://github.com/poplknight/Wox/releases), then `sudo apt install ./wox-linux-amd64.deb` |
+| Fedora / RHEL | `.rpm` | Download `wox-linux-amd64.rpm` from [Releases](https://github.com/poplknight/Wox/releases), then `sudo dnf install ./wox-linux-amd64.rpm` |
+| openSUSE | `.rpm` | Download `wox-linux-amd64.rpm` from [Releases](https://github.com/poplknight/Wox/releases), then `sudo zypper install ./wox-linux-amd64.rpm` |
 
 After installation, start Wox from your app launcher or run the installed executable once. Wox creates its data directory on first launch.
 
 ## Manual Download
 
-Download the latest stable package from [GitHub Releases](https://github.com/Wox-launcher/Wox/releases) if your platform does not have a package-manager entry yet or you prefer a portable setup.
+Download the latest stable package from [GitHub Releases](https://github.com/poplknight/Wox/releases) if your platform does not have a package-manager entry yet or you prefer a portable setup.
 
 ## Update Channels
 

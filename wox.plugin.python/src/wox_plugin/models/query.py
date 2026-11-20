@@ -315,7 +315,7 @@ class QueryEnv:
     2. The Wox Chrome Extension is installed
 
     The extension is available at:
-    https://github.com/Wox-launcher/Wox.Chrome.Extension
+    https://github.com/poplknight/Wox.Chrome.Extension
 
     Note: Only available when both conditions above are met.
     """

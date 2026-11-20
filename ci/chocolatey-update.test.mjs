@@ -31,14 +31,14 @@ import { join } from 'node:path';
 const options = JSON.parse(readFileSync('options.json', 'utf8'));
 const bytes = Buffer.from('fixture executable');
 const assetName = 'wox-windows-amd64.exe';
-const url = 'https://github.com/Wox-launcher/Wox/releases/download/v2.4.5/' + assetName;
+const url = 'https://github.com/poplknight/Wox/releases/download/v2.4.5/' + assetName;
 childProcess.spawnSync = (command, args) => {
   const calls = JSON.parse(readFileSync('calls.json', 'utf8'));
   calls.push([command, ...args]);
   writeFileSync('calls.json', JSON.stringify(calls));
   let stdout = '';
   if (command === 'gh' && args[1] === 'view') {
-    stdout = JSON.stringify({ tagName: 'v2.4.5', url: 'https://github.com/Wox-launcher/Wox/releases/tag/v2.4.5',
+    stdout = JSON.stringify({ tagName: 'v2.4.5', url: 'https://github.com/poplknight/Wox/releases/tag/v2.4.5',
       isDraft: false, isPrerelease: options.prerelease ?? false,
       assets: options.missingAsset ? [] : [{ name: assetName, url, state: 'uploaded',
         digest: 'sha256:' + (options.badDigest ? '0'.repeat(64) : createHash('sha256').update(bytes).digest('hex')) }] });

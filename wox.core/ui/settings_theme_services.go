@@ -151,7 +151,7 @@ func (s *CoreServices) SaveTheme(ctx context.Context, sessionID string, name str
 		theme.ThemeAuthor = "Wox Launcher"
 	}
 	if strings.TrimSpace(theme.ThemeUrl) == "" {
-		theme.ThemeUrl = "https://github.com/Wox-launcher/Wox"
+		theme.ThemeUrl = "https://github.com/poplknight/Wox"
 	}
 	if strings.TrimSpace(theme.Version) == "" {
 		theme.Version = "1.0.0"
@@ -276,7 +276,7 @@ func composeUserAutoTheme(id, name string, template common.Theme, lightThemeID, 
 		theme.ThemeAuthor = "Wox Launcher"
 	}
 	if strings.TrimSpace(theme.ThemeUrl) == "" {
-		theme.ThemeUrl = "https://github.com/Wox-launcher/Wox"
+		theme.ThemeUrl = "https://github.com/poplknight/Wox"
 	}
 	if strings.TrimSpace(theme.Version) == "" {
 		theme.Version = "1.0.0"

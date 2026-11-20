@@ -164,7 +164,7 @@ func (c *FileSearchPlugin) GetMetadata() plugin.Metadata {
 		Id:            PluginID,
 		Name:          "i18n:plugin_file_plugin_name",
 		Author:        "Wox Launcher",
-		Website:       "https://github.com/Wox-launcher/Wox",
+		Website:       "https://github.com/poplknight/Wox",
 		Version:       "1.0.0",
 		MinWoxVersion: "2.0.0",
 		Runtime:       "Go",

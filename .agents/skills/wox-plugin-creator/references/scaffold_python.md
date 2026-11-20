@@ -5,7 +5,7 @@ Wox requires **Python 3.10 or later**. Store install and plugin load fail on old
 Best practice: clone the official template repo instead of hardcoding a scaffold.
 
 ```bash
-git clone https://github.com/Wox-launcher/Wox.Plugin.Template.Python my-plugin
+git clone https://github.com/poplknight/Wox.Plugin.Template.Python my-plugin
 ```
 
 Before editing a new project, run `make init` in the project root when initialization has not been done yet.

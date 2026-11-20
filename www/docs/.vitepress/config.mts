@@ -126,7 +126,7 @@ export default defineConfig({
 
   themeConfig: {
     logo: "/logo.png",
-    socialLinks: [{ icon: "github", link: "https://github.com/Wox-launcher/Wox" }],
+    socialLinks: [{ icon: "github", link: "https://github.com/poplknight/Wox" }],
   },
 });
 

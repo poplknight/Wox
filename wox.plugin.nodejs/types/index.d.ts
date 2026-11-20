@@ -346,7 +346,7 @@ export interface QueryEnv {
    * - The active window is a supported browser
    * - The Wox browser extension is installed
    *
-   * @see https://github.com/Wox-launcher/Wox.Chrome.Extension
+   * @see https://github.com/poplknight/Wox.Chrome.Extension
    */
   ActiveBrowserUrl: string
 }
@@ -2099,7 +2099,7 @@ export interface WoxPreviewTag {
  * // URL preview
  * {
  *   PreviewType: "url",
- *   PreviewData: "https://github.com/Wox-launcher/Wox",
+ *   PreviewData: "https://github.com/poplknight/Wox",
  *   PreviewTags: []
  * }
  *

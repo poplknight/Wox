@@ -10,15 +10,15 @@
 | Windows | Winget | `winget install -e --id Wox.Wox` |
 | Windows | Scoop | `scoop install extras/wox` |
 | Arch Linux | AUR | `yay -S wox-bin` |
-| Debian / Ubuntu | `.deb` | 从 [Releases](https://github.com/Wox-launcher/Wox/releases) 下载 `wox-linux-amd64.deb`，然后执行 `sudo apt install ./wox-linux-amd64.deb` |
-| Fedora / RHEL | `.rpm` | 从 [Releases](https://github.com/Wox-launcher/Wox/releases) 下载 `wox-linux-amd64.rpm`，然后执行 `sudo dnf install ./wox-linux-amd64.rpm` |
-| openSUSE | `.rpm` | 从 [Releases](https://github.com/Wox-launcher/Wox/releases) 下载 `wox-linux-amd64.rpm`，然后执行 `sudo zypper install ./wox-linux-amd64.rpm` |
+| Debian / Ubuntu | `.deb` | 从 [Releases](https://github.com/poplknight/Wox/releases) 下载 `wox-linux-amd64.deb`，然后执行 `sudo apt install ./wox-linux-amd64.deb` |
+| Fedora / RHEL | `.rpm` | 从 [Releases](https://github.com/poplknight/Wox/releases) 下载 `wox-linux-amd64.rpm`，然后执行 `sudo dnf install ./wox-linux-amd64.rpm` |
+| openSUSE | `.rpm` | 从 [Releases](https://github.com/poplknight/Wox/releases) 下载 `wox-linux-amd64.rpm`，然后执行 `sudo zypper install ./wox-linux-amd64.rpm` |
 
 安装完成后，从应用启动器打开 Wox，或运行一次已安装的可执行文件。首次启动时 Wox 会创建用户数据目录。
 
 ## 手动下载
 
-如果你的平台暂时没有包管理器入口，或你希望把 Wox 放在固定目录中运行，可以从 [GitHub Releases](https://github.com/Wox-launcher/Wox/releases) 下载最新稳定版安装包。
+如果你的平台暂时没有包管理器入口，或你希望把 Wox 放在固定目录中运行，可以从 [GitHub Releases](https://github.com/poplknight/Wox/releases) 下载最新稳定版安装包。
 
 ## 更新通道
 

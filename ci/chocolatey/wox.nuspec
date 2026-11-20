@@ -8,10 +8,10 @@
     <licenseUrl>https://raw.githubusercontent.com/Wox-launcher/Wox/@@TAG@@/LICENSE</licenseUrl>
     <projectUrl>https://www.woxlauncher.com/</projectUrl>
     <iconUrl>https://raw.githubusercontent.com/Wox-launcher/Wox/@@TAG@@/assets/app.png</iconUrl>
-    <packageSourceUrl>https://github.com/Wox-launcher/Wox/tree/master/ci/chocolatey</packageSourceUrl>
-    <projectSourceUrl>https://github.com/Wox-launcher/Wox</projectSourceUrl>
+    <packageSourceUrl>https://github.com/poplknight/Wox/tree/master/ci/chocolatey</packageSourceUrl>
+    <projectSourceUrl>https://github.com/poplknight/Wox</projectSourceUrl>
     <docsUrl>https://www.woxlauncher.com/</docsUrl>
-    <bugTrackerUrl>https://github.com/Wox-launcher/Wox/issues</bugTrackerUrl>
+    <bugTrackerUrl>https://github.com/poplknight/Wox/issues</bugTrackerUrl>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
     <description>Wox is an open-source cross-platform launcher for macOS, Linux, and Windows. It provides fast local search, extensibility through plugins, and a lightweight distribution that runs from a single executable.</description>
     <summary>A cross-platform launcher that simply works</summary>

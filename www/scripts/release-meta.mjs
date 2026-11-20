@@ -68,7 +68,7 @@ export function publicReleaseMeta(release) {
     dateLongZh: release.dateLongZh,
     dateMonthZh: release.dateMonthZh,
     highlight: release.highlight,
-    githubReleaseUrl: `https://github.com/Wox-launcher/Wox/releases/tag/${release.tag}`,
+    githubReleaseUrl: `https://github.com/poplknight/Wox/releases/tag/${release.tag}`,
     changelogUrl: `/changelog/${release.version}`,
   };
 }
@@ -242,7 +242,7 @@ lastUpdated: ${release.date}
 
 # Wox ${release.version}
 
-**${release.dateLongEn}** · [GitHub Release ${release.tag}](https://github.com/Wox-launcher/Wox/releases/tag/${release.tag})
+**${release.dateLongEn}** · [GitHub Release ${release.tag}](https://github.com/poplknight/Wox/releases/tag/${release.tag})
 
 ${release.highlight}
 ${body}`;
@@ -261,7 +261,7 @@ lastUpdated: ${release.date}
 
 # Wox ${release.version}
 
-**${release.dateLongZh}** · [GitHub Release ${release.tag}](https://github.com/Wox-launcher/Wox/releases/tag/${release.tag})
+**${release.dateLongZh}** · [GitHub Release ${release.tag}](https://github.com/poplknight/Wox/releases/tag/${release.tag})
 
 ${release.highlight}
 ${body}`;
@@ -316,7 +316,7 @@ ${latest}
 </div>
 <div class="release-meta">
 <time datetime="${release.date}">${chinese ? release.dateLongZh : release.dateLongEn}</time>
-<a href="https://github.com/Wox-launcher/Wox/releases/tag/${release.tag}">GitHub Release ↗</a>
+<a href="https://github.com/poplknight/Wox/releases/tag/${release.tag}">GitHub Release ↗</a>
 </div>
 </header>
 ${fallback}

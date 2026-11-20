@@ -32,8 +32,8 @@ const (
 
 var currentUpdateInfo = UpdateInfo{Status: UpdateStatusNone} // global variable to store update info
 
-const stableVersionManifestUrl = "https://raw.githubusercontent.com/Wox-launcher/Wox/master/updater.json"
-const betaVersionManifestUrl = "https://raw.githubusercontent.com/Wox-launcher/Wox/master/updater.beta.json"
+const stableVersionManifestUrl = "https://raw.githubusercontent.com/poplknight/Wox/master/updater.json"
+const betaVersionManifestUrl = "https://raw.githubusercontent.com/poplknight/Wox/master/updater.beta.json"
 
 type VersionManifest struct {
 	Version string

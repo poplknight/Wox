@@ -30,8 +30,8 @@
     "Runtime": "nodejs",
     "Description": "Sum Selection Numbers",
     "IconUrl": "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Selection.Sum/main/images/app.png",
-    "Website": "https://github.com/Wox-launcher/Wox.Plugin.Selection.Sum",
-    "DownloadUrl": "https://github.com/Wox-launcher/Wox.Plugin.Selection.Sum/releases/latest/download/Wox.Plugin.Selection.Sum.wox",
+    "Website": "https://github.com/poplknight/Wox.Plugin.Selection.Sum",
+    "DownloadUrl": "https://github.com/poplknight/Wox.Plugin.Selection.Sum/releases/latest/download/Wox.Plugin.Selection.Sum.wox",
     "ScreenshotUrls": [
       "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Selection.Sum/main/assets/snipaste.png"
     ],
@@ -52,8 +52,8 @@
     "Runtime": "nodejs",
     "Description": "DeepL translation plugin for Wox",
     "IconUrl": "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.DeepL/main/images/app.png",
-    "Website": "https://github.com/Wox-launcher/Wox.Plugin.DeepL",
-    "DownloadUrl": "https://github.com/Wox-launcher/Wox.Plugin.DeepL/releases/latest/download/Wox.Plugin.DeepL.wox",
+    "Website": "https://github.com/poplknight/Wox.Plugin.DeepL",
+    "DownloadUrl": "https://github.com/poplknight/Wox.Plugin.DeepL/releases/latest/download/Wox.Plugin.DeepL.wox",
     "ScreenshotUrls": [
       "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.DeepL/main/assets/snapshot.png"
     ],
@@ -74,8 +74,8 @@
     "Runtime": "nodejs",
     "Description": "Search arc tabs",
     "IconUrl": "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Arc/main/images/app.png",
-    "Website": "https://github.com/Wox-launcher/Wox.Plugin.Arc",
-    "DownloadUrl": "https://github.com/Wox-launcher/Wox.Plugin.Arc/releases/latest/download/wox.plugin.arc.wox",
+    "Website": "https://github.com/poplknight/Wox.Plugin.Arc",
+    "DownloadUrl": "https://github.com/poplknight/Wox.Plugin.Arc/releases/latest/download/wox.plugin.arc.wox",
     "ScreenshotUrls": [
       "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Arc/main/assets/snapshot.png"
     ],
@@ -136,8 +136,8 @@
     "Runtime": "nodejs",
     "Description": "Spotify integration",
     "IconUrl": "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Spotify/main/images/app.png",
-    "Website": "https://github.com/Wox-launcher/Wox.Plugin.Spotify",
-    "DownloadUrl": "https://github.com/Wox-launcher/Wox.Plugin.Spotify/releases/latest/download/Wox.Plugin.Spotify.wox",
+    "Website": "https://github.com/poplknight/Wox.Plugin.Spotify",
+    "DownloadUrl": "https://github.com/poplknight/Wox.Plugin.Spotify/releases/latest/download/Wox.Plugin.Spotify.wox",
     "ScreenshotUrls": [
       "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Spotify/main/prev.png"
     ],
@@ -309,10 +309,10 @@
     "Runtime": "nodejs",
     "Description": "i18n:plugin_desc",
     "IconUrl": "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.ColorPicker/refs/heads/main/images/app.png",
-    "Website": "https://github.com/Wox-launcher/Wox.Plugin.ColorPicker",
+    "Website": "https://github.com/poplknight/Wox.Plugin.ColorPicker",
     "DownloadUrl": "https://github.com/wox-launcher/Wox.Plugin.ColorPicker/releases/latest/download/wox.plugin.colorpicker.wox",
     "ScreenshotUrls": [
-      "https://github.com/Wox-launcher/Wox.Plugin.ColorPicker/raw/main/images/screenshot1.png"
+      "https://github.com/poplknight/Wox.Plugin.ColorPicker/raw/main/images/screenshot1.png"
     ],
     "SupportedOS": [
       "windows",
@@ -517,8 +517,8 @@
     "Runtime": "python",
     "Description": "i18n:plugin_description",
     "IconUrl": "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Iconify/master/image/app.png",
-    "Website": "https://github.com/Wox-launcher/Wox.Plugin.Iconify",
-    "DownloadUrl": "https://github.com/Wox-launcher/Wox.Plugin.Iconify/releases/latest/download/Wox.Plugin.Iconify.wox",
+    "Website": "https://github.com/poplknight/Wox.Plugin.Iconify",
+    "DownloadUrl": "https://github.com/poplknight/Wox.Plugin.Iconify/releases/latest/download/Wox.Plugin.Iconify.wox",
     "ScreenshotUrls": [
       "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Iconify/master/screenshot.png"
     ],
@@ -547,8 +547,8 @@
     "Runtime": "nodejs",
     "Description": "i18n:plugin_desc",
     "IconUrl": "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.AIQuota/master/images/app.svg",
-    "Website": "https://github.com/Wox-launcher/Wox.Plugin.AIQuota",
-    "DownloadUrl": "https://github.com/Wox-launcher/Wox.Plugin.AIQuota/releases/latest/download/Wox.Plugin.AIQuota.wox",
+    "Website": "https://github.com/poplknight/Wox.Plugin.AIQuota",
+    "DownloadUrl": "https://github.com/poplknight/Wox.Plugin.AIQuota/releases/latest/download/Wox.Plugin.AIQuota.wox",
     "ScreenshotUrls": [
       "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.AIQuota/master/screenshot.png"
     ],
@@ -579,8 +579,8 @@
     "Runtime": "nodejs",
     "Description": "i18n:plugin_description",
     "IconUrl": "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Projects/main/images/app.svg",
-    "Website": "https://github.com/Wox-launcher/Wox.Plugin.Projects",
-    "DownloadUrl": "https://github.com/Wox-launcher/Wox.Plugin.Projects/releases/latest/download/Wox.Plugin.Projects.wox",
+    "Website": "https://github.com/poplknight/Wox.Plugin.Projects",
+    "DownloadUrl": "https://github.com/poplknight/Wox.Plugin.Projects/releases/latest/download/Wox.Plugin.Projects.wox",
     "ScreenshotUrls": [
       "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Projects/main/screenshot.png"
     ],
@@ -868,8 +868,8 @@
     "Runtime": "nodejs",
     "Description": "i18n:plugin_description",
     "IconUrl": "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.WorldCup/main/images/app.svg",
-    "Website": "https://github.com/Wox-launcher/Wox.Plugin.WorldCup",
-    "DownloadUrl": "https://github.com/Wox-launcher/Wox.Plugin.WorldCup/releases/latest/download/wox.plugin.worldcup.wox",
+    "Website": "https://github.com/poplknight/Wox.Plugin.WorldCup",
+    "DownloadUrl": "https://github.com/poplknight/Wox.Plugin.WorldCup/releases/latest/download/wox.plugin.worldcup.wox",
     "ScreenshotUrls": [
       "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.WorldCup/main/screenshot.png"
     ],
@@ -1241,8 +1241,8 @@
     "Runtime": "nodejs",
     "Description": "i18n:plugin_description",
     "IconUrl": "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Github/main/images/app.svg",
-    "Website": "https://github.com/Wox-launcher/Wox.Plugin.Github",
-    "DownloadUrl": "https://github.com/Wox-launcher/Wox.Plugin.Github/releases/latest/download/wox.plugin.github.wox",
+    "Website": "https://github.com/poplknight/Wox.Plugin.Github",
+    "DownloadUrl": "https://github.com/poplknight/Wox.Plugin.Github/releases/latest/download/wox.plugin.github.wox",
     "ScreenshotUrls": [
       "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Github/main/screenshot.jpg"
     ],
@@ -1598,8 +1598,8 @@
     "Runtime": "nodejs",
     "Description": "i18n:plugin_description",
     "IconUrl": "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Games/refs/heads/main/images/app.svg",
-    "Website": "https://github.com/Wox-launcher/Wox.Plugin.Games",
-    "DownloadUrl": "https://github.com/Wox-launcher/Wox.Plugin.Games/releases/latest/download/wox.plugin.games.wox",
+    "Website": "https://github.com/poplknight/Wox.Plugin.Games",
+    "DownloadUrl": "https://github.com/poplknight/Wox.Plugin.Games/releases/latest/download/wox.plugin.games.wox",
     "ScreenshotUrls": [
       "https://raw.githubusercontent.com/Wox-launcher/Wox.Plugin.Games/refs/heads/main/screenshot.png"
     ],

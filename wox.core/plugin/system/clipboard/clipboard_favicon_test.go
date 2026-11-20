@@ -17,7 +17,7 @@ import (
 
 func TestResolveTextRecordIconPrefersCachedFaviconForLinks(t *testing.T) {
 	initClipboardFaviconCache(t)
-	link := "https://github.com/Wox-launcher/Wox"
+	link := "https://github.com/poplknight/Wox"
 	cachePath := writeClipboardWebsiteIconCache(t, link)
 	sourceIcon := common.NewWoxImageAbsolutePath("/tmp/chrome.png")
 	sourceIconData := sourceIcon.String()
@@ -49,7 +49,7 @@ func TestResolveTextRecordIconPrefersCachedFaviconForLinks(t *testing.T) {
 
 func TestConvertTextRecordUsesCachedFavicon(t *testing.T) {
 	initClipboardFaviconCache(t)
-	link := "https://github.com/Wox-launcher/Wox"
+	link := "https://github.com/poplknight/Wox"
 	cachePath := writeClipboardWebsiteIconCache(t, link)
 	clipboardPlugin := &ClipboardPlugin{api: &imagePasteFailureAPI{}, imageCache: util.NewHashMap[string, *ImageCacheEntry]()}
 
@@ -65,7 +65,7 @@ func TestConvertTextRecordUsesCachedFavicon(t *testing.T) {
 
 func TestCollectMissingLinkFaviconURLsIsOncePerHostAndSkipsCache(t *testing.T) {
 	initClipboardFaviconCache(t)
-	cached := "https://github.com/Wox-launcher/Wox"
+	cached := "https://github.com/poplknight/Wox"
 	writeClipboardWebsiteIconCache(t, cached)
 	missing := "https://example.com/path"
 	clipboardPlugin := &ClipboardPlugin{faviconFetchAttempted: util.NewHashMap[string, bool]()}

@@ -38,7 +38,7 @@ func (p *Plugin) GetMetadata() plugin.Metadata {
 		Id:              common.InfoPluginID,
 		Name:            "i18n:plugin_info_plugin_name",
 		Author:          "Wox Launcher",
-		Website:         "https://github.com/Wox-launcher/Wox",
+		Website:         "https://github.com/poplknight/Wox",
 		Version:         "1.0.0",
 		MinWoxVersion:   "2.0.0",
 		Runtime:         "Go",

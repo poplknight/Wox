@@ -29,7 +29,7 @@ func (a *App) buildAboutSettingsPage(snapshot settingsSnapshot, width, height, i
 		Links: []launcherview.AboutLink{
 			{ID: "about-open-onboarding-button", Label: a.language.translate("i18n:ui_about_onboarding"), Icon: a.imageForTint(settingControlIconSource("onboarding"), &iconTint, physicalImageSize(18, imageScale)), OnTap: a.openAboutOnboarding},
 			{ID: "about-link-documentation", Label: a.language.translate("i18n:ui_about_docs"), Icon: a.imageForTint(settingControlIconSource("documentation"), &iconTint, physicalImageSize(18, imageScale)), OnTap: func() { a.openAboutLink("https://www.woxlauncher.com/") }},
-			{ID: "about-link-github", Label: a.language.translate("i18n:ui_about_github"), Icon: a.imageForTint(pluginMetadataIconSource("github"), &iconTint, physicalImageSize(18, imageScale)), OnTap: func() { a.openAboutLink("https://github.com/Wox-launcher/Wox") }},
+			{ID: "about-link-github", Label: a.language.translate("i18n:ui_about_github"), Icon: a.imageForTint(pluginMetadataIconSource("github"), &iconTint, physicalImageSize(18, imageScale)), OnTap: func() { a.openAboutLink("https://github.com/poplknight/Wox") }},
 		},
 	})
 }
