@@ -44,7 +44,7 @@ make -C wox.core build     # 只构建核心二进制到 release/
 
 ## 文档与社区
 
-- 上游项目：[Wox-launcher/Wox](https://github.com/poplknight/Wox)
+- 上游项目：[Wox-launcher/Wox](https://github.com/Wox-launcher/Wox)
 - 官网：[woxlauncher.com](https://www.woxlauncher.com/)
 
 ## 许可证
